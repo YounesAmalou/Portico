@@ -93,11 +93,18 @@ pub struct InitPlan {
     pub insert_include: bool,
     pub reposition_include: bool,
     pub backup_entry: bool,
+    pub fix_portico_permissions: bool,
+    pub fix_managed_permissions: bool,
 }
 
 impl InitPlan {
     pub fn requires_confirmation(&self) -> bool {
-        self.create_entry || self.create_managed || self.insert_include || self.reposition_include
+        self.create_entry
+            || self.create_managed
+            || self.insert_include
+            || self.reposition_include
+            || self.fix_portico_permissions
+            || self.fix_managed_permissions
     }
 }
 
@@ -179,7 +186,7 @@ impl ManagedStore {
             None => String::new(),
         };
         let entry = analyze_entry(&contents, &self.paths)?;
-        if entry_kind.as_ref().is_some_and(|kind| kind.is_symlink()) && !entry.has_include {
+        if entry_kind.as_ref().is_some_and(|kind| kind.is_symlink()) && !entry.is_normalized {
             return Err(InitError::SymlinkRequiresManualSetup {
                 path: self.paths.entry.clone(),
                 directive: PORTICO_INCLUDE,
@@ -194,17 +201,60 @@ impl ManagedStore {
                 io::Error::new(io::ErrorKind::InvalidInput, "entry config is not a file"),
             ));
         }
-        reject_symlink(&self.paths.managed)
-            .map_err(|source| init_io(&self.paths.managed, source))?;
+        let portico_mode = match fs::symlink_metadata(&self.paths.portico_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(init_io(
+                    &self.paths.portico_dir,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Portico directory is a symbolic link",
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(init_io(
+                    &self.paths.portico_dir,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Portico path is not a directory",
+                    ),
+                ));
+            }
+            Ok(metadata) => Some(metadata.permissions().mode() & 0o777),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(init_io(&self.paths.portico_dir, source)),
+        };
+        let managed_mode = match fs::symlink_metadata(&self.paths.managed) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(init_io(
+                    &self.paths.managed,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "managed config is a symbolic link",
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(init_io(
+                    &self.paths.managed,
+                    io::Error::new(io::ErrorKind::InvalidInput, "managed config is not a file"),
+                ));
+            }
+            Ok(metadata) => Some(metadata.permissions().mode() & 0o777),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(init_io(&self.paths.managed, source)),
+        };
 
         let create_entry = entry_kind.is_none();
         let entry_writable = !entry_kind.as_ref().is_some_and(|kind| kind.is_symlink());
         Ok(InitPlan {
             create_entry,
-            create_managed: !self.paths.managed.exists(),
+            create_managed: managed_mode.is_none(),
             insert_include: entry_writable && !entry.has_include,
             reposition_include: entry_writable && entry.has_include && !entry.is_normalized,
             backup_entry: entry_writable && !create_entry && !entry.is_normalized,
+            fix_portico_permissions: portico_mode.is_some_and(|mode| mode != 0o700),
+            fix_managed_permissions: managed_mode.is_some_and(|mode| mode != 0o600),
         })
     }
 
@@ -224,13 +274,30 @@ impl ManagedStore {
             .map_err(|source| init_io(&self.paths.ssh_dir, source))?;
         create_private_dir(&self.paths.portico_dir)
             .map_err(|source| init_io(&self.paths.portico_dir, source))?;
+        if preview.fix_portico_permissions {
+            fs::set_permissions(&self.paths.portico_dir, fs::Permissions::from_mode(0o700))
+                .map_err(|source| init_io(&self.paths.portico_dir, source))?;
+            sync_dir(&self.paths.portico_dir)
+                .map_err(|source| init_io(&self.paths.portico_dir, source))?;
+        }
         let lock =
             open_lock(&self.paths.lock).map_err(|source| init_io(&self.paths.lock, source))?;
         FileExt::lock_exclusive(&lock).map_err(|source| init_io(&self.paths.lock, source))?;
 
         let plan = self.plan_init()?;
         if !plan.requires_confirmation() {
-            return Ok(InitOutcome::Unchanged);
+            return Ok(if preview.fix_portico_permissions {
+                InitOutcome::Initialized
+            } else {
+                InitOutcome::Unchanged
+            });
+        }
+        if plan.fix_managed_permissions {
+            fs::set_permissions(&self.paths.managed, fs::Permissions::from_mode(0o600))
+                .map_err(|source| init_io(&self.paths.managed, source))?;
+            File::open(&self.paths.managed)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| init_io(&self.paths.managed, source))?;
         }
 
         let entry_contents = if plan.create_entry {
@@ -332,17 +399,24 @@ impl ManagedStore {
                 return Err(init_io(&self.paths.portico_dir, source));
             }
         }
-        if let Some(candidate) = entry_candidate
-            && let Err(source) = candidate.rename_to(&self.paths.entry)
-        {
-            if created_managed {
-                let _ = fs::remove_file(&self.paths.managed);
-                let _ = sync_dir(&self.paths.portico_dir);
+        let mut entry_activated = false;
+        if let Some(candidate) = entry_candidate {
+            if let Err(source) = candidate.rename_to(&self.paths.entry) {
+                if created_managed {
+                    let _ = fs::remove_file(&self.paths.managed);
+                    let _ = sync_dir(&self.paths.portico_dir);
+                }
+                return Err(init_io(&self.paths.entry, source));
             }
-            return Err(init_io(&self.paths.entry, source));
+            entry_activated = true;
         }
         if let Err(source) = sync_dir(&self.paths.ssh_dir) {
-            self.rollback_init(&entry_contents, entry_metadata.as_ref(), created_managed);
+            self.rollback_init(
+                &entry_contents,
+                entry_metadata.as_ref(),
+                entry_activated,
+                created_managed,
+            );
             return Err(init_io(&self.paths.ssh_dir, source));
         }
         Ok(InitOutcome::Initialized)
@@ -371,19 +445,22 @@ impl ManagedStore {
         &self,
         entry_contents: &str,
         entry_metadata: Option<&fs::Metadata>,
+        entry_activated: bool,
         created_managed: bool,
     ) {
-        if let Some(metadata) = entry_metadata {
-            if let Ok(candidate) = write_unique(
-                &self.paths.ssh_dir,
-                ".config.portico-rollback",
-                entry_contents.as_bytes(),
-                metadata.permissions().mode(),
-            ) {
-                let _ = candidate.rename_to(&self.paths.entry);
+        if entry_activated {
+            if let Some(metadata) = entry_metadata {
+                if let Ok(candidate) = write_unique(
+                    &self.paths.ssh_dir,
+                    ".config.portico-rollback",
+                    entry_contents.as_bytes(),
+                    metadata.permissions().mode(),
+                ) {
+                    let _ = candidate.rename_to(&self.paths.entry);
+                }
+            } else {
+                let _ = fs::remove_file(&self.paths.entry);
             }
-        } else {
-            let _ = fs::remove_file(&self.paths.entry);
         }
         if created_managed {
             let _ = fs::remove_file(&self.paths.managed);
@@ -451,8 +528,18 @@ impl ManagedStore {
         candidate
             .rename_to(&self.paths.managed)
             .map_err(|source| transaction_io(&self.paths.managed, source))?;
-        sync_dir(&self.paths.portico_dir)
-            .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
+        if let Err(source) = sync_dir(&self.paths.portico_dir) {
+            let rollback = write_unique(
+                &self.paths.portico_dir,
+                ".config.portico-rollback",
+                &active,
+                0o600,
+            )
+            .and_then(|candidate| candidate.rename_to(&self.paths.managed));
+            let _ = sync_dir(&self.paths.portico_dir);
+            rollback.map_err(|rollback| transaction_io(&self.paths.managed, rollback))?;
+            return Err(transaction_io(&self.paths.portico_dir, source));
+        }
         Ok(result)
     }
 
@@ -747,19 +834,18 @@ fn substitute_include(
                     .iter()
                     .any(|argument| is_managed_include(argument, paths)) =>
             {
-                if replaced {
-                    continue;
-                }
                 replaced = true;
-                lines.push(format!("Include {}", quote_path(&target.to_string_lossy())));
-                let remaining = arguments
+                let arguments = arguments
                     .iter()
-                    .filter(|argument| !is_managed_include(argument, paths))
-                    .map(|argument| quote(argument))
+                    .map(|argument| {
+                        if is_managed_include(argument, paths) {
+                            quote_path(&target.to_string_lossy())
+                        } else {
+                            quote(argument)
+                        }
+                    })
                     .collect::<Vec<_>>();
-                if !remaining.is_empty() {
-                    lines.push(format!("Include {}", remaining.join(" ")));
-                }
+                lines.push(format!("Include {}", arguments.join(" ")));
             }
             _ => lines.push(line.to_owned()),
         }
@@ -1209,6 +1295,25 @@ mod tests {
     }
 
     #[test]
+    fn candidate_substitution_preserves_all_include_arguments_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        let candidate = paths.portico_dir.join("candidate");
+        let entry = "Include ~/.ssh/portico/config first.conf\nHost unrelated\nInclude second.conf ~/.ssh/portico/config third.conf\n";
+
+        let substituted = substitute_include(entry, &paths, &candidate).unwrap();
+
+        assert_eq!(
+            substituted,
+            format!(
+                "Include \"{}\" first.conf\nHost unrelated\nInclude second.conf \"{}\" third.conf\n",
+                candidate.display(),
+                candidate.display()
+            )
+        );
+    }
+
+    #[test]
     fn symlinked_entry_requires_manual_setup() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
@@ -1223,6 +1328,53 @@ mod tests {
             error,
             InitError::SymlinkRequiresManualSetup { .. }
         ));
+    }
+
+    #[test]
+    fn conditional_include_in_symlink_requires_manual_setup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        let target = dir.path().join("dotfiles-ssh-config");
+        std::fs::write(&target, "Host unrelated\n  Include ~/.ssh/portico/config\n").unwrap();
+        symlink(&target, &paths.entry).unwrap();
+
+        let error = ManagedStore::new(paths).plan_init().unwrap_err();
+
+        assert!(matches!(
+            error,
+            InitError::SymlinkRequiresManualSetup { .. }
+        ));
+    }
+
+    #[test]
+    fn managed_only_init_rollback_preserves_entry_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        let target = dir.path().join("dotfiles-ssh-config");
+        std::fs::write(&target, "Include ~/.ssh/portico/config\n").unwrap();
+        symlink(&target, &paths.entry).unwrap();
+        std::fs::set_permissions(&paths.ssh_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = ManagedStore::new(paths.clone()).apply_init(true, |_, _| Ok(()));
+
+        std::fs::set_permissions(&paths.ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(InitError::Io { .. })));
+        assert!(
+            std::fs::symlink_metadata(&paths.entry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "Include ~/.ssh/portico/config\n"
+        );
     }
 
     #[test]
@@ -1264,6 +1416,61 @@ mod tests {
     }
 
     #[test]
+    fn existing_managed_paths_are_repaired_to_private_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = initialized_store();
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fixture.paths.managed,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        assert!(fixture.store.plan_init().unwrap().requires_confirmation());
+        fixture.store.apply_init(true, |_, _| Ok(())).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&fixture.paths.portico_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&fixture.paths.managed)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn symlinked_portico_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        std::fs::write(&paths.entry, "Include ~/.ssh/portico/config\n").unwrap();
+        let target = dir.path().join("external-portico");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &paths.portico_dir).unwrap();
+
+        let error = ManagedStore::new(paths).plan_init().unwrap_err();
+
+        assert!(matches!(error, InitError::Io { .. }));
+        assert!(error.to_string().contains("symbolic link"));
+    }
+
+    #[test]
     fn failed_validation_preserves_active_bytes() {
         let fixture = initialized_store();
         let before = std::fs::read(&fixture.paths.managed).unwrap();
@@ -1294,5 +1501,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read(&fixture.paths.backup).unwrap(), before_second);
+    }
+
+    #[test]
+    fn post_rename_sync_failure_restores_active_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = initialized_store();
+        let before = std::fs::read(&fixture.paths.managed).unwrap();
+        let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o300),
+        )
+        .unwrap();
+
+        let result = fixture
+            .store
+            .transact(|config| config.insert(host), |_, _| Ok(()));
+
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(matches!(result, Err(TransactionError::Io { .. })));
+        assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
     }
 }
