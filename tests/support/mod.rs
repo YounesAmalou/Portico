@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     ffi::OsStr,
     fs,
@@ -22,13 +24,16 @@ impl TestEnv {
         let home = dir.path().join("home");
         let bin = dir.path().join("bin");
         let log = dir.path().join("connections");
+        let rejected_alias = dir.path().join("rejected-alias");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&bin).unwrap();
 
         write_executable(
             bin.join("ssh"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  printf 'hostname resolved.example\\nuser resolved\\nport 22\\nidentityfile ~/.ssh/id_default\\nproxyjump none\\n'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" >> '{}'\n[ \"$2\" = 'fail' ] && exit 23\nexit 0\n",
+                "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  for alias do :; done\n  if [ -f '{}' ] && [ \"$(cat '{}')\" = \"$alias\" ]; then\n    printf 'rejected alias: %s\\n' \"$alias\" >&2\n    exit 23\n  fi\n  printf 'hostname resolved.example\\nuser resolved\\nport 22\\nidentityfile ~/.ssh/id_default\\nproxyjump none\\n'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" >> '{}'\n[ \"$2\" = 'fail' ] && exit 23\nexit 0\n",
+                rejected_alias.display(),
+                rejected_alias.display(),
                 log.display()
             ),
         );
@@ -70,12 +75,20 @@ impl TestEnv {
         self.home.join(".ssh/config")
     }
 
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
     pub fn managed_config(&self) -> PathBuf {
         self.home.join(".ssh/portico/config")
     }
 
     pub fn connection_log(&self) -> PathBuf {
         self._dir.path().join("connections")
+    }
+
+    pub fn reject_alias(&self, alias: &str) {
+        fs::write(self._dir.path().join("rejected-alias"), alias).unwrap();
     }
 }
 
