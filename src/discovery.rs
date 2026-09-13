@@ -69,6 +69,14 @@ pub(crate) fn parse_directive(line: &str) -> Result<Option<ConfigDirective>, Dis
     {
         arguments.insert(0, value.into());
     }
+    if let Some(argument) = arguments.first_mut()
+        && let Some(value) = argument.strip_prefix('=')
+    {
+        *argument = value.into();
+        if argument.is_empty() {
+            arguments.remove(0);
+        }
+    }
 
     if directive.eq_ignore_ascii_case("Include") {
         if arguments.is_empty() {
@@ -386,6 +394,38 @@ mod tests {
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
         std::fs::write(ssh.join("config"), "Include=conf.d/*.conf\n").unwrap();
+        std::fs::write(ssh.join("conf.d/host.conf"), "Host included\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+
+        assert_eq!(result.hosts[0].alias, "included");
+        assert!(result.aliases_complete);
+    }
+
+    #[test]
+    fn recognizes_host_space_equals_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("config"), "Host = prod\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+        let aliases: Vec<_> = result
+            .hosts
+            .iter()
+            .map(|host| host.alias.as_str())
+            .collect();
+
+        assert_eq!(aliases, ["prod"]);
+        assert!(result.aliases_complete);
+    }
+
+    #[test]
+    fn recognizes_include_space_equals_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(ssh.join("config"), "Include = conf.d/*.conf\n").unwrap();
         std::fs::write(ssh.join("conf.d/host.conf"), "Host included\n").unwrap();
 
         let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
