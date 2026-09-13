@@ -155,6 +155,16 @@ pub enum TransactionError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "activation sync failed at {path} and rollback also failed; active state is uncertain; recover from {recovery}: sync: {sync}; rollback: {rollback}"
+    )]
+    Rollback {
+        path: PathBuf,
+        recovery: PathBuf,
+        sync: io::Error,
+        #[source]
+        rollback: io::Error,
+    },
 }
 
 pub struct ManagedStore {
@@ -536,9 +546,20 @@ impl ManagedStore {
                 0o600,
             )
             .and_then(|candidate| candidate.rename_to(&self.paths.managed));
-            let _ = sync_dir(&self.paths.portico_dir);
-            rollback.map_err(|rollback| transaction_io(&self.paths.managed, rollback))?;
-            return Err(transaction_io(&self.paths.portico_dir, source));
+            match rollback {
+                Ok(()) => {
+                    let _ = sync_dir(&self.paths.portico_dir);
+                    return Err(transaction_io(&self.paths.portico_dir, source));
+                }
+                Err(rollback) => {
+                    return Err(TransactionError::Rollback {
+                        path: self.paths.managed.clone(),
+                        recovery: self.paths.backup.clone(),
+                        sync: source,
+                        rollback,
+                    });
+                }
+            }
         }
         Ok(result)
     }
@@ -967,6 +988,12 @@ impl Drop for PendingFile {
 }
 
 fn write_unique(dir: &Path, stem: &str, contents: &[u8], mode: u32) -> io::Result<PendingFile> {
+    #[cfg(test)]
+    if stem == ".config.portico-rollback"
+        && FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.replace(false))
+    {
+        return Err(io::Error::other("injected rollback write failure"));
+    }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -983,6 +1010,16 @@ fn write_unique(dir: &Path, stem: &str, contents: &[u8], mode: u32) -> io::Resul
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique temporary file",
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_TRANSACTION_ROLLBACK_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_transaction_rollback_write() {
+    FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.set(true));
 }
 
 fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
@@ -1527,5 +1564,43 @@ mod tests {
         .unwrap();
         assert!(matches!(result, Err(TransactionError::Io { .. })));
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
+    }
+
+    #[test]
+    fn rollback_failure_reports_uncertain_state_and_recovery_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = initialized_store();
+        let before = std::fs::read(&fixture.paths.managed).unwrap();
+        let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o300),
+        )
+        .unwrap();
+        fail_next_transaction_rollback_write();
+
+        let error = fixture
+            .store
+            .transact(|config| config.insert(host), |_, _| Ok(()))
+            .unwrap_err();
+
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(matches!(
+            &error,
+            TransactionError::Rollback { path, recovery, sync, rollback }
+                if path == &fixture.paths.managed
+                    && recovery == &fixture.paths.backup
+                    && sync.kind() == io::ErrorKind::PermissionDenied
+                    && rollback.to_string() == "injected rollback write failure"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("active state is uncertain"));
+        assert!(message.contains(&fixture.paths.backup.display().to_string()));
+        assert_eq!(std::fs::read(&fixture.paths.backup).unwrap(), before);
     }
 }
