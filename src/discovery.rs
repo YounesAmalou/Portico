@@ -56,21 +56,30 @@ pub(crate) enum ConfigDirective {
 }
 
 pub(crate) fn parse_directive(line: &str) -> Result<Option<ConfigDirective>, DiscoveryError> {
-    let tokens = tokenize(line)?;
-    let Some((directive, arguments)) = tokens.split_first() else {
+    let mut tokens = tokenize(line)?.into_iter();
+    let Some(first) = tokens.next() else {
         return Ok(None);
     };
+    let (directive, value) = first
+        .split_once('=')
+        .map_or((&*first, None), |(key, value)| (key, Some(value)));
+    let mut arguments = tokens.collect::<Vec<_>>();
+    if let Some(value) = value
+        && !value.is_empty()
+    {
+        arguments.insert(0, value.into());
+    }
 
     if directive.eq_ignore_ascii_case("Include") {
         if arguments.is_empty() {
             return Err(DiscoveryError::Parse("Include requires a path".into()));
         }
-        Ok(Some(ConfigDirective::Include(arguments.to_vec())))
+        Ok(Some(ConfigDirective::Include(arguments)))
     } else if directive.eq_ignore_ascii_case("Host") {
         if arguments.is_empty() {
             return Err(DiscoveryError::Parse("Host requires an alias".into()));
         }
-        Ok(Some(ConfigDirective::Host(arguments.to_vec())))
+        Ok(Some(ConfigDirective::Host(arguments)))
     } else {
         Ok(Some(ConfigDirective::Other))
     }
@@ -137,7 +146,7 @@ impl Scanner {
             match parse_directive(line) {
                 Ok(Some(ConfigDirective::Include(patterns))) => {
                     for pattern in patterns {
-                        self.expand_include(&pattern, source.parent().unwrap_or(Path::new(".")));
+                        self.expand_include(&pattern);
                     }
                 }
                 Ok(Some(ConfigDirective::Host(aliases))) => {
@@ -163,8 +172,8 @@ impl Scanner {
         }
     }
 
-    fn expand_include(&mut self, pattern: &str, base: &Path) {
-        let path = self.include_path(pattern, base);
+    fn expand_include(&mut self, pattern: &str) {
+        let path = self.include_path(pattern);
         let matches = match glob::glob(&path.to_string_lossy()) {
             Ok(matches) => matches,
             Err(error) => return self.warn_include(path, error.to_string()),
@@ -190,17 +199,16 @@ impl Scanner {
         }
     }
 
-    fn include_path(&self, pattern: &str, base: &Path) -> PathBuf {
+    fn include_path(&self, pattern: &str) -> PathBuf {
         if let Some(path) = pattern.strip_prefix("~/") {
             self.root.parent().unwrap_or(&self.root).join(path)
         } else if pattern == "~" {
             self.root.parent().unwrap_or(&self.root).to_path_buf()
         } else {
-            let path = Path::new(pattern);
-            if path.is_absolute() {
-                path.into()
+            if Path::new(pattern).is_absolute() {
+                pattern.into()
             } else {
-                base.join(path)
+                self.root.join(pattern)
             }
         }
     }
@@ -290,7 +298,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             ssh.join("conf.d/hosts.conf"),
-            "Host bastion\n  HostName bastion.example\nInclude ../config\n",
+            "Host bastion\n  HostName bastion.example\nInclude config\n",
         )
         .unwrap();
 
@@ -336,5 +344,53 @@ mod tests {
         let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
         assert!(!result.aliases_complete);
         assert!(result.warnings.iter().any(|warning| matches!(warning, DiscoveryWarning::DuplicateAlias { alias, .. } if alias.eq_ignore_ascii_case("prod"))));
+    }
+
+    #[test]
+    fn nested_includes_stay_relative_to_the_entry_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(ssh.join("config"), "Include conf.d/first.conf\n").unwrap();
+        std::fs::write(ssh.join("conf.d/first.conf"), "Include sibling.conf\n").unwrap();
+        std::fs::write(ssh.join("sibling.conf"), "Host entry-root\n").unwrap();
+        std::fs::write(ssh.join("conf.d/sibling.conf"), "Host included-parent\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+        let aliases: Vec<_> = result
+            .hosts
+            .iter()
+            .map(|host| host.alias.as_str())
+            .collect();
+
+        assert_eq!(aliases, ["entry-root"]);
+        assert!(result.aliases_complete);
+    }
+
+    #[test]
+    fn recognizes_host_equals_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("config"), "Host=prod\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+
+        assert_eq!(result.hosts[0].alias, "prod");
+        assert!(result.aliases_complete);
+    }
+
+    #[test]
+    fn recognizes_include_equals_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(ssh.join("config"), "Include=conf.d/*.conf\n").unwrap();
+        std::fs::write(ssh.join("conf.d/host.conf"), "Host included\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+
+        assert_eq!(result.hosts[0].alias, "included");
+        assert!(result.aliases_complete);
     }
 }
