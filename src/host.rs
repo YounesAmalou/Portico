@@ -252,4 +252,42 @@ mod tests {
         assert_eq!(host().apply(changes).unwrap().user(), None);
         assert!("hostname".parse::<ClearField>().is_err());
     }
+
+    #[test]
+    fn identity_and_jump_allow_spaces_but_reject_controls() {
+        let accepted = Host::new(
+            "dev-vps",
+            "203.0.113.8",
+            None,
+            None,
+            Some("/keys/my deploy key".into()),
+            Some("bastion host".into()),
+        )
+        .unwrap();
+        assert_eq!(accepted.identity_file(), Some("/keys/my deploy key"));
+        assert_eq!(accepted.proxy_jump(), Some("bastion host"));
+
+        assert!(matches!(
+            Host::new(
+                "dev-vps",
+                "203.0.113.8",
+                None,
+                None,
+                Some("/keys/bad\nkey".into()),
+                None,
+            ),
+            Err(HostError::InvalidIdentity(_))
+        ));
+        assert!(matches!(
+            Host::new(
+                "dev-vps",
+                "203.0.113.8",
+                None,
+                None,
+                None,
+                Some("bastion\thost".into()),
+            ),
+            Err(HostError::InvalidJump(_))
+        ));
+    }
 }
