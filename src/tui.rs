@@ -22,7 +22,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, AppError, HostDetails, HostSummary, Ownership},
+    app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership},
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::InitPlan,
@@ -225,7 +225,7 @@ fn complete_mutation<E, F>(
 ) -> bool
 where
     E: std::fmt::Display,
-    F: FnOnce() -> Result<Vec<HostSummary>, E>,
+    F: FnOnce() -> Result<HostInventory, E>,
 {
     state.mode = Mode::Browse;
     state.form = FormState::default();
@@ -314,6 +314,7 @@ enum Mode {
 #[derive(Clone, Debug)]
 struct UiState {
     hosts: Vec<HostSummary>,
+    warnings: Vec<DiscoveryWarning>,
     visible: Vec<usize>,
     selected: Option<usize>,
     filter: String,
@@ -340,11 +341,13 @@ enum UiAction {
 }
 
 impl UiState {
-    fn new(hosts: Vec<HostSummary>) -> Self {
+    fn new(inventory: HostInventory) -> Self {
+        let HostInventory { hosts, warnings } = inventory;
         let visible = (0..hosts.len()).collect::<Vec<_>>();
         let selected = visible.first().copied();
         Self {
             hosts,
+            warnings,
             visible,
             selected,
             filter: String::new(),
@@ -391,9 +394,10 @@ impl UiState {
         self.selected.map(|index| &self.hosts[index])
     }
 
-    fn replace_hosts(&mut self, hosts: Vec<HostSummary>) {
+    fn replace_hosts(&mut self, inventory: HostInventory) {
         let selected = self.selected_summary().cloned();
-        self.hosts = hosts;
+        self.hosts = inventory.hosts;
+        self.warnings = inventory.warnings;
         let filter = self.filter.clone();
         self.selected = None;
         self.set_filter(&filter);
@@ -656,7 +660,17 @@ fn details_stale(
 fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(
+                state
+                    .warnings
+                    .len()
+                    .min(usize::from(frame.area().height / 3)) as u16,
+            ),
+            Constraint::Length(u16::from(state.status.is_some())),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -729,18 +743,37 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
         columns[1],
     );
 
-    let footer = state.status.as_deref().unwrap_or_else(|| match state.mode {
+    let warnings = state
+        .warnings
+        .iter()
+        .map(|warning| format!("Warning: {}", format_warning(warning)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(Paragraph::new(warnings), areas[1]);
+    frame.render_widget(
+        Paragraph::new(state.status.as_deref().unwrap_or_default()),
+        areas[2],
+    );
+    let footer = match state.mode {
         Mode::Browse => match state.selected.map(|index| state.hosts[index].ownership) {
-            Some(Ownership::Managed) => {
+            Some(Ownership::Managed)
+                if details.is_some_and(|details| details.declared.is_some()) =>
+            {
                 "↑↓ move  / filter  a add  e edit  x remove  Enter connect  n new terminal  q quit"
             }
-            _ => "↑↓ move  / filter  a add  Enter connect  n new terminal  q quit",
+            Some(Ownership::Managed) => {
+                "↑↓ move  / filter  a add  x remove  Enter connect  n new terminal  q quit"
+            }
+            Some(Ownership::External) => {
+                "↑↓ move  / filter  a add  Enter connect  n new terminal  q quit"
+            }
+            None => "/ filter  a add  q quit",
         },
         Mode::Filter => "type to filter  Enter apply  Esc cancel",
         Mode::AddForm | Mode::EditForm => "↑↓ field  Enter save  Esc cancel",
         Mode::ConfirmRemove => "Enter remove  Esc cancel",
-    });
-    frame.render_widget(Paragraph::new(footer), areas[1]);
+    };
+    frame.render_widget(Paragraph::new(footer), areas[3]);
 }
 
 fn detail_text(details: &HostDetails) -> String {
@@ -777,17 +810,6 @@ fn detail_text(details: &HostDetails) -> String {
         },
         details.resolved.proxy_jump.as_deref().unwrap_or("—"),
     ));
-    if !details.warnings.is_empty() {
-        text.push_str("\nWarnings\n");
-        text.push_str(
-            &details
-                .warnings
-                .iter()
-                .map(format_warning)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-    }
     text
 }
 
@@ -885,6 +907,13 @@ mod tests {
 
     use super::*;
 
+    fn test_state(hosts: Vec<HostSummary>) -> UiState {
+        UiState::new(HostInventory {
+            hosts,
+            warnings: Vec::new(),
+        })
+    }
+
     fn summary(alias: &str, ownership: Ownership) -> HostSummary {
         HostSummary {
             alias: alias.into(),
@@ -919,10 +948,14 @@ mod tests {
     }
 
     fn render_to_buffer(state: &UiState, details: HostDetails) -> Buffer {
+        render_optional_to_buffer(state, Some(&details))
+    }
+
+    fn render_optional_to_buffer(state: &UiState, details: Option<&HostDetails>) -> Buffer {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, state, Some(&details)))
+            .draw(|frame| render(frame, state, details))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -951,7 +984,7 @@ mod tests {
             summary("dev", Ownership::Managed),
             summary("legacy", Ownership::External),
         ];
-        let mut state = UiState::new(hosts);
+        let mut state = test_state(hosts);
         state.select_alias("legacy");
         let buffer = render_to_buffer(&state, details("legacy", Ownership::External));
         let text = buffer_text(&buffer);
@@ -965,7 +998,7 @@ mod tests {
 
     #[test]
     fn filtering_preserves_a_valid_selection() {
-        let mut state = UiState::new(vec![
+        let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("prod", Ownership::Managed),
         ]);
@@ -974,8 +1007,79 @@ mod tests {
     }
 
     #[test]
+    fn inventory_warnings_remain_visible_without_resolved_details() {
+        for external in ["", "Host legacy\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = crate::managed::ConfigPaths::from_home(dir.path());
+            let store = crate::managed::ManagedStore::new(paths.clone());
+            store.apply_init(true, |_, _| Ok(())).unwrap();
+            std::fs::write(
+                &paths.entry,
+                format!("Include ~/.ssh/portico/config\nInclude missing.conf\n{external}"),
+            )
+            .unwrap();
+            let app = App::new(
+                store,
+                crate::openssh::OpenSsh::new("/usr/bin/false".into(), "/usr/bin/false".into()),
+            );
+            let mut state = UiState::new(app.hosts().unwrap());
+
+            assert!(resolve_selected(&app, &mut state).is_none());
+            let text = buffer_text(&render_optional_to_buffer(&state, None));
+
+            assert!(text.contains("Warning"), "{text}");
+            assert!(text.contains("missing.conf"), "{text}");
+            assert!(text.contains("q quit"), "{text}");
+            if !external.is_empty() {
+                assert!(text.contains("exited with"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_without_selection_omits_host_actions() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.set_filter("missing");
+
+        let text = buffer_text(&render_optional_to_buffer(&state, None));
+
+        assert!(text.contains("a add"));
+        assert!(text.contains("q quit"));
+        for action in [
+            "Enter connect",
+            "n new terminal",
+            "e edit",
+            "x remove",
+            "↑↓ move",
+        ] {
+            assert!(!text.contains(action), "invalid action: {action}\n{text}");
+        }
+    }
+
+    #[test]
+    fn status_preserves_context_valid_footer_actions() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.status = Some("Saved dev".into());
+        let text = buffer_text(&render_to_buffer(
+            &state,
+            details("dev", Ownership::Managed),
+        ));
+        assert!(text.contains("Saved dev"));
+        assert!(text.contains("e edit"));
+        assert!(text.contains("q quit"));
+
+        state.mode = Mode::AddForm;
+        state.status = Some("invalid alias".into());
+        let text = buffer_text(&render_optional_to_buffer(&state, None));
+        assert!(text.contains("invalid alias"));
+        assert!(text.contains("Enter save"));
+        assert!(text.contains("Esc cancel"));
+        assert!(!text.contains("e edit"));
+    }
+
+    #[test]
     fn browse_keys_move_connect_and_protect_external_hosts() {
-        let mut state = UiState::new(vec![
+        let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("legacy", Ownership::External),
         ]);
@@ -1012,7 +1116,7 @@ mod tests {
         let managed = summary("shared", Ownership::Managed);
         let mut external = summary("shared", Ownership::External);
         external.source = PathBuf::from("/home/test/.ssh/external.conf");
-        let mut state = UiState::new(vec![managed.clone(), external.clone()]);
+        let mut state = test_state(vec![managed.clone(), external.clone()]);
         let cached_for = state.selected_summary().cloned();
         let mut cached_details = details("shared", Ownership::Managed);
 
@@ -1031,13 +1135,16 @@ mod tests {
         assert_eq!(cached_details.summary, external);
         assert!(cached_details.declared.is_none());
 
-        state.replace_hosts(vec![managed, external.clone()]);
+        state.replace_hosts(HostInventory {
+            hosts: vec![managed, external.clone()],
+            warnings: Vec::new(),
+        });
         assert_eq!(state.selected_summary(), Some(&external));
     }
 
     #[test]
     fn managed_remove_requires_confirmation_and_q_quits() {
-        let mut state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
 
         assert_eq!(
             state.handle_key(key(KeyCode::Char('x')), None).unwrap(),
@@ -1057,7 +1164,7 @@ mod tests {
 
     #[test]
     fn form_renders_exactly_the_six_v1_fields() {
-        let mut state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         state.handle_key(key(KeyCode::Char('a')), None).unwrap();
         let text = buffer_text(&render_to_buffer(
             &state,
@@ -1096,7 +1203,8 @@ mod tests {
             path: PathBuf::from("/home/test/.ssh/missing.conf"),
             message: "no matching files".into(),
         }];
-        let state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.warnings = host_details.warnings.clone();
 
         let text = buffer_text(&render_to_buffer(&state, host_details));
 
@@ -1104,13 +1212,13 @@ mod tests {
         assert!(text.contains("declared.example"));
         assert!(text.contains("Resolved"));
         assert!(text.contains("effective.example"));
-        assert!(text.contains("Warnings"));
+        assert!(text.contains("Warning:"));
         assert!(text.contains("missing.conf: no matching files"));
     }
 
     #[test]
     fn add_form_reuses_host_validation() {
-        let mut state = UiState::new(Vec::new());
+        let mut state = test_state(Vec::new());
         state.handle_key(key(KeyCode::Char('a')), None).unwrap();
         state.form.values[0] = "-bad".into();
         state.form.values[1] = "dev.example".into();
@@ -1123,7 +1231,7 @@ mod tests {
 
     #[test]
     fn edit_form_prefills_and_clears_optional_fields() {
-        let mut state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         let details = details("dev", Ownership::Managed);
         state
             .handle_key(key(KeyCode::Char('e')), Some(&details))
@@ -1157,7 +1265,7 @@ mod tests {
 
     #[test]
     fn filter_mode_updates_selection_and_escape_returns_to_browse() {
-        let mut state = UiState::new(vec![
+        let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("prod", Ownership::Managed),
         ]);
@@ -1174,23 +1282,26 @@ mod tests {
 
     #[test]
     fn refreshing_hosts_retains_the_selected_alias() {
-        let mut state = UiState::new(vec![
+        let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("prod", Ownership::Managed),
         ]);
         state.select_alias("prod");
 
-        state.replace_hosts(vec![
-            summary("new", Ownership::Managed),
-            summary("prod", Ownership::Managed),
-        ]);
+        state.replace_hosts(HostInventory {
+            hosts: vec![
+                summary("new", Ownership::Managed),
+                summary("prod", Ownership::Managed),
+            ],
+            warnings: Vec::new(),
+        });
 
         assert_eq!(state.selected_alias(), Some("prod"));
     }
 
     #[test]
     fn completed_mutation_exits_form_even_when_refresh_fails() {
-        let mut state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         let details = details("dev", Ownership::Managed);
         state
             .handle_key(key(KeyCode::Char('e')), Some(&details))
@@ -1198,7 +1309,7 @@ mod tests {
         assert_eq!(state.mode, Mode::EditForm);
 
         let refreshed = complete_mutation(&mut state, Some("dev"), "Saved dev".into(), || {
-            Err::<Vec<HostSummary>, _>("inventory unavailable")
+            Err::<HostInventory, _>("inventory unavailable")
         });
 
         assert!(!refreshed);

@@ -36,6 +36,20 @@ fn lists_ownership_and_rejects_external_mutation() {
 }
 
 #[test]
+fn hosts_reports_discovery_warnings_even_without_rows() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\nInclude missing.conf\n",
+    )
+    .unwrap();
+
+    env.run(["hosts"]).assert_stdout_contains("Warning:");
+    env.run(["hosts"]).assert_stdout_contains("missing.conf");
+}
+
+#[test]
 fn connection_modes_propagate_status_and_arguments() {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();

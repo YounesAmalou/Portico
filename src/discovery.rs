@@ -94,13 +94,13 @@ pub(crate) fn parse_directive(line: &str) -> Result<Option<ConfigDirective>, Dis
 }
 
 pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryError> {
-    let entry = entry
+    let root = entry.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let canonical = entry
         .canonicalize()
         .map_err(|source| DiscoveryError::EntryRead {
             path: entry.into(),
             source,
         })?;
-    let root = entry.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut scanner = Scanner {
         root,
         managed: managed.canonicalize().ok(),
@@ -111,8 +111,8 @@ pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryErro
         },
     };
 
-    scanner.visited.insert(entry.clone());
-    scanner.scan_entry(entry)?;
+    scanner.visited.insert(canonical);
+    scanner.scan_entry(entry.to_path_buf())?;
     scanner.report_duplicates();
     Ok(scanner.discovery)
 }
@@ -142,11 +142,11 @@ impl Scanner {
         if self.managed.as_ref() == Some(&canonical) || !self.visited.insert(canonical.clone()) {
             return;
         }
-        let contents = match fs::read_to_string(&canonical) {
+        let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(error) => return self.warn_include(canonical, error.to_string()),
+            Err(error) => return self.warn_include(path, error.to_string()),
         };
-        self.scan_contents(&contents, &canonical);
+        self.scan_contents(&contents, &path);
     }
 
     fn scan_contents(&mut self, contents: &str, source: &Path) {
@@ -252,33 +252,44 @@ fn tokenize(line: &str) -> Result<Vec<String>, DiscoveryError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut characters = line.chars().peekable();
+    let mut token_started = false;
 
     while let Some(character) = characters.next() {
         match character {
-            '#' => break,
+            '#' if !token_started => break,
             character if character.is_whitespace() => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
+                token_started = false;
             }
-            '"' => loop {
-                match characters.next() {
-                    Some('"') => break,
-                    Some('\\') => current.push(
-                        characters
-                            .next()
-                            .ok_or_else(|| DiscoveryError::Parse("unterminated escape".into()))?,
-                    ),
-                    Some(character) => current.push(character),
-                    None => return Err(DiscoveryError::Parse("unterminated quote".into())),
+            quote @ ('"' | '\'') => {
+                token_started = true;
+                loop {
+                    match characters.next() {
+                        Some(character) if character == quote => break,
+                        Some('\\') => {
+                            current.push(characters.next().ok_or_else(|| {
+                                DiscoveryError::Parse("unterminated escape".into())
+                            })?)
+                        }
+                        Some(character) => current.push(character),
+                        None => return Err(DiscoveryError::Parse("unterminated quote".into())),
+                    }
                 }
-            },
-            '\\' => current.push(
-                characters
-                    .next()
-                    .ok_or_else(|| DiscoveryError::Parse("unterminated escape".into()))?,
-            ),
-            character => current.push(character),
+            }
+            '\\' => {
+                token_started = true;
+                current.push(
+                    characters
+                        .next()
+                        .ok_or_else(|| DiscoveryError::Parse("unterminated escape".into()))?,
+                );
+            }
+            character => {
+                token_started = true;
+                current.push(character);
+            }
         }
     }
     if !current.is_empty() {
@@ -432,5 +443,62 @@ mod tests {
 
         assert_eq!(result.hosts[0].alias, "included");
         assert!(result.aliases_complete);
+    }
+
+    #[test]
+    fn single_quoted_includes_discover_literal_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("config");
+        fs::write(&entry, "Include 'hosts with spaces'\n").unwrap();
+        fs::write(dir.path().join("hosts with spaces"), "Host 'prod'\n").unwrap();
+
+        let result = discover(&entry, &dir.path().join("managed")).unwrap();
+
+        assert!(result.aliases_complete, "{:?}", result.warnings);
+        assert_eq!(result.hosts[0].alias, "prod");
+    }
+
+    #[test]
+    fn literal_hashes_in_include_paths_do_not_truncate_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("config");
+        fs::write(&entry, "Include hosts#extra # a real comment\n").unwrap();
+        fs::write(dir.path().join("hosts"), "Host wrong-file\n").unwrap();
+        fs::write(dir.path().join("hosts#extra"), "Host prod\n").unwrap();
+
+        let result = discover(&entry, &dir.path().join("managed")).unwrap();
+
+        assert_eq!(result.hosts[0].alias, "prod");
+        assert!(result.aliases_complete, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn symlinked_entry_keeps_lexical_include_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("home/.ssh");
+        let dotfiles = dir.path().join("dotfiles/ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::write(
+            dotfiles.join("config"),
+            "Include relative.conf ~/.ssh/tilde.conf\n",
+        )
+        .unwrap();
+        fs::write(ssh.join("relative.conf"), "Host relative\nInclude config\n").unwrap();
+        fs::write(ssh.join("tilde.conf"), "Host tilde\n").unwrap();
+        fs::write(dotfiles.join("relative.conf"), "Host wrong-root\n").unwrap();
+        std::os::unix::fs::symlink(dotfiles.join("config"), ssh.join("config")).unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+
+        assert_eq!(
+            result
+                .hosts
+                .iter()
+                .map(|host| host.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["relative", "tilde"]
+        );
+        assert!(result.aliases_complete, "{:?}", result.warnings);
     }
 }

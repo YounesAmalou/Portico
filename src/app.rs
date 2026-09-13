@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
     host::{Host, HostChanges, HostError},
-    managed::{InitError, InitOutcome, InitPlan, ManagedStore, TransactionError},
+    managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
     openssh::{OpenSsh, OpenSshError, ResolvedConfig},
 };
 
@@ -25,6 +25,12 @@ pub struct HostSummary {
     pub alias: String,
     pub ownership: Ownership,
     pub source: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostInventory {
+    pub hosts: Vec<HostSummary>,
+    pub warnings: Vec<DiscoveryWarning>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,7 +80,7 @@ impl App {
         })?)
     }
 
-    pub fn hosts(&self) -> Result<Vec<HostSummary>, AppError> {
+    pub fn hosts(&self) -> Result<HostInventory, AppError> {
         let managed = self.store.load()?;
         let external = self.discover()?;
         let mut hosts = managed
@@ -92,7 +98,10 @@ impl App {
             }))
             .collect::<Vec<_>>();
         hosts.sort_by_key(|host| host.alias.to_ascii_lowercase());
-        Ok(hosts)
+        Ok(HostInventory {
+            hosts,
+            warnings: external.warnings,
+        })
     }
 
     pub fn show(&self, alias: &str) -> Result<HostDetails, AppError> {
@@ -133,33 +142,42 @@ impl App {
     }
 
     pub fn add(&self, host: Host) -> Result<(), AppError> {
-        self.ensure_alias_available(host.alias(), None)?;
-        self.transact(|config| config.insert(host))
+        self.transact(|config| {
+            self.ensure_alias_available(config, host.alias(), None)?;
+            Ok(config.insert(host).map_err(TransactionError::Operation)?)
+        })
     }
 
     pub fn edit(&self, alias: &str, changes: HostChanges) -> Result<(), AppError> {
-        let config = self.store.load()?;
-        let current = match config.find(alias) {
-            Some(host) => host.clone(),
-            None => return Err(self.missing_host_error(alias)?),
-        };
-        let changed = current.apply(changes.clone())?;
-        if changed.alias() != current.alias() {
-            self.ensure_alias_available(changed.alias(), Some(current.alias()))?;
-        }
-        self.transact(|config| config.apply(alias, changes))
+        self.transact(|config| {
+            let current = match config.find(alias) {
+                Some(host) => host,
+                None => return Err(self.missing_host_error(alias)?),
+            };
+            let changed = current.apply(changes)?;
+            if changed.alias() != current.alias() {
+                self.ensure_alias_available(config, changed.alias(), Some(current.alias()))?;
+            }
+            Ok(config
+                .replace(alias, changed)
+                .map_err(TransactionError::Operation)?)
+        })
     }
 
     pub fn remove(&self, alias: &str) -> Result<(), AppError> {
-        if self.store.load()?.find(alias).is_none() {
-            return Err(self.missing_host_error(alias)?);
-        }
-        self.transact(|config| config.remove(alias).map(drop))
+        self.transact(|config| {
+            if config.find(alias).is_none() {
+                return Err(self.missing_host_error(alias)?);
+            }
+            config.remove(alias).map_err(TransactionError::Operation)?;
+            Ok(())
+        })
     }
 
     pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ExitStatus, AppError> {
         let host = self
             .hosts()?
+            .hosts
             .into_iter()
             .find(|host| host.alias.eq_ignore_ascii_case(alias))
             .ok_or_else(|| AppError::UnknownHost(alias.into()))?;
@@ -175,6 +193,7 @@ impl App {
 
     fn ensure_alias_available(
         &self,
+        managed: &ManagedConfig,
         alias: &str,
         current_alias: Option<&str>,
     ) -> Result<(), AppError> {
@@ -182,7 +201,6 @@ impl App {
         if !discovery.aliases_complete {
             return Err(AppError::IncompleteDiscovery(discovery.warnings));
         }
-        let managed = self.store.load()?;
         let managed_collision = managed.hosts().iter().any(|host| {
             host.alias().eq_ignore_ascii_case(alias)
                 && !current_alias.is_some_and(|current| host.alias().eq_ignore_ascii_case(current))
@@ -213,13 +231,13 @@ impl App {
 
     fn transact<M>(&self, mutate: M) -> Result<(), AppError>
     where
-        M: FnOnce(&mut crate::managed::ManagedConfig) -> Result<(), crate::managed::ManagedError>,
+        M: FnOnce(&mut ManagedConfig) -> Result<(), AppError>,
     {
-        Ok(self.store.transact(mutate, |entry, aliases| {
+        self.store.transact(mutate, |entry, aliases| {
             self.openssh
                 .validate(entry, aliases)
                 .map_err(|error| error.to_string())
-        })?)
+        })
     }
 }
 
@@ -313,6 +331,7 @@ mod tests {
         let listed = app.hosts().unwrap();
         assert!(
             listed
+                .hosts
                 .iter()
                 .any(|host| host.alias == "legacy" && host.ownership == Ownership::External)
         );
@@ -350,6 +369,41 @@ mod tests {
             .add(Host::new("prod", "other.example", None, None, None, None).unwrap())
             .unwrap_err();
         assert!(matches!(error, AppError::AliasCollision(alias) if alias == "prod"));
+    }
+
+    #[test]
+    fn add_rejects_single_quoted_external_alias() {
+        let app = test_app_with_external("Host 'Prod'\n  HostName prod.example\n");
+        let before = fs::read(&app.store.paths().managed).unwrap();
+
+        let error = app
+            .add(Host::new("prod", "other.example", None, None, None, None).unwrap())
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::AliasCollision(alias) if alias == "prod"));
+        assert_eq!(fs::read(&app.store.paths().managed).unwrap(), before);
+    }
+
+    #[test]
+    fn add_rejects_aliases_after_literal_hashes() {
+        for line in [
+            "Host ignored# Prod\n",
+            "Host ''# Prod\n",
+            "Host \"\"# Prod\n",
+        ] {
+            let app = test_app_with_external(line);
+            let before = fs::read(&app.store.paths().managed).unwrap();
+
+            let error = app
+                .add(Host::new("prod", "other.example", None, None, None, None).unwrap())
+                .unwrap_err();
+
+            assert!(
+                matches!(error, AppError::AliasCollision(alias) if alias == "prod"),
+                "{line}"
+            );
+            assert_eq!(fs::read(&app.store.paths().managed).unwrap(), before);
+        }
     }
 
     #[test]
@@ -444,6 +498,102 @@ mod tests {
         let host = app.show("dev").unwrap().declared.unwrap();
         assert_eq!(host.user(), Some("deploy"));
         assert_eq!(host.port(), Some(2222));
+    }
+
+    #[test]
+    fn waiting_mutations_recheck_external_aliases_under_the_lock() {
+        use fs2::FileExt;
+
+        for rename in [false, true] {
+            for external in ["Host 'Prod'\n", "Include missing/*.conf\n"] {
+                let armed = Arc::new(AtomicBool::new(false));
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let hook_armed = Arc::clone(&armed);
+                let app = test_app(
+                    None,
+                    Some(Arc::new(move || {
+                        if hook_armed.load(Ordering::SeqCst) {
+                            entered_tx.send(()).unwrap();
+                        }
+                    })),
+                );
+                app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+                    .unwrap();
+                let paths = app.store.paths();
+                let before = fs::read(&paths.managed).unwrap();
+                let backup = fs::read(&paths.backup).unwrap();
+                let lock = fs::File::open(&paths.lock).unwrap();
+                lock.lock_exclusive().unwrap();
+                armed.store(true, Ordering::SeqCst);
+
+                let error = thread::scope(|scope| {
+                    let operation = scope.spawn(|| {
+                        if rename {
+                            app.edit(
+                                "dev",
+                                HostChanges {
+                                    alias: Change::Set("prod".into()),
+                                    ..Default::default()
+                                },
+                            )
+                        } else {
+                            app.add(
+                                Host::new("prod", "prod.example", None, None, None, None).unwrap(),
+                            )
+                        }
+                    });
+                    // Dropping the lock also releases a waiter if an assertion panics.
+                    let held_lock = lock;
+                    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    fs::write(
+                        &paths.entry,
+                        format!("Include ~/.ssh/portico/config\n{external}"),
+                    )
+                    .unwrap();
+                    drop(held_lock);
+                    operation.join().unwrap().unwrap_err()
+                });
+
+                if external.starts_with("Host") {
+                    assert!(matches!(error, AppError::AliasCollision(alias) if alias == "prod"));
+                } else {
+                    assert!(matches!(error, AppError::IncompleteDiscovery(_)));
+                }
+                assert_eq!(fs::read(&paths.managed).unwrap(), before);
+                assert_eq!(fs::read(&paths.backup).unwrap(), backup);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_duplicate_add_reports_collision_without_recovery_advice() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(TransactionGate::new(entered_tx));
+        let hook_gate = Arc::clone(&gate);
+        let app = test_app(None, Some(Arc::new(move || hook_gate.wait())));
+
+        let results = thread::scope(|scope| {
+            let _release_on_unwind = OpenGateOnDrop(Arc::clone(&gate));
+            let first = scope.spawn(|| {
+                app.add(Host::new("same", "one.example", None, None, None, None).unwrap())
+            });
+            let second = scope.spawn(|| {
+                app.add(Host::new("SAME", "two.example", None, None, None, None).unwrap())
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            gate.open();
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results.into_iter().find_map(Result::err).unwrap();
+        assert!(
+            matches!(&error, AppError::AliasCollision(alias) if alias.eq_ignore_ascii_case("same"))
+        );
+        assert!(!error.to_string().contains("recover"), "{error}");
+        assert!(!error.to_string().contains("config is invalid"), "{error}");
+        assert_eq!(app.store.load().unwrap().hosts().len(), 1);
     }
 
     #[test]

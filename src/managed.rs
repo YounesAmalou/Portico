@@ -144,10 +144,19 @@ pub enum InitError {
         #[source]
         source: io::Error,
     },
+    #[error("initialization failed: {original}; rollback also failed; active state is uncertain; recovery: {recovery}; rollback: {failures}", failures = .rollback.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    Rollback {
+        #[source]
+        original: Box<InitError>,
+        rollback: Vec<InitError>,
+        recovery: String,
+    },
 }
 
 #[derive(Debug, Error)]
 pub enum TransactionError {
+    #[error(transparent)]
+    Operation(#[from] ManagedError),
     #[error("managed config is invalid; recover from {backup}: {source}")]
     Managed {
         backup: PathBuf,
@@ -395,15 +404,17 @@ impl ManagedStore {
         validate(validation_file.path(), &aliases).map_err(InitError::Validation)?;
         drop(validation_file);
 
-        if plan.backup_entry {
+        let backup = if plan.backup_entry {
             let metadata = entry_metadata.as_ref().ok_or_else(|| {
                 init_io(
                     &self.paths.entry,
                     io::Error::other("entry metadata disappeared during initialization"),
                 )
             })?;
-            self.back_up_entry(&entry_contents, metadata)?;
-        }
+            Some(self.back_up_entry(&entry_contents, metadata)?)
+        } else {
+            None
+        };
 
         let entry_candidate = if plan.create_entry || plan.insert_include || plan.reposition_include
         {
@@ -422,41 +433,67 @@ impl ManagedStore {
             None
         };
 
-        let created_managed = managed_candidate.is_some();
-        if let Some(candidate) = managed_candidate {
-            candidate
-                .rename_to(&self.paths.managed)
-                .map_err(|source| init_io(&self.paths.managed, source))?;
-            if let Err(source) = sync_dir(&self.paths.portico_dir) {
-                let _ = fs::remove_file(&self.paths.managed);
-                let _ = sync_dir(&self.paths.portico_dir);
-                return Err(init_io(&self.paths.portico_dir, source));
-            }
-        }
+        let mut created_managed = false;
         let mut entry_activated = false;
-        if let Some(candidate) = entry_candidate {
-            if let Err(source) = candidate.rename_to(&self.paths.entry) {
-                if created_managed {
-                    let _ = fs::remove_file(&self.paths.managed);
-                    let _ = sync_dir(&self.paths.portico_dir);
-                }
-                return Err(init_io(&self.paths.entry, source));
+        let activation = (|| {
+            if let Some(candidate) = managed_candidate {
+                candidate
+                    .rename_to(&self.paths.managed)
+                    .map_err(|source| init_io(&self.paths.managed, source))?;
+                created_managed = true;
+                sync_dir(&self.paths.portico_dir)
+                    .map_err(|source| init_io(&self.paths.portico_dir, source))?;
             }
-            entry_activated = true;
-        }
-        if let Err(source) = sync_dir(&self.paths.ssh_dir) {
-            self.rollback_init(
+            if let Some(candidate) = entry_candidate {
+                candidate
+                    .rename_to(&self.paths.entry)
+                    .map_err(|source| init_io(&self.paths.entry, source))?;
+                entry_activated = true;
+            }
+            sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))
+        })();
+        if let Err(original) = activation {
+            let rollback = self.rollback_init(
                 &entry_contents,
                 entry_metadata.as_ref(),
                 entry_activated,
                 created_managed,
             );
-            return Err(init_io(&self.paths.ssh_dir, source));
+            if rollback.is_empty() {
+                return Err(original);
+            }
+            let mut recovery = Vec::new();
+            if entry_activated {
+                recovery.push(match backup {
+                    Some(backup) => format!(
+                        "restore {} from {}",
+                        self.paths.entry.display(),
+                        backup.display()
+                    ),
+                    None => format!("remove newly created {}", self.paths.entry.display()),
+                });
+            }
+            if created_managed {
+                recovery.push(format!(
+                    "remove newly created {}",
+                    self.paths.managed.display()
+                ));
+            }
+            recovery.push(format!(
+                "sync {} and {}",
+                self.paths.ssh_dir.display(),
+                self.paths.portico_dir.display()
+            ));
+            return Err(InitError::Rollback {
+                original: Box::new(original),
+                rollback,
+                recovery: recovery.join("; "),
+            });
         }
         Ok(InitOutcome::Initialized)
     }
 
-    fn back_up_entry(&self, contents: &str, metadata: &fs::Metadata) -> Result<(), InitError> {
+    fn back_up_entry(&self, contents: &str, metadata: &fs::Metadata) -> Result<PathBuf, InitError> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
@@ -472,7 +509,8 @@ impl ManagedStore {
         ));
         write_named_new(&backup, contents.as_bytes(), metadata.permissions().mode())
             .map_err(|source| init_io(&backup, source))?;
-        sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))
+        sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))?;
+        Ok(backup)
     }
 
     fn rollback_init(
@@ -481,31 +519,39 @@ impl ManagedStore {
         entry_metadata: Option<&fs::Metadata>,
         entry_activated: bool,
         created_managed: bool,
-    ) {
+    ) -> Vec<InitError> {
+        let mut errors = Vec::new();
+        let mut record = |path: &Path, result: io::Result<()>| {
+            if let Err(source) = result {
+                errors.push(init_io(path, source));
+            }
+        };
         if entry_activated {
-            if let Some(metadata) = entry_metadata {
-                if let Ok(candidate) = write_unique(
+            let restored = if let Some(metadata) = entry_metadata {
+                write_unique(
                     &self.paths.ssh_dir,
                     ".config.portico-rollback",
                     entry_contents.as_bytes(),
                     metadata.permissions().mode(),
-                ) {
-                    let _ = candidate.rename_to(&self.paths.entry);
-                }
+                )
+                .and_then(|candidate| candidate.rename_to(&self.paths.entry))
             } else {
-                let _ = fs::remove_file(&self.paths.entry);
-            }
+                fs::remove_file(&self.paths.entry)
+            };
+            record(&self.paths.entry, restored);
         }
         if created_managed {
-            let _ = fs::remove_file(&self.paths.managed);
-            let _ = sync_dir(&self.paths.portico_dir);
+            record(&self.paths.managed, fs::remove_file(&self.paths.managed));
+            record(&self.paths.portico_dir, sync_dir(&self.paths.portico_dir));
         }
-        let _ = sync_dir(&self.paths.ssh_dir);
+        record(&self.paths.ssh_dir, sync_dir(&self.paths.ssh_dir));
+        errors
     }
 
-    pub fn transact<R, M, V>(&self, mutate: M, validate: V) -> Result<R, TransactionError>
+    pub fn transact<R, E, M, V>(&self, mutate: M, validate: V) -> Result<R, E>
     where
-        M: FnOnce(&mut ManagedConfig) -> Result<R, ManagedError>,
+        E: From<TransactionError>,
+        M: FnOnce(&mut ManagedConfig) -> Result<R, E>,
         V: Fn(&Path, &[String]) -> Result<(), String>,
     {
         let lock = open_lock(&self.paths.lock)
@@ -518,10 +564,7 @@ impl ManagedStore {
             .map_err(|source| transaction_io(&self.paths.lock, source))?;
 
         let (active, mut config) = self.read_managed()?;
-        let result = mutate(&mut config).map_err(|source| TransactionError::Managed {
-            backup: self.paths.backup.clone(),
-            source,
-        })?;
+        let result = mutate(&mut config)?;
         let candidate = write_unique(
             &self.paths.portico_dir,
             ".config.portico-candidate",
@@ -577,7 +620,7 @@ impl ManagedStore {
             .and_then(|()| sync_dir(&self.paths.portico_dir));
             match rollback {
                 Ok(()) => {
-                    return Err(transaction_io(&self.paths.portico_dir, source));
+                    return Err(transaction_io(&self.paths.portico_dir, source).into());
                 }
                 Err(rollback) => {
                     return Err(TransactionError::Rollback {
@@ -585,7 +628,8 @@ impl ManagedStore {
                         recovery: self.paths.backup.clone(),
                         sync: source,
                         rollback,
-                    });
+                    }
+                    .into());
                 }
             }
         }
@@ -648,7 +692,12 @@ impl ManagedConfig {
                     directive: directive.into(),
                 });
             }
-            let value = parse_value(argument, line)?;
+            let value = if directive.eq_ignore_ascii_case("ProxyJump") {
+                // OpenSSH parses the whole ProxyJump remainder, including literal quotes.
+                argument.to_owned()
+            } else {
+                parse_value(argument, line)?
+            };
             if directive.eq_ignore_ascii_case("HostName") {
                 set_once(&mut host.hostname, value, line, directive)?;
             } else if directive.eq_ignore_ascii_case("User") {
@@ -1082,7 +1131,21 @@ fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
 
 fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.borrow_mut().take().as_deref() == Some(path)) {
+    if DIRECTORY_SYNC_FAILURES.with(|failures| {
+        let mut failures = failures.borrow_mut();
+        let Some((target, remaining)) = failures.front_mut() else {
+            return false;
+        };
+        if target != path {
+            return false;
+        }
+        if *remaining > 0 {
+            *remaining -= 1;
+            return false;
+        }
+        failures.pop_front();
+        true
+    }) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "injected directory sync failure",
@@ -1093,12 +1156,21 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_NEXT_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static DIRECTORY_SYNC_FAILURES: std::cell::RefCell<std::collections::VecDeque<(PathBuf, usize)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 #[cfg(test)]
 fn fail_next_directory_sync(path: &Path) {
-    FAIL_NEXT_DIRECTORY_SYNC.with(|fail| *fail.borrow_mut() = Some(path.to_owned()));
+    fail_directory_sync_after(path, 0);
+}
+
+#[cfg(test)]
+fn fail_directory_sync_after(path: &Path, successful_syncs: usize) {
+    DIRECTORY_SYNC_FAILURES.with(|failures| {
+        failures
+            .borrow_mut()
+            .push_back((path.to_owned(), successful_syncs))
+    });
 }
 
 fn init_io(path: &Path, source: io::Error) -> InitError {
@@ -1239,14 +1311,17 @@ fn render_host(host: &Host) -> String {
         lines.push(format!("    IdentityFile {}", quote(identity_file)));
     }
     if let Some(proxy_jump) = host.proxy_jump() {
-        lines.push(format!("    ProxyJump {}", quote(proxy_jump)));
+        lines.push(format!("    ProxyJump {proxy_jump}"));
     }
     lines.join("\n")
 }
 
 fn quote(value: &str) -> String {
-    if value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() || "\\\"'#".contains(c))
+    {
+        quote_path(value)
     } else {
         value.into()
     }
@@ -1340,6 +1415,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ManagedConfig::parse(&config.render()).unwrap(), config);
+    }
+
+    #[test]
+    fn literal_quoted_identity_survives_managed_round_trip() {
+        let mut config = ManagedConfig::empty();
+        config
+            .insert(
+                Host::new(
+                    "dev",
+                    "dev.example",
+                    None,
+                    None,
+                    Some("\"key\"".into()),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let parsed = ManagedConfig::parse(&config.render()).unwrap();
+
+        assert_eq!(parsed.find("dev").unwrap().identity_file(), Some("\"key\""));
+    }
+
+    #[test]
+    fn proxy_jump_preserves_openssh_literal_directive_value() {
+        let parsed =
+            ManagedConfig::parse("Host dev\n HostName dev.example\n ProxyJump \"jump.example\"\n")
+                .unwrap();
+
+        assert_eq!(
+            parsed.find("dev").unwrap().proxy_jump(),
+            Some("\"jump.example\"")
+        );
+        assert_eq!(ManagedConfig::parse(&parsed.render()).unwrap(), parsed);
     }
 
     #[test]
@@ -1458,7 +1568,7 @@ mod tests {
         let result = ManagedStore::new(paths.clone()).apply_init(true, |_, _| Ok(()));
 
         std::fs::set_permissions(&paths.ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(result, Err(InitError::Io { .. })));
+        assert!(matches!(result, Err(InitError::Rollback { .. })));
         assert!(
             std::fs::symlink_metadata(&paths.entry)
                 .unwrap()
@@ -1480,6 +1590,102 @@ mod tests {
 
         assert!(matches!(error, InitError::ConfirmationRequired));
         assert!(!paths.ssh_dir.exists());
+    }
+
+    #[test]
+    fn initialization_failed_restoration_reports_uncertain_state_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host existing\n HostName original.example\n").unwrap();
+        // Allow backup sync, then fail activation sync and the rollback write.
+        fail_directory_sync_after(&paths.ssh_dir, 1);
+        fail_next_transaction_rollback_write();
+
+        let error = ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Ok(()))
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("active state is uncertain"), "{message}");
+        assert!(
+            message.contains("injected directory sync failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("injected rollback write failure"),
+            "{message}"
+        );
+        let backup = paths.init_backups().unwrap().pop().unwrap();
+        assert!(message.contains(&backup.display().to_string()), "{message}");
+        assert!(
+            message.contains(&paths.entry.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&paths.managed.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            b"Host existing\n HostName original.example\n"
+        );
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn initialization_failed_rollback_sync_reports_uncertain_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fail_next_directory_sync(&paths.ssh_dir);
+        fail_next_directory_sync(&paths.ssh_dir);
+
+        let error = ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Ok(()))
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("active state is uncertain"), "{message}");
+        assert_eq!(
+            message.matches("injected directory sync failure").count(),
+            2,
+            "{message}"
+        );
+        assert!(
+            message.contains(&paths.entry.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&paths.managed.display().to_string()),
+            "{message}"
+        );
+        assert!(!paths.entry.exists());
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn initialization_successful_rollback_restores_entry_bytes_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host existing\n HostName original.example\n").unwrap();
+        fs::set_permissions(&paths.entry, fs::Permissions::from_mode(0o640)).unwrap();
+        fail_directory_sync_after(&paths.ssh_dir, 1);
+
+        let error = ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Ok(()))
+            .unwrap_err();
+
+        assert!(matches!(error, InitError::Io { .. }));
+        assert_eq!(
+            fs::read(&paths.entry).unwrap(),
+            b"Host existing\n HostName original.example\n"
+        );
+        assert_eq!(
+            fs::metadata(&paths.entry).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!paths.managed.exists());
     }
 
     #[test]
@@ -1571,7 +1777,7 @@ mod tests {
         let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
 
         let result = fixture.store.transact(
-            |config| config.insert(host),
+            |config| config.insert(host).map_err(TransactionError::Operation),
             |_, _| Err("invalid candidate".into()),
         );
 
@@ -1580,18 +1786,63 @@ mod tests {
     }
 
     #[test]
+    fn rejected_operation_does_not_suggest_recovering_valid_config() {
+        let fixture = initialized_store();
+        let before = fs::read(&fixture.paths.managed).unwrap();
+        let error = fixture
+            .store
+            .transact(
+                |config| {
+                    config
+                        .remove("missing")
+                        .map_err(TransactionError::Operation)
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown alias"));
+        assert!(!error.to_string().contains("recover"), "{error}");
+        assert!(!error.to_string().contains("config is invalid"), "{error}");
+        assert_eq!(fs::read(&fixture.paths.managed).unwrap(), before);
+        assert!(!fixture.paths.backup.exists());
+    }
+
+    #[test]
+    fn corrupt_active_config_still_names_the_recovery_backup() {
+        let fixture = initialized_store();
+        fs::write(&fixture.paths.managed, "Host bad\n Unexpected value\n").unwrap();
+
+        let error = fixture
+            .store
+            .transact(|_| Ok::<_, TransactionError>(()), |_, _| Ok(()))
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, TransactionError::Managed { backup, .. } if backup == &fixture.paths.backup)
+        );
+        assert!(error.to_string().contains("recover"));
+    }
+
+    #[test]
     fn successful_mutation_keeps_exact_previous_version() {
         let fixture = initialized_store();
         let first = Host::new("one", "one.example", None, None, None, None).unwrap();
         fixture
             .store
-            .transact(|config| config.insert(first), |_, _| Ok(()))
+            .transact(
+                |config| config.insert(first).map_err(TransactionError::Operation),
+                |_, _| Ok(()),
+            )
             .unwrap();
         let before_second = std::fs::read(&fixture.paths.managed).unwrap();
         let second = Host::new("two", "two.example", None, None, None, None).unwrap();
         fixture
             .store
-            .transact(|config| config.insert(second), |_, _| Ok(()))
+            .transact(
+                |config| config.insert(second).map_err(TransactionError::Operation),
+                |_, _| Ok(()),
+            )
             .unwrap();
 
         assert_eq!(std::fs::read(&fixture.paths.backup).unwrap(), before_second);
@@ -1604,9 +1855,10 @@ mod tests {
         let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
         fail_next_directory_sync(&fixture.paths.portico_dir);
 
-        let result = fixture
-            .store
-            .transact(|config| config.insert(host), |_, _| Ok(()));
+        let result = fixture.store.transact(
+            |config| config.insert(host).map_err(TransactionError::Operation),
+            |_, _| Ok(()),
+        );
 
         assert!(matches!(result, Err(TransactionError::Io { .. })));
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
@@ -1628,7 +1880,10 @@ mod tests {
 
         let error = fixture
             .store
-            .transact(|config| config.insert(host), |_, _| Ok(()))
+            .transact(
+                |config| config.insert(host).map_err(TransactionError::Operation),
+                |_, _| Ok(()),
+            )
             .unwrap_err();
 
         std::fs::set_permissions(
@@ -1665,7 +1920,10 @@ mod tests {
 
         let error = fixture
             .store
-            .transact(|config| config.insert(host), |_, _| Ok(()))
+            .transact(
+                |config| config.insert(host).map_err(TransactionError::Operation),
+                |_, _| Ok(()),
+            )
             .unwrap_err();
 
         std::fs::set_permissions(
