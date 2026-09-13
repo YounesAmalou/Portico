@@ -10,7 +10,7 @@ use fs2::FileExt;
 use thiserror::Error;
 
 use crate::discovery::{ConfigDirective, parse_directive};
-use crate::host::{Host, HostError};
+use crate::host::{Host, HostChanges, HostError};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
 const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
@@ -37,6 +37,12 @@ pub enum ManagedError {
     DuplicateAlias(String),
     #[error("unknown alias: {0}")]
     UnknownAlias(String),
+    #[error("invalid changes for alias {alias}: {source}")]
+    InvalidChanges {
+        alias: String,
+        #[source]
+        source: HostError,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -687,6 +693,18 @@ impl ManagedConfig {
         }
         self.hosts[index] = host;
         Ok(())
+    }
+
+    pub fn apply(&mut self, alias: &str, changes: HostChanges) -> Result<(), ManagedError> {
+        let host = self
+            .find(alias)
+            .ok_or_else(|| ManagedError::UnknownAlias(alias.into()))?
+            .apply(changes)
+            .map_err(|source| ManagedError::InvalidChanges {
+                alias: alias.into(),
+                source,
+            })?;
+        self.replace(alias, host)
     }
 
     pub fn remove(&mut self, alias: &str) -> Result<Host, ManagedError> {
