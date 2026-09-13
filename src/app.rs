@@ -227,15 +227,18 @@ impl App {
 mod tests {
     use std::{
         fs,
-        fs::OpenOptions,
         ops::Deref,
         os::unix::fs::PermissionsExt,
-        sync::{Arc, Barrier, mpsc},
+        panic,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
-    use fs2::FileExt;
     use tempfile::TempDir;
 
     use crate::{
@@ -249,7 +252,6 @@ mod tests {
     struct TestApp {
         _dir: TempDir,
         app: App,
-        paths: ConfigPaths,
         fake_log: std::path::PathBuf,
     }
 
@@ -262,14 +264,17 @@ mod tests {
     }
 
     fn initialized_test_app() -> TestApp {
-        test_app(None)
+        test_app(None, None)
     }
 
     fn test_app_with_external(contents: &str) -> TestApp {
-        test_app(Some(contents))
+        test_app(Some(contents), None)
     }
 
-    fn test_app(external: Option<&str>) -> TestApp {
+    fn test_app(
+        external: Option<&str>,
+        before_transaction_lock: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> TestApp {
         let dir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::from_home(dir.path());
         let fake = dir.path().join("ssh");
@@ -284,10 +289,11 @@ mod tests {
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
         wait_until_executable(&fake);
-        let app = App::new(
-            ManagedStore::new(paths.clone()),
-            OpenSsh::new(fake.clone(), fake),
-        );
+        let mut store = ManagedStore::new(paths.clone());
+        if let Some(hook) = before_transaction_lock {
+            store = store.with_before_transaction_lock(hook);
+        }
+        let app = App::new(store, OpenSsh::new(fake.clone(), fake));
         app.initialize(true).unwrap();
         if let Some(contents) = external {
             let mut entry = fs::read_to_string(&paths.entry).unwrap();
@@ -297,7 +303,6 @@ mod tests {
         TestApp {
             _dir: dir,
             app,
-            paths,
             fake_log,
         }
     }
@@ -390,25 +395,27 @@ mod tests {
 
     #[test]
     fn concurrent_disjoint_edits_both_survive() {
-        let app = initialized_test_app();
+        let armed = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(TransactionGate::new(entered_tx));
+        let hook_armed = Arc::clone(&armed);
+        let hook_gate = Arc::clone(&gate);
+        let app = test_app(
+            None,
+            Some(Arc::new(move || {
+                if hook_armed.load(Ordering::SeqCst) {
+                    hook_gate.wait();
+                }
+            })),
+        );
         app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
             .unwrap();
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&app.paths.lock)
-            .unwrap();
-        lock.lock_exclusive().unwrap();
-        let barrier = Arc::new(Barrier::new(3));
-        let (tx, rx) = mpsc::channel();
+        armed.store(true, Ordering::SeqCst);
 
         thread::scope(|scope| {
-            let user_barrier = Arc::clone(&barrier);
-            let user_tx = tx.clone();
+            let _release_on_unwind = OpenGateOnDrop(Arc::clone(&gate));
             let user_app = &app.app;
             let user = scope.spawn(move || {
-                user_tx.send(current_thread_id()).unwrap();
-                user_barrier.wait();
                 user_app.edit(
                     "dev",
                     HostChanges {
@@ -417,11 +424,8 @@ mod tests {
                     },
                 )
             });
-            let port_barrier = Arc::clone(&barrier);
             let port_app = &app.app;
             let port = scope.spawn(move || {
-                tx.send(current_thread_id()).unwrap();
-                port_barrier.wait();
                 port_app.edit(
                     "dev",
                     HostChanges {
@@ -430,12 +434,9 @@ mod tests {
                     },
                 )
             });
-            let thread_ids = [rx.recv().unwrap(), rx.recv().unwrap()];
-            barrier.wait();
-            for thread_id in thread_ids {
-                wait_for_lock_wait(&thread_id);
-            }
-            FileExt::unlock(&lock).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            gate.open();
             user.join().unwrap().unwrap();
             port.join().unwrap().unwrap();
         });
@@ -443,6 +444,25 @@ mod tests {
         let host = app.show("dev").unwrap().declared.unwrap();
         assert_eq!(host.user(), Some("deploy"));
         assert_eq!(host.port(), Some(2222));
+    }
+
+    #[test]
+    fn parent_panic_releases_transaction_gate() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(TransactionGate::new(entered_tx));
+        let result = panic::catch_unwind({
+            let gate = Arc::clone(&gate);
+            move || {
+                thread::scope(|scope| {
+                    let _release_on_unwind = OpenGateOnDrop(Arc::clone(&gate));
+                    scope.spawn(|| gate.wait());
+                    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    panic!("simulated parent failure");
+                });
+            }
+        });
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -456,13 +476,41 @@ mod tests {
         );
     }
 
-    fn current_thread_id() -> String {
-        fs::read_link("/proc/thread-self")
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
+    struct TransactionGate {
+        open: Mutex<bool>,
+        opened: Condvar,
+        entered: mpsc::Sender<()>,
+    }
+
+    impl TransactionGate {
+        fn new(entered: mpsc::Sender<()>) -> Self {
+            Self {
+                open: Mutex::new(false),
+                opened: Condvar::new(),
+                entered,
+            }
+        }
+
+        fn wait(&self) {
+            self.entered.send(()).unwrap();
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    struct OpenGateOnDrop(Arc<TransactionGate>);
+
+    impl Drop for OpenGateOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
     }
 
     fn wait_until_executable(path: &std::path::Path) {
@@ -476,22 +524,6 @@ mod tests {
                 Err(error) if error.raw_os_error() == Some(26) => thread::yield_now(),
                 Err(error) => panic!("could not execute fake program: {error}"),
             }
-        }
-    }
-
-    fn wait_for_lock_wait(thread_id: &str) {
-        let path = format!("/proc/self/task/{thread_id}/wchan");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let wait_channel = fs::read_to_string(&path).unwrap();
-            if wait_channel.contains("locks_lock_inode_wait") {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "thread did not wait for store lock: {wait_channel}"
-            );
-            thread::sleep(Duration::from_millis(1));
         }
     }
 }

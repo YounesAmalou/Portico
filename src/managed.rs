@@ -9,6 +9,9 @@ use std::{
 use fs2::FileExt;
 use thiserror::Error;
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use crate::discovery::{ConfigDirective, parse_directive};
 use crate::host::{Host, HostChanges, HostError};
 
@@ -175,11 +178,26 @@ pub enum TransactionError {
 
 pub struct ManagedStore {
     paths: ConfigPaths,
+    #[cfg(test)]
+    before_transaction_lock: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ManagedStore {
     pub fn new(paths: ConfigPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            #[cfg(test)]
+            before_transaction_lock: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_before_transaction_lock(
+        mut self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.before_transaction_lock = Some(hook);
+        self
     }
 
     pub fn paths(&self) -> &ConfigPaths {
@@ -492,6 +510,10 @@ impl ManagedStore {
     {
         let lock = open_lock(&self.paths.lock)
             .map_err(|source| transaction_io(&self.paths.lock, source))?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_transaction_lock {
+            hook();
+        }
         FileExt::lock_exclusive(&lock)
             .map_err(|source| transaction_io(&self.paths.lock, source))?;
 
