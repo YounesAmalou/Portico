@@ -545,10 +545,10 @@ impl ManagedStore {
                 &active,
                 0o600,
             )
-            .and_then(|candidate| candidate.rename_to(&self.paths.managed));
+            .and_then(|candidate| candidate.rename_to(&self.paths.managed))
+            .and_then(|()| sync_dir(&self.paths.portico_dir));
             match rollback {
                 Ok(()) => {
-                    let _ = sync_dir(&self.paths.portico_dir);
                     return Err(transaction_io(&self.paths.portico_dir, source));
                 }
                 Err(rollback) => {
@@ -1041,7 +1041,24 @@ fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.borrow_mut().take().as_deref() == Some(path)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected directory sync failure",
+        ));
+    }
     File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_next_directory_sync(path: &Path) {
+    FAIL_NEXT_DIRECTORY_SYNC.with(|fail| *fail.borrow_mut() = Some(path.to_owned()));
 }
 
 fn init_io(path: &Path, source: io::Error) -> InitError {
@@ -1542,26 +1559,15 @@ mod tests {
 
     #[test]
     fn post_rename_sync_failure_restores_active_bytes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let fixture = initialized_store();
         let before = std::fs::read(&fixture.paths.managed).unwrap();
         let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
-        std::fs::set_permissions(
-            &fixture.paths.portico_dir,
-            std::fs::Permissions::from_mode(0o300),
-        )
-        .unwrap();
+        fail_next_directory_sync(&fixture.paths.portico_dir);
 
         let result = fixture
             .store
             .transact(|config| config.insert(host), |_, _| Ok(()));
 
-        std::fs::set_permissions(
-            &fixture.paths.portico_dir,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
         assert!(matches!(result, Err(TransactionError::Io { .. })));
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
     }
@@ -1602,5 +1608,39 @@ mod tests {
         assert!(message.contains("active state is uncertain"));
         assert!(message.contains(&fixture.paths.backup.display().to_string()));
         assert_eq!(std::fs::read(&fixture.paths.backup).unwrap(), before);
+    }
+
+    #[test]
+    fn rollback_directory_sync_failure_reports_uncertain_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = initialized_store();
+        let before = std::fs::read(&fixture.paths.managed).unwrap();
+        let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o300),
+        )
+        .unwrap();
+
+        let error = fixture
+            .store
+            .transact(|config| config.insert(host), |_, _| Ok(()))
+            .unwrap_err();
+
+        std::fs::set_permissions(
+            &fixture.paths.portico_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(matches!(
+            &error,
+            TransactionError::Rollback { path, recovery, sync, rollback }
+                if path == &fixture.paths.managed
+                    && recovery == &fixture.paths.backup
+                    && sync.kind() == io::ErrorKind::PermissionDenied
+                    && rollback.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
     }
 }
