@@ -1,8 +1,19 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use fs2::FileExt;
 use thiserror::Error;
 
+use crate::discovery::{ConfigDirective, parse_directive};
 use crate::host::{Host, HostError};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
+const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ManagedError {
@@ -31,6 +42,438 @@ pub enum ManagedError {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ManagedConfig {
     hosts: Vec<Host>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigPaths {
+    pub ssh_dir: PathBuf,
+    pub entry: PathBuf,
+    pub portico_dir: PathBuf,
+    pub managed: PathBuf,
+    pub backup: PathBuf,
+    pub lock: PathBuf,
+}
+
+impl ConfigPaths {
+    pub fn from_home(home: impl AsRef<Path>) -> Self {
+        let ssh_dir = home.as_ref().join(".ssh");
+        let entry = ssh_dir.join("config");
+        let portico_dir = ssh_dir.join("portico");
+        Self {
+            managed: portico_dir.join("config"),
+            backup: portico_dir.join("config.bak"),
+            lock: portico_dir.join("config.lock"),
+            ssh_dir,
+            entry,
+            portico_dir,
+        }
+    }
+
+    pub fn init_backups(&self) -> Result<Vec<PathBuf>, io::Error> {
+        let mut backups = Vec::new();
+        for entry in fs::read_dir(&self.ssh_dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("config.portico-backup-"))
+            {
+                backups.push(path);
+            }
+        }
+        backups.sort();
+        Ok(backups)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitPlan {
+    pub create_entry: bool,
+    pub create_managed: bool,
+    pub insert_include: bool,
+    pub reposition_include: bool,
+    pub backup_entry: bool,
+}
+
+impl InitPlan {
+    pub fn requires_confirmation(&self) -> bool {
+        self.create_entry || self.create_managed || self.insert_include || self.reposition_include
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitOutcome {
+    Initialized,
+    Unchanged,
+}
+
+#[derive(Debug, Error)]
+pub enum InitError {
+    #[error("initialization requires confirmation")]
+    ConfirmationRequired,
+    #[error("{path} is a symbolic link; add `{directive}` to its target and rerun initialization")]
+    SymlinkRequiresManualSetup {
+        path: PathBuf,
+        directive: &'static str,
+    },
+    #[error("could not parse entry config: {0}")]
+    EntryParse(String),
+    #[error("managed config is invalid: {0}")]
+    Managed(#[from] ManagedError),
+    #[error("configuration validation failed: {0}")]
+    Validation(String),
+    #[error("filesystem error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum TransactionError {
+    #[error("managed config is invalid; recover from {backup}: {source}")]
+    Managed {
+        backup: PathBuf,
+        #[source]
+        source: ManagedError,
+    },
+    #[error("configuration validation failed: {0}")]
+    Validation(String),
+    #[error("entry config cannot be used for validation: {0}")]
+    Entry(String),
+    #[error("filesystem error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+pub struct ManagedStore {
+    paths: ConfigPaths,
+}
+
+impl ManagedStore {
+    pub fn new(paths: ConfigPaths) -> Self {
+        Self { paths }
+    }
+
+    pub fn paths(&self) -> &ConfigPaths {
+        &self.paths
+    }
+
+    pub fn load(&self) -> Result<ManagedConfig, TransactionError> {
+        self.read_managed().map(|(_, config)| config)
+    }
+
+    pub fn plan_init(&self) -> Result<InitPlan, InitError> {
+        let entry_kind = match fs::symlink_metadata(&self.paths.entry) {
+            Ok(metadata) => Some(metadata.file_type()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(init_io(&self.paths.entry, source)),
+        };
+        let contents = match entry_kind {
+            Some(_) => fs::read_to_string(&self.paths.entry)
+                .map_err(|source| init_io(&self.paths.entry, source))?,
+            None => String::new(),
+        };
+        let entry = analyze_entry(&contents, &self.paths)?;
+        if entry_kind.as_ref().is_some_and(|kind| kind.is_symlink()) && !entry.has_include {
+            return Err(InitError::SymlinkRequiresManualSetup {
+                path: self.paths.entry.clone(),
+                directive: PORTICO_INCLUDE,
+            });
+        }
+        if entry_kind
+            .as_ref()
+            .is_some_and(|kind| !kind.is_file() && !kind.is_symlink())
+        {
+            return Err(init_io(
+                &self.paths.entry,
+                io::Error::new(io::ErrorKind::InvalidInput, "entry config is not a file"),
+            ));
+        }
+        reject_symlink(&self.paths.managed)
+            .map_err(|source| init_io(&self.paths.managed, source))?;
+
+        let create_entry = entry_kind.is_none();
+        let entry_writable = !entry_kind.as_ref().is_some_and(|kind| kind.is_symlink());
+        Ok(InitPlan {
+            create_entry,
+            create_managed: !self.paths.managed.exists(),
+            insert_include: entry_writable && !entry.has_include,
+            reposition_include: entry_writable && entry.has_include && !entry.is_normalized,
+            backup_entry: entry_writable && !create_entry && !entry.is_normalized,
+        })
+    }
+
+    pub fn apply_init<V>(&self, approved: bool, validate: V) -> Result<InitOutcome, InitError>
+    where
+        V: Fn(&Path, &[String]) -> Result<(), String>,
+    {
+        let preview = self.plan_init()?;
+        if !preview.requires_confirmation() {
+            return Ok(InitOutcome::Unchanged);
+        }
+        if !approved {
+            return Err(InitError::ConfirmationRequired);
+        }
+
+        create_private_dir(&self.paths.ssh_dir)
+            .map_err(|source| init_io(&self.paths.ssh_dir, source))?;
+        create_private_dir(&self.paths.portico_dir)
+            .map_err(|source| init_io(&self.paths.portico_dir, source))?;
+        let lock =
+            open_lock(&self.paths.lock).map_err(|source| init_io(&self.paths.lock, source))?;
+        FileExt::lock_exclusive(&lock).map_err(|source| init_io(&self.paths.lock, source))?;
+
+        let plan = self.plan_init()?;
+        if !plan.requires_confirmation() {
+            return Ok(InitOutcome::Unchanged);
+        }
+
+        let entry_contents = if plan.create_entry {
+            String::new()
+        } else {
+            fs::read_to_string(&self.paths.entry)
+                .map_err(|source| init_io(&self.paths.entry, source))?
+        };
+        let entry_metadata = if plan.create_entry {
+            None
+        } else {
+            Some(
+                fs::metadata(&self.paths.entry)
+                    .map_err(|source| init_io(&self.paths.entry, source))?,
+            )
+        };
+        let final_entry = if plan.create_entry || plan.insert_include || plan.reposition_include {
+            analyze_entry(&entry_contents, &self.paths)?.normalized
+        } else {
+            entry_contents.clone()
+        };
+
+        let managed_config = if self.paths.managed.exists() {
+            let contents = fs::read_to_string(&self.paths.managed)
+                .map_err(|source| init_io(&self.paths.managed, source))?;
+            ManagedConfig::parse(&contents)?
+        } else {
+            ManagedConfig::empty()
+        };
+        let managed_candidate = if plan.create_managed {
+            Some(
+                write_unique(
+                    &self.paths.portico_dir,
+                    ".config.init",
+                    managed_config.render().as_bytes(),
+                    0o600,
+                )
+                .map_err(|source| init_io(&self.paths.portico_dir, source))?,
+            )
+        } else {
+            None
+        };
+        let validation_target = managed_candidate
+            .as_ref()
+            .map_or(self.paths.managed.as_path(), |candidate| candidate.path());
+        let validation_entry = substitute_include(&final_entry, &self.paths, validation_target)?;
+        let validation_file = write_unique(
+            &self.paths.ssh_dir,
+            ".config.portico-validation",
+            validation_entry.as_bytes(),
+            entry_metadata
+                .as_ref()
+                .map_or(0o600, |metadata| metadata.permissions().mode()),
+        )
+        .map_err(|source| init_io(&self.paths.ssh_dir, source))?;
+        let aliases = managed_config
+            .hosts()
+            .iter()
+            .map(|host| host.alias().to_owned())
+            .collect::<Vec<_>>();
+        validate(validation_file.path(), &aliases).map_err(InitError::Validation)?;
+        drop(validation_file);
+
+        if plan.backup_entry {
+            let metadata = entry_metadata.as_ref().ok_or_else(|| {
+                init_io(
+                    &self.paths.entry,
+                    io::Error::other("entry metadata disappeared during initialization"),
+                )
+            })?;
+            self.back_up_entry(&entry_contents, metadata)?;
+        }
+
+        let entry_candidate = if plan.create_entry || plan.insert_include || plan.reposition_include
+        {
+            Some(
+                write_unique(
+                    &self.paths.ssh_dir,
+                    ".config.portico-init",
+                    final_entry.as_bytes(),
+                    entry_metadata
+                        .as_ref()
+                        .map_or(0o600, |metadata| metadata.permissions().mode()),
+                )
+                .map_err(|source| init_io(&self.paths.ssh_dir, source))?,
+            )
+        } else {
+            None
+        };
+
+        let created_managed = managed_candidate.is_some();
+        if let Some(candidate) = managed_candidate {
+            candidate
+                .rename_to(&self.paths.managed)
+                .map_err(|source| init_io(&self.paths.managed, source))?;
+            if let Err(source) = sync_dir(&self.paths.portico_dir) {
+                let _ = fs::remove_file(&self.paths.managed);
+                let _ = sync_dir(&self.paths.portico_dir);
+                return Err(init_io(&self.paths.portico_dir, source));
+            }
+        }
+        if let Some(candidate) = entry_candidate
+            && let Err(source) = candidate.rename_to(&self.paths.entry)
+        {
+            if created_managed {
+                let _ = fs::remove_file(&self.paths.managed);
+                let _ = sync_dir(&self.paths.portico_dir);
+            }
+            return Err(init_io(&self.paths.entry, source));
+        }
+        if let Err(source) = sync_dir(&self.paths.ssh_dir) {
+            self.rollback_init(&entry_contents, entry_metadata.as_ref(), created_managed);
+            return Err(init_io(&self.paths.ssh_dir, source));
+        }
+        Ok(InitOutcome::Initialized)
+    }
+
+    fn back_up_entry(&self, contents: &str, metadata: &fs::Metadata) -> Result<(), InitError> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                init_io(
+                    &self.paths.entry,
+                    io::Error::other(format!("system clock before Unix epoch: {error}")),
+                )
+            })?
+            .as_secs();
+        let backup = self.paths.ssh_dir.join(format!(
+            "config.portico-backup-{timestamp}-{}",
+            std::process::id()
+        ));
+        write_named_new(&backup, contents.as_bytes(), metadata.permissions().mode())
+            .map_err(|source| init_io(&backup, source))?;
+        sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))
+    }
+
+    fn rollback_init(
+        &self,
+        entry_contents: &str,
+        entry_metadata: Option<&fs::Metadata>,
+        created_managed: bool,
+    ) {
+        if let Some(metadata) = entry_metadata {
+            if let Ok(candidate) = write_unique(
+                &self.paths.ssh_dir,
+                ".config.portico-rollback",
+                entry_contents.as_bytes(),
+                metadata.permissions().mode(),
+            ) {
+                let _ = candidate.rename_to(&self.paths.entry);
+            }
+        } else {
+            let _ = fs::remove_file(&self.paths.entry);
+        }
+        if created_managed {
+            let _ = fs::remove_file(&self.paths.managed);
+            let _ = sync_dir(&self.paths.portico_dir);
+        }
+        let _ = sync_dir(&self.paths.ssh_dir);
+    }
+
+    pub fn transact<R, M, V>(&self, mutate: M, validate: V) -> Result<R, TransactionError>
+    where
+        M: FnOnce(&mut ManagedConfig) -> Result<R, ManagedError>,
+        V: Fn(&Path, &[String]) -> Result<(), String>,
+    {
+        let lock = open_lock(&self.paths.lock)
+            .map_err(|source| transaction_io(&self.paths.lock, source))?;
+        FileExt::lock_exclusive(&lock)
+            .map_err(|source| transaction_io(&self.paths.lock, source))?;
+
+        let (active, mut config) = self.read_managed()?;
+        let result = mutate(&mut config).map_err(|source| TransactionError::Managed {
+            backup: self.paths.backup.clone(),
+            source,
+        })?;
+        let candidate = write_unique(
+            &self.paths.portico_dir,
+            ".config.portico-candidate",
+            config.render().as_bytes(),
+            0o600,
+        )
+        .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
+
+        let entry = fs::read_to_string(&self.paths.entry)
+            .map_err(|source| transaction_io(&self.paths.entry, source))?;
+        let validation_entry = substitute_include(&entry, &self.paths, candidate.path())
+            .map_err(transaction_entry_error)?;
+        let entry_mode = fs::metadata(&self.paths.entry)
+            .map_err(|source| transaction_io(&self.paths.entry, source))?
+            .permissions()
+            .mode();
+        let validation_file = write_unique(
+            &self.paths.ssh_dir,
+            ".config.portico-validation",
+            validation_entry.as_bytes(),
+            entry_mode,
+        )
+        .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
+        let aliases = config
+            .hosts()
+            .iter()
+            .map(|host| host.alias().to_owned())
+            .collect::<Vec<_>>();
+        validate(validation_file.path(), &aliases).map_err(TransactionError::Validation)?;
+        drop(validation_file);
+
+        let backup_candidate = write_unique(
+            &self.paths.portico_dir,
+            ".config.portico-backup",
+            &active,
+            0o600,
+        )
+        .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
+        backup_candidate
+            .rename_to(&self.paths.backup)
+            .map_err(|source| transaction_io(&self.paths.backup, source))?;
+        candidate
+            .rename_to(&self.paths.managed)
+            .map_err(|source| transaction_io(&self.paths.managed, source))?;
+        sync_dir(&self.paths.portico_dir)
+            .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
+        Ok(result)
+    }
+
+    fn read_managed(&self) -> Result<(Vec<u8>, ManagedConfig), TransactionError> {
+        reject_symlink(&self.paths.managed)
+            .map_err(|source| transaction_io(&self.paths.managed, source))?;
+        let contents = fs::read(&self.paths.managed)
+            .map_err(|source| transaction_io(&self.paths.managed, source))?;
+        let text = std::str::from_utf8(&contents).map_err(|source| TransactionError::Managed {
+            backup: self.paths.backup.clone(),
+            source: ManagedError::Parse {
+                line: 1,
+                message: source.to_string(),
+            },
+        })?;
+        let config = ManagedConfig::parse(text).map_err(|source| TransactionError::Managed {
+            backup: self.paths.backup.clone(),
+            source,
+        })?;
+        Ok((contents, config))
+    }
 }
 
 impl ManagedConfig {
@@ -200,6 +643,302 @@ impl ManagedConfig {
     }
 }
 
+struct EntryAnalysis {
+    has_include: bool,
+    is_normalized: bool,
+    normalized: String,
+}
+
+fn analyze_entry(contents: &str, paths: &ConfigPaths) -> Result<EntryAnalysis, InitError> {
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let trailing_newline = contents.ends_with('\n') || contents.is_empty();
+    let mut matches = Vec::new();
+    let mut first_active = None;
+
+    for (index, line) in lines.iter().enumerate() {
+        let directive =
+            parse_directive(line).map_err(|error| InitError::EntryParse(error.to_string()))?;
+        if directive.is_some() && first_active.is_none() {
+            first_active = Some(index);
+        }
+        if let Some(ConfigDirective::Include(arguments)) = directive {
+            let count = arguments
+                .iter()
+                .filter(|argument| is_managed_include(argument, paths))
+                .count();
+            matches.extend(std::iter::repeat_n(index, count));
+        }
+    }
+
+    let already_normalized = matches.len() == 1
+        && first_active == matches.first().copied()
+        && matches.first().is_some_and(|index| {
+            matches!(
+                parse_directive(&lines[*index]),
+                Ok(Some(ConfigDirective::Include(arguments)))
+                    if arguments.len() == 1 && is_managed_include(&arguments[0], paths)
+            )
+        });
+    if already_normalized {
+        return Ok(EntryAnalysis {
+            has_include: true,
+            is_normalized: true,
+            normalized: contents.to_owned(),
+        });
+    }
+
+    let mut retained = Vec::with_capacity(lines.len() + 1);
+    for line in lines.drain(..) {
+        match parse_directive(&line).map_err(|error| InitError::EntryParse(error.to_string()))? {
+            Some(ConfigDirective::Include(arguments)) => {
+                if !arguments
+                    .iter()
+                    .any(|argument| is_managed_include(argument, paths))
+                {
+                    retained.push(line);
+                    continue;
+                }
+                let remaining = arguments
+                    .into_iter()
+                    .filter(|argument| !is_managed_include(argument, paths))
+                    .collect::<Vec<_>>();
+                if !remaining.is_empty() {
+                    retained.push(format!(
+                        "Include {}",
+                        remaining
+                            .iter()
+                            .map(|argument| quote(argument))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+            }
+            _ => retained.push(line),
+        }
+    }
+    let insertion = retained
+        .iter()
+        .position(|line| parse_directive(line).is_ok_and(|directive| directive.is_some()))
+        .unwrap_or(retained.len());
+    retained.insert(insertion, PORTICO_INCLUDE.to_owned());
+    let mut normalized = retained.join("\n");
+    if trailing_newline {
+        normalized.push('\n');
+    }
+
+    Ok(EntryAnalysis {
+        has_include: !matches.is_empty(),
+        is_normalized: false,
+        normalized,
+    })
+}
+
+fn substitute_include(
+    contents: &str,
+    paths: &ConfigPaths,
+    target: &Path,
+) -> Result<String, InitError> {
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        match parse_directive(line).map_err(|error| InitError::EntryParse(error.to_string()))? {
+            Some(ConfigDirective::Include(arguments))
+                if arguments
+                    .iter()
+                    .any(|argument| is_managed_include(argument, paths)) =>
+            {
+                if replaced {
+                    continue;
+                }
+                replaced = true;
+                lines.push(format!("Include {}", quote_path(&target.to_string_lossy())));
+                let remaining = arguments
+                    .iter()
+                    .filter(|argument| !is_managed_include(argument, paths))
+                    .map(|argument| quote(argument))
+                    .collect::<Vec<_>>();
+                if !remaining.is_empty() {
+                    lines.push(format!("Include {}", remaining.join(" ")));
+                }
+            }
+            _ => lines.push(line.to_owned()),
+        }
+    }
+    if !replaced {
+        return Err(InitError::EntryParse(
+            "Portico Include is missing from candidate entry config".into(),
+        ));
+    }
+    let mut result = lines.join("\n");
+    if contents.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
+fn is_managed_include(argument: &str, paths: &ConfigPaths) -> bool {
+    let path = if let Some(relative) = argument.strip_prefix("~/") {
+        paths
+            .ssh_dir
+            .parent()
+            .unwrap_or(&paths.ssh_dir)
+            .join(relative)
+    } else if argument == "~" {
+        paths
+            .ssh_dir
+            .parent()
+            .unwrap_or(&paths.ssh_dir)
+            .to_path_buf()
+    } else if Path::new(argument).is_absolute() {
+        argument.into()
+    } else {
+        paths.ssh_dir.join(argument)
+    };
+    normalize_path(&path) == normalize_path(&paths.managed)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn reject_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed path is a symbolic link",
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed path is not a file",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_lock(path: &Path) -> io::Result<File> {
+    reject_symlink(path)?;
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            OpenOptions::new().read(true).write(true).open(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct PendingFile {
+    path: Option<PathBuf>,
+}
+
+impl PendingFile {
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("pending file has a path")
+    }
+
+    fn rename_to(mut self, destination: &Path) -> io::Result<()> {
+        fs::rename(self.path(), destination)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn write_unique(dir: &Path, stem: &str, contents: &[u8], mode: u32) -> io::Result<PendingFile> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    for attempt in 0..1000 {
+        let path = dir.join(format!("{stem}-{}-{nonce}-{attempt}", std::process::id()));
+        match write_named_new(&path, contents, mode) {
+            Ok(()) => return Ok(PendingFile { path: Some(path) }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary file",
+    ))
+}
+
+fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    let result = (|| {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(contents)?;
+        file.sync_all()
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn init_io(path: &Path, source: io::Error) -> InitError {
+    InitError::Io {
+        path: path.into(),
+        source,
+    }
+}
+
+fn transaction_io(path: &Path, source: io::Error) -> TransactionError {
+    TransactionError::Io {
+        path: path.into(),
+        source,
+    }
+}
+
+fn transaction_entry_error(error: InitError) -> TransactionError {
+    TransactionError::Entry(error.to_string())
+}
+
 struct ParsedHost {
     alias: String,
     line: usize,
@@ -333,9 +1072,32 @@ fn quote(value: &str) -> String {
     }
 }
 
+fn quote_path(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    struct InitializedStore {
+        _dir: TempDir,
+        store: ManagedStore,
+        paths: ConfigPaths,
+    }
+
+    fn initialized_store() -> InitializedStore {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        let store = ManagedStore::new(paths.clone());
+        store.apply_init(true, |_, _| Ok(())).unwrap();
+        InitializedStore {
+            _dir: dir,
+            store,
+            paths,
+        }
+    }
 
     #[test]
     fn round_trips_supported_hosts_in_stable_order() {
@@ -398,5 +1160,139 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ManagedConfig::parse(&config.render()).unwrap(), config);
+    }
+
+    #[test]
+    fn initialization_backs_up_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        std::fs::write(&paths.entry, "Host existing\n  HostName old.example\n").unwrap();
+        let store = ManagedStore::new(paths.clone());
+
+        let plan = store.plan_init().unwrap();
+        assert!(plan.requires_confirmation());
+        store.apply_init(true, |_, _| Ok(())).unwrap();
+        let once = std::fs::read(&paths.entry).unwrap();
+        assert!(String::from_utf8_lossy(&once).starts_with("Include ~/.ssh/portico/config\n"));
+        assert_eq!(
+            store.apply_init(true, |_, _| Ok(())).unwrap(),
+            InitOutcome::Unchanged
+        );
+        assert_eq!(std::fs::read(&paths.entry).unwrap(), once);
+        assert_eq!(
+            std::fs::read(paths.init_backups().unwrap().first().unwrap()).unwrap(),
+            b"Host existing\n  HostName old.example\n"
+        );
+    }
+
+    #[test]
+    fn initialization_preserves_unrelated_include_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        std::fs::write(
+            &paths.entry,
+            "Include   conf.d/*.conf # keep this comment\nHost existing\n",
+        )
+        .unwrap();
+
+        ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Ok(()))
+            .unwrap();
+
+        assert!(
+            std::fs::read_to_string(&paths.entry)
+                .unwrap()
+                .contains("Include   conf.d/*.conf # keep this comment\n")
+        );
+    }
+
+    #[test]
+    fn symlinked_entry_requires_manual_setup() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        let target = dir.path().join("dotfiles-ssh-config");
+        std::fs::write(&target, "Host external\n  HostName external.example\n").unwrap();
+        symlink(&target, &paths.entry).unwrap();
+
+        let error = ManagedStore::new(paths).plan_init().unwrap_err();
+        assert!(matches!(
+            error,
+            InitError::SymlinkRequiresManualSetup { .. }
+        ));
+    }
+
+    #[test]
+    fn rejected_initialization_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        let store = ManagedStore::new(paths.clone());
+        let error = store.apply_init(false, |_, _| Ok(())).unwrap_err();
+
+        assert!(matches!(error, InitError::ConfirmationRequired));
+        assert!(!paths.ssh_dir.exists());
+    }
+
+    #[test]
+    fn created_paths_have_restrictive_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Ok(()))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&paths.portico_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.managed)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn failed_validation_preserves_active_bytes() {
+        let fixture = initialized_store();
+        let before = std::fs::read(&fixture.paths.managed).unwrap();
+        let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
+
+        let result = fixture.store.transact(
+            |config| config.insert(host),
+            |_, _| Err("invalid candidate".into()),
+        );
+
+        assert!(matches!(result, Err(TransactionError::Validation(_))));
+        assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
+    }
+
+    #[test]
+    fn successful_mutation_keeps_exact_previous_version() {
+        let fixture = initialized_store();
+        let first = Host::new("one", "one.example", None, None, None, None).unwrap();
+        fixture
+            .store
+            .transact(|config| config.insert(first), |_, _| Ok(()))
+            .unwrap();
+        let before_second = std::fs::read(&fixture.paths.managed).unwrap();
+        let second = Host::new("two", "two.example", None, None, None, None).unwrap();
+        fixture
+            .store
+            .transact(|config| config.insert(second), |_, _| Ok(()))
+            .unwrap();
+
+        assert_eq!(std::fs::read(&fixture.paths.backup).unwrap(), before_second);
     }
 }
