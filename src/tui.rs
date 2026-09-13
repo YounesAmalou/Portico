@@ -128,7 +128,7 @@ fn browse<B: Backend>(
             return Ok(());
         }
 
-        let before = state.selected_alias().map(str::to_owned);
+        let before = state.selected_summary().cloned();
         let action = match state.handle_key(key, details.as_ref()) {
             Ok(action) => action,
             Err(error) => {
@@ -210,8 +210,7 @@ fn browse<B: Backend>(
             },
         }
 
-        let after = state.selected_alias().map(str::to_owned);
-        if before != after || inventory_changed {
+        if details_stale(before.as_ref(), state.selected_summary(), inventory_changed) {
             details = resolve_selected(app, &mut state);
         }
         redraw = true;
@@ -646,6 +645,14 @@ fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> Hos
     details
 }
 
+fn details_stale(
+    cached_for: Option<&HostSummary>,
+    selected: Option<&HostSummary>,
+    inventory_changed: bool,
+) -> bool {
+    inventory_changed || cached_for != selected
+}
+
 fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -1006,23 +1013,26 @@ mod tests {
         let mut external = summary("shared", Ownership::External);
         external.source = PathBuf::from("/home/test/.ssh/external.conf");
         let mut state = UiState::new(vec![managed.clone(), external.clone()]);
+        let cached_for = state.selected_summary().cloned();
+        let mut cached_details = details("shared", Ownership::Managed);
+
         state.handle_key(key(KeyCode::Down), None).unwrap();
+        assert!(details_stale(
+            cached_for.as_ref(),
+            state.selected_summary(),
+            false,
+        ));
+        cached_details = details_for_selected(state.selected_summary().unwrap(), cached_details);
 
         state
-            .handle_key(
-                key(KeyCode::Char('e')),
-                Some(&details("shared", Ownership::Managed)),
-            )
+            .handle_key(key(KeyCode::Char('e')), Some(&cached_details))
             .unwrap();
         assert_eq!(state.mode, Mode::Browse);
+        assert_eq!(cached_details.summary, external);
+        assert!(cached_details.declared.is_none());
 
         state.replace_hosts(vec![managed, external.clone()]);
         assert_eq!(state.selected_summary(), Some(&external));
-
-        let selected_details =
-            details_for_selected(&external, details("shared", Ownership::Managed));
-        assert_eq!(selected_details.summary, external);
-        assert!(selected_details.declared.is_none());
     }
 
     #[test]
