@@ -23,6 +23,7 @@ use ratatui::{
 
 use crate::{
     app::{App, AppError, HostDetails, HostSummary, Ownership},
+    discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::InitPlan,
 };
@@ -137,6 +138,7 @@ fn browse<B: Backend>(
             }
         };
 
+        let mut inventory_changed = false;
         match action {
             UiAction::None => {}
             UiAction::Quit => return Ok(()),
@@ -169,12 +171,14 @@ fn browse<B: Backend>(
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
                 match app.add(host) {
-                    Ok(()) => refresh_after_mutation(
-                        app,
-                        &mut state,
-                        Some(&alias),
-                        format!("Added {alias}"),
-                    ),
+                    Ok(()) => {
+                        inventory_changed = complete_mutation(
+                            &mut state,
+                            Some(&alias),
+                            format!("Saved {alias}"),
+                            || app.hosts(),
+                        )
+                    }
                     Err(error) => state.status = Some(error.to_string()),
                 }
             }
@@ -184,48 +188,68 @@ fn browse<B: Backend>(
                     Change::Keep | Change::Clear => alias.clone(),
                 };
                 match app.edit(&alias, changes) {
-                    Ok(()) => refresh_after_mutation(
-                        app,
-                        &mut state,
-                        Some(&selected),
-                        format!("Updated {selected}"),
-                    ),
+                    Ok(()) => {
+                        inventory_changed = complete_mutation(
+                            &mut state,
+                            Some(&selected),
+                            format!("Saved {selected}"),
+                            || app.hosts(),
+                        )
+                    }
                     Err(error) => state.status = Some(error.to_string()),
                 }
             }
             UiAction::Remove(alias) => match app.remove(&alias) {
-                Ok(()) => refresh_after_mutation(app, &mut state, None, format!("Removed {alias}")),
+                Ok(()) => {
+                    inventory_changed =
+                        complete_mutation(&mut state, None, format!("Removed {alias}"), || {
+                            app.hosts()
+                        })
+                }
                 Err(error) => state.status = Some(error.to_string()),
             },
         }
 
         let after = state.selected_alias().map(str::to_owned);
-        if before != after || matches!(state.mode, Mode::Browse) {
+        if before != after || inventory_changed {
             details = resolve_selected(app, &mut state);
         }
         redraw = true;
     }
 }
 
-fn refresh_after_mutation(app: &App, state: &mut UiState, preferred: Option<&str>, status: String) {
-    match app.hosts() {
+fn complete_mutation<E, F>(
+    state: &mut UiState,
+    preferred: Option<&str>,
+    status: String,
+    refresh: F,
+) -> bool
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<Vec<HostSummary>, E>,
+{
+    state.mode = Mode::Browse;
+    state.form = FormState::default();
+    match refresh() {
         Ok(hosts) => {
             state.replace_hosts(hosts);
             if let Some(alias) = preferred {
                 state.select_alias(alias);
             }
-            state.mode = Mode::Browse;
-            state.form = FormState::default();
             state.status = Some(status);
+            true
         }
-        Err(error) => state.status = Some(error.to_string()),
+        Err(error) => {
+            state.status = Some(format!("{status}, refresh failed: {error}"));
+            false
+        }
     }
 }
 
 fn resolve_selected(app: &App, state: &mut UiState) -> Option<HostDetails> {
-    let alias = state.selected_alias()?;
-    match app.show(alias) {
-        Ok(details) => Some(details),
+    let selected = state.selected_summary()?.clone();
+    match app.show(&selected.alias) {
+        Ok(details) => Some(details_for_selected(&selected, details)),
         Err(error) => {
             state.status = Some(error.to_string());
             None
@@ -364,14 +388,20 @@ impl UiState {
         self.selected.map(|index| self.hosts[index].alias.as_str())
     }
 
+    fn selected_summary(&self) -> Option<&HostSummary> {
+        self.selected.map(|index| &self.hosts[index])
+    }
+
     fn replace_hosts(&mut self, hosts: Vec<HostSummary>) {
-        let selected = self.selected_alias().map(str::to_owned);
+        let selected = self.selected_summary().cloned();
         self.hosts = hosts;
         let filter = self.filter.clone();
         self.selected = None;
         self.set_filter(&filter);
-        if let Some(alias) = selected {
-            self.select_alias(&alias);
+        if let Some(selected) = selected
+            && let Some(index) = self.hosts.iter().position(|host| host == &selected)
+        {
+            self.selected = Some(index);
         }
     }
 
@@ -403,7 +433,9 @@ impl UiState {
                 self.mode = Mode::AddForm;
             }
             KeyCode::Char('e') => {
-                if let Some(host) = details.and_then(|details| details.declared.as_ref()) {
+                if self.selected_is_managed()
+                    && let Some(host) = details.and_then(|details| details.declared.as_ref())
+                {
                     self.form = FormState::from_host(host);
                     self.mode = Mode::EditForm;
                 }
@@ -606,6 +638,14 @@ fn set_optional_changed(change: &mut Change<String>, before: Option<&str>, after
     }
 }
 
+fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> HostDetails {
+    details.summary = selected.clone();
+    if selected.ownership == Ownership::External {
+        details.declared = None;
+    }
+    details
+}
+
 fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -673,29 +713,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
         ),
         _ => (
             "Details",
-            details.map_or_else(
-                || "No host selected".into(),
-                |details| {
-            format!(
-                "Alias: {}\nOwnership: {}\nSource: {}\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}",
-                details.summary.alias,
-                ownership(details.summary.ownership),
-                details.summary.source.display(),
-                details.resolved.hostname,
-                details.resolved.user.as_deref().unwrap_or("—"),
-                details
-                    .resolved
-                    .port
-                    .map_or_else(|| "—".into(), |port| port.to_string()),
-                if details.resolved.identity_files.is_empty() {
-                    "—".into()
-                } else {
-                    details.resolved.identity_files.join(", ")
-                },
-                details.resolved.proxy_jump.as_deref().unwrap_or("—"),
-            )
-                },
-            ),
+            details.map_or_else(|| "No host selected".into(), detail_text),
         ),
     };
     frame.render_widget(
@@ -716,6 +734,75 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
         Mode::ConfirmRemove => "Enter remove  Esc cancel",
     });
     frame.render_widget(Paragraph::new(footer), areas[1]);
+}
+
+fn detail_text(details: &HostDetails) -> String {
+    let mut text = format!(
+        "Ownership: {}\nSource: {}\n",
+        ownership(details.summary.ownership),
+        details.summary.source.display(),
+    );
+    if let Some(host) = &details.declared {
+        text.push_str(&format!(
+            "Portico-declared\nAlias: {}\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}\n",
+            host.alias(),
+            host.hostname(),
+            host.user().unwrap_or("—"),
+            host.port().map_or_else(|| "—".into(), |port| port.to_string()),
+            host.identity_file().unwrap_or("—"),
+            host.proxy_jump().unwrap_or("—"),
+        ));
+    } else {
+        text.push_str("Portico-declared: —\n");
+    }
+    text.push_str(&format!(
+        "Resolved\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}",
+        details.resolved.hostname,
+        details.resolved.user.as_deref().unwrap_or("—"),
+        details
+            .resolved
+            .port
+            .map_or_else(|| "—".into(), |port| port.to_string()),
+        if details.resolved.identity_files.is_empty() {
+            "—".into()
+        } else {
+            details.resolved.identity_files.join(", ")
+        },
+        details.resolved.proxy_jump.as_deref().unwrap_or("—"),
+    ));
+    if !details.warnings.is_empty() {
+        text.push_str("\nWarnings\n");
+        text.push_str(
+            &details
+                .warnings
+                .iter()
+                .map(format_warning)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    text
+}
+
+fn format_warning(warning: &DiscoveryWarning) -> String {
+    match warning {
+        DiscoveryWarning::Include { path, message } => {
+            format!("{}: {message}", path.display())
+        }
+        DiscoveryWarning::Parse {
+            path,
+            line,
+            message,
+        } => format!("{}:{line}: {message}", path.display()),
+        DiscoveryWarning::DuplicateAlias { alias, sources } => format!(
+            "duplicate alias {alias}: {}",
+            sources
+                .iter()
+                .map(|source| source.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn render_init(frame: &mut Frame<'_>, plan: &InitPlan) {
@@ -783,6 +870,7 @@ mod tests {
 
     use crate::{
         app::{HostDetails, HostSummary, Ownership},
+        discovery::DiscoveryWarning,
         host::{Change, Host},
         managed::InitPlan,
         openssh::ResolvedConfig,
@@ -913,6 +1001,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_external_row_keeps_its_identity_and_cannot_edit_managed_details() {
+        let managed = summary("shared", Ownership::Managed);
+        let mut external = summary("shared", Ownership::External);
+        external.source = PathBuf::from("/home/test/.ssh/external.conf");
+        let mut state = UiState::new(vec![managed.clone(), external.clone()]);
+        state.handle_key(key(KeyCode::Down), None).unwrap();
+
+        state
+            .handle_key(
+                key(KeyCode::Char('e')),
+                Some(&details("shared", Ownership::Managed)),
+            )
+            .unwrap();
+        assert_eq!(state.mode, Mode::Browse);
+
+        state.replace_hosts(vec![managed, external.clone()]);
+        assert_eq!(state.selected_summary(), Some(&external));
+
+        let selected_details =
+            details_for_selected(&external, details("shared", Ownership::Managed));
+        assert_eq!(selected_details.summary, external);
+        assert!(selected_details.declared.is_none());
+    }
+
+    #[test]
     fn managed_remove_requires_confirmation_and_q_quits() {
         let mut state = UiState::new(vec![summary("dev", Ownership::Managed)]);
 
@@ -952,6 +1065,37 @@ mod tests {
             assert!(text.contains(label), "missing {label}");
         }
         assert_eq!(text.matches(": ").count(), 6);
+    }
+
+    #[test]
+    fn details_render_declared_resolved_and_discovery_warnings() {
+        let mut host_details = details("dev", Ownership::Managed);
+        host_details.declared = Some(
+            Host::new(
+                "dev",
+                "declared.example",
+                Some("declared-user".into()),
+                Some(2200),
+                Some("~/.ssh/id_declared".into()),
+                Some("declared-jump".into()),
+            )
+            .unwrap(),
+        );
+        host_details.resolved.hostname = "effective.example".into();
+        host_details.warnings = vec![DiscoveryWarning::Include {
+            path: PathBuf::from("/home/test/.ssh/missing.conf"),
+            message: "no matching files".into(),
+        }];
+        let state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+
+        let text = buffer_text(&render_to_buffer(&state, host_details));
+
+        assert!(text.contains("Portico-declared"));
+        assert!(text.contains("declared.example"));
+        assert!(text.contains("Resolved"));
+        assert!(text.contains("effective.example"));
+        assert!(text.contains("Warnings"));
+        assert!(text.contains("missing.conf: no matching files"));
     }
 
     #[test]
@@ -1032,6 +1176,32 @@ mod tests {
         ]);
 
         assert_eq!(state.selected_alias(), Some("prod"));
+    }
+
+    #[test]
+    fn completed_mutation_exits_form_even_when_refresh_fails() {
+        let mut state = UiState::new(vec![summary("dev", Ownership::Managed)]);
+        let details = details("dev", Ownership::Managed);
+        state
+            .handle_key(key(KeyCode::Char('e')), Some(&details))
+            .unwrap();
+        assert_eq!(state.mode, Mode::EditForm);
+
+        let refreshed = complete_mutation(&mut state, Some("dev"), "Saved dev".into(), || {
+            Err::<Vec<HostSummary>, _>("inventory unavailable")
+        });
+
+        assert!(!refreshed);
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(state.form.original.is_none());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Saved dev, refresh failed: inventory unavailable")
+        );
+        assert!(matches!(
+            state.handle_key(key(KeyCode::Enter), None).unwrap(),
+            UiAction::Connect { .. }
+        ));
     }
 
     #[test]
