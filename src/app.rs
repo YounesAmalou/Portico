@@ -143,11 +143,11 @@ impl App {
             Some(host) => host.clone(),
             None => return Err(self.missing_host_error(alias)?),
         };
-        let changed = current.apply(changes)?;
+        let changed = current.apply(changes.clone())?;
         if changed.alias() != current.alias() {
             self.ensure_alias_available(changed.alias(), Some(current.alias()))?;
         }
-        self.transact(|config| config.replace(alias, changed))
+        self.transact(|config| config.apply(alias, changes))
     }
 
     pub fn remove(&self, alias: &str) -> Result<(), AppError> {
@@ -225,8 +225,17 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, ops::Deref, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        fs::OpenOptions,
+        ops::Deref,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Barrier, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
 
+    use fs2::FileExt;
     use tempfile::TempDir;
 
     use crate::{
@@ -240,6 +249,8 @@ mod tests {
     struct TestApp {
         _dir: TempDir,
         app: App,
+        paths: ConfigPaths,
+        fake_log: std::path::PathBuf,
     }
 
     impl Deref for TestApp {
@@ -262,12 +273,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::from_home(dir.path());
         let fake = dir.path().join("ssh");
+        let fake_log = dir.path().join("ssh.args");
         fs::write(
             &fake,
-            "#!/bin/sh\nif [ \"$1\" = '-G' ] && [ \"$2\" != '-F' ]; then\n  printf 'hostname resolved.example\\nuser resolved\\nport 22\\n'\nfi\n",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncase \"$1\" in\n  -G) if [ \"$2\" != '-F' ]; then printf 'hostname resolved.example\\nuser resolved\\nport 22\\n'; fi ;;\n  --) ;;\n  -*) exit 23 ;;\nesac\n",
+                fake_log.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_executable(&fake);
         let app = App::new(
             ManagedStore::new(paths.clone()),
             OpenSsh::new(fake.clone(), fake),
@@ -278,7 +294,12 @@ mod tests {
             entry.push_str(contents);
             fs::write(&paths.entry, entry).unwrap();
         }
-        TestApp { _dir: dir, app }
+        TestApp {
+            _dir: dir,
+            app,
+            paths,
+            fake_log,
+        }
     }
 
     #[test]
@@ -365,5 +386,112 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, AppError::AliasCollision(alias) if alias == "prod"));
+    }
+
+    #[test]
+    fn concurrent_disjoint_edits_both_survive() {
+        let app = initialized_test_app();
+        app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+            .unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&app.paths.lock)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let user_barrier = Arc::clone(&barrier);
+            let user_tx = tx.clone();
+            let user_app = &app.app;
+            let user = scope.spawn(move || {
+                user_tx.send(current_thread_id()).unwrap();
+                user_barrier.wait();
+                user_app.edit(
+                    "dev",
+                    HostChanges {
+                        user: Change::Set("deploy".into()),
+                        ..Default::default()
+                    },
+                )
+            });
+            let port_barrier = Arc::clone(&barrier);
+            let port_app = &app.app;
+            let port = scope.spawn(move || {
+                tx.send(current_thread_id()).unwrap();
+                port_barrier.wait();
+                port_app.edit(
+                    "dev",
+                    HostChanges {
+                        port: Change::Set(2222),
+                        ..Default::default()
+                    },
+                )
+            });
+            let thread_ids = [rx.recv().unwrap(), rx.recv().unwrap()];
+            barrier.wait();
+            for thread_id in thread_ids {
+                wait_for_lock_wait(&thread_id);
+            }
+            FileExt::unlock(&lock).unwrap();
+            user.join().unwrap().unwrap();
+            port.join().unwrap().unwrap();
+        });
+
+        let host = app.show("dev").unwrap().declared.unwrap();
+        assert_eq!(host.user(), Some("deploy"));
+        assert_eq!(host.port(), Some(2222));
+    }
+
+    #[test]
+    fn dash_prefixed_external_alias_is_a_destination_not_an_option() {
+        let app = test_app_with_external("Host -external\n  HostName external.example\n");
+
+        assert!(app.connect("-external", false).unwrap().success());
+        assert_eq!(
+            fs::read_to_string(&app.fake_log).unwrap(),
+            "--\n-external\n"
+        );
+    }
+
+    fn current_thread_id() -> String {
+        fs::read_link("/proc/thread-self")
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn wait_until_executable(path: &std::path::Path) {
+        loop {
+            match std::process::Command::new(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return,
+                Err(error) if error.raw_os_error() == Some(26) => thread::yield_now(),
+                Err(error) => panic!("could not execute fake program: {error}"),
+            }
+        }
+    }
+
+    fn wait_for_lock_wait(thread_id: &str) {
+        let path = format!("/proc/self/task/{thread_id}/wchan");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let wait_channel = fs::read_to_string(&path).unwrap();
+            if wait_channel.contains("locks_lock_inode_wait") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thread did not wait for store lock: {wait_channel}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }

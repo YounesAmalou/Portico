@@ -60,7 +60,7 @@ impl OpenSsh {
     }
 
     pub fn resolve(&self, alias: &str) -> Result<ResolvedConfig, OpenSshError> {
-        let output = self.checked_output(Command::new(&self.ssh).args(["-G", alias]))?;
+        let output = self.checked_output(Command::new(&self.ssh).args(["-G", "--", alias]))?;
         let text = String::from_utf8(output.stdout)
             .map_err(|error| OpenSshError::InvalidOutput(error.to_string()))?;
         let mut hostname = None;
@@ -101,11 +101,11 @@ impl OpenSsh {
     pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ExitStatus, OpenSshError> {
         let (program, mut command) = if new_terminal {
             let mut command = Command::new(&self.terminal);
-            command.arg("--").arg(&self.ssh).arg(alias);
+            command.arg("--").arg(&self.ssh).arg("--").arg(alias);
             (&self.terminal, command)
         } else {
             let mut command = Command::new(&self.ssh);
-            command.arg(alias);
+            command.arg("--").arg(alias);
             (&self.ssh, command)
         };
         command.status().map_err(|source| OpenSshError::Io {
@@ -120,6 +120,7 @@ impl OpenSsh {
                 .arg("-G")
                 .arg("-F")
                 .arg(entry)
+                .arg("--")
                 .arg(alias),
         )?;
         Ok(())
@@ -191,6 +192,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_executable(&path);
         FakeProgram {
             _dir: dir,
             path,
@@ -206,12 +208,14 @@ mod tests {
             format!("printf '%s\\n' \"$@\" > '{}'", log.display())
         } else {
             format!(
-                "if [ \"$1\" = '-G' ]; then printf '%s' '{}'; fi",
+                "printf '%s\\n' \"$@\" > '{}'\nif [ \"$1\" = '-G' ]; then printf '%s' '{}'; fi",
+                log.display(),
                 output.replace('\'', "'\\''")
             )
         };
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_executable(&path);
         FakeProgram {
             _dir: dir,
             path,
@@ -219,14 +223,28 @@ mod tests {
         }
     }
 
+    fn wait_until_executable(path: &Path) {
+        loop {
+            match std::process::Command::new(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return,
+                Err(error) if error.raw_os_error() == Some(26) => std::thread::yield_now(),
+                Err(error) => panic!("could not execute fake program: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn passes_alias_as_one_argument_without_a_shell() {
         let fake = fake_ssh();
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
-        let status = openssh.connect("dev-vps", false).unwrap();
+        let status = openssh.connect("-external", false).unwrap();
 
         assert!(status.success());
-        assert_eq!(fs::read_to_string(fake.log()).unwrap(), "dev-vps\n");
+        assert_eq!(fs::read_to_string(fake.log()).unwrap(), "--\n-external\n");
     }
 
     #[test]
@@ -235,8 +253,12 @@ mod tests {
             "hostname dev.example\nuser deploy\nport 2222\nidentityfile ~/.ssh/id_dev\nproxyjump bastion\n",
         );
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
-        let resolved = openssh.resolve("dev-vps").unwrap();
+        let resolved = openssh.resolve("-external").unwrap();
 
+        assert_eq!(
+            fs::read_to_string(fake.log()).unwrap(),
+            "-G\n--\n-external\n"
+        );
         assert_eq!(resolved.hostname, "dev.example");
         assert_eq!(resolved.user.as_deref(), Some("deploy"));
         assert_eq!(resolved.port, Some(2222));
@@ -250,11 +272,11 @@ mod tests {
         let entry = fake.log().with_file_name("entry config");
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
 
-        openssh.validate(&entry, &["dev-vps".into()]).unwrap();
+        openssh.validate(&entry, &["-external".into()]).unwrap();
 
         assert_eq!(
             fs::read_to_string(fake.log()).unwrap(),
-            format!("-G\n-F\n{}\ndev-vps\n", entry.display())
+            format!("-G\n-F\n{}\n--\n-external\n", entry.display())
         );
     }
 
@@ -264,10 +286,10 @@ mod tests {
         let terminal = fake_ssh();
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
 
-        assert!(openssh.connect("dev-vps", true).unwrap().success());
+        assert!(openssh.connect("-external", true).unwrap().success());
         assert_eq!(
             fs::read_to_string(terminal.log()).unwrap(),
-            format!("--\n{}\ndev-vps\n", ssh.path().display())
+            format!("--\n{}\n--\n-external\n", ssh.path().display())
         );
     }
 
