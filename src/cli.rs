@@ -127,7 +127,8 @@ fn execute<I: BufRead, O: Write>(
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Hosts) => {
-            for host in app.hosts().map_err(|error| error.to_string())? {
+            let inventory = app.hosts().map_err(|error| error.to_string())?;
+            for host in inventory.hosts {
                 writeln!(
                     output,
                     "{}  {}  {}",
@@ -136,6 +137,10 @@ fn execute<I: BufRead, O: Write>(
                     host.source.display()
                 )
                 .map_err(|error| error.to_string())?;
+            }
+            for warning in &inventory.warnings {
+                writeln!(output, "Warning: {}", format_warning(warning))
+                    .map_err(|error| error.to_string())?;
             }
             Ok(ExitCode::SUCCESS)
         }

@@ -79,6 +79,10 @@ impl TestEnv {
         &self.home
     }
 
+    pub fn bin(&self) -> &std::path::Path {
+        &self.bin
+    }
+
     pub fn managed_config(&self) -> PathBuf {
         self.home.join(".ssh/portico/config")
     }
