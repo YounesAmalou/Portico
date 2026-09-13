@@ -2,6 +2,7 @@ mod support;
 
 use std::os::unix::fs::PermissionsExt;
 
+use portico::managed::ManagedConfig;
 use support::TestEnv;
 
 #[test]
@@ -73,9 +74,23 @@ fn concurrent_adds_do_not_lose_completed_updates() {
         }
     });
 
-    let managed = std::fs::read_to_string(env.managed_config()).unwrap();
-    for index in 0..8 {
-        assert!(managed.contains(&format!("Host host-{index}\n")));
+    let managed =
+        ManagedConfig::parse(&std::fs::read_to_string(env.managed_config()).unwrap()).unwrap();
+    assert_eq!(managed.hosts().len(), 8);
+    for (alias, hostname) in [
+        ("host-0", "host-0.example"),
+        ("host-1", "host-1.example"),
+        ("host-2", "host-2.example"),
+        ("host-3", "host-3.example"),
+        ("host-4", "host-4.example"),
+        ("host-5", "host-5.example"),
+        ("host-6", "host-6.example"),
+        ("host-7", "host-7.example"),
+    ] {
+        assert_eq!(
+            managed.find(alias).map(|host| host.hostname()),
+            Some(hostname)
+        );
     }
 }
 
@@ -91,7 +106,7 @@ fn rejected_candidate_preserves_active_and_backup_bytes() {
     env.reject_alias("rejected");
 
     env.run(["add", "rejected", "-H", "rejected.example"])
-        .assert_failure();
+        .assert_failure_stderr_contains("rejected alias: rejected");
 
     assert_eq!(std::fs::read(env.managed_config()).unwrap(), active_before);
     assert_eq!(std::fs::read(&backup_path).ok(), backup_before);
@@ -101,13 +116,30 @@ fn rejected_candidate_preserves_active_and_backup_bytes() {
 fn approved_v1_flow_works_in_an_isolated_home() {
     let env = TestEnv::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let external = env.home().join(".ssh/external.conf");
+        let external_before = b"# User-owned host.\nHost legacy\n  HostName 198.51.100.20\n  User operator\n  Port 2200\n";
+        let entry_before = b"# Existing SSH configuration.\nInclude external.conf\n";
+        let expected_entry = b"# Existing SSH configuration.\nInclude ~/.ssh/portico/config\nInclude external.conf\n";
+        std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            external.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(env.ssh_config(), entry_before).unwrap();
+        std::fs::write(&external, external_before).unwrap();
+
         env.run(["init", "-y"]).assert_success();
+        assert_eq!(std::fs::read(env.ssh_config()).unwrap(), expected_entry);
+        assert_eq!(std::fs::read(&external).unwrap(), external_before);
         env.run(["add", "dev", "-H", "dev.example", "-u", "deploy"])
             .assert_success();
         env.run(["hosts"]).assert_stdout_contains("dev  managed");
         env.run(["show", "dev"])
             .assert_stdout_contains("Declared HostName: dev.example");
         env.run(["edit", "dev", "-p", "2222"]).assert_success();
+        env.run(["show", "dev"])
+            .assert_stdout_contains("Declared Port: 2222");
         env.run(["connect", "dev", "-n"]).assert_success();
         assert!(
             std::fs::read_to_string(env.connection_log())
@@ -125,9 +157,13 @@ fn approved_v1_flow_works_in_an_isolated_home() {
             Some(0o600)
         );
         env.run(["remove", "dev", "-f"]).assert_success();
+        let managed =
+            ManagedConfig::parse(&std::fs::read_to_string(env.managed_config()).unwrap()).unwrap();
+        assert!(managed.hosts().is_empty());
 
         let entry = std::fs::read_to_string(env.ssh_config()).unwrap();
-        assert_eq!(entry, "Include ~/.ssh/portico/config\n");
+        assert_eq!(entry.as_bytes(), expected_entry);
+        assert_eq!(std::fs::read(&external).unwrap(), external_before);
         let validation = env.ssh_config().with_file_name("acceptance-config");
         std::fs::write(
             &validation,
@@ -140,15 +176,19 @@ fn approved_v1_flow_works_in_an_isolated_home() {
         let output = std::process::Command::new("ssh")
             .args(["-G", "-F"])
             .arg(validation)
-            .arg("ordinary.example")
+            .arg("legacy")
             .env("HOME", env.home())
             .output()
             .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(
             output.status.success(),
             "ssh -G failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(stdout.contains("hostname 198.51.100.20"), "{stdout}");
+        assert!(stdout.contains("user operator"), "{stdout}");
+        assert!(stdout.contains("port 2200"), "{stdout}");
     }));
 
     if let Err(payload) = result {
@@ -196,7 +236,7 @@ fn openssh_diagnostics(env: &TestEnv) -> String {
     match std::process::Command::new("ssh")
         .args(["-G", "-F"])
         .arg(validation)
-        .arg("ordinary.example")
+        .arg("legacy")
         .env("HOME", env.home())
         .output()
     {
