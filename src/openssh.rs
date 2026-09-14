@@ -184,7 +184,10 @@ impl OpenSsh {
                         return Ok(ConnectionOutcome::LaunchRequested);
                     }
                     Err(source) => {
-                        terminate_process_tree(&mut child);
+                        terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
+                            program: self.terminal.clone(),
+                            source,
+                        })?;
                         return Err(OpenSshError::Io {
                             program: self.terminal.clone(),
                             source,
@@ -221,14 +224,20 @@ impl OpenSsh {
             })?;
         loop {
             if cancelled.load(Ordering::Relaxed) {
-                terminate_process_tree(&mut child);
+                terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
+                    program: self.ssh.clone(),
+                    source,
+                })?;
                 return Err(OpenSshError::Cancelled);
             }
             match child.try_wait() {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => thread::sleep(Duration::from_millis(20)),
                 Err(source) => {
-                    terminate_process_tree(&mut child);
+                    terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
+                        program: self.ssh.clone(),
+                        source,
+                    })?;
                     return Err(OpenSshError::Io {
                         program: self.ssh.clone(),
                         source,
@@ -325,39 +334,100 @@ fn terminate_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn terminate_process_tree(child: &mut std::process::Child) {
-    kill_process_tree(child.id(), None);
-    let _ = child.wait();
-}
-
-fn kill_process_tree(pid: u32, parent: Option<libc::pid_t>) {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return;
-    };
-    let Ok(pidfd) = open_pidfd(pid) else {
-        return;
-    };
-    if parent.is_some_and(|parent| !process_children(parent).contains(&(pid as u32))) {
-        return;
+fn terminate_process_tree(child: &mut std::process::Child) -> io::Result<()> {
+    if let Err(error) = kill_process_tree(child.id(), None) {
+        let _ = kill_direct_child(child);
+        let _ = reap_child_bounded(child);
+        return Err(error);
     }
-    if signal_pidfd(&pidfd, libc::SIGSTOP).is_err() {
-        return;
-    }
-    if wait_until_stopped(pid) {
-        for child in process_children(pid) {
-            kill_process_tree(child, Some(pid));
+    match reap_child_bounded(child) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = kill_direct_child(child);
+            let _ = reap_child_bounded(child);
+            Err(error)
         }
     }
-    let _ = signal_pidfd(&pidfd, libc::SIGKILL);
+}
+
+fn kill_direct_child(child: &mut std::process::Child) -> io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn reap_child_bounded(child: &mut std::process::Child) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait()? {
+            Some(_) => return Ok(()),
+            None if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out reaping child process",
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+fn kill_process_tree(pid: u32, parent: Option<libc::pid_t>) -> io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid process ID"))?;
+    let pidfd = open_pidfd(pid)?;
+    if let Some(parent) = parent
+        && !process_children(parent)?.contains(&(pid as u32))
+    {
+        return Ok(());
+    }
+    match signal_pidfd(&pidfd, libc::SIGSTOP) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let traversal = (|| {
+        if wait_until_stopped(pid)? {
+            for child in process_children(pid)? {
+                kill_process_tree(child, Some(pid))?;
+            }
+        }
+        Ok(())
+    })();
+    let kill = match signal_pidfd(&pidfd, libc::SIGKILL) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) => Err(error),
+    };
+    match traversal {
+        Err(error) => Err(error),
+        Ok(()) => kill,
+    }
 }
 
 fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    #[cfg(test)]
+    if FAIL_PIDFD_OPEN.with(|fail| fail.replace(false)) {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PIDFD_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_pidfd_open() {
+    FAIL_PIDFD_OPEN.with(|fail| fail.set(true));
 }
 
 fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
@@ -377,12 +447,13 @@ fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn wait_until_stopped(pid: libc::pid_t) -> bool {
+fn wait_until_stopped(pid: libc::pid_t) -> io::Result<bool> {
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
         let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
             Ok(tasks) => tasks,
-            Err(_) => return false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
         };
         let mut found = false;
         let mut stopped = true;
@@ -405,23 +476,31 @@ fn wait_until_stopped(pid: libc::pid_t) -> bool {
             }
         }
         if found && stopped {
-            return true;
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return false;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out stopping child process",
+            ));
         }
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn process_children(pid: libc::pid_t) -> Vec<u32> {
+fn process_children(pid: libc::pid_t) -> io::Result<Vec<u32>> {
     let mut children = Vec::new();
-    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
-        return children;
+    let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(children),
+        Err(error) => return Err(error),
     };
-    for task in tasks.flatten() {
-        let Ok(contents) = fs::read_to_string(task.path().join("children")) else {
-            continue;
+    for task in tasks {
+        let task = task?;
+        let contents = match fs::read_to_string(task.path().join("children")) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         };
         children.extend(
             contents
@@ -431,7 +510,7 @@ fn process_children(pid: libc::pid_t) -> Vec<u32> {
     }
     children.sort_unstable();
     children.dedup();
-    children
+    Ok(children)
 }
 
 fn kill_process_group(child: &mut std::process::Child) {
@@ -731,6 +810,51 @@ mod tests {
             "cancellation blocked for {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn pidfd_failure_falls_back_to_bounded_direct_child_cleanup() {
+        let fake = fake_ssh();
+        let marker = fake.log.with_file_name("connection-started");
+        fs::write(
+            &fake.path,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsleep 2\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let cancel = thread::spawn({
+            let marker = marker.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !fs::read_to_string(&marker).is_ok_and(|pid| !pid.is_empty()) {
+                    assert!(Instant::now() < deadline, "connection did not start");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                signal.store(true, Ordering::Relaxed);
+            }
+        });
+        fail_next_pidfd_open();
+        let started = Instant::now();
+
+        let result = openssh.connect_cancellable("dev", &cancelled);
+
+        cancel.join().unwrap();
+        let pid = fs::read_to_string(marker).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            result,
+            Err(OpenSshError::Io { source, .. }) if source.raw_os_error() == Some(libc::EMFILE)
+        ));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]
