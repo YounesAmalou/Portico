@@ -212,6 +212,10 @@ fn tui_paste_and_terminal_lifecycle_work_on_a_real_pty() {
     env.run(["init", "-y"]).assert_success();
     env.run(["add", "fail", "-H", "fail.example"])
         .assert_success();
+    env.run(["add", "alpha", "-H", "alpha.example"])
+        .assert_success();
+    env.run(["add", "beta", "-H", "beta.example"])
+        .assert_success();
     std::fs::write(env.bin().join("ssh"), "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  if [ \"$2\" != '-F' ] && [ -f \"$HOME/block-resolver\" ]; then\n    : > \"$HOME/resolver-started\"\n    sleep 4\n  fi\n  printf 'hostname fail.example\\nport 22\\n'\n  exit 0\nfi\nstty -g > \"$HOME/child-terminal-state\"\nexit 23\n").unwrap();
 
     let output = std::process::Command::new("python3")

@@ -199,10 +199,15 @@ impl Scanner {
         }
         paths.sort();
         if paths.is_empty() && !had_error {
-            self.discovery.warnings.push(DiscoveryWarning::Include {
-                path,
-                message: "no matching files".into(),
-            });
+            match fs::metadata(&path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    self.warn_include(path, error.to_string());
+                }
+                _ => self.discovery.warnings.push(DiscoveryWarning::Include {
+                    path,
+                    message: "no matching files".into(),
+                }),
+            }
         } else {
             for path in paths {
                 self.scan_include(path);

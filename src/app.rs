@@ -513,6 +513,20 @@ mod tests {
     }
 
     #[test]
+    fn inaccessible_include_parent_blocks_mutation() {
+        let app = test_app_with_external("Include locked/hidden.conf\n");
+        let locked = app.store.paths().ssh_dir.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("hidden.conf"), "Host hidden\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = app.add(Host::new("hidden", "other.example", None, None, None, None).unwrap());
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(AppError::IncompleteDiscovery(_))));
+    }
+
+    #[test]
     fn edit_rejects_external_host() {
         let app = test_app_with_external("Host legacy\n  HostName legacy.example\n");
 
