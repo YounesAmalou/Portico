@@ -201,6 +201,8 @@ pub struct ManagedStore {
     before_transaction_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     before_init_activation: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_init_exchange: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ManagedStore {
@@ -211,6 +213,8 @@ impl ManagedStore {
             before_transaction_lock: None,
             #[cfg(test)]
             before_init_activation: None,
+            #[cfg(test)]
+            after_init_exchange: None,
         }
     }
 
@@ -226,6 +230,12 @@ impl ManagedStore {
     #[cfg(test)]
     pub(crate) fn with_before_init_activation(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.before_init_activation = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_init_exchange(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.after_init_exchange = Some(hook);
         self
     }
 
@@ -485,12 +495,18 @@ impl ManagedStore {
                     hook();
                 }
                 if let Some(metadata) = entry_metadata.as_ref() {
+                    let candidate_metadata = fs::symlink_metadata(candidate.path())
+                        .map_err(|source| init_io(candidate.path(), source))?;
                     match candidate.exchange_with(&self.paths.entry) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
                             return Err(InitError::EntryChanged);
                         }
                         Err(source) => return Err(init_io(&self.paths.entry, source)),
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = &self.after_init_exchange {
+                        hook();
                     }
                     let matches = entry_matches_snapshot(
                         candidate.path(),
@@ -500,17 +516,19 @@ impl ManagedStore {
                     match matches {
                         Ok(true) => {}
                         Ok(false) => {
-                            return Err(restore_displaced_entry(
+                            return Err(self.restore_displaced_entry(
                                 candidate,
-                                &self.paths.entry,
+                                final_entry.as_bytes(),
+                                &candidate_metadata,
                                 InitError::EntryChanged,
                             ));
                         }
                         Err(source) => {
                             let original = init_io(candidate.path(), source);
-                            return Err(restore_displaced_entry(
+                            return Err(self.restore_displaced_entry(
                                 candidate,
-                                &self.paths.entry,
+                                final_entry.as_bytes(),
+                                &candidate_metadata,
                                 original,
                             ));
                         }
@@ -518,18 +536,20 @@ impl ManagedStore {
                     let backup_path = match self.entry_backup_path() {
                         Ok(path) => path,
                         Err(original) => {
-                            return Err(restore_displaced_entry(
+                            return Err(self.restore_displaced_entry(
                                 candidate,
-                                &self.paths.entry,
+                                final_entry.as_bytes(),
+                                &candidate_metadata,
                                 original,
                             ));
                         }
                     };
                     if let Err(source) = candidate.rename_to_noreplace(&backup_path) {
                         let original = init_io(&backup_path, source);
-                        return Err(restore_displaced_entry(
+                        return Err(self.restore_displaced_entry(
                             candidate,
-                            &self.paths.entry,
+                            final_entry.as_bytes(),
+                            &candidate_metadata,
                             original,
                         ));
                     }
@@ -604,6 +624,112 @@ impl ManagedStore {
             std::process::id()
         ));
         Ok(backup)
+    }
+
+    fn restore_displaced_entry(
+        &self,
+        candidate: &mut PendingFile,
+        expected_entry: &[u8],
+        expected_metadata: &fs::Metadata,
+        original: InitError,
+    ) -> InitError {
+        match fs::symlink_metadata(&self.paths.entry) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match candidate.rename_to_noreplace(&self.paths.entry) {
+                    Ok(()) => return original,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(source) => {
+                        return self.preserve_displaced_entry(
+                            candidate,
+                            original,
+                            Some(init_io(&self.paths.entry, source)),
+                        );
+                    }
+                }
+            }
+            Ok(metadata) if metadata.file_type().is_file() => {
+                match entry_matches_snapshot(&self.paths.entry, expected_entry, expected_metadata) {
+                    Ok(true) => {
+                        return match candidate.exchange_with(&self.paths.entry) {
+                            Ok(()) => original,
+                            Err(source) => self.preserve_displaced_entry(
+                                candidate,
+                                original,
+                                Some(init_io(&self.paths.entry, source)),
+                            ),
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(source) => {
+                        return self.preserve_displaced_entry(
+                            candidate,
+                            original,
+                            Some(init_io(&self.paths.entry, source)),
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(source) => {
+                return self.preserve_displaced_entry(
+                    candidate,
+                    original,
+                    Some(init_io(&self.paths.entry, source)),
+                );
+            }
+        }
+        self.preserve_displaced_entry(candidate, original, None)
+    }
+
+    fn preserve_displaced_entry(
+        &self,
+        candidate: &mut PendingFile,
+        original: InitError,
+        failure: Option<InitError>,
+    ) -> InitError {
+        let backup = match self.entry_backup_path() {
+            Ok(path) => path,
+            Err(error) => {
+                let recovery = candidate.keep();
+                return InitError::Rollback {
+                    original: Box::new(original),
+                    rollback: failure.into_iter().chain([error]).collect(),
+                    recovery: format!(
+                        "restore {} from {}",
+                        self.paths.entry.display(),
+                        recovery.display()
+                    ),
+                };
+            }
+        };
+        if let Err(source) = candidate.rename_to_noreplace(&backup) {
+            let recovery = candidate.keep();
+            return InitError::Rollback {
+                original: Box::new(original),
+                rollback: failure
+                    .into_iter()
+                    .chain([init_io(&backup, source)])
+                    .collect(),
+                recovery: format!(
+                    "restore {} from {}",
+                    self.paths.entry.display(),
+                    recovery.display()
+                ),
+            };
+        }
+        let sync = sync_dir(&self.paths.ssh_dir)
+            .err()
+            .map(|source| init_io(&self.paths.ssh_dir, source));
+        let rollback = failure.into_iter().chain(sync).collect::<Vec<_>>();
+        if rollback.is_empty() {
+            original
+        } else {
+            InitError::Rollback {
+                original: Box::new(original),
+                rollback,
+                recovery: format!("displaced entry preserved at {}", backup.display()),
+            }
+        }
     }
 
     fn rollback_init(
@@ -1180,24 +1306,6 @@ fn entry_matches_snapshot(
     let mut actual_contents = Vec::new();
     file.read_to_end(&mut actual_contents)?;
     Ok(same_metadata && actual_contents == contents)
-}
-
-fn restore_displaced_entry(
-    candidate: &mut PendingFile,
-    entry: &Path,
-    original: InitError,
-) -> InitError {
-    match candidate.exchange_with(entry) {
-        Ok(()) => original,
-        Err(source) => {
-            let recovery = candidate.keep();
-            InitError::Rollback {
-                original: Box::new(original),
-                rollback: vec![init_io(entry, source)],
-                recovery: format!("restore {} from {}", entry.display(), recovery.display()),
-            }
-        }
-    }
 }
 
 fn reject_symlink(path: &Path) -> io::Result<()> {
@@ -1867,6 +1975,32 @@ mod tests {
         assert!(matches!(result, Err(InitError::EntryChanged)));
         assert_eq!(fs::read(&paths.entry).unwrap(), b"Host user-save\n");
         assert!(paths.init_backups().unwrap().is_empty());
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn initialization_mismatch_preserves_save_after_exchange_and_displaced_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host A\n").unwrap();
+        let before_paths = paths.clone();
+        let after_paths = paths.clone();
+        let store = ManagedStore::new(paths.clone())
+            .with_before_init_activation(Arc::new(move || {
+                fs::write(&before_paths.entry, "Host B\n").unwrap();
+            }))
+            .with_after_init_exchange(Arc::new(move || {
+                fs::write(&after_paths.entry, "Host C\n").unwrap();
+            }));
+
+        let result = store.apply_init(true, |_, _| Ok(()));
+
+        assert!(matches!(result, Err(InitError::EntryChanged)));
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Host C\n");
+        let backups = paths.init_backups().unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"Host B\n");
         assert!(!paths.managed.exists());
     }
 
