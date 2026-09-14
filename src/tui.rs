@@ -9,7 +9,10 @@ use std::{
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -57,7 +60,7 @@ pub fn run(app: &App) -> Result<(), TuiError> {
         return Ok(());
     }
     if plan.requires_confirmation() {
-        app.initialize(true)?;
+        app.initialize_cancellable(true, &terminated)?;
     }
 
     browse(app, &mut terminal, &terminated)
@@ -99,7 +102,7 @@ fn browse<B: Backend>(
     terminated: &AtomicBool,
 ) -> Result<(), TuiError> {
     let mut state = UiState::new(app.hosts()?);
-    let mut details = resolve_selected(app, &mut state);
+    let mut details = resolve_selected(app, &mut state, terminated);
     let mut redraw = true;
 
     loop {
@@ -115,6 +118,11 @@ fn browse<B: Backend>(
         }
         let event = event::read()?;
         if matches!(event, Event::Resize(_, _)) {
+            redraw = true;
+            continue;
+        }
+        if let Event::Paste(text) = event {
+            state.handle_paste(&text);
             redraw = true;
             continue;
         }
@@ -163,6 +171,9 @@ fn browse<B: Backend>(
                     }
                 };
                 state.status = Some(match result {
+                    Ok(status) if status.success() && new_terminal => {
+                        format!("Opened {alias} in a new terminal")
+                    }
                     Ok(status) if status.success() => format!("Disconnected from {alias}"),
                     Ok(status) => format!("ssh exited with {status}"),
                     Err(error) => error.to_string(),
@@ -170,7 +181,7 @@ fn browse<B: Backend>(
             }
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
-                match app.add(host) {
+                match app.add_cancellable(host, terminated) {
                     Ok(()) => {
                         inventory_changed = complete_mutation(
                             &mut state,
@@ -187,7 +198,7 @@ fn browse<B: Backend>(
                     Change::Set(changed) => changed.clone(),
                     Change::Keep | Change::Clear => alias.clone(),
                 };
-                match app.edit(&alias, changes) {
+                match app.edit_cancellable(&alias, changes, terminated) {
                     Ok(()) => {
                         inventory_changed = complete_mutation(
                             &mut state,
@@ -199,7 +210,7 @@ fn browse<B: Backend>(
                     Err(error) => state.status = Some(error.to_string()),
                 }
             }
-            UiAction::Remove(alias) => match app.remove(&alias) {
+            UiAction::Remove(alias) => match app.remove_cancellable(&alias, terminated) {
                 Ok(()) => {
                     inventory_changed =
                         complete_mutation(&mut state, None, format!("Removed {alias}"), || {
@@ -211,7 +222,7 @@ fn browse<B: Backend>(
         }
 
         if details_stale(before.as_ref(), state.selected_summary(), inventory_changed) {
-            details = resolve_selected(app, &mut state);
+            details = resolve_selected(app, &mut state, terminated);
         }
         redraw = true;
     }
@@ -245,9 +256,13 @@ where
     }
 }
 
-fn resolve_selected(app: &App, state: &mut UiState) -> Option<HostDetails> {
+fn resolve_selected(
+    app: &App,
+    state: &mut UiState,
+    terminated: &AtomicBool,
+) -> Option<HostDetails> {
     let selected = state.selected_summary()?.clone();
-    match app.show(&selected.alias) {
+    match app.show_cancellable(&selected.alias, terminated) {
         Ok(details) => Some(details_for_selected(&selected, details)),
         Err(error) => {
             state.status = Some(error.to_string());
@@ -285,7 +300,12 @@ impl Drop for TerminalGuard {
 
 fn enter_terminal() -> Result<(), TuiError> {
     enable_raw_mode()?;
-    if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+    if let Err(error) = execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    ) {
         let _ = leave_terminal();
         return Err(error.into());
     }
@@ -294,7 +314,7 @@ fn enter_terminal() -> Result<(), TuiError> {
 
 fn leave_terminal() -> Result<(), TuiError> {
     let raw = disable_raw_mode();
-    let screen = execute!(io::stdout(), LeaveAlternateScreen);
+    let screen = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     let cursor = execute!(io::stdout(), Show);
     raw?;
     screen?;
@@ -422,6 +442,21 @@ impl UiState {
         }
     }
 
+    fn handle_paste(&mut self, text: &str) {
+        self.status = None;
+        match self.mode {
+            Mode::Filter => {
+                let mut filter = self.filter.clone();
+                filter.push_str(text);
+                self.set_filter(&filter);
+            }
+            Mode::AddForm | Mode::EditForm => {
+                self.form.values[self.form.active].push_str(text);
+            }
+            Mode::Browse | Mode::ConfirmRemove => {}
+        }
+    }
+
     fn handle_browse_key(
         &mut self,
         key: KeyEvent,
@@ -458,8 +493,8 @@ impl UiState {
 
     fn handle_filter_key(&mut self, key: KeyEvent) -> Result<UiAction, String> {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Browse,
-            KeyCode::Backspace => {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Enter => self.mode = Mode::Browse,
+            KeyCode::Delete => {
                 let mut filter = self.filter.clone();
                 filter.pop();
                 self.set_filter(&filter);
@@ -480,12 +515,12 @@ impl UiState {
 
     fn handle_form_key(&mut self, key: KeyEvent) -> Result<UiAction, String> {
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Browse,
+            KeyCode::Esc | KeyCode::Backspace => self.mode = Mode::Browse,
             KeyCode::Up | KeyCode::BackTab => self.form.active = self.form.active.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => {
                 self.form.active = (self.form.active + 1).min(FORM_LABELS.len() - 1)
             }
-            KeyCode::Backspace => {
+            KeyCode::Delete => {
                 self.form.values[self.form.active].pop();
             }
             KeyCode::Char(character)
@@ -503,7 +538,7 @@ impl UiState {
 
     fn handle_remove_key(&mut self, key: KeyEvent) -> UiAction {
         match key.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Backspace => {
                 self.mode = Mode::Browse;
                 UiAction::None
             }
@@ -769,9 +804,11 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
             }
             None => "/ filter  a add  q quit",
         },
-        Mode::Filter => "type to filter  Enter apply  Esc cancel",
-        Mode::AddForm | Mode::EditForm => "↑↓ field  Enter save  Esc cancel",
-        Mode::ConfirmRemove => "Enter remove  Esc cancel",
+        Mode::Filter => "type to filter  Delete erase  Enter apply  Esc/Backspace cancel",
+        Mode::AddForm | Mode::EditForm => {
+            "↑↓ field  Delete erase  Enter save  Esc/Backspace cancel"
+        }
+        Mode::ConfirmRemove => "Enter remove  Esc/Backspace cancel",
     };
     frame.render_widget(Paragraph::new(footer), areas[3]);
 }
@@ -795,21 +832,23 @@ fn detail_text(details: &HostDetails) -> String {
     } else {
         text.push_str("Portico-declared: —\n");
     }
-    text.push_str(&format!(
-        "Resolved\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}",
-        details.resolved.hostname,
-        details.resolved.user.as_deref().unwrap_or("—"),
-        details
-            .resolved
-            .port
-            .map_or_else(|| "—".into(), |port| port.to_string()),
-        if details.resolved.identity_files.is_empty() {
-            "—".into()
-        } else {
-            details.resolved.identity_files.join(", ")
-        },
-        details.resolved.proxy_jump.as_deref().unwrap_or("—"),
-    ));
+    match &details.resolution {
+        Ok(resolved) => text.push_str(&format!(
+            "Resolved\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}",
+            resolved.hostname,
+            resolved.user.as_deref().unwrap_or("—"),
+            resolved
+                .port
+                .map_or_else(|| "—".into(), |port| port.to_string()),
+            if resolved.identity_files.is_empty() {
+                "—".into()
+            } else {
+                resolved.identity_files.join(", ")
+            },
+            resolved.proxy_jump.as_deref().unwrap_or("—"),
+        )),
+        Err(error) => text.push_str(&format!("Resolved\nError: {error}")),
+    }
     text
 }
 
@@ -860,7 +899,10 @@ fn render_init(frame: &mut Frame<'_>, plan: &InitPlan) {
         ),
         areas[0],
     );
-    frame.render_widget(Paragraph::new("y initialize  n/q cancel"), areas[1]);
+    frame.render_widget(
+        Paragraph::new("y initialize  n/q/Esc/Backspace cancel"),
+        areas[1],
+    );
 }
 
 fn ownership(ownership: Ownership) -> &'static str {
@@ -873,7 +915,7 @@ fn ownership(ownership: Ownership) -> &'static str {
 fn init_decision(key: KeyEvent) -> Option<bool> {
     match key.code {
         KeyCode::Char('y') => Some(true),
-        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('n') => Some(false),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('n') => Some(false),
         _ => None,
     }
 }
@@ -936,13 +978,13 @@ mod tests {
                 )
                 .unwrap()
             }),
-            resolved: ResolvedConfig {
+            resolution: Ok(ResolvedConfig {
                 hostname: format!("{alias}.example"),
                 user: Some("deploy".into()),
                 port: Some(22),
                 identity_files: vec!["~/.ssh/id_ed25519".into()],
                 proxy_jump: None,
-            },
+            }),
             warnings: Vec::new(),
         }
     }
@@ -1024,8 +1066,14 @@ mod tests {
             );
             let mut state = UiState::new(app.hosts().unwrap());
 
-            assert!(resolve_selected(&app, &mut state).is_none());
-            let text = buffer_text(&render_optional_to_buffer(&state, None));
+            let details =
+                resolve_selected(&app, &mut state, &std::sync::atomic::AtomicBool::new(false));
+            if external.is_empty() {
+                assert!(details.is_none());
+            } else {
+                assert!(details.as_ref().unwrap().resolution.is_err());
+            }
+            let text = buffer_text(&render_optional_to_buffer(&state, details.as_ref()));
 
             assert!(text.contains("Warning"), "{text}");
             assert!(text.contains("missing.conf"), "{text}");
@@ -1073,7 +1121,7 @@ mod tests {
         let text = buffer_text(&render_optional_to_buffer(&state, None));
         assert!(text.contains("invalid alias"));
         assert!(text.contains("Enter save"));
-        assert!(text.contains("Esc cancel"));
+        assert!(text.contains("Esc/Backspace cancel"));
         assert!(!text.contains("e edit"));
     }
 
@@ -1198,7 +1246,7 @@ mod tests {
             )
             .unwrap(),
         );
-        host_details.resolved.hostname = "effective.example".into();
+        host_details.resolution.as_mut().unwrap().hostname = "effective.example".into();
         host_details.warnings = vec![DiscoveryWarning::Include {
             path: PathBuf::from("/home/test/.ssh/missing.conf"),
             message: "no matching files".into(),
@@ -1214,6 +1262,23 @@ mod tests {
         assert!(text.contains("effective.example"));
         assert!(text.contains("Warning:"));
         assert!(text.contains("missing.conf: no matching files"));
+    }
+
+    #[test]
+    fn resolution_failure_keeps_managed_host_editable() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let mut host_details = details("dev", Ownership::Managed);
+        host_details.resolution = Err("ssh -G failed".into());
+        let text = buffer_text(&render_to_buffer(&state, host_details.clone()));
+
+        assert!(text.contains("ssh -G failed"));
+
+        state
+            .handle_key(key(KeyCode::Char('e')), Some(&host_details))
+            .unwrap();
+
+        assert_eq!(state.mode, Mode::EditForm);
+        assert_eq!(state.form.values[0], "dev");
     }
 
     #[test]
@@ -1278,6 +1343,32 @@ mod tests {
         assert_eq!(state.selected_alias(), Some("prod"));
         state.handle_key(key(KeyCode::Esc), None).unwrap();
         assert_eq!(state.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn backspace_cancels_while_delete_erases_text() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.handle_key(key(KeyCode::Char('/')), None).unwrap();
+        state.handle_key(key(KeyCode::Char('d')), None).unwrap();
+        state.handle_key(key(KeyCode::Delete), None).unwrap();
+        assert_eq!(state.filter, "");
+        assert_eq!(state.mode, Mode::Filter);
+        state.handle_key(key(KeyCode::Backspace), None).unwrap();
+        assert_eq!(state.mode, Mode::Browse);
+
+        state.handle_key(key(KeyCode::Char('a')), None).unwrap();
+        state.form.values[0] = "dev".into();
+        state.handle_key(key(KeyCode::Delete), None).unwrap();
+        assert_eq!(state.form.values[0], "de");
+        assert_eq!(state.mode, Mode::AddForm);
+        state.handle_key(key(KeyCode::Backspace), None).unwrap();
+        assert_eq!(state.mode, Mode::Browse);
+
+        state.handle_key(key(KeyCode::Char('x')), None).unwrap();
+        assert_eq!(state.mode, Mode::ConfirmRemove);
+        state.handle_key(key(KeyCode::Backspace), None).unwrap();
+        assert_eq!(state.mode, Mode::Browse);
+        assert_eq!(init_decision(key(KeyCode::Backspace)), Some(false));
     }
 
     #[test]

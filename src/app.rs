@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitStatus};
+use std::{path::PathBuf, process::ExitStatus, sync::atomic::AtomicBool};
 
 use thiserror::Error;
 
@@ -37,7 +37,7 @@ pub struct HostInventory {
 pub struct HostDetails {
     pub summary: HostSummary,
     pub declared: Option<Host>,
-    pub resolved: ResolvedConfig,
+    pub resolution: Result<ResolvedConfig, String>,
     pub warnings: Vec<DiscoveryWarning>,
 }
 
@@ -73,10 +73,28 @@ impl App {
     }
 
     pub fn initialize(&self, approved: bool) -> Result<InitOutcome, AppError> {
+        self.initialize_inner(approved, None)
+    }
+
+    pub(crate) fn initialize_cancellable(
+        &self,
+        approved: bool,
+        cancelled: &AtomicBool,
+    ) -> Result<InitOutcome, AppError> {
+        self.initialize_inner(approved, Some(cancelled))
+    }
+
+    fn initialize_inner(
+        &self,
+        approved: bool,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<InitOutcome, AppError> {
         Ok(self.store.apply_init(approved, |entry, aliases| {
-            self.openssh
-                .validate(entry, aliases)
-                .map_err(|error| error.to_string())
+            match cancelled {
+                Some(cancelled) => self.openssh.validate_cancellable(entry, aliases, cancelled),
+                None => self.openssh.validate(entry, aliases),
+            }
+            .map_err(|error| error.to_string())
         })?)
     }
 
@@ -105,6 +123,22 @@ impl App {
     }
 
     pub fn show(&self, alias: &str) -> Result<HostDetails, AppError> {
+        self.show_inner(alias, None)
+    }
+
+    pub(crate) fn show_cancellable(
+        &self,
+        alias: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<HostDetails, AppError> {
+        self.show_inner(alias, Some(cancelled))
+    }
+
+    fn show_inner(
+        &self,
+        alias: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<HostDetails, AppError> {
         let managed = self.store.load()?;
         let discovery = self.discover()?;
         let (summary, declared) = if let Some(host) = managed.find(alias) {
@@ -132,46 +166,101 @@ impl App {
         } else {
             return Err(AppError::UnknownHost(alias.into()));
         };
-        let resolved = self.openssh.resolve(&summary.alias)?;
+        let resolution = match cancelled {
+            Some(cancelled) => self.openssh.resolve_cancellable(&summary.alias, cancelled),
+            None => self.openssh.resolve(&summary.alias),
+        }
+        .map_err(|error| error.to_string());
         Ok(HostDetails {
             summary,
             declared,
-            resolved,
+            resolution,
             warnings: discovery.warnings,
         })
     }
 
     pub fn add(&self, host: Host) -> Result<(), AppError> {
-        self.transact(|config| {
-            self.ensure_alias_available(config, host.alias(), None)?;
-            Ok(config.insert(host).map_err(TransactionError::Operation)?)
-        })
+        self.add_inner(host, None)
+    }
+
+    pub(crate) fn add_cancellable(
+        &self,
+        host: Host,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AppError> {
+        self.add_inner(host, Some(cancelled))
+    }
+
+    fn add_inner(&self, host: Host, cancelled: Option<&AtomicBool>) -> Result<(), AppError> {
+        self.transact(
+            |config| {
+                self.ensure_alias_available(config, host.alias(), None)?;
+                Ok(config.insert(host).map_err(TransactionError::Operation)?)
+            },
+            cancelled,
+        )
     }
 
     pub fn edit(&self, alias: &str, changes: HostChanges) -> Result<(), AppError> {
-        self.transact(|config| {
-            let current = match config.find(alias) {
-                Some(host) => host,
-                None => return Err(self.missing_host_error(alias)?),
-            };
-            let changed = current.apply(changes)?;
-            if changed.alias() != current.alias() {
-                self.ensure_alias_available(config, changed.alias(), Some(current.alias()))?;
-            }
-            Ok(config
-                .replace(alias, changed)
-                .map_err(TransactionError::Operation)?)
-        })
+        self.edit_inner(alias, changes, None)
+    }
+
+    pub(crate) fn edit_cancellable(
+        &self,
+        alias: &str,
+        changes: HostChanges,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AppError> {
+        self.edit_inner(alias, changes, Some(cancelled))
+    }
+
+    fn edit_inner(
+        &self,
+        alias: &str,
+        changes: HostChanges,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), AppError> {
+        self.transact(
+            |config| {
+                let current = match config.find(alias) {
+                    Some(host) => host,
+                    None => return Err(self.missing_host_error(alias)?),
+                };
+                let changed = current.apply(changes)?;
+                if changed.alias() != current.alias() {
+                    self.ensure_alias_available(config, changed.alias(), Some(current.alias()))?;
+                }
+                Ok(config
+                    .replace(alias, changed)
+                    .map_err(TransactionError::Operation)?)
+            },
+            cancelled,
+        )
     }
 
     pub fn remove(&self, alias: &str) -> Result<(), AppError> {
-        self.transact(|config| {
-            if config.find(alias).is_none() {
-                return Err(self.missing_host_error(alias)?);
-            }
-            config.remove(alias).map_err(TransactionError::Operation)?;
-            Ok(())
-        })
+        self.remove_inner(alias, None)
+    }
+
+    pub(crate) fn remove_cancellable(
+        &self,
+        alias: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AppError> {
+        self.remove_inner(alias, Some(cancelled))
+    }
+
+    fn remove_inner(&self, alias: &str, cancelled: Option<&AtomicBool>) -> Result<(), AppError> {
+        self.transact(
+            |config| {
+                if config.find(alias).is_none() {
+                    return Err(self.missing_host_error(alias)?);
+                }
+                config.remove(alias).map_err(TransactionError::Operation)?;
+                Ok(())
+            },
+            cancelled,
+        )
     }
 
     pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ExitStatus, AppError> {
@@ -229,14 +318,16 @@ impl App {
         }
     }
 
-    fn transact<M>(&self, mutate: M) -> Result<(), AppError>
+    fn transact<M>(&self, mutate: M, cancelled: Option<&AtomicBool>) -> Result<(), AppError>
     where
         M: FnOnce(&mut ManagedConfig) -> Result<(), AppError>,
     {
         self.store.transact(mutate, |entry, aliases| {
-            self.openssh
-                .validate(entry, aliases)
-                .map_err(|error| error.to_string())
+            match cancelled {
+                Some(cancelled) => self.openssh.validate_cancellable(entry, aliases, cancelled),
+                None => self.openssh.validate(entry, aliases),
+            }
+            .map_err(|error| error.to_string())
         })
     }
 }
@@ -407,14 +498,16 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_discovery_blocks_add_but_not_existing_connect() {
+    fn harmless_discovery_warnings_do_not_block_unrelated_add() {
         let app = test_app_with_external(
-            "Include missing/*.conf\nHost legacy\n  HostName legacy.example\n",
+            "Include missing/*.conf\nHost legacy\n  HostName legacy.example\nHost LEGACY\n  HostName duplicate.example\n",
         );
+        app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+            .unwrap();
         let error = app
-            .add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+            .add(Host::new("legacy", "other.example", None, None, None, None).unwrap())
             .unwrap_err();
-        assert!(matches!(error, AppError::IncompleteDiscovery(_)));
+        assert!(matches!(error, AppError::AliasCollision(_)));
         assert!(app.show("legacy").is_ok());
         assert!(app.connect("legacy", false).unwrap().success());
     }
@@ -505,63 +598,51 @@ mod tests {
         use fs2::FileExt;
 
         for rename in [false, true] {
-            for external in ["Host 'Prod'\n", "Include missing/*.conf\n"] {
-                let armed = Arc::new(AtomicBool::new(false));
-                let (entered_tx, entered_rx) = mpsc::channel();
-                let hook_armed = Arc::clone(&armed);
-                let app = test_app(
-                    None,
-                    Some(Arc::new(move || {
-                        if hook_armed.load(Ordering::SeqCst) {
-                            entered_tx.send(()).unwrap();
-                        }
-                    })),
-                );
-                app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
-                    .unwrap();
-                let paths = app.store.paths();
-                let before = fs::read(&paths.managed).unwrap();
-                let backup = fs::read(&paths.backup).unwrap();
-                let lock = fs::File::open(&paths.lock).unwrap();
-                lock.lock_exclusive().unwrap();
-                armed.store(true, Ordering::SeqCst);
+            let armed = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let hook_armed = Arc::clone(&armed);
+            let app = test_app(
+                None,
+                Some(Arc::new(move || {
+                    if hook_armed.load(Ordering::SeqCst) {
+                        entered_tx.send(()).unwrap();
+                    }
+                })),
+            );
+            app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+                .unwrap();
+            let paths = app.store.paths();
+            let before = fs::read(&paths.managed).unwrap();
+            let backup = fs::read(&paths.backup).unwrap();
+            let lock = fs::File::open(&paths.lock).unwrap();
+            lock.lock_exclusive().unwrap();
+            armed.store(true, Ordering::SeqCst);
 
-                let error = thread::scope(|scope| {
-                    let operation = scope.spawn(|| {
-                        if rename {
-                            app.edit(
-                                "dev",
-                                HostChanges {
-                                    alias: Change::Set("prod".into()),
-                                    ..Default::default()
-                                },
-                            )
-                        } else {
-                            app.add(
-                                Host::new("prod", "prod.example", None, None, None, None).unwrap(),
-                            )
-                        }
-                    });
-                    // Dropping the lock also releases a waiter if an assertion panics.
-                    let held_lock = lock;
-                    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    fs::write(
-                        &paths.entry,
-                        format!("Include ~/.ssh/portico/config\n{external}"),
-                    )
-                    .unwrap();
-                    drop(held_lock);
-                    operation.join().unwrap().unwrap_err()
+            let error = thread::scope(|scope| {
+                let operation = scope.spawn(|| {
+                    if rename {
+                        app.edit(
+                            "dev",
+                            HostChanges {
+                                alias: Change::Set("prod".into()),
+                                ..Default::default()
+                            },
+                        )
+                    } else {
+                        app.add(Host::new("prod", "prod.example", None, None, None, None).unwrap())
+                    }
                 });
+                // Dropping the lock also releases a waiter if an assertion panics.
+                let held_lock = lock;
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                fs::write(&paths.entry, "Include ~/.ssh/portico/config\nHost 'Prod'\n").unwrap();
+                drop(held_lock);
+                operation.join().unwrap().unwrap_err()
+            });
 
-                if external.starts_with("Host") {
-                    assert!(matches!(error, AppError::AliasCollision(alias) if alias == "prod"));
-                } else {
-                    assert!(matches!(error, AppError::IncompleteDiscovery(_)));
-                }
-                assert_eq!(fs::read(&paths.managed).unwrap(), before);
-                assert_eq!(fs::read(&paths.backup).unwrap(), backup);
-            }
+            assert!(matches!(error, AppError::AliasCollision(alias) if alias == "prod"));
+            assert_eq!(fs::read(&paths.managed).unwrap(), before);
+            assert_eq!(fs::read(&paths.backup).unwrap(), backup);
         }
     }
 

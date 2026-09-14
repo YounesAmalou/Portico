@@ -11,6 +11,7 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Shows the effective configuration reported by `ssh -G`.
 - Connects in the current terminal or through `xdg-terminal-exec`.
 - Provides a master-detail TUI when run without a subcommand.
+- Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only.
 
 Portico owns only `~/.ssh/portico/config`. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`.
@@ -39,6 +40,8 @@ Initialize Portico. Without `--yes`, Portico displays the plan and asks before c
 ```sh
 cargo run -- init
 ```
+
+Other commands report that Portico is not initialized and direct you to run `portico init`.
 
 Open the TUI:
 
@@ -119,6 +122,8 @@ portico connect development
 portico connect development --new-terminal
 ```
 
+New-terminal connections are launched in the background, so the CLI returns immediately and the TUI remains usable.
+
 Remove a managed host. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
 
 ```sh
@@ -137,11 +142,14 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `a` | Add a host |
 | `e` | Edit the selected managed host |
 | `x` | Remove the selected managed host |
+| `Delete` | Erase text in a filter or form field |
+| `Backspace` / `Esc` | Cancel or return to the host list |
 | `Enter` | Connect in the current terminal |
 | `n` | Connect in a new terminal |
 | `q` | Quit |
 
 External hosts can be inspected and connected to, but Portico will not edit or remove them.
+Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
 
 ## Development checks
 

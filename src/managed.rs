@@ -155,6 +155,8 @@ pub enum InitError {
 
 #[derive(Debug, Error)]
 pub enum TransactionError {
+    #[error("Portico is not initialized; run `portico init` first")]
+    NotInitialized,
     #[error(transparent)]
     Operation(#[from] ManagedError),
     #[error("managed config is invalid; recover from {backup}: {source}")]
@@ -555,7 +557,7 @@ impl ManagedStore {
         V: Fn(&Path, &[String]) -> Result<(), String>,
     {
         let lock = open_lock(&self.paths.lock)
-            .map_err(|source| transaction_io(&self.paths.lock, source))?;
+            .map_err(|source| transaction_storage_io(&self.paths.lock, source))?;
         #[cfg(test)]
         if let Some(hook) = &self.before_transaction_lock {
             hook();
@@ -640,7 +642,7 @@ impl ManagedStore {
         reject_symlink(&self.paths.managed)
             .map_err(|source| transaction_io(&self.paths.managed, source))?;
         let contents = fs::read(&self.paths.managed)
-            .map_err(|source| transaction_io(&self.paths.managed, source))?;
+            .map_err(|source| transaction_storage_io(&self.paths.managed, source))?;
         let text = std::str::from_utf8(&contents).map_err(|source| TransactionError::Managed {
             backup: self.paths.backup.clone(),
             source: ManagedError::Parse {
@@ -1184,6 +1186,14 @@ fn transaction_io(path: &Path, source: io::Error) -> TransactionError {
     TransactionError::Io {
         path: path.into(),
         source,
+    }
+}
+
+fn transaction_storage_io(path: &Path, source: io::Error) -> TransactionError {
+    if source.kind() == io::ErrorKind::NotFound {
+        TransactionError::NotInitialized
+    } else {
+        transaction_io(path, source)
     }
 }
 

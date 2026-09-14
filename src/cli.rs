@@ -288,30 +288,29 @@ fn print_details(output: &mut impl Write, details: &HostDetails) -> Result<(), S
         print_optional(output, "Declared IdentityFile", host.identity_file())?;
         print_optional(output, "Declared ProxyJump", host.proxy_jump())?;
     }
-    writeln!(output, "Resolved HostName: {}", details.resolved.hostname)
-        .map_err(|error| error.to_string())?;
-    print_optional(output, "Resolved User", details.resolved.user.as_deref())?;
-    print_optional(
-        output,
-        "Resolved Port",
-        details
-            .resolved
-            .port
-            .map(|port| port.to_string())
-            .as_deref(),
-    )?;
-    print_optional(
-        output,
-        "Resolved IdentityFile",
-        (!details.resolved.identity_files.is_empty())
-            .then(|| details.resolved.identity_files.join(", "))
-            .as_deref(),
-    )?;
-    print_optional(
-        output,
-        "Resolved ProxyJump",
-        details.resolved.proxy_jump.as_deref(),
-    )?;
+    match &details.resolution {
+        Ok(resolved) => {
+            writeln!(output, "Resolved HostName: {}", resolved.hostname)
+                .map_err(|error| error.to_string())?;
+            print_optional(output, "Resolved User", resolved.user.as_deref())?;
+            print_optional(
+                output,
+                "Resolved Port",
+                resolved.port.map(|port| port.to_string()).as_deref(),
+            )?;
+            print_optional(
+                output,
+                "Resolved IdentityFile",
+                (!resolved.identity_files.is_empty())
+                    .then(|| resolved.identity_files.join(", "))
+                    .as_deref(),
+            )?;
+            print_optional(output, "Resolved ProxyJump", resolved.proxy_jump.as_deref())?;
+        }
+        Err(error) => {
+            writeln!(output, "Resolution error: {error}").map_err(|error| error.to_string())?;
+        }
+    }
     for warning in &details.warnings {
         writeln!(output, "Warning: {}", format_warning(warning))
             .map_err(|error| error.to_string())?;

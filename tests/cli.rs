@@ -3,6 +3,16 @@ mod support;
 use support::TestEnv;
 
 #[test]
+fn commands_before_initialization_explain_how_to_continue() {
+    let env = TestEnv::new();
+
+    env.run(["hosts"])
+        .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
+}
+
+#[test]
 fn add_show_edit_and_force_remove_flow() {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();
@@ -18,6 +28,22 @@ fn add_show_edit_and_force_remove_flow() {
         .assert_failure_stderr_contains("--force");
     env.run(["remove", "prod", "-f"]).assert_success();
     env.run(["show", "dev"]).assert_failure();
+}
+
+#[test]
+fn show_preserves_declared_details_when_resolution_fails() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    env.reject_alias("dev");
+
+    env.run(["show", "dev"])
+        .assert_stdout_contains("Declared HostName: dev.example");
+    env.run(["show", "dev"])
+        .assert_stdout_contains("Resolution error:");
+    env.run(["show", "dev"])
+        .assert_stdout_contains("rejected alias: dev");
 }
 
 #[test]

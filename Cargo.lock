@@ -434,6 +434,7 @@ dependencies = [
  "crossterm",
  "fs2",
  "glob",
+ "libc",
  "ratatui",
  "signal-hook",
  "tempfile",

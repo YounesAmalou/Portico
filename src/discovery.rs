@@ -199,7 +199,10 @@ impl Scanner {
         }
         paths.sort();
         if paths.is_empty() && !had_error {
-            self.warn_include(path, "no matching files".into());
+            self.discovery.warnings.push(DiscoveryWarning::Include {
+                path,
+                message: "no matching files".into(),
+            });
         } else {
             for path in paths {
                 self.scan_include(path);
@@ -240,7 +243,6 @@ impl Scanner {
             .into_iter()
             .filter(|(_, (_, sources))| sources.len() > 1)
         {
-            self.discovery.aliases_complete = false;
             self.discovery
                 .warnings
                 .push(DiscoveryWarning::DuplicateAlias { alias, sources });
@@ -333,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_include_marks_alias_inventory_incomplete() {
+    fn missing_include_warns_without_blocking_known_aliases() {
         let dir = tempfile::tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -344,13 +346,13 @@ mod tests {
         .unwrap();
 
         let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
-        assert!(!result.aliases_complete);
+        assert!(result.aliases_complete);
         assert_eq!(result.hosts[0].alias, "visible");
         assert_eq!(result.warnings.len(), 1);
     }
 
     #[test]
-    fn case_only_duplicate_is_reported_as_ambiguous() {
+    fn case_only_duplicate_warns_without_hiding_other_known_aliases() {
         let dir = tempfile::tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -361,7 +363,7 @@ mod tests {
         .unwrap();
 
         let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
-        assert!(!result.aliases_complete);
+        assert!(result.aliases_complete);
         assert!(result.warnings.iter().any(|warning| matches!(warning, DiscoveryWarning::DuplicateAlias { alias, .. } if alias.eq_ignore_ascii_case("prod"))));
     }
 
