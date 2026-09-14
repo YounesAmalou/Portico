@@ -8,6 +8,7 @@ use crate::{
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
+    openssh::ConnectionOutcome,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -221,10 +222,15 @@ fn execute<I: BufRead, O: Write>(
             let status = app
                 .connect(&alias, new_terminal)
                 .map_err(|error| error.to_string())?;
-            Ok(status
-                .code()
-                .and_then(|code| u8::try_from(code).ok())
-                .map_or(ExitCode::FAILURE, ExitCode::from))
+            Ok(match status {
+                ConnectionOutcome::LaunchRequested => ExitCode::SUCCESS,
+                ConnectionOutcome::Exited(status) | ConnectionOutcome::LaunchFailed(status) => {
+                    status
+                        .code()
+                        .and_then(|code| u8::try_from(code).ok())
+                        .map_or(ExitCode::FAILURE, ExitCode::from)
+                }
+            })
         }
     }
 }

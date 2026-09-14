@@ -1,11 +1,12 @@
 use std::{
+    fs,
     io::{self, Read},
-    os::unix::process::{CommandExt, ExitStatusExt},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -23,6 +24,13 @@ pub struct ResolvedConfig {
     pub port: Option<u16>,
     pub identity_files: Vec<String>,
     pub proxy_jump: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionOutcome {
+    Exited(ExitStatus),
+    LaunchRequested,
+    LaunchFailed(ExitStatus),
 }
 
 #[derive(Debug, Error)]
@@ -139,28 +147,94 @@ impl OpenSsh {
         })
     }
 
-    pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ExitStatus, OpenSshError> {
+    pub fn connect(
+        &self,
+        alias: &str,
+        new_terminal: bool,
+    ) -> Result<ConnectionOutcome, OpenSshError> {
         if new_terminal {
             let mut command = Command::new(&self.terminal);
-            command.arg("--").arg(&self.ssh).arg("--").arg(alias);
+            command
+                .arg("--")
+                .arg(&self.ssh)
+                .arg("--")
+                .arg(alias)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             let mut child = command.spawn().map_err(|source| OpenSshError::Io {
                 program: self.terminal.clone(),
                 source,
             })?;
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(ExitStatus::from_raw(0));
+            let deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) if status.success() => {
+                        return Ok(ConnectionOutcome::LaunchRequested);
+                    }
+                    Ok(Some(status)) => return Ok(ConnectionOutcome::LaunchFailed(status)),
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        return Ok(ConnectionOutcome::LaunchRequested);
+                    }
+                    Err(source) => {
+                        terminate_process_tree(&mut child);
+                        return Err(OpenSshError::Io {
+                            program: self.terminal.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
         }
 
-        Command::new(&self.ssh)
+        Ok(ConnectionOutcome::Exited(
+            Command::new(&self.ssh)
+                .arg("--")
+                .arg(alias)
+                .status()
+                .map_err(|source| OpenSshError::Io {
+                    program: self.ssh.clone(),
+                    source,
+                })?,
+        ))
+    }
+
+    pub(crate) fn connect_cancellable(
+        &self,
+        alias: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<ExitStatus, OpenSshError> {
+        let mut child = Command::new(&self.ssh)
             .arg("--")
             .arg(alias)
-            .status()
+            .spawn()
             .map_err(|source| OpenSshError::Io {
                 program: self.ssh.clone(),
                 source,
-            })
+            })?;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                terminate_process_tree(&mut child);
+                return Err(OpenSshError::Cancelled);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(source) => {
+                    terminate_process_tree(&mut child);
+                    return Err(OpenSshError::Io {
+                        program: self.ssh.clone(),
+                        source,
+                    });
+                }
+            }
+        }
     }
 
     fn validate_alias(
@@ -248,6 +322,31 @@ impl OpenSsh {
 fn terminate_process_group(child: &mut std::process::Child) {
     kill_process_group(child);
     let _ = child.wait();
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    kill_process_tree(child.id());
+    let _ = child.wait();
+}
+
+fn kill_process_tree(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+    }
+    if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+        for child in children
+            .split_whitespace()
+            .filter_map(|child| child.parse().ok())
+        {
+            kill_process_tree(child);
+        }
+    }
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
 }
 
 fn kill_process_group(child: &mut std::process::Child) {
@@ -421,9 +520,12 @@ mod tests {
     fn passes_alias_as_one_argument_without_a_shell() {
         let fake = fake_ssh();
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
-        let status = openssh.connect("-external", false).unwrap();
+        let outcome = openssh.connect("-external", false).unwrap();
 
-        assert!(status.success());
+        assert!(matches!(
+            outcome,
+            ConnectionOutcome::Exited(status) if status.success()
+        ));
         assert_eq!(fs::read_to_string(fake.log()).unwrap(), "--\n-external\n");
     }
 
@@ -466,7 +568,10 @@ mod tests {
         let terminal = fake_ssh();
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
 
-        assert!(openssh.connect("-external", true).unwrap().success());
+        assert_eq!(
+            openssh.connect("-external", true).unwrap(),
+            ConnectionOutcome::LaunchRequested
+        );
         wait_for_contents(
             terminal.log(),
             &format!("--\n{}\n--\n-external\n", ssh.path().display()),
@@ -492,7 +597,10 @@ mod tests {
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
         let started = std::time::Instant::now();
 
-        assert!(openssh.connect("dev", true).unwrap().success());
+        assert_eq!(
+            openssh.connect("dev", true).unwrap(),
+            ConnectionOutcome::LaunchRequested
+        );
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),

@@ -1,9 +1,11 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    io::{self, Read, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
@@ -138,6 +140,8 @@ pub enum InitError {
     Managed(#[from] ManagedError),
     #[error("configuration validation failed: {0}")]
     Validation(String),
+    #[error("entry config changed during initialization")]
+    EntryChanged,
     #[error("filesystem error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -307,6 +311,30 @@ impl ManagedStore {
     where
         V: Fn(&Path, &[String]) -> Result<(), String>,
     {
+        self.apply_init_inner(approved, None, validate)
+    }
+
+    pub(crate) fn apply_init_cancellable<V>(
+        &self,
+        approved: bool,
+        cancelled: &AtomicBool,
+        validate: V,
+    ) -> Result<InitOutcome, InitError>
+    where
+        V: Fn(&Path, &[String]) -> Result<(), String>,
+    {
+        self.apply_init_inner(approved, Some(cancelled), validate)
+    }
+
+    fn apply_init_inner<V>(
+        &self,
+        approved: bool,
+        cancelled: Option<&AtomicBool>,
+        validate: V,
+    ) -> Result<InitOutcome, InitError>
+    where
+        V: Fn(&Path, &[String]) -> Result<(), String>,
+    {
         let preview = self.plan_init()?;
         if !preview.requires_confirmation() {
             return Ok(InitOutcome::Unchanged);
@@ -327,7 +355,7 @@ impl ManagedStore {
         }
         let lock =
             open_lock(&self.paths.lock).map_err(|source| init_io(&self.paths.lock, source))?;
-        FileExt::lock_exclusive(&lock).map_err(|source| init_io(&self.paths.lock, source))?;
+        acquire_lock(&lock, cancelled).map_err(|source| init_io(&self.paths.lock, source))?;
 
         let plan = self.plan_init()?;
         if !plan.requires_confirmation() {
@@ -405,6 +433,17 @@ impl ManagedStore {
             .collect::<Vec<_>>();
         validate(validation_file.path(), &aliases).map_err(InitError::Validation)?;
         drop(validation_file);
+
+        if (plan.create_entry || plan.insert_include || plan.reposition_include)
+            && !entry_matches_snapshot(
+                &self.paths.entry,
+                entry_contents.as_bytes(),
+                entry_metadata.as_ref(),
+            )
+            .map_err(|source| init_io(&self.paths.entry, source))?
+        {
+            return Err(InitError::EntryChanged);
+        }
 
         let backup = if plan.backup_entry {
             let metadata = entry_metadata.as_ref().ok_or_else(|| {
@@ -556,13 +595,41 @@ impl ManagedStore {
         M: FnOnce(&mut ManagedConfig) -> Result<R, E>,
         V: Fn(&Path, &[String]) -> Result<(), String>,
     {
+        self.transact_inner(mutate, validate, None)
+    }
+
+    pub(crate) fn transact_cancellable<R, E, M, V>(
+        &self,
+        mutate: M,
+        validate: V,
+        cancelled: &AtomicBool,
+    ) -> Result<R, E>
+    where
+        E: From<TransactionError>,
+        M: FnOnce(&mut ManagedConfig) -> Result<R, E>,
+        V: Fn(&Path, &[String]) -> Result<(), String>,
+    {
+        self.transact_inner(mutate, validate, Some(cancelled))
+    }
+
+    fn transact_inner<R, E, M, V>(
+        &self,
+        mutate: M,
+        validate: V,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<R, E>
+    where
+        E: From<TransactionError>,
+        M: FnOnce(&mut ManagedConfig) -> Result<R, E>,
+        V: Fn(&Path, &[String]) -> Result<(), String>,
+    {
         let lock = open_lock(&self.paths.lock)
             .map_err(|source| transaction_storage_io(&self.paths.lock, source))?;
         #[cfg(test)]
         if let Some(hook) = &self.before_transaction_lock {
             hook();
         }
-        FileExt::lock_exclusive(&lock)
+        acquire_lock(&lock, cancelled)
             .map_err(|source| transaction_io(&self.paths.lock, source))?;
 
         let (active, mut config) = self.read_managed()?;
@@ -1017,6 +1084,36 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+fn entry_matches_snapshot(
+    path: &Path,
+    contents: &[u8],
+    expected: Option<&fs::Metadata>,
+) -> io::Result<bool> {
+    let Some(expected) = expected else {
+        return match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) => Err(error),
+        };
+    };
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let actual = file.metadata()?;
+    let same_metadata = actual.dev() == expected.dev()
+        && actual.ino() == expected.ino()
+        && actual.mode() == expected.mode()
+        && actual.uid() == expected.uid()
+        && actual.gid() == expected.gid()
+        && actual.mtime() == expected.mtime()
+        && actual.mtime_nsec() == expected.mtime_nsec();
+    let mut actual_contents = Vec::new();
+    file.read_to_end(&mut actual_contents)?;
+    Ok(same_metadata && actual_contents == contents)
+}
+
 fn reject_symlink(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
@@ -1051,6 +1148,27 @@ fn open_lock(path: &Path) -> io::Result<File> {
             OpenOptions::new().read(true).write(true).open(path)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
+    let Some(cancelled) = cancelled else {
+        return FileExt::lock_exclusive(file);
+    };
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "operation cancelled",
+            ));
+        }
+        match FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -1261,8 +1379,11 @@ fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
             message: "missing value".into(),
         });
     }
-    if input.len() < 2 || !input.starts_with('"') || !input.ends_with('"') {
-        if input.chars().any(char::is_whitespace) {
+    if !input.starts_with('"') {
+        if input
+            .chars()
+            .any(|character| character.is_whitespace() || ['"', '\'', '\\'].contains(&character))
+        {
             return Err(ManagedError::Parse {
                 line,
                 message: "expected one value".into(),
@@ -1387,6 +1508,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_strict_values() {
+        for value in ["\"unterminated", "mis\"placed", "invalid\\escape"] {
+            let input = format!("Host dev\n  HostName dev.example\n  IdentityFile {value}\n");
+            assert!(
+                matches!(
+                    ManagedConfig::parse(&input),
+                    Err(ManagedError::Parse { .. })
+                ),
+                "accepted {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn quotes_identity_paths_as_one_argument() {
         let input = "Host dev\n  HostName dev.example\n  IdentityFile \"~/.ssh/key with space\"\n";
         let parsed = ManagedConfig::parse(input).unwrap();
@@ -1506,6 +1641,63 @@ mod tests {
                 .unwrap()
                 .contains("Include   conf.d/*.conf # keep this comment\n")
         );
+    }
+
+    #[test]
+    fn initialization_aborts_if_existing_entry_is_edited_during_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host existing\n").unwrap();
+        let store = ManagedStore::new(paths.clone());
+
+        let result = store.apply_init(true, |_, _| {
+            fs::write(&paths.entry, "Host user-edit\n").map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Host user-edit\n");
+        assert!(paths.init_backups().unwrap().is_empty());
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn initialization_aborts_if_entry_is_created_during_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        let store = ManagedStore::new(paths.clone());
+
+        let result = store.apply_init(true, |_, _| {
+            fs::write(&paths.entry, "Host user-created\n").map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Host user-created\n");
+        assert!(paths.init_backups().unwrap().is_empty());
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn initialization_aborts_if_entry_is_replaced_during_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host existing\n").unwrap();
+        let replacement = paths.ssh_dir.join("replacement");
+        let store = ManagedStore::new(paths.clone());
+
+        let result = store.apply_init(true, |_, _| {
+            fs::write(&replacement, "Host existing\n").map_err(|error| error.to_string())?;
+            fs::rename(&replacement, &paths.entry).map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Host existing\n");
+        assert!(paths.init_backups().unwrap().is_empty());
+        assert!(!paths.managed.exists());
     }
 
     #[test]
@@ -1832,6 +2024,33 @@ mod tests {
             matches!(&error, TransactionError::Managed { backup, .. } if backup == &fixture.paths.backup)
         );
         assert!(error.to_string().contains("recover"));
+    }
+
+    #[test]
+    fn malformed_quoted_active_config_preserves_active_and_backup_bytes() {
+        let fixture = initialized_store();
+        fixture
+            .store
+            .transact(
+                |config| {
+                    config
+                        .insert(Host::new("one", "one.example", None, None, None, None).unwrap())
+                        .map_err(TransactionError::Operation)
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let backup = fs::read(&fixture.paths.backup).unwrap();
+        let malformed = b"Host one\n  HostName one.example\n  IdentityFile \"unterminated\n";
+        fs::write(&fixture.paths.managed, malformed).unwrap();
+
+        let result = fixture
+            .store
+            .transact(|_| Ok::<_, TransactionError>(()), |_, _| Ok(()));
+
+        assert!(matches!(result, Err(TransactionError::Managed { .. })));
+        assert_eq!(fs::read(&fixture.paths.managed).unwrap(), malformed);
+        assert_eq!(fs::read(&fixture.paths.backup).unwrap(), backup);
     }
 
     #[test]
