@@ -68,6 +68,19 @@ def check_terminal(scenario):
             os.write(master, b"\r")
             read_until(b"Saved", start)
             assert "Host pasted\n" in Path(home, ".ssh/portico/config").read_text()
+        elif scenario == "paste_filter_edit":
+            start = len(transcript)
+            os.write(master, b"/")
+            os.write(master, b"\x1b[200~beta\x1b[201~")
+            os.write(master, b"\r")
+            os.write(master, b"e")
+            read_until(b"save", start)
+            os.write(master, b"\x1b[200~x\x1b[201~")
+            os.write(master, b"\r")
+            read_until(b"Saved", start)
+            config = Path(home, ".ssh/portico/config").read_text()
+            assert "Host alpha\n" in config
+            assert "Host betax\n" in config
         elif scenario == "child_failure":
             start = len(transcript)
             os.write(master, b"\r")
@@ -104,5 +117,5 @@ def check_terminal(scenario):
         os.close(slave)
 
 
-for scenario in ["paste", "blocked_resolution", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
     check_terminal(scenario)

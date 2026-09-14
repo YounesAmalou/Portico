@@ -221,27 +221,33 @@ impl OpenSsh {
 
         let status = loop {
             if cancelled.load(Ordering::Relaxed) {
-                kill_process_group(&mut child);
-                let _ = child.wait();
-                let _ = finish_pipe(stdout, &self.ssh);
-                let _ = finish_pipe(stderr, &self.ssh);
+                terminate_process_group(&mut child);
                 return Err(OpenSshError::Cancelled);
             }
-            match child.try_wait().map_err(|source| OpenSshError::Io {
-                program: self.ssh.clone(),
-                source,
-            })? {
-                Some(status) => break status,
-                None => thread::sleep(Duration::from_millis(20)),
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(source) => {
+                    terminate_process_group(&mut child);
+                    return Err(OpenSshError::Io {
+                        program: self.ssh.clone(),
+                        source,
+                    });
+                }
             }
         };
 
         Ok(Output {
             status,
-            stdout: finish_pipe(stdout, &self.ssh)?,
-            stderr: finish_pipe(stderr, &self.ssh)?,
+            stdout: finish_pipe_cancellable(stdout, &mut child, cancelled, &self.ssh)?,
+            stderr: finish_pipe_cancellable(stderr, &mut child, cancelled, &self.ssh)?,
         })
     }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    kill_process_group(child);
+    let _ = child.wait();
 }
 
 fn kill_process_group(child: &mut std::process::Child) {
@@ -279,12 +285,35 @@ fn finish_pipe(
         })
 }
 
+fn finish_pipe_cancellable(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    child: &mut std::process::Child,
+    cancelled: &AtomicBool,
+    program: &Path,
+) -> Result<Vec<u8>, OpenSshError> {
+    while !reader.is_finished() {
+        if cancelled.load(Ordering::Relaxed) {
+            terminate_process_group(child);
+            return Err(OpenSshError::Cancelled);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    match finish_pipe(reader, program) {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            terminate_process_group(child);
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use tempfile::TempDir;
@@ -476,6 +505,39 @@ mod tests {
         );
         fs::write(release, "").unwrap();
         wait_for_contents(&done, "");
+    }
+
+    #[test]
+    fn cancellation_stops_descendant_holding_pipes_after_resolver_exits() {
+        let fake = fake_ssh();
+        let marker = fake.log.with_file_name("parent-exited");
+        fs::write(
+            &fake.path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  sleep 3 &\n  printf 'hostname dev.example\\n'\n  : > '{}'\nfi\n",
+                marker.display(),
+            ),
+        )
+        .unwrap();
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let cancel = thread::spawn(move || {
+            wait_for_contents(&marker, "");
+            thread::sleep(Duration::from_millis(100));
+            signal.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+
+        let result = openssh.resolve_cancellable("dev", &cancelled);
+
+        cancel.join().unwrap();
+        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation blocked for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

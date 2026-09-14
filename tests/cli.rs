@@ -10,6 +10,8 @@ fn commands_before_initialization_explain_how_to_continue() {
         .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
     env.run(["add", "dev", "-H", "dev.example"])
         .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
+    env.run(["remove", "dev"])
+        .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
 }
 
 #[test]

@@ -122,7 +122,11 @@ fn browse<B: Backend>(
             continue;
         }
         if let Event::Paste(text) = event {
+            let before = state.selected_summary().cloned();
             state.handle_paste(&text);
+            if details_stale(before.as_ref(), state.selected_summary(), false) {
+                details = resolve_selected(app, &mut state, terminated);
+            }
             redraw = true;
             continue;
         }

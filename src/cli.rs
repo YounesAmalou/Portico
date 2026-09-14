@@ -200,6 +200,7 @@ fn execute<I: BufRead, O: Write>(
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Remove { alias, force }) => {
+            app.hosts().map_err(|error| error.to_string())?;
             if !force {
                 if !interactive {
                     return Err("removal requires --force in non-interactive mode".into());
