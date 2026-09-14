@@ -18,8 +18,19 @@ environment = dict(os.environ, HOME=home, PATH=fake_bin + os.pathsep + os.enviro
 
 
 def check_terminal(scenario):
+    scenario_home = Path(home, "uninitialized") if scenario == "blocked_init_lock" else Path(home)
+    held_lock = None
+    if scenario in ["blocked_mutation_lock", "blocked_init_lock"]:
+        lock_path = scenario_home / ".ssh/portico/config.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        held_lock = lock_path.open("a+")
+        fcntl.flock(held_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     if scenario == "blocked_resolution":
         Path(home, "block-resolver").touch()
+    if scenario == "blocked_connection":
+        Path(home, "block-connection").touch()
+    if scenario == "launcher_failure":
+        Path(home, "fail-launcher").touch()
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
     before = termios.tcgetattr(slave)
@@ -32,7 +43,7 @@ def check_terminal(scenario):
 
     process = subprocess.Popen(
         [binary], stdin=slave, stdout=slave, stderr=slave,
-        env=environment, preexec_fn=controlling_terminal,
+        env=dict(environment, HOME=str(scenario_home)), preexec_fn=controlling_terminal,
     )
 
     def read_until(marker, start=0, timeout=5):
@@ -53,6 +64,10 @@ def check_terminal(scenario):
             while not Path(home, "resolver-started").exists():
                 assert time.monotonic() < deadline, "resolver did not start"
                 time.sleep(0.01)
+        elif scenario == "blocked_init_lock":
+            read_until(b"initialize")
+            os.write(master, b"y")
+            time.sleep(0.1)
         else:
             # Crossterm positions words independently, so do not expect literal spaces.
             read_until(b"quit")
@@ -81,6 +96,25 @@ def check_terminal(scenario):
             config = Path(home, ".ssh/portico/config").read_text()
             assert "Host alpha\n" in config
             assert "Host betax\n" in config
+        elif scenario == "blocked_mutation_lock":
+            start = len(transcript)
+            os.write(master, b"a")
+            read_until(b"save", start)
+            os.write(master, b"\x1b[200~locked\x1b[201~")
+            os.write(master, b"\t")
+            os.write(master, b"\x1b[200~locked.example\x1b[201~")
+            os.write(master, b"\r")
+            time.sleep(0.1)
+        elif scenario == "blocked_connection":
+            os.write(master, b"\r")
+            deadline = time.monotonic() + 5
+            while not Path(home, "connection-started").exists():
+                assert time.monotonic() < deadline, "connection did not start"
+                time.sleep(0.01)
+        elif scenario == "launcher_failure":
+            start = len(transcript)
+            os.write(master, b"n")
+            read_until(b"launcher", start)
         elif scenario == "child_failure":
             start = len(transcript)
             os.write(master, b"\r")
@@ -93,18 +127,29 @@ def check_terminal(scenario):
             assert Path(home, "child-terminal-state").read_bytes().strip() == before_stty
             assert not termios.tcgetattr(slave)[3] & (termios.ICANON | termios.ECHO)
         start = len(transcript)
-        if scenario == "blocked_resolution":
+        if scenario in ["blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection"]:
             os.kill(process.pid, signal.SIGTERM)
         elif isinstance(scenario, int):
             os.kill(process.pid, scenario)
         else:
             os.write(master, b"q")
-        read_until(b"\x1b[?1049l", start, 1 if scenario == "blocked_resolution" else 5)
+        timeout = 1 if scenario in ["blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection"] else 5
+        read_until(b"\x1b[?1049l", start, timeout)
         left = transcript.index(b"\x1b[?1049l", start)
         read_until(b"\x1b[?25h", left)
         assert process.wait(timeout=5) == 0, f"{scenario}: {transcript!r}"
         assert termios.tcgetattr(slave) == before, f"{scenario}: termios was not restored"
         assert b"\x1b[?1049l" in transcript[start:]
+        if scenario == "blocked_connection":
+            for pid in map(int, Path(home, "connection-started").read_text().split()):
+                deadline = time.monotonic() + 1
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    assert time.monotonic() < deadline, f"connection process survived: {pid}"
+                    time.sleep(0.01)
         print(f"PTY restored: {scenario}")
     finally:
         if process.poll() is None:
@@ -113,9 +158,23 @@ def check_terminal(scenario):
         if scenario == "blocked_resolution":
             Path(home, "block-resolver").unlink(missing_ok=True)
             Path(home, "resolver-started").unlink(missing_ok=True)
+        if scenario == "blocked_connection":
+            marker = Path(home, "connection-started")
+            if marker.exists():
+                for pid in map(int, marker.read_text().split()):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            Path(home, "block-connection").unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+        if scenario == "launcher_failure":
+            Path(home, "fail-launcher").unlink(missing_ok=True)
+        if held_lock is not None:
+            held_lock.close()
         os.close(master)
         os.close(slave)
 
 
-for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "launcher_failure", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
     check_terminal(scenario)

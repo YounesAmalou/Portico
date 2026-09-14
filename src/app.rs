@@ -6,7 +6,7 @@ use crate::{
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
     host::{Host, HostChanges, HostError},
     managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
-    openssh::{OpenSsh, OpenSshError, ResolvedConfig},
+    openssh::{ConnectionOutcome, OpenSsh, OpenSshError, ResolvedConfig},
 };
 
 pub struct App {
@@ -89,13 +89,21 @@ impl App {
         approved: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<InitOutcome, AppError> {
-        Ok(self.store.apply_init(approved, |entry, aliases| {
-            match cancelled {
-                Some(cancelled) => self.openssh.validate_cancellable(entry, aliases, cancelled),
-                None => self.openssh.validate(entry, aliases),
+        Ok(match cancelled {
+            Some(cancelled) => {
+                self.store
+                    .apply_init_cancellable(approved, cancelled, |entry, aliases| {
+                        self.openssh
+                            .validate_cancellable(entry, aliases, cancelled)
+                            .map_err(|error| error.to_string())
+                    })
             }
-            .map_err(|error| error.to_string())
-        })?)
+            None => self.store.apply_init(approved, |entry, aliases| {
+                self.openssh
+                    .validate(entry, aliases)
+                    .map_err(|error| error.to_string())
+            }),
+        }?)
     }
 
     pub fn hosts(&self) -> Result<HostInventory, AppError> {
@@ -263,7 +271,7 @@ impl App {
         )
     }
 
-    pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ExitStatus, AppError> {
+    pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ConnectionOutcome, AppError> {
         let host = self
             .hosts()?
             .hosts
@@ -271,6 +279,20 @@ impl App {
             .find(|host| host.alias.eq_ignore_ascii_case(alias))
             .ok_or_else(|| AppError::UnknownHost(alias.into()))?;
         Ok(self.openssh.connect(&host.alias, new_terminal)?)
+    }
+
+    pub(crate) fn connect_cancellable(
+        &self,
+        alias: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<ExitStatus, AppError> {
+        let host = self
+            .hosts()?
+            .hosts
+            .into_iter()
+            .find(|host| host.alias.eq_ignore_ascii_case(alias))
+            .ok_or_else(|| AppError::UnknownHost(alias.into()))?;
+        Ok(self.openssh.connect_cancellable(&host.alias, cancelled)?)
     }
 
     fn discover(&self) -> Result<Discovery, AppError> {
@@ -322,13 +344,22 @@ impl App {
     where
         M: FnOnce(&mut ManagedConfig) -> Result<(), AppError>,
     {
-        self.store.transact(mutate, |entry, aliases| {
-            match cancelled {
-                Some(cancelled) => self.openssh.validate_cancellable(entry, aliases, cancelled),
-                None => self.openssh.validate(entry, aliases),
-            }
-            .map_err(|error| error.to_string())
-        })
+        match cancelled {
+            Some(cancelled) => self.store.transact_cancellable(
+                mutate,
+                |entry, aliases| {
+                    self.openssh
+                        .validate_cancellable(entry, aliases, cancelled)
+                        .map_err(|error| error.to_string())
+                },
+                cancelled,
+            ),
+            None => self.store.transact(mutate, |entry, aliases| {
+                self.openssh
+                    .validate(entry, aliases)
+                    .map_err(|error| error.to_string())
+            }),
+        }
     }
 }
 
@@ -509,7 +540,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, AppError::AliasCollision(_)));
         assert!(app.show("legacy").is_ok());
-        assert!(app.connect("legacy", false).unwrap().success());
+        assert!(matches!(
+            app.connect("legacy", false).unwrap(),
+            ConnectionOutcome::Exited(status) if status.success()
+        ));
     }
 
     #[test]
@@ -714,7 +748,10 @@ mod tests {
     fn dash_prefixed_external_alias_is_a_destination_not_an_option() {
         let app = test_app_with_external("Host -external\n  HostName external.example\n");
 
-        assert!(app.connect("-external", false).unwrap().success());
+        assert!(matches!(
+            app.connect("-external", false).unwrap(),
+            ConnectionOutcome::Exited(status) if status.success()
+        ));
         assert_eq!(
             fs::read_to_string(&app.fake_log).unwrap(),
             "--\n-external\n"

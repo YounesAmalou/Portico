@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -181,7 +181,10 @@ impl Scanner {
     }
 
     fn expand_include(&mut self, pattern: &str) {
-        let path = self.include_path(pattern);
+        let path = match self.include_path(pattern) {
+            Ok(path) => path,
+            Err(message) => return self.warn_include(pattern.into(), message),
+        };
         let matches = match glob::glob(&path.to_string_lossy()) {
             Ok(matches) => matches,
             Err(error) => return self.warn_include(path, error.to_string()),
@@ -215,16 +218,22 @@ impl Scanner {
         }
     }
 
-    fn include_path(&self, pattern: &str) -> PathBuf {
+    fn include_path(&self, pattern: &str) -> Result<PathBuf, String> {
+        let pattern = expand_environment(pattern)?;
+        if pattern.contains('%') {
+            return Err("unsupported Include token expansion".into());
+        }
         if let Some(path) = pattern.strip_prefix("~/") {
-            self.root.parent().unwrap_or(&self.root).join(path)
+            Ok(self.root.parent().unwrap_or(&self.root).join(path))
         } else if pattern == "~" {
-            self.root.parent().unwrap_or(&self.root).to_path_buf()
+            Ok(self.root.parent().unwrap_or(&self.root).to_path_buf())
+        } else if pattern.starts_with('~') {
+            Err("unsupported Include user expansion".into())
         } else {
-            if Path::new(pattern).is_absolute() {
-                pattern.into()
+            if Path::new(&pattern).is_absolute() {
+                Ok(pattern.into())
             } else {
-                self.root.join(pattern)
+                Ok(self.root.join(pattern))
             }
         }
     }
@@ -253,6 +262,35 @@ impl Scanner {
                 .push(DiscoveryWarning::DuplicateAlias { alias, sources });
         }
     }
+}
+
+fn expand_environment(pattern: &str) -> Result<String, String> {
+    let mut expanded = String::new();
+    let mut remaining = pattern;
+    while let Some(start) = remaining.find('$') {
+        expanded.push_str(&remaining[..start]);
+        let variable = &remaining[start..];
+        let Some(variable) = variable.strip_prefix("${") else {
+            return Err("unsupported Include environment expansion".into());
+        };
+        let Some(end) = variable.find('}') else {
+            return Err("malformed Include environment expansion".into());
+        };
+        let name = &variable[..end];
+        if name.is_empty()
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            })
+        {
+            return Err("malformed Include environment expansion".into());
+        }
+        let value = env::var(name)
+            .map_err(|_| format!("unresolved Include environment variable: {name}"))?;
+        expanded.push_str(&value);
+        remaining = &variable[end + 1..];
+    }
+    expanded.push_str(remaining);
+    Ok(expanded)
 }
 
 fn tokenize(line: &str) -> Result<Vec<String>, DiscoveryError> {
@@ -354,6 +392,23 @@ mod tests {
         assert!(result.aliases_complete);
         assert_eq!(result.hosts[0].alias, "visible");
         assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn unknown_or_unsupported_include_expansions_make_discovery_incomplete() {
+        for pattern in [
+            "${PORTICO_TEST_VARIABLE_THAT_DOES_NOT_EXIST}",
+            "${HOME",
+            "~otheruser/.ssh/config",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let entry = dir.path().join("config");
+            fs::write(&entry, format!("Include {pattern}\n")).unwrap();
+
+            let result = discover(&entry, &dir.path().join("managed")).unwrap();
+
+            assert!(!result.aliases_complete, "{pattern}: {:?}", result.warnings);
+        }
     }
 
     #[test]

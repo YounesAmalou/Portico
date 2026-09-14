@@ -29,6 +29,7 @@ use crate::{
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::InitPlan,
+    openssh::ConnectionOutcome,
 };
 use thiserror::Error;
 
@@ -59,8 +60,13 @@ pub fn run(app: &App) -> Result<(), TuiError> {
     if plan.requires_confirmation() && !confirm_initialization(&mut terminal, &plan, &terminated)? {
         return Ok(());
     }
-    if plan.requires_confirmation() {
-        app.initialize_cancellable(true, &terminated)?;
+    if plan.requires_confirmation()
+        && let Err(error) = app.initialize_cancellable(true, &terminated)
+    {
+        if terminated.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        return Err(error.into());
     }
 
     browse(app, &mut terminal, &terminated)
@@ -163,7 +169,11 @@ fn browse<B: Backend>(
                 } else {
                     let result = suspend_for_child(
                         leave_terminal,
-                        || app.connect(&alias, false).map_err(TuiError::from),
+                        || {
+                            app.connect_cancellable(&alias, terminated)
+                                .map(ConnectionOutcome::Exited)
+                                .map_err(TuiError::from)
+                        },
                         enter_terminal,
                     );
                     match result {
@@ -175,11 +185,16 @@ fn browse<B: Backend>(
                     }
                 };
                 state.status = Some(match result {
-                    Ok(status) if status.success() && new_terminal => {
-                        format!("Opened {alias} in a new terminal")
+                    Ok(ConnectionOutcome::LaunchRequested) => {
+                        format!("Launch requested for {alias}")
                     }
-                    Ok(status) if status.success() => format!("Disconnected from {alias}"),
-                    Ok(status) => format!("ssh exited with {status}"),
+                    Ok(ConnectionOutcome::LaunchFailed(status)) => {
+                        format!("terminal launcher exited with {status}")
+                    }
+                    Ok(ConnectionOutcome::Exited(status)) if status.success() => {
+                        format!("Disconnected from {alias}")
+                    }
+                    Ok(ConnectionOutcome::Exited(status)) => format!("ssh exited with {status}"),
                     Err(error) => error.to_string(),
                 });
             }

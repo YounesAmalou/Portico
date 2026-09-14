@@ -78,6 +78,25 @@ fn hosts_reports_discovery_warnings_even_without_rows() {
 }
 
 #[test]
+fn expanded_include_alias_blocks_collision() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    std::fs::write(
+        env.home().join(".ssh/external.conf"),
+        "Host expanded\n  HostName expanded.example\n",
+    )
+    .unwrap();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\nInclude ${HOME}/.ssh/external.conf\n",
+    )
+    .unwrap();
+
+    env.run(["add", "expanded", "-H", "other.example"])
+        .assert_failure_stderr_contains("alias already exists");
+}
+
+#[test]
 fn connection_modes_propagate_status_and_arguments() {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();
@@ -104,4 +123,38 @@ fn connection_exit_code_is_propagated() {
     env.run(["add", "fail", "-H", "fail.example"])
         .assert_success();
     env.run(["connect", "fail"]).assert_exit_code(23);
+}
+
+#[test]
+fn new_terminal_detaches_launcher_streams() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    std::fs::write(
+        env.bin().join("xdg-terminal-exec"),
+        "#!/bin/sh\nprintf 'launcher-noise\\n'\nprintf 'launcher-noise\\n' >&2\nsleep 2\n",
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+
+    let result = env.run(["connect", "dev", "-n"]);
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "captured call waited {:?}",
+        started.elapsed()
+    );
+    result.assert_success_without_output("launcher-noise");
+}
+
+#[test]
+fn prompt_terminal_launcher_failure_is_propagated() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    std::fs::write(env.bin().join("xdg-terminal-exec"), "#!/bin/sh\nexit 23\n").unwrap();
+
+    env.run(["connect", "dev", "-n"]).assert_exit_code(23);
 }

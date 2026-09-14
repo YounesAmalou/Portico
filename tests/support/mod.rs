@@ -134,6 +134,16 @@ impl RunResult {
     pub fn assert_exit_code(self, expected: i32) {
         assert_eq!(self.0.status.code(), Some(expected));
     }
+
+    pub fn assert_success_without_output(self, unexpected: &str) {
+        let stdout = String::from_utf8_lossy(&self.0.stdout);
+        let stderr = String::from_utf8_lossy(&self.0.stderr);
+        assert!(
+            self.0.status.success() && !stdout.contains(unexpected) && !stderr.contains(unexpected),
+            "status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            self.0.status,
+        );
+    }
 }
 
 fn write_executable(path: PathBuf, contents: &str) {

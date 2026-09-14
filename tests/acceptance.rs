@@ -216,7 +216,12 @@ fn tui_paste_and_terminal_lifecycle_work_on_a_real_pty() {
         .assert_success();
     env.run(["add", "beta", "-H", "beta.example"])
         .assert_success();
-    std::fs::write(env.bin().join("ssh"), "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  if [ \"$2\" != '-F' ] && [ -f \"$HOME/block-resolver\" ]; then\n    : > \"$HOME/resolver-started\"\n    sleep 4\n  fi\n  printf 'hostname fail.example\\nport 22\\n'\n  exit 0\nfi\nstty -g > \"$HOME/child-terminal-state\"\nexit 23\n").unwrap();
+    std::fs::write(env.bin().join("ssh"), "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  if [ \"$2\" != '-F' ] && [ -f \"$HOME/block-resolver\" ]; then\n    : > \"$HOME/resolver-started\"\n    sleep 4\n  fi\n  printf 'hostname fail.example\\nport 22\\n'\n  exit 0\nfi\nif [ -f \"$HOME/block-connection\" ]; then\n  sleep 30 &\n  printf '%s %s\\n' \"$$\" \"$!\" > \"$HOME/connection-started\"\n  wait\nfi\nstty -g > \"$HOME/child-terminal-state\"\nexit 23\n").unwrap();
+    std::fs::write(
+        env.bin().join("xdg-terminal-exec"),
+        "#!/bin/sh\n[ -f \"$HOME/fail-launcher\" ] && exit 23\nexit 0\n",
+    )
+    .unwrap();
 
     let output = std::process::Command::new("python3")
         .arg("-I")
