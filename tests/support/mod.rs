@@ -57,18 +57,29 @@ impl TestEnv {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        RunResult(self.command(args).output().unwrap())
+    }
+
+    pub fn run_with_env<I, S>(&self, args: I, key: &str, value: &OsStr) -> RunResult
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        RunResult(self.command(args).env(key, value).output().unwrap())
+    }
+
+    fn command<I, S>(&self, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.bin.clone()];
         paths.extend(std::env::split_paths(&inherited));
         let path = std::env::join_paths(paths).unwrap();
-        RunResult(
-            Command::new(env!("CARGO_BIN_EXE_portico"))
-                .args(args)
-                .env("HOME", &self.home)
-                .env("PATH", path)
-                .output()
-                .unwrap(),
-        )
+        let mut command = Command::new(env!("CARGO_BIN_EXE_portico"));
+        command.args(args).env("HOME", &self.home).env("PATH", path);
+        command
     }
 
     pub fn ssh_config(&self) -> PathBuf {

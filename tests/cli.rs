@@ -97,6 +97,27 @@ fn expanded_include_alias_blocks_collision() {
 }
 
 #[test]
+fn escaped_expanded_include_makes_collision_discovery_incomplete() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    let external = env.home().join(".ssh/external.conf");
+    std::fs::write(&external, "Host escaped\n  HostName escaped.example\n").unwrap();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\nInclude ${PORTICO_ESCAPED_INCLUDE}\n",
+    )
+    .unwrap();
+    let escaped = external.to_string_lossy().replace(".conf", "\\.conf");
+
+    env.run_with_env(
+        ["add", "escaped", "-H", "other.example"],
+        "PORTICO_ESCAPED_INCLUDE",
+        escaped.as_ref(),
+    )
+    .assert_failure_stderr_contains("host inventory is incomplete");
+}
+
+#[test]
 fn connection_modes_propagate_status_and_arguments() {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();
