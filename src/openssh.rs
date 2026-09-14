@@ -1,7 +1,11 @@
 use std::{
-    io,
+    io::{self, Read},
+    os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output},
+    process::{Command, ExitStatus, Output, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -37,6 +41,8 @@ pub enum OpenSshError {
     },
     #[error("invalid ssh configuration output: {0}")]
     InvalidOutput(String),
+    #[error("SSH operation cancelled")]
+    Cancelled,
 }
 
 impl OpenSsh {
@@ -49,18 +55,53 @@ impl OpenSsh {
     }
 
     pub fn validate(&self, entry: &Path, aliases: &[String]) -> Result<(), OpenSshError> {
+        self.validate_inner(entry, aliases, None)
+    }
+
+    pub(crate) fn validate_cancellable(
+        &self,
+        entry: &Path,
+        aliases: &[String],
+        cancelled: &AtomicBool,
+    ) -> Result<(), OpenSshError> {
+        self.validate_inner(entry, aliases, Some(cancelled))
+    }
+
+    fn validate_inner(
+        &self,
+        entry: &Path,
+        aliases: &[String],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), OpenSshError> {
         if aliases.is_empty() {
-            self.validate_alias(entry, "portico-validation")?;
+            self.validate_alias(entry, "portico-validation", cancelled)?;
         } else {
             for alias in aliases {
-                self.validate_alias(entry, alias)?;
+                self.validate_alias(entry, alias, cancelled)?;
             }
         }
         Ok(())
     }
 
     pub fn resolve(&self, alias: &str) -> Result<ResolvedConfig, OpenSshError> {
-        let output = self.checked_output(Command::new(&self.ssh).args(["-G", "--", alias]))?;
+        self.resolve_inner(alias, None)
+    }
+
+    pub(crate) fn resolve_cancellable(
+        &self,
+        alias: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<ResolvedConfig, OpenSshError> {
+        self.resolve_inner(alias, Some(cancelled))
+    }
+
+    fn resolve_inner(
+        &self,
+        alias: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<ResolvedConfig, OpenSshError> {
+        let output =
+            self.checked_output(Command::new(&self.ssh).args(["-G", "--", alias]), cancelled)?;
         let text = String::from_utf8(output.stdout)
             .map_err(|error| OpenSshError::InvalidOutput(error.to_string()))?;
         let mut hostname = None;
@@ -99,22 +140,35 @@ impl OpenSsh {
     }
 
     pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ExitStatus, OpenSshError> {
-        let (program, mut command) = if new_terminal {
+        if new_terminal {
             let mut command = Command::new(&self.terminal);
             command.arg("--").arg(&self.ssh).arg("--").arg(alias);
-            (&self.terminal, command)
-        } else {
-            let mut command = Command::new(&self.ssh);
-            command.arg("--").arg(alias);
-            (&self.ssh, command)
-        };
-        command.status().map_err(|source| OpenSshError::Io {
-            program: program.clone(),
-            source,
-        })
+            let mut child = command.spawn().map_err(|source| OpenSshError::Io {
+                program: self.terminal.clone(),
+                source,
+            })?;
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(ExitStatus::from_raw(0));
+        }
+
+        Command::new(&self.ssh)
+            .arg("--")
+            .arg(alias)
+            .status()
+            .map_err(|source| OpenSshError::Io {
+                program: self.ssh.clone(),
+                source,
+            })
     }
 
-    fn validate_alias(&self, entry: &Path, alias: &str) -> Result<(), OpenSshError> {
+    fn validate_alias(
+        &self,
+        entry: &Path,
+        alias: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), OpenSshError> {
         self.checked_output(
             Command::new(&self.ssh)
                 .arg("-G")
@@ -122,15 +176,24 @@ impl OpenSsh {
                 .arg(entry)
                 .arg("--")
                 .arg(alias),
+            cancelled,
         )?;
         Ok(())
     }
 
-    fn checked_output(&self, command: &mut Command) -> Result<Output, OpenSshError> {
-        let output = command.output().map_err(|source| OpenSshError::Io {
-            program: self.ssh.clone(),
-            source,
-        })?;
+    fn checked_output(
+        &self,
+        command: &mut Command,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Output, OpenSshError> {
+        let output = if let Some(cancelled) = cancelled {
+            self.cancellable_output(command, cancelled)?
+        } else {
+            command.output().map_err(|source| OpenSshError::Io {
+                program: self.ssh.clone(),
+                source,
+            })?
+        };
         if output.status.success() {
             Ok(output)
         } else {
@@ -141,6 +204,79 @@ impl OpenSsh {
             })
         }
     }
+
+    fn cancellable_output(
+        &self,
+        command: &mut Command,
+        cancelled: &AtomicBool,
+    ) -> Result<Output, OpenSshError> {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|source| OpenSshError::Io {
+            program: self.ssh.clone(),
+            source,
+        })?;
+        let stdout = read_pipe(child.stdout.take().expect("stdout is piped"));
+        let stderr = read_pipe(child.stderr.take().expect("stderr is piped"));
+
+        let status = loop {
+            if cancelled.load(Ordering::Relaxed) {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                let _ = finish_pipe(stdout, &self.ssh);
+                let _ = finish_pipe(stderr, &self.ssh);
+                return Err(OpenSshError::Cancelled);
+            }
+            match child.try_wait().map_err(|source| OpenSshError::Io {
+                program: self.ssh.clone(),
+                source,
+            })? {
+                Some(status) => break status,
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        Ok(Output {
+            status,
+            stdout: finish_pipe(stdout, &self.ssh)?,
+            stderr: finish_pipe(stderr, &self.ssh)?,
+        })
+    }
+}
+
+fn kill_process_group(child: &mut std::process::Child) {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        let _ = child.kill();
+        return;
+    };
+    // The child was placed in a process group whose ID is its PID above.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+        let _ = child.kill();
+    }
+}
+
+fn read_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn finish_pipe(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    program: &Path,
+) -> Result<Vec<u8>, OpenSshError> {
+    reader
+        .join()
+        .map_err(|_| OpenSshError::Io {
+            program: program.into(),
+            source: io::Error::other("output reader panicked"),
+        })?
+        .map_err(|source| OpenSshError::Io {
+            program: program.into(),
+            source,
+        })
 }
 
 #[cfg(test)]
@@ -237,6 +373,21 @@ mod tests {
         }
     }
 
+    fn wait_for_contents(path: &Path, expected: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if fs::read_to_string(path).is_ok_and(|contents| contents == expected) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing output at {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn passes_alias_as_one_argument_without_a_shell() {
         let fake = fake_ssh();
@@ -287,10 +438,44 @@ mod tests {
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
 
         assert!(openssh.connect("-external", true).unwrap().success());
-        assert_eq!(
-            fs::read_to_string(terminal.log()).unwrap(),
-            format!("--\n{}\n--\n-external\n", ssh.path().display())
+        wait_for_contents(
+            terminal.log(),
+            &format!("--\n{}\n--\n-external\n", ssh.path().display()),
         );
+    }
+
+    #[test]
+    fn new_terminal_connection_returns_after_launch() {
+        let ssh = fake_ssh();
+        let terminal = fake_ssh();
+        let release = terminal.log.with_file_name("release");
+        let done = terminal.log.with_file_name("done");
+        fs::write(
+            &terminal.path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ \"$i\" -lt 200 ]; do i=$((i + 1)); sleep 0.01; done\n: > '{}'\n",
+                terminal.log.display(),
+                release.display(),
+                done.display(),
+            ),
+        )
+        .unwrap();
+        let openssh = OpenSsh::new(ssh.path(), terminal.path());
+        let started = std::time::Instant::now();
+
+        assert!(openssh.connect("dev", true).unwrap().success());
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "new-terminal launch blocked for {:?}",
+            started.elapsed()
+        );
+        wait_for_contents(
+            terminal.log(),
+            &format!("--\n{}\n--\ndev\n", ssh.path().display()),
+        );
+        fs::write(release, "").unwrap();
+        wait_for_contents(&done, "");
     }
 
     #[test]
