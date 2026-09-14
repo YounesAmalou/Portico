@@ -1,7 +1,11 @@
 use std::{
+    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -195,6 +199,8 @@ pub struct ManagedStore {
     paths: ConfigPaths,
     #[cfg(test)]
     before_transaction_lock: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_init_activation: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ManagedStore {
@@ -203,6 +209,8 @@ impl ManagedStore {
             paths,
             #[cfg(test)]
             before_transaction_lock: None,
+            #[cfg(test)]
+            before_init_activation: None,
         }
     }
 
@@ -212,6 +220,12 @@ impl ManagedStore {
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         self.before_transaction_lock = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_before_init_activation(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.before_init_activation = Some(hook);
         self
     }
 
@@ -373,18 +387,20 @@ impl ManagedStore {
                 .map_err(|source| init_io(&self.paths.managed, source))?;
         }
 
-        let entry_contents = if plan.create_entry {
-            String::new()
+        let (entry_contents, entry_metadata) = if plan.create_entry {
+            (String::new(), None)
+        } else if plan.insert_include || plan.reposition_include {
+            let (contents, metadata) = read_entry(&self.paths.entry)
+                .map_err(|source| init_io(&self.paths.entry, source))?;
+            (contents, Some(metadata))
         } else {
-            fs::read_to_string(&self.paths.entry)
-                .map_err(|source| init_io(&self.paths.entry, source))?
-        };
-        let entry_metadata = if plan.create_entry {
-            None
-        } else {
-            Some(
-                fs::metadata(&self.paths.entry)
+            (
+                fs::read_to_string(&self.paths.entry)
                     .map_err(|source| init_io(&self.paths.entry, source))?,
+                Some(
+                    fs::metadata(&self.paths.entry)
+                        .map_err(|source| init_io(&self.paths.entry, source))?,
+                ),
             )
         };
         let final_entry = if plan.create_entry || plan.insert_include || plan.reposition_include {
@@ -434,46 +450,24 @@ impl ManagedStore {
         validate(validation_file.path(), &aliases).map_err(InitError::Validation)?;
         drop(validation_file);
 
-        if (plan.create_entry || plan.insert_include || plan.reposition_include)
-            && !entry_matches_snapshot(
-                &self.paths.entry,
-                entry_contents.as_bytes(),
-                entry_metadata.as_ref(),
-            )
-            .map_err(|source| init_io(&self.paths.entry, source))?
-        {
-            return Err(InitError::EntryChanged);
-        }
-
-        let backup = if plan.backup_entry {
-            let metadata = entry_metadata.as_ref().ok_or_else(|| {
-                init_io(
-                    &self.paths.entry,
-                    io::Error::other("entry metadata disappeared during initialization"),
+        let mut entry_candidate =
+            if plan.create_entry || plan.insert_include || plan.reposition_include {
+                Some(
+                    write_unique(
+                        &self.paths.ssh_dir,
+                        ".config.portico-init",
+                        final_entry.as_bytes(),
+                        entry_metadata
+                            .as_ref()
+                            .map_or(0o600, |metadata| metadata.permissions().mode()),
+                    )
+                    .map_err(|source| init_io(&self.paths.ssh_dir, source))?,
                 )
-            })?;
-            Some(self.back_up_entry(&entry_contents, metadata)?)
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
-        let entry_candidate = if plan.create_entry || plan.insert_include || plan.reposition_include
-        {
-            Some(
-                write_unique(
-                    &self.paths.ssh_dir,
-                    ".config.portico-init",
-                    final_entry.as_bytes(),
-                    entry_metadata
-                        .as_ref()
-                        .map_or(0o600, |metadata| metadata.permissions().mode()),
-                )
-                .map_err(|source| init_io(&self.paths.ssh_dir, source))?,
-            )
-        } else {
-            None
-        };
-
+        let mut backup = None;
         let mut created_managed = false;
         let mut entry_activated = false;
         let activation = (|| {
@@ -485,15 +479,76 @@ impl ManagedStore {
                 sync_dir(&self.paths.portico_dir)
                     .map_err(|source| init_io(&self.paths.portico_dir, source))?;
             }
-            if let Some(candidate) = entry_candidate {
-                candidate
-                    .rename_to(&self.paths.entry)
-                    .map_err(|source| init_io(&self.paths.entry, source))?;
-                entry_activated = true;
+            if let Some(candidate) = entry_candidate.as_mut() {
+                #[cfg(test)]
+                if let Some(hook) = &self.before_init_activation {
+                    hook();
+                }
+                if let Some(metadata) = entry_metadata.as_ref() {
+                    match candidate.exchange_with(&self.paths.entry) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            return Err(InitError::EntryChanged);
+                        }
+                        Err(source) => return Err(init_io(&self.paths.entry, source)),
+                    }
+                    let matches = entry_matches_snapshot(
+                        candidate.path(),
+                        entry_contents.as_bytes(),
+                        metadata,
+                    );
+                    match matches {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(restore_displaced_entry(
+                                candidate,
+                                &self.paths.entry,
+                                InitError::EntryChanged,
+                            ));
+                        }
+                        Err(source) => {
+                            let original = init_io(candidate.path(), source);
+                            return Err(restore_displaced_entry(
+                                candidate,
+                                &self.paths.entry,
+                                original,
+                            ));
+                        }
+                    }
+                    let backup_path = match self.entry_backup_path() {
+                        Ok(path) => path,
+                        Err(original) => {
+                            return Err(restore_displaced_entry(
+                                candidate,
+                                &self.paths.entry,
+                                original,
+                            ));
+                        }
+                    };
+                    if let Err(source) = candidate.rename_to_noreplace(&backup_path) {
+                        let original = init_io(&backup_path, source);
+                        return Err(restore_displaced_entry(
+                            candidate,
+                            &self.paths.entry,
+                            original,
+                        ));
+                    }
+                    backup = Some(backup_path);
+                    entry_activated = true;
+                } else {
+                    match candidate.rename_to_noreplace(&self.paths.entry) {
+                        Ok(()) => entry_activated = true,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            return Err(InitError::EntryChanged);
+                        }
+                        Err(source) => return Err(init_io(&self.paths.entry, source)),
+                    }
+                }
             }
             sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))
         })();
         if let Err(original) = activation {
+            drop(entry_candidate.take());
             let rollback = self.rollback_init(
                 &entry_contents,
                 entry_metadata.as_ref(),
@@ -534,7 +589,7 @@ impl ManagedStore {
         Ok(InitOutcome::Initialized)
     }
 
-    fn back_up_entry(&self, contents: &str, metadata: &fs::Metadata) -> Result<PathBuf, InitError> {
+    fn entry_backup_path(&self) -> Result<PathBuf, InitError> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
@@ -548,9 +603,6 @@ impl ManagedStore {
             "config.portico-backup-{timestamp}-{}",
             std::process::id()
         ));
-        write_named_new(&backup, contents.as_bytes(), metadata.permissions().mode())
-            .map_err(|source| init_io(&backup, source))?;
-        sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))?;
         Ok(backup)
     }
 
@@ -1084,25 +1136,41 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+fn read_entry(path: &Path) -> io::Result<(String, fs::Metadata)> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok((contents, metadata))
+}
+
 fn entry_matches_snapshot(
     path: &Path,
     contents: &[u8],
-    expected: Option<&fs::Metadata>,
+    expected: &fs::Metadata,
 ) -> io::Result<bool> {
-    let Some(expected) = expected else {
-        return match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-            Ok(_) => Ok(false),
-            Err(error) => Err(error),
-        };
+    let link = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
     };
-    let mut file = match File::open(path) {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     let actual = file.metadata()?;
-    let same_metadata = actual.dev() == expected.dev()
+    let same_metadata = link.dev() == expected.dev()
+        && link.ino() == expected.ino()
+        && actual.dev() == expected.dev()
         && actual.ino() == expected.ino()
         && actual.mode() == expected.mode()
         && actual.uid() == expected.uid()
@@ -1112,6 +1180,24 @@ fn entry_matches_snapshot(
     let mut actual_contents = Vec::new();
     file.read_to_end(&mut actual_contents)?;
     Ok(same_metadata && actual_contents == contents)
+}
+
+fn restore_displaced_entry(
+    candidate: &mut PendingFile,
+    entry: &Path,
+    original: InitError,
+) -> InitError {
+    match candidate.exchange_with(entry) {
+        Ok(()) => original,
+        Err(source) => {
+            let recovery = candidate.keep();
+            InitError::Rollback {
+                original: Box::new(original),
+                rollback: vec![init_io(entry, source)],
+                recovery: format!("restore {} from {}", entry.display(), recovery.display()),
+            }
+        }
+    }
 }
 
 fn reject_symlink(path: &Path) -> io::Result<()> {
@@ -1186,6 +1272,20 @@ impl PendingFile {
         self.path = None;
         Ok(())
     }
+
+    fn rename_to_noreplace(&mut self, destination: &Path) -> io::Result<()> {
+        rename_with_flags(self.path(), destination, libc::RENAME_NOREPLACE)?;
+        self.path = None;
+        Ok(())
+    }
+
+    fn exchange_with(&self, destination: &Path) -> io::Result<()> {
+        rename_with_flags(self.path(), destination, libc::RENAME_EXCHANGE)
+    }
+
+    fn keep(&mut self) -> PathBuf {
+        self.path.take().expect("pending file has a path")
+    }
 }
 
 impl Drop for PendingFile {
@@ -1193,6 +1293,27 @@ impl Drop for PendingFile {
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+fn rename_with_flags(source: &Path, destination: &Path, flags: libc::c_uint) -> io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            flags,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -1701,6 +1822,55 @@ mod tests {
     }
 
     #[test]
+    fn initialization_aborts_if_entry_becomes_symlink_to_inspected_inode() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host existing\n").unwrap();
+        let displaced = paths.ssh_dir.join("displaced");
+        let store = ManagedStore::new(paths.clone());
+
+        let result = store.apply_init(true, |_, _| {
+            fs::rename(&paths.entry, &displaced).map_err(|error| error.to_string())?;
+            symlink(&displaced, &paths.entry).map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(InitError::EntryChanged)));
+        assert!(
+            fs::symlink_metadata(&paths.entry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Host existing\n");
+        assert!(paths.init_backups().unwrap().is_empty());
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn initialization_aborts_if_entry_changes_at_activation_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(&paths.entry, "Host existing\n").unwrap();
+        let hook_paths = paths.clone();
+        let store =
+            ManagedStore::new(paths.clone()).with_before_init_activation(Arc::new(move || {
+                fs::write(&hook_paths.entry, "Host user-save\n").unwrap();
+            }));
+
+        let result = store.apply_init(true, |_, _| Ok(()));
+
+        assert!(matches!(result, Err(InitError::EntryChanged)));
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Host user-save\n");
+        assert!(paths.init_backups().unwrap().is_empty());
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
     fn candidate_substitution_preserves_all_include_arguments_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::from_home(dir.path());
@@ -1800,8 +1970,8 @@ mod tests {
         let paths = ConfigPaths::from_home(dir.path());
         fs::create_dir_all(&paths.ssh_dir).unwrap();
         fs::write(&paths.entry, "Host existing\n HostName original.example\n").unwrap();
-        // Allow backup sync, then fail activation sync and the rollback write.
-        fail_directory_sync_after(&paths.ssh_dir, 1);
+        // Fail activation sync and the rollback write.
+        fail_next_directory_sync(&paths.ssh_dir);
         fail_next_transaction_rollback_write();
 
         let error = ManagedStore::new(paths.clone())
@@ -1872,7 +2042,7 @@ mod tests {
         fs::create_dir_all(&paths.ssh_dir).unwrap();
         fs::write(&paths.entry, "Host existing\n HostName original.example\n").unwrap();
         fs::set_permissions(&paths.entry, fs::Permissions::from_mode(0o640)).unwrap();
-        fail_directory_sync_after(&paths.ssh_dir, 1);
+        fail_next_directory_sync(&paths.ssh_dir);
 
         let error = ManagedStore::new(paths.clone())
             .apply_init(true, |_, _| Ok(()))

@@ -111,6 +111,9 @@ def check_terminal(scenario):
             while not Path(home, "connection-started").exists():
                 assert time.monotonic() < deadline, "connection did not start"
                 time.sleep(0.01)
+            _, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())
+            assert str(child) not in Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+            assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")
@@ -141,7 +144,8 @@ def check_terminal(scenario):
         assert termios.tcgetattr(slave) == before, f"{scenario}: termios was not restored"
         assert b"\x1b[?1049l" in transcript[start:]
         if scenario == "blocked_connection":
-            for pid in map(int, Path(home, "connection-started").read_text().split()):
+            shell, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())
+            for pid in [shell, parent, worker, child]:
                 deadline = time.monotonic() + 1
                 while True:
                     try:
@@ -161,7 +165,8 @@ def check_terminal(scenario):
         if scenario == "blocked_connection":
             marker = Path(home, "connection-started")
             if marker.exists():
-                for pid in map(int, marker.read_text().split()):
+                shell, parent, worker, child = map(int, marker.read_text().split())
+                for pid in [shell, parent, worker, child]:
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:

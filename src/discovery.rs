@@ -286,6 +286,11 @@ fn expand_environment(pattern: &str) -> Result<String, String> {
         }
         let value = env::var(name)
             .map_err(|_| format!("unresolved Include environment variable: {name}"))?;
+        if value.contains('\\') {
+            return Err(format!(
+                "unsupported syntax in Include environment variable: {name}"
+            ));
+        }
         expanded.push_str(&value);
         remaining = &variable[end + 1..];
     }

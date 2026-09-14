@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{self, Read},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
@@ -325,28 +326,112 @@ fn terminate_process_group(child: &mut std::process::Child) {
 }
 
 fn terminate_process_tree(child: &mut std::process::Child) {
-    kill_process_tree(child.id());
+    kill_process_tree(child.id(), None);
     let _ = child.wait();
 }
 
-fn kill_process_tree(pid: u32) {
+fn kill_process_tree(pid: u32, parent: Option<libc::pid_t>) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;
     };
-    unsafe {
-        libc::kill(pid, libc::SIGSTOP);
+    let Ok(pidfd) = open_pidfd(pid) else {
+        return;
+    };
+    if parent.is_some_and(|parent| !process_children(parent).contains(&(pid as u32))) {
+        return;
     }
-    if let Ok(children) = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-        for child in children
-            .split_whitespace()
-            .filter_map(|child| child.parse().ok())
-        {
-            kill_process_tree(child);
+    if signal_pidfd(&pidfd, libc::SIGSTOP).is_err() {
+        return;
+    }
+    if wait_until_stopped(pid) {
+        for child in process_children(pid) {
+            kill_process_tree(child, Some(pid));
         }
     }
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
+    let _ = signal_pidfd(&pidfd, libc::SIGKILL);
+}
+
+fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
     }
+}
+
+fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn wait_until_stopped(pid: libc::pid_t) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+            Ok(tasks) => tasks,
+            Err(_) => return false,
+        };
+        let mut found = false;
+        let mut stopped = true;
+        for task in tasks.flatten() {
+            if task.file_name().to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            found = true;
+            let state = fs::read_to_string(task.path().join("status"))
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("State:").map(str::trim_start))
+                        .and_then(|state| state.chars().next())
+                });
+            if !matches!(state, Some('T' | 't' | 'Z' | 'X')) {
+                stopped = false;
+                break;
+            }
+        }
+        if found && stopped {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn process_children(pid: libc::pid_t) -> Vec<u32> {
+    let mut children = Vec::new();
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return children;
+    };
+    for task in tasks.flatten() {
+        let Ok(contents) = fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        children.extend(
+            contents
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok()),
+        );
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
 }
 
 fn kill_process_group(child: &mut std::process::Child) {
