@@ -318,7 +318,7 @@ fn approved_v1_flow_works_in_an_isolated_home() {
         let external = env.home().join(".ssh/external.conf");
         let external_before = b"# User-owned host.\nHost legacy\n  HostName 198.51.100.20\n  User operator\n  Port 2200\n";
         let entry_before = b"# Existing SSH configuration.\nInclude external.conf\n";
-        let expected_entry = b"# Existing SSH configuration.\nInclude ~/.ssh/portico/config\nInclude external.conf\n";
+        let expected_entry = b"Include ~/.ssh/portico/config\n# Existing SSH configuration.\nInclude external.conf\n";
         std::fs::create_dir_all(external.parent().unwrap()).unwrap();
         std::fs::set_permissions(
             external.parent().unwrap(),
