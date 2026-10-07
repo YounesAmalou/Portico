@@ -70,7 +70,7 @@ These are ordinary Rust modules, not traits or provider interfaces. The initial 
 
 The managed fragment starts with a clear machine-owned warning. Manual advanced rules belong in other user-owned config files.
 
-If `~/.ssh/config` does not exist, initialization creates it with mode `0600`. If it is a symbolic link, v1 reads it for discovery but refuses to rewrite it automatically and prints the exact `Include` directive for manual installation; this avoids breaking dotfile-managed links. After the user adds the directive, rerunning initialization detects it and creates any missing Portico-owned files without touching the link.
+If `~/.ssh/config` does not exist, initialization creates it with mode `0600`. If it is a symbolic link, initialization automatically repairs its target with an atomic replacement beside that target, preserving the link and the target's permissions. An inaccessible or invalid target produces an error naming the affected path and how to retry after correction.
 
 ## Initialization
 
@@ -82,18 +82,22 @@ The active directive is:
 Include ~/.ssh/portico/config
 ```
 
-It is placed before other active directives because OpenSSH generally uses the first obtained value. Portico's explicit per-host values therefore win, while omitted values may inherit from later wildcard rules.
+It is the exact first line, at byte zero, before comments as well as active directives. OpenSSH generally uses the first obtained value. Portico's explicit per-host values therefore win, while omitted values may inherit from later wildcard rules.
+
+Before any ordinary host operation (hosts, show, add, edit, remove, or connect), the shared managed-config store requires both `~/.ssh/config` and `~/.ssh/portico/config` and one exact top-level Include on the first line. Incomplete setup produces one concise error naming all three requirements and instructing the user to run `portico init`. This applies to CLI and TUI callers.
 
 Initialization:
 
-1. Inspects the entry config and detects an equivalent existing Include.
-2. Shows whether it will insert or reposition that directive.
+1. Inspects the entry and managed configs, detects equivalent Includes, and refuses to discard invalid existing managed content. Errors identify `~/.ssh/portico/config.bak` as the recovery source where available.
+2. Shows whether it will insert or normalize the directive. Duplicate, conditional, combined, alternate-spelling, and displaced Includes become one exact first line, preserving unrelated configuration. If no Include exists, all existing bytes follow the new first line unchanged.
 3. Creates an exact, non-overwriting timestamped backup before changing an existing entry config.
 4. Writes the updated entry config atomically while preserving its permissions.
-5. Creates the Portico directory and managed fragment with restrictive permissions.
-6. Validates the complete configuration with OpenSSH.
+5. Creates or repairs the Portico directory and managed fragment with restrictive permissions. Existing valid managed bytes are retained.
+6. Closes all entry and managed writes, then validates the installed `~/.ssh/config` with OpenSSH. Initialization does not validate a temporary entry or candidate before activation.
 
-Running initialization again with a correctly positioned Include makes no changes. Any failure restores or retains the prior entry config.
+Running initialization again with complete valid setup still validates the installed entry but makes no file changes. Validation or write failures restore the prior entry and managed state where possible, keep recovery backups, report the actual error and a manual remedy, and explain that `portico init` can be rerun after correction. Permission/path errors name the path and explain that permissions or another writer may be blocking the operation. A failed rollback explicitly reports uncertain state and recovery paths.
+
+Initialization retains the Portico advisory lock, atomic replacement, backups, and rollback for actual failures. It does not use compare/exchange, inode snapshots, or concurrent-editor arbitration. An editor with an older view must refresh; a later readiness check detects an editor overwriting the Include, and `portico init` can repair it. Ordinary managed-file mutation transactions below retain their pre-activation validation and concurrency guarantees.
 
 ## Host model
 

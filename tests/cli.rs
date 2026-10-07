@@ -4,14 +4,38 @@ use support::TestEnv;
 
 #[test]
 fn commands_before_initialization_explain_how_to_continue() {
-    let env = TestEnv::new();
-
-    env.run(["hosts"])
-        .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
-    env.run(["add", "dev", "-H", "dev.example"])
-        .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
-    env.run(["remove", "dev"])
-        .assert_failure_stderr_contains("Portico is not initialized; run `portico init` first");
+    for command in [
+        vec!["hosts"],
+        vec!["show", "dev"],
+        vec!["add", "dev", "-H", "dev.example"],
+        vec!["edit", "dev", "-u", "deploy"],
+        vec!["remove", "dev"],
+        vec!["connect", "dev"],
+    ] {
+        for entry in [
+            None,
+            Some("Host legacy\n"),
+            Some("# comment\nInclude ~/.ssh/portico/config\n"),
+            Some("Include ~/.ssh/portico/config\nInclude portico/config\n"),
+            Some("Host *\n Include ~/.ssh/portico/config\n"),
+            Some("Include ~/.ssh/portico/config other.conf\n"),
+            Some("Include portico/config\n"),
+            Some("Include ~/.ssh/portico/config\n"),
+        ] {
+            let env = TestEnv::new();
+            std::fs::create_dir_all(env.managed_config().parent().unwrap()).unwrap();
+            if let Some(contents) = entry {
+                std::fs::write(env.ssh_config(), contents).unwrap();
+            }
+            if entry != Some("Include ~/.ssh/portico/config\n") {
+                std::fs::write(env.managed_config(), "Host dev\n HostName dev.example\n").unwrap();
+            }
+            env.run(&command).assert_failure_stderr_contains(
+                "setup requires ~/.ssh/config, ~/.ssh/portico/config, and one exact top-level `Include ~/.ssh/portico/config` on the first line; run `portico init`",
+            );
+            assert!(!env.connection_log().exists());
+        }
+    }
 }
 
 #[test]
