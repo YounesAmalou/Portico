@@ -14,7 +14,7 @@ use thiserror::Error;
 #[cfg(test)]
 use std::sync::Arc;
 
-use crate::discovery::{ConfigDirective, parse_directive};
+use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
 use crate::host::{Host, HostChanges, HostError};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
@@ -244,10 +244,8 @@ impl ManagedStore {
             ));
         }
         let contents = match entry_kind {
-            Some(_) => {
-                fs::read_to_string(&entry_path).map_err(|source| init_io(&entry_path, source))?
-            }
-            None => String::new(),
+            Some(_) => fs::read(&entry_path).map_err(|source| init_io(&entry_path, source))?,
+            None => Vec::new(),
         };
         let entry = analyze_entry(&contents, &self.paths)?;
         let portico_mode = match fs::symlink_metadata(&self.paths.portico_dir) {
@@ -370,9 +368,9 @@ impl ManagedStore {
         let entry_path = self.entry_target()?;
         let entry_dir = entry_path.parent().expect("entry config has a parent");
         let entry_contents = if plan.create_entry {
-            String::new()
+            Vec::new()
         } else {
-            fs::read_to_string(&entry_path).map_err(|source| init_io(&entry_path, source))?
+            fs::read(&entry_path).map_err(|source| init_io(&entry_path, source))?
         };
         let entry_mode = if plan.create_entry {
             None
@@ -402,7 +400,7 @@ impl ManagedStore {
             let mut backup = write_unique(
                 &self.paths.ssh_dir,
                 "config.portico-backup",
-                entry_contents.as_bytes(),
+                &entry_contents,
                 entry_mode
                     .as_ref()
                     .expect("existing entry has permissions")
@@ -424,7 +422,7 @@ impl ManagedStore {
                 write_unique(
                     entry_dir,
                     ".config.portico-init",
-                    final_entry.as_bytes(),
+                    &final_entry,
                     entry_mode.as_ref().map_or(0o600, PermissionsExt::mode),
                 )
                 .and_then(|candidate| candidate.rename_to(&entry_path))
@@ -468,7 +466,7 @@ impl ManagedStore {
                     write_unique(
                         entry_dir,
                         ".config.portico-rollback",
-                        entry_contents.as_bytes(),
+                        &entry_contents,
                         mode.mode(),
                     )
                     .and_then(|candidate| candidate.rename_to(&entry_path))
@@ -573,7 +571,7 @@ impl ManagedStore {
     }
 
     fn ensure_ready(&self) -> Result<(), TransactionError> {
-        let entry = fs::read_to_string(&self.paths.entry)
+        let entry = fs::read(&self.paths.entry)
             .map_err(|source| transaction_storage_io(&self.paths.entry, source))?;
         if !self.paths.managed.is_file()
             || !analyze_entry(&entry, &self.paths)
@@ -639,7 +637,7 @@ impl ManagedStore {
         )
         .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
 
-        let entry = fs::read_to_string(&self.paths.entry)
+        let entry = fs::read(&self.paths.entry)
             .map_err(|source| transaction_io(&self.paths.entry, source))?;
         let validation_entry = substitute_include(&entry, &self.paths, candidate.path())
             .map_err(transaction_entry_error)?;
@@ -650,7 +648,7 @@ impl ManagedStore {
         let validation_file = write_unique(
             &self.paths.ssh_dir,
             ".config.portico-validation",
-            validation_entry.as_bytes(),
+            &validation_entry,
             entry_mode,
         )
         .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
@@ -910,15 +908,15 @@ impl ManagedConfig {
 struct EntryAnalysis {
     has_include: bool,
     is_normalized: bool,
-    normalized: String,
+    normalized: Vec<u8>,
 }
 
-fn analyze_entry(contents: &str, paths: &ConfigPaths) -> Result<EntryAnalysis, InitError> {
+fn analyze_entry(contents: &[u8], paths: &ConfigPaths) -> Result<EntryAnalysis, InitError> {
     let mut matches = 0;
-    let mut retained = String::new();
-    for line in contents.split_inclusive('\n') {
+    let mut retained = Vec::new();
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
         // Discovery owns unrelated syntax warnings; installed OpenSSH validation reports errors.
-        match parse_directive(line) {
+        match parse_directive_bytes(line) {
             Ok(Some(ConfigDirective::Include(arguments))) => {
                 let count = arguments
                     .iter()
@@ -926,48 +924,65 @@ fn analyze_entry(contents: &str, paths: &ConfigPaths) -> Result<EntryAnalysis, I
                     .count();
                 matches += count;
                 if count == 0 {
-                    retained.push_str(line);
+                    retained.extend_from_slice(line);
                 } else {
                     let remaining = arguments
                         .iter()
                         .filter(|argument| !is_managed_include(argument, paths))
                         .map(|argument| quote(argument))
                         .collect::<Vec<_>>();
-                    if !remaining.is_empty() {
-                        retained.push_str(&format!("Include {}", remaining.join(" ")));
-                        if line.ends_with("\r\n") {
-                            retained.push_str("\r\n");
-                        } else if line.ends_with('\n') {
-                            retained.push('\n');
-                        }
-                    }
+                    append_include(&mut retained, &remaining, line);
                 }
             }
-            _ => retained.push_str(line),
+            _ => retained.extend_from_slice(line),
         }
     }
     let is_normalized = matches == 1
-        && (contents == PORTICO_INCLUDE || contents.starts_with(&format!("{PORTICO_INCLUDE}\n")));
+        && (contents == PORTICO_INCLUDE.as_bytes()
+            || contents.starts_with(format!("{PORTICO_INCLUDE}\n").as_bytes()));
     Ok(EntryAnalysis {
         has_include: matches > 0,
         is_normalized,
         normalized: if is_normalized {
-            contents.to_owned()
+            contents.to_vec()
         } else {
-            format!("{PORTICO_INCLUDE}\n{retained}")
+            let mut normalized = format!("{PORTICO_INCLUDE}\n").into_bytes();
+            normalized.extend(retained);
+            normalized
         },
     })
 }
 
+fn append_include(output: &mut Vec<u8>, arguments: &[String], original: &[u8]) {
+    let comment = split_comment(original).1;
+    if !arguments.is_empty() {
+        output.extend_from_slice(format!("Include {}", arguments.join(" ")).as_bytes());
+        if !comment.is_empty() {
+            output.push(b' ');
+        }
+    }
+    if !comment.is_empty() {
+        output.extend_from_slice(comment);
+    } else if !arguments.is_empty() {
+        if original.ends_with(b"\r\n") {
+            output.extend_from_slice(b"\r\n");
+        } else if original.ends_with(b"\n") {
+            output.push(b'\n');
+        }
+    }
+}
+
 fn substitute_include(
-    contents: &str,
+    contents: &[u8],
     paths: &ConfigPaths,
     target: &Path,
-) -> Result<String, InitError> {
+) -> Result<Vec<u8>, InitError> {
     let mut replaced = false;
-    let mut lines = Vec::new();
-    for line in contents.lines() {
-        match parse_directive(line).map_err(|error| InitError::EntryParse(error.to_string()))? {
+    let mut result = Vec::new();
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        match parse_directive_bytes(line)
+            .map_err(|error| InitError::EntryParse(error.to_string()))?
+        {
             Some(ConfigDirective::Include(arguments))
                 if arguments
                     .iter()
@@ -984,19 +999,15 @@ fn substitute_include(
                         }
                     })
                     .collect::<Vec<_>>();
-                lines.push(format!("Include {}", arguments.join(" ")));
+                append_include(&mut result, &arguments, line);
             }
-            _ => lines.push(line.to_owned()),
+            _ => result.extend_from_slice(line),
         }
     }
     if !replaced {
         return Err(InitError::EntryParse(
             "Portico Include is missing from candidate entry config".into(),
         ));
-    }
-    let mut result = lines.join("\n");
-    if contents.ends_with('\n') {
-        result.push('\n');
     }
     Ok(result)
 }
@@ -1528,6 +1539,106 @@ mod tests {
     }
 
     #[test]
+    fn review_init_preserves_raw_comments_and_validates_with_real_openssh() {
+        for (original, expected) in [
+            (&b"# caf\xe9\r\nHost legacy\r\n HostName legacy.example"[..], &b"Include ~/.ssh/portico/config\n# caf\xe9\r\nHost legacy\r\n HostName legacy.example"[..]),
+            (&b"# caf\xe9\r\nInclude portico/config other.conf # ann\xff\r\nHost legacy\n HostName legacy.example\n"[..], &b"Include ~/.ssh/portico/config\n# caf\xe9\r\nInclude other.conf # ann\xff\r\nHost legacy\n HostName legacy.example\n"[..]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::from_home(dir.path());
+            fs::create_dir_all(&paths.ssh_dir).unwrap();
+            fs::write(&paths.entry, original).unwrap();
+            let store = ManagedStore::new(paths.clone());
+            store.apply_init(true, |entry, _| {
+                let output = std::process::Command::new("ssh").args(["-G", "-F"]).arg(entry).args(["--", "legacy"]).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                assert!(String::from_utf8_lossy(&output.stdout).contains("hostname legacy.example"));
+                Ok(())
+            }).unwrap();
+            assert_eq!(fs::read(&paths.entry).unwrap(), expected);
+            assert_eq!(fs::read(&paths.init_backups().unwrap()[0]).unwrap(), original);
+            assert_eq!(store.apply_init(true, |_, _| Ok(())).unwrap(), InitOutcome::Unchanged);
+            assert!(store.load().is_ok());
+        }
+    }
+
+    #[test]
+    fn review_init_retains_mixed_include_annotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        fs::write(
+            &paths.entry,
+            "Include 'other#literal.conf' portico/config # keep this annotation\r\n",
+        )
+        .unwrap();
+        ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(fs::read(&paths.entry).unwrap(), b"Include ~/.ssh/portico/config\nInclude \"other#literal.conf\" # keep this annotation\r\n");
+    }
+
+    #[test]
+    fn review_validation_rollback_restores_raw_entry_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        fs::create_dir_all(&paths.ssh_dir).unwrap();
+        let original = b"# raw \xff\r\nHost legacy\n";
+        fs::write(&paths.entry, original).unwrap();
+        let error = ManagedStore::new(paths.clone())
+            .apply_init(true, |_, _| Err("rejected installed setup".into()))
+            .unwrap_err();
+        assert!(matches!(error, InitError::Validation(_)), "{error}");
+        assert_eq!(fs::read(&paths.entry).unwrap(), original);
+        assert_eq!(
+            fs::read(&paths.init_backups().unwrap()[0]).unwrap(),
+            original
+        );
+        assert!(!paths.managed.exists());
+    }
+
+    #[test]
+    fn review_mutation_preserves_raw_entry_in_candidate_and_keeps_managed_utf8_strict() {
+        let fixture = initialized_store();
+        let entry =
+            b"Include ~/.ssh/portico/config\n# raw \xff\r\nHost legacy\n HostName legacy.example\n";
+        fs::write(&fixture.paths.entry, entry).unwrap();
+        fixture
+            .store
+            .transact(
+                |config| {
+                    config
+                        .insert(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+                        .map_err(TransactionError::Operation)
+                },
+                |candidate, aliases| {
+                    assert!(
+                        fs::read(candidate)
+                            .unwrap()
+                            .ends_with(b"# raw \xff\r\nHost legacy\n HostName legacy.example\n")
+                    );
+                    crate::openssh::OpenSsh::system()
+                        .validate(candidate, aliases)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+        assert!(fixture.store.load().unwrap().find("dev").is_some());
+        assert_eq!(fs::read(&fixture.paths.entry).unwrap(), entry);
+        let invalid = b"# invalid managed \xff\n";
+        fs::write(&fixture.paths.managed, invalid).unwrap();
+        assert!(matches!(
+            fixture.store.load(),
+            Err(TransactionError::Managed { .. })
+        ));
+        assert!(matches!(
+            fixture.store.apply_init(true, |_, _| Ok(())),
+            Err(InitError::Managed { .. })
+        ));
+        assert_eq!(fs::read(&fixture.paths.managed).unwrap(), invalid);
+    }
+
+    #[test]
     fn automatic_init_checks_complete_setup_without_changing_files() {
         let fixture = initialized_store();
         let entry = b"Include ~/.ssh/portico/config\nBrokenOption yes\n";
@@ -1890,10 +2001,10 @@ mod tests {
         let candidate = paths.portico_dir.join("candidate");
         let entry = "Include ~/.ssh/portico/config first.conf\nHost unrelated\nInclude second.conf ~/.ssh/portico/config third.conf\n";
 
-        let substituted = substitute_include(entry, &paths, &candidate).unwrap();
+        let substituted = substitute_include(entry.as_bytes(), &paths, &candidate).unwrap();
 
         assert_eq!(
-            substituted,
+            String::from_utf8(substituted).unwrap(),
             format!(
                 "Include \"{}\" first.conf\nHost unrelated\nInclude second.conf \"{}\" third.conf\n",
                 candidate.display(),
