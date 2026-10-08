@@ -93,6 +93,40 @@ pub(crate) fn parse_directive(line: &str) -> Result<Option<ConfigDirective>, Dis
     }
 }
 
+pub(crate) fn split_comment(line: &[u8]) -> (&[u8], &[u8]) {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut token_started = false;
+    for (index, &byte) in line.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+            token_started = true;
+        } else if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            token_started = true;
+        } else if byte == b'#' && !token_started {
+            return line.split_at(index);
+        } else {
+            token_started = !byte.is_ascii_whitespace();
+        }
+    }
+    (line, &[])
+}
+
+pub(crate) fn parse_directive_bytes(
+    line: &[u8],
+) -> Result<Option<ConfigDirective>, DiscoveryError> {
+    let active = std::str::from_utf8(split_comment(line).0)
+        .map_err(|error| DiscoveryError::Parse(error.to_string()))?;
+    parse_directive(active)
+}
+
 pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryError> {
     let root = entry.parent().unwrap_or(Path::new(".")).to_path_buf();
     let canonical = entry
@@ -126,7 +160,7 @@ struct Scanner {
 
 impl Scanner {
     fn scan_entry(&mut self, path: PathBuf) -> Result<(), DiscoveryError> {
-        let contents = fs::read_to_string(&path).map_err(|source| DiscoveryError::EntryRead {
+        let contents = fs::read(&path).map_err(|source| DiscoveryError::EntryRead {
             path: path.clone(),
             source,
         })?;
@@ -142,16 +176,16 @@ impl Scanner {
         if self.managed.as_ref() == Some(&canonical) || !self.visited.insert(canonical.clone()) {
             return;
         }
-        let contents = match fs::read_to_string(&path) {
+        let contents = match fs::read(&path) {
             Ok(contents) => contents,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
         self.scan_contents(&contents, &path);
     }
 
-    fn scan_contents(&mut self, contents: &str, source: &Path) {
-        for (index, line) in contents.lines().enumerate() {
-            match parse_directive(line) {
+    fn scan_contents(&mut self, contents: &[u8], source: &Path) {
+        for (index, line) in contents.split(|byte| *byte == b'\n').enumerate() {
+            match parse_directive_bytes(line) {
                 Ok(Some(ConfigDirective::Include(patterns))) => {
                     for pattern in patterns {
                         self.expand_include(&pattern);

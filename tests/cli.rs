@@ -3,6 +3,36 @@ mod support;
 use support::TestEnv;
 
 #[test]
+fn review_raw_comments_survive_init_and_host_operations() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(env.ssh_config().parent().unwrap()).unwrap();
+    let original = b"# caf\xe9\r\nHost legacy # ann\xff\n HostName legacy.example\n";
+    std::fs::write(env.ssh_config(), original).unwrap();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["hosts"])
+        .assert_stdout_contains("legacy  external");
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    env.run(["show", "dev"])
+        .assert_stdout_contains("dev.example");
+    env.run(["edit", "dev", "-u", "deploy"]).assert_success();
+    env.run(["remove", "dev", "-f"]).assert_success();
+    assert_eq!(
+        std::fs::read(env.ssh_config())
+            .unwrap()
+            .strip_prefix(b"Include ~/.ssh/portico/config\n")
+            .unwrap(),
+        original
+    );
+    let undecodable =
+        b"Include ~/.ssh/portico/config\nHost undecodable\xff\n HostName legacy.example\n";
+    std::fs::write(env.ssh_config(), undecodable).unwrap();
+    env.run(["add", "other", "-H", "other.example"])
+        .assert_failure_stderr_contains("host inventory is incomplete");
+    assert_eq!(std::fs::read(env.ssh_config()).unwrap(), undecodable);
+}
+
+#[test]
 fn commands_before_initialization_explain_how_to_continue() {
     for command in [
         vec!["hosts"],
