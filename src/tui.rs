@@ -3,7 +3,9 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
     },
+    thread,
     time::Duration,
 };
 
@@ -11,36 +13,89 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::{
     app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership},
     discovery::DiscoveryWarning,
-    host::{Change, ClearField, Host, HostChanges},
+    host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::InitPlan,
-    openssh::ConnectionOutcome,
+    openssh::{ConnectionOutcome, ResolvedConfig},
 };
 use thiserror::Error;
 
-const FORM_LABELS: [&str; 6] = [
-    "Alias",
-    "HostName",
-    "User",
-    "Port",
-    "IdentityFile",
-    "ProxyJump",
+/// One row of the Add/Edit form.
+struct FormField {
+    field: HostField,
+    label: &'static str,
+    placeholder: &'static str,
+    hint: &'static str,
+    optional: bool,
+}
+
+const FORM_FIELDS: [FormField; 6] = [
+    FormField {
+        field: HostField::Alias,
+        label: "Alias",
+        placeholder: "dev-vps",
+        hint: "The name you type after ssh. Letters, digits, '.', '_' and '-'; it must start with a letter or digit.",
+        optional: false,
+    },
+    FormField {
+        field: HostField::Hostname,
+        label: "HostName",
+        placeholder: "dev.example.com",
+        hint: "DNS name or IP address to connect to.",
+        optional: false,
+    },
+    FormField {
+        field: HostField::User,
+        label: "User",
+        placeholder: "deploy",
+        hint: "Login user. Leave empty to let OpenSSH choose.",
+        optional: true,
+    },
+    FormField {
+        field: HostField::Port,
+        label: "Port",
+        placeholder: "22",
+        hint: "A number from 1 through 65535. Leave empty for the OpenSSH default.",
+        optional: true,
+    },
+    FormField {
+        field: HostField::IdentityFile,
+        label: "IdentityFile",
+        placeholder: "~/.ssh/id_ed25519",
+        hint: "Path to a private key. Portico stores the path and never reads the file.",
+        optional: true,
+    },
+    FormField {
+        field: HostField::ProxyJump,
+        label: "ProxyJump",
+        placeholder: "bastion",
+        hint: "Jump host as [user@]host[:port] or an existing alias. Separate several hops with commas, without spaces.",
+        optional: true,
+    },
 ];
+
+/// Longest quiet period after a selection change before the host is resolved.
+const RESOLVE_DEBOUNCE: Duration = Duration::from_millis(60);
 
 #[derive(Debug, Error)]
 pub enum TuiError {
@@ -53,7 +108,7 @@ pub enum TuiError {
 }
 
 pub fn run(app: &App) -> Result<(), TuiError> {
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let terminated = termination_flag()?;
     let plan = app.init_plan()?;
@@ -69,7 +124,7 @@ pub fn run(app: &App) -> Result<(), TuiError> {
         return Err(error.into());
     }
 
-    browse(app, &mut terminal, &terminated)
+    browse(app, &mut terminal, &terminated, guard.keyboard_enhancement)
 }
 
 fn confirm_initialization<B: Backend>(
@@ -106,20 +161,47 @@ fn browse<B: Backend>(
     app: &App,
     terminal: &mut Terminal<B>,
     terminated: &AtomicBool,
+    keyboard_enhancement: bool,
 ) -> Result<(), TuiError> {
-    let mut state = UiState::new(app.hosts()?);
-    let mut details = resolve_selected(app, &mut state, terminated);
+    // Host details come from `ssh -G`, so a worker resolves them while the UI keeps handling keys.
+    // The resolver is dropped (cancelling any running `ssh -G`) before the scope waits for the worker.
+    thread::scope(|scope| {
+        let resolver = Resolver::spawn(scope, app);
+        browse_hosts(app, terminal, terminated, keyboard_enhancement, resolver)
+    })
+}
+
+fn browse_hosts<B: Backend>(
+    app: &App,
+    terminal: &mut Terminal<B>,
+    terminated: &AtomicBool,
+    keyboard_enhancement: bool,
+    mut resolver: Resolver,
+) -> Result<(), TuiError> {
+    let mut state = UiState::new(app.hosts()?, keyboard_enhancement);
+    sync_details(&mut state, &mut resolver, false);
     let mut redraw = true;
 
     loop {
         if terminated.load(Ordering::Relaxed) {
             return Ok(());
         }
+        if let Some((host, loaded)) = resolver.poll() {
+            state.details.insert(host, loaded);
+            state.open_pending_edit();
+            redraw = true;
+        }
         if redraw {
-            terminal.draw(|frame| render(frame, &state, details.as_ref()))?;
+            terminal.draw(|frame| render(frame, &state))?;
             redraw = false;
         }
-        if !event::poll(Duration::from_millis(100))? {
+        // Poll quickly while a resolution is running so its result appears promptly.
+        let wait = if resolver.is_pending() {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_millis(100)
+        };
+        if !event::poll(wait)? {
             continue;
         }
         let event = event::read()?;
@@ -128,11 +210,8 @@ fn browse<B: Backend>(
             continue;
         }
         if let Event::Paste(text) = event {
-            let before = state.selected_summary().cloned();
             state.handle_paste(&text);
-            if details_stale(before.as_ref(), state.selected_summary(), false) {
-                details = resolve_selected(app, &mut state, terminated);
-            }
+            sync_details(&mut state, &mut resolver, false);
             redraw = true;
             continue;
         }
@@ -146,18 +225,8 @@ fn browse<B: Backend>(
             return Ok(());
         }
 
-        let before = state.selected_summary().cloned();
-        let action = match state.handle_key(key, details.as_ref()) {
-            Ok(action) => action,
-            Err(error) => {
-                state.status = Some(error);
-                redraw = true;
-                continue;
-            }
-        };
-
         let mut inventory_changed = false;
-        match action {
+        match state.handle_key(key) {
             UiAction::None => {}
             UiAction::Quit => return Ok(()),
             UiAction::Connect {
@@ -168,13 +237,13 @@ fn browse<B: Backend>(
                     app.connect(&alias, true).map_err(TuiError::from)
                 } else {
                     let result = suspend_for_child(
-                        leave_terminal,
+                        || leave_terminal(keyboard_enhancement),
                         || {
                             app.connect_cancellable(&alias, terminated)
                                 .map(ConnectionOutcome::Exited)
                                 .map_err(TuiError::from)
                         },
-                        enter_terminal,
+                        || enter_terminal(keyboard_enhancement),
                     );
                     match result {
                         Err(TuiError::Io(error)) => return Err(TuiError::Io(error)),
@@ -200,59 +269,62 @@ fn browse<B: Backend>(
             }
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
-                match app.add_cancellable(host, terminated) {
-                    Ok(()) => {
-                        inventory_changed = complete_mutation(
-                            &mut state,
-                            Some(&alias),
-                            format!("Saved {alias}"),
-                            || app.hosts(),
-                        )
-                    }
-                    Err(error) => state.status = Some(error.to_string()),
-                }
+                let result = app.add_cancellable(host, terminated);
+                inventory_changed = finish_mutation(
+                    app,
+                    &mut state,
+                    result,
+                    Some(&alias),
+                    format!("Saved {alias}"),
+                );
             }
             UiAction::Edit { alias, changes } => {
                 let selected = match &changes.alias {
                     Change::Set(changed) => changed.clone(),
                     Change::Keep | Change::Clear => alias.clone(),
                 };
-                match app.edit_cancellable(&alias, changes, terminated) {
-                    Ok(()) => {
-                        inventory_changed = complete_mutation(
-                            &mut state,
-                            Some(&selected),
-                            format!("Saved {selected}"),
-                            || app.hosts(),
-                        )
-                    }
-                    Err(error) => state.status = Some(error.to_string()),
-                }
+                let result = app.edit_cancellable(&alias, changes, terminated);
+                inventory_changed = finish_mutation(
+                    app,
+                    &mut state,
+                    result,
+                    Some(&selected),
+                    format!("Saved {selected}"),
+                );
             }
-            UiAction::Remove(alias) => match app.remove_cancellable(&alias, terminated) {
-                Ok(()) => {
-                    inventory_changed =
-                        complete_mutation(&mut state, None, format!("Removed {alias}"), || {
-                            app.hosts()
-                        })
-                }
-                Err(error) => state.status = Some(error.to_string()),
-            },
+            UiAction::Remove(alias) => {
+                let result = app.remove_cancellable(&alias, terminated);
+                inventory_changed =
+                    finish_mutation(app, &mut state, result, None, format!("Removed {alias}"));
+            }
         }
 
-        if details_stale(before.as_ref(), state.selected_summary(), inventory_changed) {
-            details = resolve_selected(app, &mut state, terminated);
-        }
+        sync_details(&mut state, &mut resolver, inventory_changed);
         redraw = true;
     }
 }
 
-fn complete_mutation<E, F>(
+/// Applies a mutation's outcome to the UI and reports whether the inventory changed.
+fn finish_mutation(
+    app: &App,
     state: &mut UiState,
+    result: Result<(), AppError>,
     preferred: Option<&str>,
     status: String,
-    refresh: F,
-) -> bool
+) -> bool {
+    match result {
+        Ok(()) => {
+            complete_mutation(state, preferred, status, || app.hosts());
+            true
+        }
+        Err(error) => {
+            state.report_error(&error);
+            false
+        }
+    }
+}
+
+fn complete_mutation<E, F>(state: &mut UiState, preferred: Option<&str>, status: String, refresh: F)
 where
     E: std::fmt::Display,
     F: FnOnce() -> Result<HostInventory, E>,
@@ -266,26 +338,153 @@ where
                 state.select_alias(alias);
             }
             state.status = Some(status);
-            true
         }
-        Err(error) => {
-            state.status = Some(format!("{status}, refresh failed: {error}"));
-            false
-        }
+        Err(error) => state.status = Some(format!("{status}, refresh failed: {error}")),
     }
 }
 
-fn resolve_selected(
+type Loaded = Result<HostDetails, String>;
+
+fn load_details(app: &App, host: &HostSummary, cancelled: &AtomicBool) -> Loaded {
+    app.show_cancellable(&host.alias, cancelled)
+        .map(|details| details_for_selected(host, details))
+        .map_err(|error| error.to_string())
+}
+
+/// Makes the resolver follow the selection: cached hosts need no work, any other is requested.
+fn sync_details(state: &mut UiState, resolver: &mut Resolver, inventory_changed: bool) {
+    if inventory_changed {
+        resolver.cancel();
+        state.details.clear();
+    }
+    match state.selected_summary() {
+        Some(host) if state.details.get(host).is_none() => resolver.request(host),
+        _ => resolver.cancel(),
+    }
+}
+
+struct ResolveRequest {
+    generation: u64,
+    host: HostSummary,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct Resolved {
+    generation: u64,
+    host: HostSummary,
+    details: Loaded,
+}
+
+struct InFlight {
+    host: HostSummary,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Resolves one host at a time on a worker thread.
+///
+/// Every request carries a generation. Superseding a request cancels its `ssh -G` and bumps the
+/// generation, so a result that was already on its way back can never be mistaken for the
+/// current selection's.
+struct Resolver {
+    requests: mpsc::Sender<ResolveRequest>,
+    results: mpsc::Receiver<Resolved>,
+    generation: u64,
+    in_flight: Option<InFlight>,
+}
+
+impl Resolver {
+    fn spawn<'scope>(scope: &'scope thread::Scope<'scope, '_>, app: &'scope App) -> Self {
+        let (requests, receiver) = mpsc::channel();
+        let (sender, results) = mpsc::channel();
+        scope.spawn(move || resolve_worker(app, &receiver, &sender));
+        Self {
+            requests,
+            results,
+            generation: 0,
+            in_flight: None,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Starts resolving `host`, replacing any other pending request.
+    fn request(&mut self, host: &HostSummary) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.host == *host)
+        {
+            return;
+        }
+        self.cancel();
+        self.generation += 1;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let request = ResolveRequest {
+            generation: self.generation,
+            host: host.clone(),
+            cancelled: Arc::clone(&cancelled),
+        };
+        if self.requests.send(request).is_ok() {
+            self.in_flight = Some(InFlight {
+                host: host.clone(),
+                cancelled,
+            });
+        }
+    }
+
+    /// Abandons the pending request, interrupting its `ssh -G` if it is running.
+    fn cancel(&mut self) {
+        if let Some(in_flight) = self.in_flight.take() {
+            in_flight.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the result of the current request, if it has arrived.
+    fn poll(&mut self) -> Option<(HostSummary, Loaded)> {
+        let mut current = None;
+        while let Ok(resolved) = self.results.try_recv() {
+            if self.in_flight.is_some() && resolved.generation == self.generation {
+                self.in_flight = None;
+                current = Some((resolved.host, resolved.details));
+            }
+        }
+        current
+    }
+}
+
+impl Drop for Resolver {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn resolve_worker(
     app: &App,
-    state: &mut UiState,
-    terminated: &AtomicBool,
-) -> Option<HostDetails> {
-    let selected = state.selected_summary()?.clone();
-    match app.show_cancellable(&selected.alias, terminated) {
-        Ok(details) => Some(details_for_selected(&selected, details)),
-        Err(error) => {
-            state.status = Some(error.to_string());
-            None
+    requests: &mpsc::Receiver<ResolveRequest>,
+    results: &mpsc::Sender<Resolved>,
+) {
+    while let Ok(mut request) = requests.recv() {
+        // Navigation requests a host per keypress; only the last one of a burst is worth an `ssh -G`.
+        loop {
+            match requests.recv_timeout(RESOLVE_DEBOUNCE) {
+                Ok(newer) => request = newer,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        let details = load_details(app, &request.host, &request.cancelled);
+        if request.cancelled.load(Ordering::Relaxed) {
+            continue;
+        }
+        let resolved = Resolved {
+            generation: request.generation,
+            host: request.host,
+            details,
+        };
+        if results.send(resolved).is_err() {
+            return;
         }
     }
 }
@@ -302,39 +501,65 @@ fn termination_flag() -> Result<Arc<AtomicBool>, TuiError> {
     Ok(terminated)
 }
 
-struct TerminalGuard;
+/// Restores the terminal when dropped, including while unwinding from a panic.
+struct TerminalGuard {
+    /// Whether the terminal reports modifiers on keys such as Enter (the kitty keyboard protocol).
+    keyboard_enhancement: bool,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self, TuiError> {
-        enter_terminal()?;
-        Ok(Self)
+        // A terminal that cannot answer the query simply keeps its legacy key reporting.
+        let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+        enter_terminal(keyboard_enhancement)?;
+        Ok(Self {
+            keyboard_enhancement,
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = leave_terminal();
+        let _ = leave_terminal(self.keyboard_enhancement);
     }
 }
 
-fn enter_terminal() -> Result<(), TuiError> {
+fn enter_terminal(keyboard_enhancement: bool) -> Result<(), TuiError> {
     enable_raw_mode()?;
-    if let Err(error) = execute!(
+    // The kitty keyboard protocol keeps separate flags per screen, so push them after switching.
+    let entered = execute!(
         io::stdout(),
         EnterAlternateScreen,
         EnableBracketedPaste,
         Hide
-    ) {
-        let _ = leave_terminal();
+    )
+    .and_then(|()| {
+        if keyboard_enhancement {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = entered {
+        let _ = leave_terminal(keyboard_enhancement);
         return Err(error.into());
     }
     Ok(())
 }
 
-fn leave_terminal() -> Result<(), TuiError> {
+fn leave_terminal(keyboard_enhancement: bool) -> Result<(), TuiError> {
+    let keys = if keyboard_enhancement {
+        execute!(io::stdout(), PopKeyboardEnhancementFlags)
+    } else {
+        Ok(())
+    };
     let raw = disable_raw_mode();
     let screen = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     let cursor = execute!(io::stdout(), Show);
+    keys?;
     raw?;
     screen?;
     cursor?;
@@ -350,23 +575,154 @@ enum Mode {
     ConfirmRemove,
 }
 
+/// A single-line text field edited at a cursor.
+///
+/// The cursor is a byte offset that always sits on a character boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TextInput {
+    text: String,
+    cursor: usize,
+}
+
+impl TextInput {
+    fn new(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            cursor: text.len(),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Applies an editing key and reports whether the key was an editing key.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert(&character.to_string());
+            }
+            KeyCode::Backspace => {
+                if let Some(previous) = self.previous_boundary() {
+                    self.text.remove(previous);
+                    self.cursor = previous;
+                }
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.text.len() {
+                    self.text.remove(self.cursor);
+                }
+            }
+            KeyCode::Left => self.cursor = self.previous_boundary().unwrap_or(0),
+            KeyCode::Right => {
+                if let Some(character) = self.text[self.cursor..].chars().next() {
+                    self.cursor += character.len_utf8();
+                }
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.text.len(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Inserts pasted text at the cursor. Fields are single-line, so line breaks and other
+    /// control characters (such as the newline that ends a copied line) are dropped.
+    fn paste(&mut self, text: &str) {
+        self.insert(&text.chars().filter(|c| !c.is_control()).collect::<String>());
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn previous_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+    }
+
+    /// The text as styled spans, with the character under the cursor reversed when `focused`.
+    fn spans(&self, focused: bool) -> Vec<Span<'static>> {
+        if !focused {
+            return vec![Span::raw(self.text.clone())];
+        }
+        let (before, rest) = self.text.split_at(self.cursor);
+        let mut rest = rest.chars();
+        let under = rest.next().map_or(" ".to_owned(), String::from);
+        vec![
+            Span::raw(before.to_owned()),
+            Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
+            Span::raw(rest.as_str().to_owned()),
+        ]
+    }
+}
+
+/// Resolved details of hosts already looked up, so revisiting a host costs nothing.
+///
+/// Entries stay valid until the inventory changes. Lookup is linear: it is bounded by the
+/// number of hosts the user scrolls through.
+#[derive(Clone, Debug, Default)]
+struct DetailsCache {
+    entries: Vec<(HostSummary, Loaded)>,
+}
+
+impl DetailsCache {
+    fn get(&self, host: &HostSummary) -> Option<&Loaded> {
+        self.entries
+            .iter()
+            .find(|(cached, _)| cached == host)
+            .map(|(_, loaded)| loaded)
+    }
+
+    fn insert(&mut self, host: HostSummary, loaded: Loaded) {
+        match self.entries.iter_mut().find(|(cached, _)| *cached == host) {
+            Some(entry) => entry.1 = loaded,
+            None => self.entries.push((host, loaded)),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 struct UiState {
     hosts: Vec<HostSummary>,
     warnings: Vec<DiscoveryWarning>,
     visible: Vec<usize>,
     selected: Option<usize>,
-    filter: String,
+    filter: TextInput,
+    /// The filter as it was when filter mode began, which Esc restores.
+    filter_before_edit: String,
     mode: Mode,
     status: Option<String>,
     form: FormState,
+    details: DetailsCache,
+    /// Set when `e` was pressed before the selected host's details had loaded.
+    edit_pending: bool,
+    /// Whether the terminal reports Ctrl+Enter, so the footer may advertise it.
+    ctrl_enter: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct FormState {
-    values: [String; 6],
+    values: [TextInput; 6],
     active: usize,
     original: Option<Host>,
+    /// The reason the last save was rejected, shown until the form is edited.
+    error: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -380,7 +736,7 @@ enum UiAction {
 }
 
 impl UiState {
-    fn new(inventory: HostInventory) -> Self {
+    fn new(inventory: HostInventory, ctrl_enter: bool) -> Self {
         let HostInventory { hosts, warnings } = inventory;
         let visible = (0..hosts.len()).collect::<Vec<_>>();
         let selected = visible.first().copied();
@@ -389,16 +745,25 @@ impl UiState {
             warnings,
             visible,
             selected,
-            filter: String::new(),
+            filter: TextInput::default(),
+            filter_before_edit: String::new(),
             mode: Mode::Browse,
             status: None,
             form: FormState::default(),
+            details: DetailsCache::default(),
+            edit_pending: false,
+            ctrl_enter,
         }
     }
 
     fn set_filter(&mut self, filter: &str) {
-        self.filter = filter.into();
-        let filter = filter.to_ascii_lowercase();
+        self.filter = TextInput::new(filter);
+        self.refilter();
+    }
+
+    /// Recomputes the visible hosts from the filter, keeping the selection when it still matches.
+    fn refilter(&mut self) {
+        let filter = self.filter.as_str().to_ascii_lowercase();
         self.visible = self
             .hosts
             .iter()
@@ -433,13 +798,16 @@ impl UiState {
         self.selected.map(|index| &self.hosts[index])
     }
 
+    fn selected_details(&self) -> Option<&HostDetails> {
+        self.details.get(self.selected_summary()?)?.as_ref().ok()
+    }
+
     fn replace_hosts(&mut self, inventory: HostInventory) {
         let selected = self.selected_summary().cloned();
         self.hosts = inventory.hosts;
         self.warnings = inventory.warnings;
-        let filter = self.filter.clone();
         self.selected = None;
-        self.set_filter(&filter);
+        self.refilter();
         if let Some(selected) = selected
             && let Some(index) = self.hosts.iter().position(|host| host == &selected)
         {
@@ -447,17 +815,14 @@ impl UiState {
         }
     }
 
-    fn handle_key(
-        &mut self,
-        key: KeyEvent,
-        details: Option<&HostDetails>,
-    ) -> Result<UiAction, String> {
+    fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         self.status = None;
+        self.edit_pending = false;
         match self.mode {
-            Mode::Browse => self.handle_browse_key(key, details),
+            Mode::Browse => self.handle_browse_key(key),
             Mode::Filter => self.handle_filter_key(key),
             Mode::AddForm | Mode::EditForm => self.handle_form_key(key),
-            Mode::ConfirmRemove => Ok(self.handle_remove_key(key)),
+            Mode::ConfirmRemove => self.handle_remove_key(key),
         }
     }
 
@@ -465,103 +830,152 @@ impl UiState {
         self.status = None;
         match self.mode {
             Mode::Filter => {
-                let mut filter = self.filter.clone();
-                filter.push_str(text);
-                self.set_filter(&filter);
+                self.filter.paste(text);
+                self.refilter();
             }
             Mode::AddForm | Mode::EditForm => {
-                self.form.values[self.form.active].push_str(text);
+                self.form.values[self.form.active].paste(text);
+                self.form.error = None;
             }
             Mode::Browse | Mode::ConfirmRemove => {}
         }
     }
 
-    fn handle_browse_key(
-        &mut self,
-        key: KeyEvent,
-        details: Option<&HostDetails>,
-    ) -> Result<UiAction, String> {
+    fn handle_browse_key(&mut self, key: KeyEvent) -> UiAction {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Char('/') => self.mode = Mode::Filter,
+            KeyCode::Char('/') => {
+                self.filter_before_edit = self.filter.as_str().into();
+                self.filter.cursor = self.filter.as_str().len();
+                self.mode = Mode::Filter;
+            }
+            KeyCode::Esc => self.set_filter(""),
             KeyCode::Char('a') => {
                 self.form = FormState::default();
                 self.mode = Mode::AddForm;
             }
-            KeyCode::Char('e') => {
-                if self.selected_is_managed()
-                    && let Some(host) = details.and_then(|details| details.declared.as_ref())
-                {
-                    self.form = FormState::from_host(host);
-                    self.mode = Mode::EditForm;
-                }
-            }
+            KeyCode::Char('e') => self.begin_edit(),
             KeyCode::Char('x') => {
                 if self.selected_is_managed() {
                     self.mode = Mode::ConfirmRemove;
                 }
             }
-            KeyCode::Enter => return Ok(self.connect_action(false)),
-            KeyCode::Char('n') => return Ok(self.connect_action(true)),
-            KeyCode::Char('q') => return Ok(UiAction::Quit),
+            KeyCode::Enter if key.modifiers.is_empty() => return self.connect_action(false),
+            KeyCode::Enter if key.modifiers == KeyModifiers::CONTROL => {
+                return self.connect_action(true);
+            }
+            KeyCode::Char('n') => return self.connect_action(true),
+            KeyCode::Char('q') => return UiAction::Quit,
             _ => {}
         }
-        Ok(UiAction::None)
+        UiAction::None
     }
 
-    fn handle_filter_key(&mut self, key: KeyEvent) -> Result<UiAction, String> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Enter => self.mode = Mode::Browse,
-            KeyCode::Delete => {
-                let mut filter = self.filter.clone();
-                filter.pop();
-                self.set_filter(&filter);
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                let mut filter = self.filter.clone();
-                filter.push(character);
-                self.set_filter(&filter);
-            }
-            _ => {}
+    /// Opens the edit form for the selected managed host once its declaration is known.
+    fn begin_edit(&mut self) {
+        if !self.selected_is_managed() {
+            return;
         }
-        Ok(UiAction::None)
+        match self
+            .selected_summary()
+            .and_then(|host| self.details.get(host))
+        {
+            // The host is still being looked up: finish the request when the result arrives.
+            None => self.edit_pending = true,
+            Some(Ok(HostDetails {
+                declared: Some(host),
+                ..
+            })) => {
+                self.form = FormState::from_host(host);
+                self.mode = Mode::EditForm;
+            }
+            Some(_) => {}
+        }
     }
 
-    fn handle_form_key(&mut self, key: KeyEvent) -> Result<UiAction, String> {
+    fn open_pending_edit(&mut self) {
+        if std::mem::take(&mut self.edit_pending) {
+            self.begin_edit();
+        }
+    }
+
+    fn handle_filter_key(&mut self, key: KeyEvent) -> UiAction {
         match key.code {
-            KeyCode::Esc | KeyCode::Backspace => self.mode = Mode::Browse,
+            KeyCode::Esc => {
+                let before = std::mem::take(&mut self.filter_before_edit);
+                self.set_filter(&before);
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => self.mode = Mode::Browse,
+            _ => {
+                if self.filter.handle_key(key) {
+                    self.refilter();
+                }
+            }
+        }
+        UiAction::None
+    }
+
+    fn handle_form_key(&mut self, key: KeyEvent) -> UiAction {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Browse,
             KeyCode::Up | KeyCode::BackTab => self.form.active = self.form.active.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => {
-                self.form.active = (self.form.active + 1).min(FORM_LABELS.len() - 1)
+                self.form.active = (self.form.active + 1).min(FORM_FIELDS.len() - 1)
             }
-            KeyCode::Delete => {
-                self.form.values[self.form.active].pop();
+            KeyCode::Enter if key.modifiers.is_empty() => return self.submit_form(),
+            _ => {
+                if self.form.values[self.form.active].handle_key(key) {
+                    self.form.error = None;
+                }
             }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.form.values[self.form.active].push(character);
-            }
-            KeyCode::Enter => return self.form.submission(&self.mode),
-            _ => {}
         }
-        Ok(UiAction::None)
+        UiAction::None
+    }
+
+    fn submit_form(&mut self) -> UiAction {
+        match self.form.submission(&self.mode) {
+            Ok(action) => action,
+            Err(error) => {
+                self.report_form_error(&error);
+                UiAction::None
+            }
+        }
+    }
+
+    /// Shows an error on the form field it is about, and a plain status otherwise.
+    fn report_error(&mut self, error: &AppError) {
+        match error {
+            AppError::InvalidHost(host_error)
+                if matches!(self.mode, Mode::AddForm | Mode::EditForm) =>
+            {
+                self.report_form_error(host_error);
+            }
+            AppError::AliasCollision(_) if matches!(self.mode, Mode::AddForm | Mode::EditForm) => {
+                self.form.active = 0;
+                self.form.error = Some(error.to_string());
+            }
+            _ => self.status = Some(error.to_string()),
+        }
+    }
+
+    fn report_form_error(&mut self, error: &HostError) {
+        if let HostError::Invalid { field, .. } = error
+            && let Some(index) = FORM_FIELDS.iter().position(|row| row.field == *field)
+        {
+            self.form.active = index;
+        }
+        self.form.error = Some(error.to_string());
     }
 
     fn handle_remove_key(&mut self, key: KeyEvent) -> UiAction {
         match key.code {
-            KeyCode::Esc | KeyCode::Backspace => {
+            KeyCode::Esc => {
                 self.mode = Mode::Browse;
                 UiAction::None
             }
-            KeyCode::Enter => self
+            KeyCode::Enter if key.modifiers.is_empty() => self
                 .selected_alias()
                 .map_or(UiAction::None, |alias| UiAction::Remove(alias.into())),
             _ => UiAction::None,
@@ -599,38 +1013,42 @@ impl FormState {
     fn from_host(host: &Host) -> Self {
         Self {
             values: [
-                host.alias().into(),
-                host.hostname().into(),
-                host.user().unwrap_or_default().into(),
-                host.port()
-                    .map_or_else(String::new, |port| port.to_string()),
-                host.identity_file().unwrap_or_default().into(),
-                host.proxy_jump().unwrap_or_default().into(),
+                TextInput::new(host.alias()),
+                TextInput::new(host.hostname()),
+                TextInput::new(host.user().unwrap_or_default()),
+                TextInput::new(
+                    &host
+                        .port()
+                        .map_or_else(String::new, |port| port.to_string()),
+                ),
+                TextInput::new(host.identity_file().unwrap_or_default()),
+                TextInput::new(host.proxy_jump().unwrap_or_default()),
             ],
             active: 0,
             original: Some(host.clone()),
+            error: None,
         }
     }
 
-    fn submission(&self, mode: &Mode) -> Result<UiAction, String> {
-        let port = if self.values[3].is_empty() {
-            None
-        } else {
-            Some(
-                self.values[3]
-                    .parse::<u16>()
-                    .map_err(|_| format!("invalid port: {}", self.values[3]))?,
-            )
-        };
-        let host = Host::new(
-            self.values[0].clone(),
-            self.values[1].clone(),
-            optional(&self.values[2]),
+    /// Builds the host the form describes. Every rule comes from the host model, so the form
+    /// cannot accept what `Host::new` rejects; whitespace is never trimmed away silently.
+    fn host(&self) -> Result<Host, HostError> {
+        let value = |index: usize| self.values[index].as_str();
+        let port = optional(value(3))
+            .map(|port| parse_port(&port))
+            .transpose()?;
+        Host::new(
+            value(0),
+            value(1),
+            optional(value(2)),
             port,
-            optional(&self.values[4]),
-            optional(&self.values[5]),
+            optional(value(4)),
+            optional(value(5)),
         )
-        .map_err(|error| error.to_string())?;
+    }
+
+    fn submission(&self, mode: &Mode) -> Result<UiAction, HostError> {
+        let host = self.host()?;
 
         if *mode == Mode::AddForm {
             return Ok(UiAction::Add(host));
@@ -639,7 +1057,7 @@ impl FormState {
         let original = self
             .original
             .as_ref()
-            .ok_or_else(|| "missing original host".to_string())?;
+            .expect("an edit form is opened from a host");
         let mut clear = Vec::new();
         if original.user().is_some() && host.user().is_none() {
             clear.push(ClearField::User);
@@ -657,8 +1075,10 @@ impl FormState {
         set_changed(&mut changes.alias, original.alias(), host.alias());
         set_changed(&mut changes.hostname, original.hostname(), host.hostname());
         set_optional_changed(&mut changes.user, original.user(), host.user());
-        if original.port() != host.port() && host.port().is_some() {
-            changes.port = Change::Set(host.port().expect("checked above"));
+        if original.port() != host.port()
+            && let Some(port) = host.port()
+        {
+            changes.port = Change::Set(port);
         }
         set_optional_changed(
             &mut changes.identity_file,
@@ -695,6 +1115,8 @@ fn set_optional_changed(change: &mut Change<String>, before: Option<&str>, after
     }
 }
 
+/// Re-labels details looked up by alias as the selected row: an external row shares its alias
+/// with a managed host it shadows, but must neither show nor edit that host's declaration.
 fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> HostDetails {
     details.summary = selected.clone();
     if selected.ownership == Ownership::External {
@@ -703,15 +1125,11 @@ fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> Hos
     details
 }
 
-fn details_stale(
-    cached_for: Option<&HostSummary>,
-    selected: Option<&HostSummary>,
-    inventory_changed: bool,
-) -> bool {
-    inventory_changed || cached_for != selected
-}
-
-fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>) {
+fn render(frame: &mut Frame<'_>, state: &UiState) {
+    let footer = footer_text(state);
+    let footer_height = (footer.chars().count() as u16)
+        .div_ceil(frame.area().width.max(1))
+        .max(1);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -723,7 +1141,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
                     .min(usize::from(frame.area().height / 3)) as u16,
             ),
             Constraint::Length(u16::from(state.status.is_some())),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(frame.area());
     let columns = Layout::default()
@@ -744,55 +1162,47 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
             .selected
             .and_then(|selected| state.visible.iter().position(|&index| index == selected)),
     );
+    let mut title = vec![Span::raw("Hosts /")];
+    title.extend(state.filter.spans(state.mode == Mode::Filter));
     frame.render_stateful_widget(
         List::new(hosts)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("Hosts /{}", state.filter)),
+                    .title(Line::from(title)),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
         columns[0],
         &mut list_state,
     );
 
-    let (right_title, detail_text) = match state.mode {
-        Mode::AddForm | Mode::EditForm => {
-            let rows = FORM_LABELS
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    format!(
-                        "{} {label}: {}",
-                        if index == state.form.active { '>' } else { ' ' },
-                        state.form.values[index]
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (
-                if state.mode == Mode::AddForm {
-                    "Add host"
-                } else {
-                    "Edit host"
-                },
-                rows,
-            )
-        }
+    let (right_title, detail_lines) = match state.mode {
+        Mode::AddForm | Mode::EditForm => (
+            if state.mode == Mode::AddForm {
+                "Add host"
+            } else {
+                "Edit host"
+            },
+            form_lines(&state.form),
+        ),
         Mode::ConfirmRemove => (
             "Remove host",
-            format!(
+            vec![Line::raw(format!(
                 "Remove {}?",
                 state.selected_alias().unwrap_or("selected host")
-            ),
+            ))],
         ),
         _ => (
             "Details",
-            details.map_or_else(|| "No host selected".into(), detail_text),
+            details_text(state)
+                .lines()
+                .map(|line| Line::raw(line.to_owned()))
+                .collect(),
         ),
     };
     frame.render_widget(
-        Paragraph::new(detail_text)
+        Paragraph::new(detail_lines)
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(right_title)),
         columns[1],
     );
@@ -808,67 +1218,204 @@ fn render(frame: &mut Frame<'_>, state: &UiState, details: Option<&HostDetails>)
         Paragraph::new(state.status.as_deref().unwrap_or_default()),
         areas[2],
     );
-    let footer = match state.mode {
-        Mode::Browse => match state.selected.map(|index| state.hosts[index].ownership) {
-            Some(Ownership::Managed)
-                if details.is_some_and(|details| details.declared.is_some()) =>
-            {
-                "↑↓ move  / filter  a add  e edit  x remove  Enter connect  n new terminal  q quit"
-            }
-            Some(Ownership::Managed) => {
-                "↑↓ move  / filter  a add  x remove  Enter connect  n new terminal  q quit"
-            }
-            Some(Ownership::External) => {
-                "↑↓ move  / filter  a add  Enter connect  n new terminal  q quit"
-            }
-            None => "/ filter  a add  q quit",
-        },
-        Mode::Filter => "type to filter  Delete erase  Enter apply  Esc/Backspace cancel",
-        Mode::AddForm | Mode::EditForm => {
-            "↑↓ field  Delete erase  Enter save  Esc/Backspace cancel"
-        }
-        Mode::ConfirmRemove => "Enter remove  Esc/Backspace cancel",
-    };
-    frame.render_widget(Paragraph::new(footer), areas[3]);
+    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), areas[3]);
 }
 
+fn footer_text(state: &UiState) -> String {
+    match state.mode {
+        Mode::Browse => {
+            let new_terminal = if state.ctrl_enter {
+                "Ctrl+Enter/n new terminal"
+            } else {
+                "n new terminal"
+            };
+            let connect = format!("Enter connect  {new_terminal}  q quit");
+            let clear_filter = if state.filter.is_empty() {
+                ""
+            } else {
+                "  Esc clear filter"
+            };
+            match state.selected.map(|index| state.hosts[index].ownership) {
+                Some(Ownership::Managed)
+                    if state
+                        .selected_details()
+                        .is_some_and(|details| details.declared.is_some()) =>
+                {
+                    format!("↑↓ move  / filter{clear_filter}  a add  e edit  x remove  {connect}")
+                }
+                Some(Ownership::Managed) => {
+                    format!("↑↓ move  / filter{clear_filter}  a add  x remove  {connect}")
+                }
+                Some(Ownership::External) => {
+                    format!("↑↓ move  / filter{clear_filter}  a add  {connect}")
+                }
+                None => format!("/ filter{clear_filter}  a add  q quit"),
+            }
+        }
+        Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
+        Mode::AddForm | Mode::EditForm => "↑↓ field  ←→ move  Enter save  Esc cancel".into(),
+        Mode::ConfirmRemove => "Enter remove  Esc cancel".into(),
+    }
+}
+
+fn form_lines(form: &FormState) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = FORM_FIELDS
+        .iter()
+        .zip(&form.values)
+        .enumerate()
+        .map(|(index, (row, input))| {
+            let focused = index == form.active;
+            let mut spans = vec![Span::raw(format!(
+                "{} {}: ",
+                if focused { '>' } else { ' ' },
+                row.label
+            ))];
+            spans.extend(input.spans(focused));
+            if input.is_empty() {
+                spans.push(Span::styled(row.placeholder, dim));
+            }
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::raw(""));
+    let active = &FORM_FIELDS[form.active];
+    lines.push(Line::styled(
+        format!(
+            "{}{}",
+            active.hint,
+            if active.optional { "" } else { " Required." }
+        ),
+        dim,
+    ));
+    if let Some(error) = &form.error {
+        lines.push(Line::styled(
+            format!("Error: {error}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines
+}
+
+fn details_text(state: &UiState) -> String {
+    let Some(selected) = state.selected_summary() else {
+        return "No host selected".into();
+    };
+    match state.details.get(selected) {
+        Some(Ok(details)) => detail_text(details),
+        Some(Err(error)) => format!("Could not load details: {error}"),
+        None => "Resolving…".into(),
+    }
+}
+
+/// One host field and every value OpenSSH may use for it (IdentityFile can repeat).
+struct DetailRow {
+    label: &'static str,
+    values: Vec<String>,
+}
+
+impl DetailRow {
+    fn new(label: &'static str, values: impl IntoIterator<Item = String>) -> Self {
+        let mut unique: Vec<String> = Vec::new();
+        for value in values {
+            if !unique.contains(&value) {
+                unique.push(value);
+            }
+        }
+        Self {
+            label,
+            values: unique,
+        }
+    }
+}
+
+fn resolved_rows(resolved: &ResolvedConfig) -> [DetailRow; 5] {
+    [
+        DetailRow::new("HostName", [resolved.hostname.clone()]),
+        DetailRow::new("User", resolved.user.clone()),
+        DetailRow::new("Port", resolved.port.map(|port| port.to_string())),
+        DetailRow::new("IdentityFile", resolved.identity_files.iter().cloned()),
+        DetailRow::new("ProxyJump", resolved.proxy_jump.clone()),
+    ]
+}
+
+fn declared_rows(host: &Host) -> [DetailRow; 5] {
+    [
+        DetailRow::new("HostName", [host.hostname().to_owned()]),
+        DetailRow::new("User", host.user().map(String::from)),
+        DetailRow::new("Port", host.port().map(|port| port.to_string())),
+        DetailRow::new("IdentityFile", host.identity_file().map(String::from)),
+        DetailRow::new("ProxyJump", host.proxy_jump().map(String::from)),
+    ]
+}
+
+/// Describes a host with each field shown once, as OpenSSH resolves it. Portico's own
+/// declaration only appears where it does not take effect, or while resolution is unavailable.
 fn detail_text(details: &HostDetails) -> String {
     let mut text = format!(
-        "Ownership: {}\nSource: {}\n",
+        "Ownership: {}\nSource: {}\n\n",
         ownership(details.summary.ownership),
         details.summary.source.display(),
     );
-    if let Some(host) = &details.declared {
-        text.push_str(&format!(
-            "Portico-declared\nAlias: {}\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}\n",
-            host.alias(),
-            host.hostname(),
-            host.user().unwrap_or("—"),
-            host.port().map_or_else(|| "—".into(), |port| port.to_string()),
-            host.identity_file().unwrap_or("—"),
-            host.proxy_jump().unwrap_or("—"),
-        ));
-    } else {
-        text.push_str("Portico-declared: —\n");
-    }
+    let declared = details.declared.as_ref().map(declared_rows);
     match &details.resolution {
-        Ok(resolved) => text.push_str(&format!(
-            "Resolved\nHostName: {}\nUser: {}\nPort: {}\nIdentityFile: {}\nProxyJump: {}",
-            resolved.hostname,
-            resolved.user.as_deref().unwrap_or("—"),
-            resolved
-                .port
-                .map_or_else(|| "—".into(), |port| port.to_string()),
-            if resolved.identity_files.is_empty() {
-                "—".into()
-            } else {
-                resolved.identity_files.join(", ")
-            },
-            resolved.proxy_jump.as_deref().unwrap_or("—"),
-        )),
-        Err(error) => text.push_str(&format!("Resolved\nError: {error}")),
+        Ok(resolved) => {
+            let rows = resolved_rows(resolved);
+            push_rows(&mut text, &rows);
+            let overridden = declared
+                .iter()
+                .flatten()
+                .zip(&rows)
+                .filter(|(declared, effective)| !declared_in_effect(declared, effective))
+                .map(|(declared, _)| format!("  {}: {}\n", declared.label, declared.values[0]))
+                .collect::<String>();
+            if !overridden.is_empty() {
+                text.push_str(&format!(
+                    "\nDeclared by Portico but overridden by OpenSSH:\n{overridden}"
+                ));
+            }
+        }
+        Err(error) => {
+            if let Some(rows) = declared {
+                push_rows(&mut text, &rows);
+                text.push('\n');
+            }
+            text.push_str(&format!("Could not resolve with ssh -G: {error}"));
+        }
     }
     text
+}
+
+fn push_rows(text: &mut String, rows: &[DetailRow]) {
+    for row in rows {
+        let mut values = row.values.iter();
+        text.push_str(&format!(
+            "{:<13}{}\n",
+            row.label,
+            values.next().map_or("—", String::as_str)
+        ));
+        for value in values {
+            text.push_str(&format!("{:<13}{value}\n", ""));
+        }
+    }
+}
+
+/// Whether the value Portico declared is among those OpenSSH uses. An undeclared field never
+/// conflicts, and `ssh -G` reports `~` paths already expanded.
+fn declared_in_effect(declared: &DetailRow, effective: &DetailRow) -> bool {
+    declared.values.iter().all(|value| {
+        effective
+            .values
+            .iter()
+            .any(|used| used == value || *used == expand_home(value))
+    })
+}
+
+fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
+        _ => path.into(),
+    }
 }
 
 fn format_warning(warning: &DiscoveryWarning) -> String {
@@ -918,10 +1465,7 @@ fn render_init(frame: &mut Frame<'_>, plan: &InitPlan) {
         ),
         areas[0],
     );
-    frame.render_widget(
-        Paragraph::new("y initialize  n/q/Esc/Backspace cancel"),
-        areas[1],
-    );
+    frame.render_widget(Paragraph::new("y initialize  n/q/Esc cancel"), areas[1]);
 }
 
 fn ownership(ownership: Ownership) -> &'static str {
@@ -934,7 +1478,7 @@ fn ownership(ownership: Ownership) -> &'static str {
 fn init_decision(key: KeyEvent) -> Option<bool> {
     match key.code {
         KeyCode::Char('y') => Some(true),
-        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('n') => Some(false),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('n') => Some(false),
         _ => None,
     }
 }
@@ -953,7 +1497,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -969,10 +1513,13 @@ mod tests {
     use super::*;
 
     fn test_state(hosts: Vec<HostSummary>) -> UiState {
-        UiState::new(HostInventory {
-            hosts,
-            warnings: Vec::new(),
-        })
+        UiState::new(
+            HostInventory {
+                hosts,
+                warnings: Vec::new(),
+            },
+            false,
+        )
     }
 
     fn summary(alias: &str, ownership: Ownership) -> HostSummary {
@@ -1002,23 +1549,27 @@ mod tests {
                 user: Some("deploy".into()),
                 port: Some(22),
                 identity_files: vec!["~/.ssh/id_ed25519".into()],
-                proxy_jump: None,
+                proxy_jump: Some("bastion".into()),
             }),
             warnings: Vec::new(),
         }
     }
 
-    fn render_to_buffer(state: &UiState, details: HostDetails) -> Buffer {
-        render_optional_to_buffer(state, Some(&details))
+    /// Caches details for the selected host, as the resolver does once `ssh -G` answers.
+    fn resolve(state: &mut UiState, details: HostDetails) {
+        let host = state.selected_summary().unwrap().clone();
+        state.details.insert(host, Ok(details));
     }
 
-    fn render_optional_to_buffer(state: &UiState, details: Option<&HostDetails>) -> Buffer {
+    fn render_to_buffer(state: &UiState) -> Buffer {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render(frame, state, details))
-            .unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn rendered(state: &UiState) -> String {
+        buffer_text(&render_to_buffer(state))
     }
 
     fn buffer_text(buffer: &Buffer) -> String {
@@ -1039,6 +1590,22 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn press(state: &mut UiState, code: KeyCode) -> UiAction {
+        state.handle_key(key(code))
+    }
+
+    fn type_text(state: &mut UiState, text: &str) {
+        for character in text.chars() {
+            press(state, KeyCode::Char(character));
+        }
+    }
+
+    fn fill_form(state: &mut UiState, values: [&str; 6]) {
+        for (input, value) in state.form.values.iter_mut().zip(values) {
+            *input = TextInput::new(value);
+        }
+    }
+
     #[test]
     fn renders_master_detail_and_hides_mutation_actions_for_external_host() {
         let hosts = vec![
@@ -1047,8 +1614,8 @@ mod tests {
         ];
         let mut state = test_state(hosts);
         state.select_alias("legacy");
-        let buffer = render_to_buffer(&state, details("legacy", Ownership::External));
-        let text = buffer_text(&buffer);
+        resolve(&mut state, details("legacy", Ownership::External));
+        let text = rendered(&state);
 
         assert!(text.contains("legacy"));
         assert!(text.contains("external"));
@@ -1068,6 +1635,17 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_selection_says_so_and_keeps_navigation_actions() {
+        let state = test_state(vec![summary("dev", Ownership::Managed)]);
+
+        let text = rendered(&state);
+
+        assert!(text.contains("Resolving"), "{text}");
+        assert!(text.contains("Enter connect"), "{text}");
+        assert!(!text.contains("e edit"), "{text}");
+    }
+
+    #[test]
     fn inventory_warnings_remain_visible_without_resolved_details() {
         for external in ["", "Host legacy\n"] {
             let dir = tempfile::tempdir().unwrap();
@@ -1083,16 +1661,14 @@ mod tests {
                 store,
                 crate::openssh::OpenSsh::new("/usr/bin/false".into(), "/usr/bin/false".into()),
             );
-            let mut state = UiState::new(app.hosts().unwrap());
+            let mut state = UiState::new(app.hosts().unwrap(), false);
 
-            let details =
-                resolve_selected(&app, &mut state, &std::sync::atomic::AtomicBool::new(false));
-            if external.is_empty() {
-                assert!(details.is_none());
-            } else {
-                assert!(details.as_ref().unwrap().resolution.is_err());
+            if let Some(host) = state.selected_summary().cloned() {
+                let loaded = load_details(&app, &host, &AtomicBool::new(false));
+                assert!(loaded.as_ref().unwrap().resolution.is_err());
+                state.details.insert(host, loaded);
             }
-            let text = buffer_text(&render_optional_to_buffer(&state, details.as_ref()));
+            let text = rendered(&state);
 
             assert!(text.contains("Warning"), "{text}");
             assert!(text.contains("missing.conf"), "{text}");
@@ -1108,7 +1684,7 @@ mod tests {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         state.set_filter("missing");
 
-        let text = buffer_text(&render_optional_to_buffer(&state, None));
+        let text = rendered(&state);
 
         assert!(text.contains("a add"));
         assert!(text.contains("q quit"));
@@ -1126,22 +1702,47 @@ mod tests {
     #[test]
     fn status_preserves_context_valid_footer_actions() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        resolve(&mut state, details("dev", Ownership::Managed));
         state.status = Some("Saved dev".into());
-        let text = buffer_text(&render_to_buffer(
-            &state,
-            details("dev", Ownership::Managed),
-        ));
+        let text = rendered(&state);
         assert!(text.contains("Saved dev"));
         assert!(text.contains("e edit"));
         assert!(text.contains("q quit"));
 
         state.mode = Mode::AddForm;
         state.status = Some("invalid alias".into());
-        let text = buffer_text(&render_optional_to_buffer(&state, None));
+        let text = rendered(&state);
         assert!(text.contains("invalid alias"));
         assert!(text.contains("Enter save"));
-        assert!(text.contains("Esc/Backspace cancel"));
+        assert!(text.contains("Esc cancel"));
         assert!(!text.contains("e edit"));
+    }
+
+    #[test]
+    fn footer_advertises_ctrl_enter_only_when_the_terminal_reports_it() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+
+        let text = rendered(&state);
+        assert!(text.contains("n new terminal"), "{text}");
+        assert!(!text.contains("Ctrl+Enter"), "{text}");
+
+        state.ctrl_enter = true;
+        let text = rendered(&state);
+        assert!(text.contains("Enter connect"), "{text}");
+        assert!(text.contains("Ctrl+Enter/n new terminal"), "{text}");
+    }
+
+    #[test]
+    fn footer_wraps_instead_of_dropping_actions_on_narrow_terminals() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.ctrl_enter = true;
+        resolve(&mut state, details("dev", Ownership::Managed));
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("quit"), "{text}");
     }
 
     #[test]
@@ -1150,32 +1751,74 @@ mod tests {
             summary("dev", Ownership::Managed),
             summary("legacy", Ownership::External),
         ]);
-        state.handle_key(key(KeyCode::Down), None).unwrap();
+        press(&mut state, KeyCode::Down);
         assert_eq!(state.selected_alias(), Some("legacy"));
 
         assert_eq!(
-            state.handle_key(key(KeyCode::Enter), None).unwrap(),
+            press(&mut state, KeyCode::Enter),
             UiAction::Connect {
                 alias: "legacy".into(),
                 new_terminal: false,
             }
         );
         assert_eq!(
-            state.handle_key(key(KeyCode::Char('n')), None).unwrap(),
+            press(&mut state, KeyCode::Char('n')),
             UiAction::Connect {
                 alias: "legacy".into(),
                 new_terminal: true,
             }
         );
-        assert_eq!(
-            state.handle_key(key(KeyCode::Char('e')), None).unwrap(),
-            UiAction::None
-        );
-        assert_eq!(
-            state.handle_key(key(KeyCode::Char('x')), None).unwrap(),
-            UiAction::None
-        );
+        assert_eq!(press(&mut state, KeyCode::Char('e')), UiAction::None);
+        assert_eq!(press(&mut state, KeyCode::Char('x')), UiAction::None);
         assert_eq!(state.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn ctrl_enter_opens_a_new_terminal_like_n() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+        assert_eq!(
+            state.handle_key(ctrl_enter),
+            UiAction::Connect {
+                alias: "dev".into(),
+                new_terminal: true,
+            }
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            UiAction::None
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_does_nothing_in_forms_filter_and_confirmation() {
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+
+        press(&mut state, KeyCode::Char('/'));
+        assert_eq!(state.handle_key(ctrl_enter), UiAction::None);
+        assert_eq!(state.mode, Mode::Filter);
+        press(&mut state, KeyCode::Enter);
+
+        press(&mut state, KeyCode::Char('a'));
+        fill_form(&mut state, ["new", "new.example", "", "", "", ""]);
+        assert_eq!(state.handle_key(ctrl_enter), UiAction::None);
+        assert_eq!(state.mode, Mode::AddForm);
+        assert!(matches!(
+            press(&mut state, KeyCode::Enter),
+            UiAction::Add(_)
+        ));
+        press(&mut state, KeyCode::Esc);
+
+        press(&mut state, KeyCode::Char('x'));
+        assert_eq!(state.handle_key(ctrl_enter), UiAction::None);
+        assert_eq!(state.mode, Mode::ConfirmRemove);
+        assert_eq!(
+            press(&mut state, KeyCode::Enter),
+            UiAction::Remove("dev".into())
+        );
     }
 
     #[test]
@@ -1184,23 +1827,24 @@ mod tests {
         let mut external = summary("shared", Ownership::External);
         external.source = PathBuf::from("/home/test/.ssh/external.conf");
         let mut state = test_state(vec![managed.clone(), external.clone()]);
-        let cached_for = state.selected_summary().cloned();
-        let mut cached_details = details("shared", Ownership::Managed);
+        resolve(&mut state, details("shared", Ownership::Managed));
+        assert!(state.selected_details().is_some());
 
-        state.handle_key(key(KeyCode::Down), None).unwrap();
-        assert!(details_stale(
-            cached_for.as_ref(),
-            state.selected_summary(),
-            false,
-        ));
-        cached_details = details_for_selected(state.selected_summary().unwrap(), cached_details);
+        press(&mut state, KeyCode::Down);
+        assert!(
+            state.selected_details().is_none(),
+            "details belong to the row they were resolved for"
+        );
+        let relabelled = details_for_selected(
+            state.selected_summary().unwrap(),
+            details("shared", Ownership::Managed),
+        );
+        assert_eq!(relabelled.summary, external);
+        assert!(relabelled.declared.is_none());
+        resolve(&mut state, relabelled);
 
-        state
-            .handle_key(key(KeyCode::Char('e')), Some(&cached_details))
-            .unwrap();
+        press(&mut state, KeyCode::Char('e'));
         assert_eq!(state.mode, Mode::Browse);
-        assert_eq!(cached_details.summary, external);
-        assert!(cached_details.declared.is_none());
 
         state.replace_hosts(HostInventory {
             hosts: vec![managed, external.clone()],
@@ -1213,30 +1857,18 @@ mod tests {
     fn managed_remove_requires_confirmation_and_q_quits() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
 
-        assert_eq!(
-            state.handle_key(key(KeyCode::Char('x')), None).unwrap(),
-            UiAction::None
-        );
+        assert_eq!(press(&mut state, KeyCode::Char('x')), UiAction::None);
         assert_eq!(state.mode, Mode::ConfirmRemove);
-        assert_eq!(
-            state.handle_key(key(KeyCode::Esc), None).unwrap(),
-            UiAction::None
-        );
+        assert_eq!(press(&mut state, KeyCode::Esc), UiAction::None);
         assert_eq!(state.mode, Mode::Browse);
-        assert_eq!(
-            state.handle_key(key(KeyCode::Char('q')), None).unwrap(),
-            UiAction::Quit
-        );
+        assert_eq!(press(&mut state, KeyCode::Char('q')), UiAction::Quit);
     }
 
     #[test]
     fn form_renders_exactly_the_six_v1_fields() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        state.handle_key(key(KeyCode::Char('a')), None).unwrap();
-        let text = buffer_text(&render_to_buffer(
-            &state,
-            details("dev", Ownership::Managed),
-        ));
+        press(&mut state, KeyCode::Char('a'));
+        let text = rendered(&state);
 
         for label in [
             "Alias:",
@@ -1246,25 +1878,125 @@ mod tests {
             "IdentityFile:",
             "ProxyJump:",
         ] {
-            assert!(text.contains(label), "missing {label}");
+            assert_eq!(text.matches(label).count(), 1, "{label}\n{text}");
         }
-        assert_eq!(text.matches(": ").count(), 6);
     }
 
     #[test]
-    fn details_render_declared_resolved_and_discovery_warnings() {
-        let mut host_details = details("dev", Ownership::Managed);
-        host_details.declared = Some(
-            Host::new(
-                "dev",
-                "declared.example",
-                Some("declared-user".into()),
-                Some(2200),
-                Some("~/.ssh/id_declared".into()),
-                Some("declared-jump".into()),
-            )
-            .unwrap(),
+    fn focused_proxy_jump_explains_its_format() {
+        let mut state = test_state(Vec::new());
+        press(&mut state, KeyCode::Char('a'));
+        assert!(!rendered(&state).contains("[user@]host[:port]"));
+
+        for _ in 0..5 {
+            press(&mut state, KeyCode::Tab);
+        }
+        let text = rendered(&state);
+
+        assert!(text.contains("[user@]host[:port]"), "{text}");
+        assert!(text.contains("existing alias"), "{text}");
+        assert!(text.contains("commas"), "{text}");
+        assert!(text.contains("bastion"), "{text}");
+    }
+
+    #[test]
+    fn add_form_reports_host_validation_errors_inline_on_the_field() {
+        let mut state = test_state(Vec::new());
+        press(&mut state, KeyCode::Char('a'));
+        fill_form(&mut state, ["-bad", "dev.example", "", "", "", ""]);
+
+        assert_eq!(press(&mut state, KeyCode::Enter), UiAction::None);
+
+        assert_eq!(state.mode, Mode::AddForm);
+        assert_eq!(state.form.active, 0);
+        let text = rendered(&state);
+        assert!(text.contains("Error: invalid alias"), "{text}");
+
+        type_text(&mut state, "x");
+        assert!(state.form.error.is_none());
+    }
+
+    #[test]
+    fn padded_or_blank_proxy_jump_is_rejected_not_trimmed() {
+        for jump in ["   ", " bastion", "bastion ", "a b"] {
+            let mut state = test_state(Vec::new());
+            press(&mut state, KeyCode::Char('a'));
+            fill_form(&mut state, ["dev", "dev.example", "", "", "", jump]);
+
+            assert_eq!(
+                press(&mut state, KeyCode::Enter),
+                UiAction::None,
+                "{jump:?}"
+            );
+
+            assert_eq!(state.form.active, 5, "{jump:?}");
+            let error = state.form.error.as_deref().unwrap();
+            assert!(error.contains("proxy jump"), "{jump:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn invalid_port_is_reported_on_the_port_field() {
+        for port in ["0", "70000", " 22", "ssh"] {
+            let mut state = test_state(Vec::new());
+            press(&mut state, KeyCode::Char('a'));
+            fill_form(&mut state, ["dev", "dev.example", "", port, "", ""]);
+
+            assert_eq!(
+                press(&mut state, KeyCode::Enter),
+                UiAction::None,
+                "{port:?}"
+            );
+
+            assert_eq!(state.form.active, 3, "{port:?}");
+            assert!(state.form.error.is_some(), "{port:?}");
+        }
+    }
+
+    #[test]
+    fn application_rejections_land_on_the_alias_field() {
+        let mut state = test_state(Vec::new());
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Tab);
+
+        state.report_error(&AppError::AliasCollision("dev".into()));
+
+        assert_eq!(state.form.active, 0);
+        assert_eq!(
+            state.form.error.as_deref(),
+            Some("alias already exists: dev")
         );
+        assert!(state.status.is_none());
+
+        state.mode = Mode::Browse;
+        state.report_error(&AppError::UnknownHost("dev".into()));
+        assert_eq!(state.status.as_deref(), Some("unknown host: dev"));
+    }
+
+    #[test]
+    fn details_render_each_field_once_with_the_effective_value() {
+        let mut host_details = details("dev", Ownership::Managed);
+        host_details.resolution.as_mut().unwrap().identity_files = vec![
+            "~/.ssh/id_ed25519".into(),
+            "~/.ssh/id_rsa".into(),
+            "~/.ssh/id_ed25519".into(),
+        ];
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        resolve(&mut state, host_details);
+
+        let text = rendered(&state);
+
+        for label in ["HostName", "User", "Port", "IdentityFile", "ProxyJump"] {
+            assert_eq!(text.matches(label).count(), 1, "{label}\n{text}");
+        }
+        assert_eq!(text.matches("id_ed25519").count(), 1, "{text}");
+        assert!(text.contains("id_rsa"), "{text}");
+        assert!(!text.contains("overridden"), "{text}");
+    }
+
+    #[test]
+    fn details_flag_declared_values_that_openssh_overrides() {
+        let mut host_details = details("dev", Ownership::Managed);
         host_details.resolution.as_mut().unwrap().hostname = "effective.example".into();
         host_details.warnings = vec![DiscoveryWarning::Include {
             path: PathBuf::from("/home/test/.ssh/missing.conf"),
@@ -1272,56 +2004,86 @@ mod tests {
         }];
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         state.warnings = host_details.warnings.clone();
+        resolve(&mut state, host_details);
 
-        let text = buffer_text(&render_to_buffer(&state, host_details));
+        let text = rendered(&state);
 
-        assert!(text.contains("Portico-declared"));
-        assert!(text.contains("declared.example"));
-        assert!(text.contains("Resolved"));
         assert!(text.contains("effective.example"));
+        assert!(text.contains("overridden by OpenSSH"), "{text}");
+        assert!(text.contains("HostName: dev.example"), "{text}");
         assert!(text.contains("Warning:"));
         assert!(text.contains("missing.conf: no matching files"));
     }
 
     #[test]
-    fn resolution_failure_keeps_managed_host_editable() {
-        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        let mut host_details = details("dev", Ownership::Managed);
-        host_details.resolution = Err("ssh -G failed".into());
-        let text = buffer_text(&render_to_buffer(&state, host_details.clone()));
+    fn declared_home_relative_paths_match_the_expanded_effective_path() {
+        let declared = DetailRow::new("IdentityFile", ["~/.ssh/id".to_owned()]);
+        let home = std::env::var("HOME").unwrap();
+        let effective = DetailRow::new("IdentityFile", [format!("{home}/.ssh/id")]);
 
-        assert!(text.contains("ssh -G failed"));
-
-        state
-            .handle_key(key(KeyCode::Char('e')), Some(&host_details))
-            .unwrap();
-
-        assert_eq!(state.mode, Mode::EditForm);
-        assert_eq!(state.form.values[0], "dev");
+        assert!(declared_in_effect(&declared, &effective));
+        assert!(declared_in_effect(
+            &DetailRow::new("IdentityFile", []),
+            &effective
+        ));
+        assert!(!declared_in_effect(
+            &DetailRow::new("IdentityFile", ["~/.ssh/other".to_owned()]),
+            &effective
+        ));
     }
 
     #[test]
-    fn add_form_reuses_host_validation() {
-        let mut state = test_state(Vec::new());
-        state.handle_key(key(KeyCode::Char('a')), None).unwrap();
-        state.form.values[0] = "-bad".into();
-        state.form.values[1] = "dev.example".into();
+    fn resolution_failure_keeps_managed_host_editable_and_shows_declared_values() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let mut host_details = details("dev", Ownership::Managed);
+        host_details.resolution = Err("ssh -G failed".into());
+        resolve(&mut state, host_details);
 
-        let error = state.handle_key(key(KeyCode::Enter), None).unwrap_err();
+        let text = rendered(&state);
+        assert!(text.contains("ssh -G failed"));
+        assert!(text.contains("dev.example"));
 
-        assert!(error.contains("invalid alias"));
-        assert_eq!(state.mode, Mode::AddForm);
+        press(&mut state, KeyCode::Char('e'));
+
+        assert_eq!(state.mode, Mode::EditForm);
+        assert_eq!(state.form.values[0].as_str(), "dev");
+    }
+
+    #[test]
+    fn edit_requested_before_details_load_opens_when_they_arrive() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+
+        press(&mut state, KeyCode::Char('e'));
+        assert_eq!(state.mode, Mode::Browse);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        state.open_pending_edit();
+
+        assert_eq!(state.mode, Mode::EditForm);
+        assert_eq!(state.form.values[0].as_str(), "dev");
+    }
+
+    #[test]
+    fn pending_edit_is_dropped_by_any_other_key() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("prod", Ownership::Managed),
+        ]);
+
+        press(&mut state, KeyCode::Char('e'));
+        press(&mut state, KeyCode::Down);
+        resolve(&mut state, details("prod", Ownership::Managed));
+        state.open_pending_edit();
+
+        assert_eq!(state.mode, Mode::Browse);
     }
 
     #[test]
     fn edit_form_prefills_and_clears_optional_fields() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        let details = details("dev", Ownership::Managed);
-        state
-            .handle_key(key(KeyCode::Char('e')), Some(&details))
-            .unwrap();
+        resolve(&mut state, details("dev", Ownership::Managed));
+        press(&mut state, KeyCode::Char('e'));
         assert_eq!(
-            state.form.values,
+            state.form.values.each_ref().map(TextInput::as_str),
             [
                 "dev",
                 "dev.example",
@@ -1332,12 +2094,10 @@ mod tests {
             ]
         );
         for index in 2..6 {
-            state.form.values[index].clear();
+            state.form.values[index] = TextInput::default();
         }
 
-        let UiAction::Edit { alias, changes } =
-            state.handle_key(key(KeyCode::Enter), None).unwrap()
-        else {
+        let UiAction::Edit { alias, changes } = press(&mut state, KeyCode::Enter) else {
             panic!("expected edit action")
         };
         assert_eq!(alias, "dev");
@@ -1348,46 +2108,123 @@ mod tests {
     }
 
     #[test]
-    fn filter_mode_updates_selection_and_escape_returns_to_browse() {
+    fn filter_mode_updates_selection_and_enter_keeps_the_filter() {
         let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("prod", Ownership::Managed),
         ]);
-        state.handle_key(key(KeyCode::Char('/')), None).unwrap();
-        for character in "pro".chars() {
-            state
-                .handle_key(key(KeyCode::Char(character)), None)
-                .unwrap();
-        }
+        press(&mut state, KeyCode::Char('/'));
+        type_text(&mut state, "pro");
         assert_eq!(state.selected_alias(), Some("prod"));
-        state.handle_key(key(KeyCode::Esc), None).unwrap();
+        press(&mut state, KeyCode::Enter);
         assert_eq!(state.mode, Mode::Browse);
+        assert_eq!(state.filter.as_str(), "pro");
+
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.filter.as_str(), "");
+        assert_eq!(state.visible.len(), 2);
     }
 
     #[test]
-    fn backspace_cancels_while_delete_erases_text() {
+    fn escape_cancels_a_filter_edit_back_to_the_previous_filter() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("prod", Ownership::Managed),
+        ]);
+        press(&mut state, KeyCode::Char('/'));
+        type_text(&mut state, "de");
+        press(&mut state, KeyCode::Enter);
+
+        press(&mut state, KeyCode::Char('/'));
+        type_text(&mut state, "v");
+        press(&mut state, KeyCode::Backspace);
+        press(&mut state, KeyCode::Backspace);
+        press(&mut state, KeyCode::Backspace);
+        assert_eq!(state.filter.as_str(), "");
+        assert_eq!(state.visible.len(), 2);
+
+        press(&mut state, KeyCode::Esc);
+
+        assert_eq!(state.mode, Mode::Browse);
+        assert_eq!(state.filter.as_str(), "de");
+        assert_eq!(state.selected_alias(), Some("dev"));
+    }
+
+    #[test]
+    fn backspace_erases_text_and_only_escape_cancels() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        state.handle_key(key(KeyCode::Char('/')), None).unwrap();
-        state.handle_key(key(KeyCode::Char('d')), None).unwrap();
-        state.handle_key(key(KeyCode::Delete), None).unwrap();
-        assert_eq!(state.filter, "");
+        resolve(&mut state, details("dev", Ownership::Managed));
+
+        press(&mut state, KeyCode::Char('/'));
+        type_text(&mut state, "dex");
+        press(&mut state, KeyCode::Backspace);
+        assert_eq!(state.filter.as_str(), "de");
         assert_eq!(state.mode, Mode::Filter);
-        state.handle_key(key(KeyCode::Backspace), None).unwrap();
+        press(&mut state, KeyCode::Esc);
         assert_eq!(state.mode, Mode::Browse);
 
-        state.handle_key(key(KeyCode::Char('a')), None).unwrap();
-        state.form.values[0] = "dev".into();
-        state.handle_key(key(KeyCode::Delete), None).unwrap();
-        assert_eq!(state.form.values[0], "de");
+        press(&mut state, KeyCode::Char('a'));
+        fill_form(&mut state, ["dev", "", "", "", "", ""]);
+        press(&mut state, KeyCode::Backspace);
+        assert_eq!(state.form.values[0].as_str(), "de");
         assert_eq!(state.mode, Mode::AddForm);
-        state.handle_key(key(KeyCode::Backspace), None).unwrap();
+        press(&mut state, KeyCode::Esc);
         assert_eq!(state.mode, Mode::Browse);
 
-        state.handle_key(key(KeyCode::Char('x')), None).unwrap();
+        press(&mut state, KeyCode::Char('x'));
         assert_eq!(state.mode, Mode::ConfirmRemove);
-        state.handle_key(key(KeyCode::Backspace), None).unwrap();
+        assert_eq!(press(&mut state, KeyCode::Backspace), UiAction::None);
+        assert_eq!(state.mode, Mode::ConfirmRemove);
+        press(&mut state, KeyCode::Esc);
         assert_eq!(state.mode, Mode::Browse);
-        assert_eq!(init_decision(key(KeyCode::Backspace)), Some(false));
+        assert_eq!(init_decision(key(KeyCode::Backspace)), None);
+        assert_eq!(init_decision(key(KeyCode::Esc)), Some(false));
+    }
+
+    #[test]
+    fn text_input_edits_at_the_cursor_on_character_boundaries() {
+        let mut input = TextInput::new("aéz");
+        assert!(input.handle_key(key(KeyCode::Left)));
+        assert!(input.handle_key(key(KeyCode::Left)));
+        input.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(input.as_str(), "axéz");
+        input.handle_key(key(KeyCode::Delete));
+        assert_eq!(input.as_str(), "axz");
+        input.handle_key(key(KeyCode::Backspace));
+        input.handle_key(key(KeyCode::Backspace));
+        assert_eq!(input.as_str(), "z");
+        input.handle_key(key(KeyCode::Backspace));
+        input.handle_key(key(KeyCode::Left));
+        assert_eq!(input.as_str(), "z");
+        input.handle_key(key(KeyCode::End));
+        input.handle_key(key(KeyCode::Delete));
+        input.handle_key(key(KeyCode::Right));
+        input.handle_key(key(KeyCode::Char('é')));
+        assert_eq!(input.as_str(), "zé");
+        input.handle_key(key(KeyCode::Home));
+        input.handle_key(key(KeyCode::Char('>')));
+        assert_eq!(input.as_str(), ">zé");
+        assert!(!input.handle_key(key(KeyCode::Enter)));
+        assert!(!input.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn paste_inserts_at_the_cursor_without_line_breaks() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('a'));
+        type_text(&mut state, "ad");
+        press(&mut state, KeyCode::Left);
+
+        state.handle_paste("bc\r\n");
+
+        assert_eq!(state.form.values[0].as_str(), "abcd");
+        press(&mut state, KeyCode::Char('x'));
+        assert_eq!(state.form.values[0].as_str(), "abcxd");
+
+        state.mode = Mode::Filter;
+        state.handle_paste("de\nv");
+        assert_eq!(state.filter.as_str(), "dev");
+        assert_eq!(state.visible.len(), 1);
     }
 
     #[test]
@@ -1412,17 +2249,14 @@ mod tests {
     #[test]
     fn completed_mutation_exits_form_even_when_refresh_fails() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        let details = details("dev", Ownership::Managed);
-        state
-            .handle_key(key(KeyCode::Char('e')), Some(&details))
-            .unwrap();
+        resolve(&mut state, details("dev", Ownership::Managed));
+        press(&mut state, KeyCode::Char('e'));
         assert_eq!(state.mode, Mode::EditForm);
 
-        let refreshed = complete_mutation(&mut state, Some("dev"), "Saved dev".into(), || {
+        complete_mutation(&mut state, Some("dev"), "Saved dev".into(), || {
             Err::<HostInventory, _>("inventory unavailable")
         });
 
-        assert!(!refreshed);
         assert_eq!(state.mode, Mode::Browse);
         assert!(state.form.original.is_none());
         assert_eq!(
@@ -1430,7 +2264,7 @@ mod tests {
             Some("Saved dev, refresh failed: inventory unavailable")
         );
         assert!(matches!(
-            state.handle_key(key(KeyCode::Enter), None).unwrap(),
+            press(&mut state, KeyCode::Enter),
             UiAction::Connect { .. }
         ));
     }
@@ -1482,6 +2316,127 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(*events.borrow(), ["leave", "child", "enter"]);
+    }
+
+    /// An app whose `ssh -G` appends its alias to a log, then runs `behaviour`.
+    fn logging_app(dir: &std::path::Path, behaviour: &str) -> (App, PathBuf) {
+        let paths = crate::managed::ConfigPaths::from_home(dir);
+        let store = crate::managed::ManagedStore::new(paths.clone());
+        store.apply_init(true, |_, _| Ok(())).unwrap();
+        std::fs::write(&paths.entry, "Include ~/.ssh/portico/config\nHost a b c\n").unwrap();
+        let log = dir.join("resolved.log");
+        let ssh = dir.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nfor alias do :; done\necho \"$alias\" >> '{}'\n{behaviour}\nprintf 'hostname %s.example\\n' \"$alias\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let app = App::new(
+            store,
+            crate::openssh::OpenSsh::new(ssh, "/usr/bin/false".into()),
+        );
+        (app, log)
+    }
+
+    fn summary_of(app: &App, alias: &str) -> HostSummary {
+        app.hosts()
+            .unwrap()
+            .hosts
+            .into_iter()
+            .find(|host| host.alias == alias)
+            .unwrap()
+    }
+
+    fn wait_for_result(resolver: &mut Resolver) -> (HostSummary, Loaded) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = resolver.poll() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "no resolution arrived");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_burst_of_selection_changes_resolves_only_the_last_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log) = logging_app(dir.path(), "");
+        thread::scope(|scope| {
+            let mut resolver = Resolver::spawn(scope, &app);
+            for alias in ["a", "b", "c"] {
+                resolver.request(&summary_of(&app, alias));
+            }
+
+            let (host, loaded) = wait_for_result(&mut resolver);
+
+            assert_eq!(host.alias, "c");
+            assert_eq!(loaded.unwrap().resolution.unwrap().hostname, "c.example");
+            assert!(!resolver.is_pending());
+        });
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "c\n");
+    }
+
+    #[test]
+    fn a_cancelled_request_never_delivers_a_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _) = logging_app(dir.path(), "");
+        thread::scope(|scope| {
+            let mut resolver = Resolver::spawn(scope, &app);
+            resolver.request(&summary_of(&app, "a"));
+            resolver.cancel();
+            assert!(!resolver.is_pending());
+
+            thread::sleep(RESOLVE_DEBOUNCE * 4);
+
+            assert!(resolver.poll().is_none());
+            resolver.request(&summary_of(&app, "b"));
+            assert_eq!(wait_for_result(&mut resolver).0.alias, "b");
+        });
+    }
+
+    #[test]
+    fn dropping_the_resolver_interrupts_a_running_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log) = logging_app(dir.path(), "sleep 10");
+        let started = Instant::now();
+        thread::scope(|scope| {
+            let mut resolver = Resolver::spawn(scope, &app);
+            resolver.request(&summary_of(&app, "a"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !log.exists() {
+                assert!(Instant::now() < deadline, "ssh never started");
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn syncing_requests_uncached_hosts_and_inventory_changes_invalidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _) = logging_app(dir.path(), "");
+        let mut state = UiState::new(app.hosts().unwrap(), false);
+        thread::scope(|scope| {
+            let mut resolver = Resolver::spawn(scope, &app);
+
+            sync_details(&mut state, &mut resolver, false);
+            assert!(resolver.is_pending());
+            let (host, loaded) = wait_for_result(&mut resolver);
+            state.details.insert(host, loaded);
+            assert!(state.selected_details().is_some());
+
+            sync_details(&mut state, &mut resolver, false);
+            assert!(!resolver.is_pending(), "cached hosts need no ssh");
+
+            sync_details(&mut state, &mut resolver, true);
+            assert!(state.selected_details().is_none());
+            assert!(resolver.is_pending());
+        });
     }
 
     fn key(code: KeyCode) -> KeyEvent {

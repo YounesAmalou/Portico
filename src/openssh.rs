@@ -12,6 +12,9 @@ use std::{
 
 use thiserror::Error;
 
+/// How long a new-terminal launcher may run before its launch counts as requested.
+const LAUNCH_GRACE: Duration = Duration::from_millis(500);
+
 #[derive(Clone, Debug)]
 pub struct OpenSsh {
     ssh: PathBuf,
@@ -154,47 +157,7 @@ impl OpenSsh {
         new_terminal: bool,
     ) -> Result<ConnectionOutcome, OpenSshError> {
         if new_terminal {
-            let mut command = Command::new(&self.terminal);
-            command
-                .arg("--")
-                .arg(&self.ssh)
-                .arg("--")
-                .arg(alias)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            let mut child = command.spawn().map_err(|source| OpenSshError::Io {
-                program: self.terminal.clone(),
-                source,
-            })?;
-            let deadline = Instant::now() + Duration::from_millis(100);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) if status.success() => {
-                        return Ok(ConnectionOutcome::LaunchRequested);
-                    }
-                    Ok(Some(status)) => return Ok(ConnectionOutcome::LaunchFailed(status)),
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => {
-                        thread::spawn(move || {
-                            let _ = child.wait();
-                        });
-                        return Ok(ConnectionOutcome::LaunchRequested);
-                    }
-                    Err(source) => {
-                        terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
-                            program: self.terminal.clone(),
-                            source,
-                        })?;
-                        return Err(OpenSshError::Io {
-                            program: self.terminal.clone(),
-                            source,
-                        });
-                    }
-                }
-            }
+            return self.launch_in_new_terminal(alias);
         }
 
         Ok(ConnectionOutcome::Exited(
@@ -207,6 +170,58 @@ impl OpenSsh {
                     source,
                 })?,
         ))
+    }
+
+    /// Asks `xdg-terminal-exec` to open `ssh -- <alias>` in a new terminal.
+    ///
+    /// The launcher's own exit status is the only signal available: it exits
+    /// non-zero when it cannot find or start a terminal, but a terminal that
+    /// stays open (or hands the window to a running instance later) is
+    /// indistinguishable from one that is still starting. A launcher that
+    /// fails within `LAUNCH_GRACE` is reported as `LaunchFailed`; anything
+    /// else is `LaunchRequested`, which promises only that the request was
+    /// accepted, never that the SSH session itself succeeded.
+    fn launch_in_new_terminal(&self, alias: &str) -> Result<ConnectionOutcome, OpenSshError> {
+        // The command follows the launcher's own arguments directly: older
+        // launchers have no option parsing and would take `--` as the command.
+        let mut child = Command::new(&self.terminal)
+            .arg(&self.ssh)
+            .arg("--")
+            .arg(alias)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| OpenSshError::Io {
+                program: self.terminal.clone(),
+                source,
+            })?;
+        let deadline = Instant::now() + LAUNCH_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    return Ok(ConnectionOutcome::LaunchRequested);
+                }
+                Ok(Some(status)) => return Ok(ConnectionOutcome::LaunchFailed(status)),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Ok(ConnectionOutcome::LaunchRequested);
+                }
+                Err(source) => {
+                    let program = self.terminal.clone();
+                    terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
+                        program: program.clone(),
+                        source,
+                    })?;
+                    return Err(OpenSshError::Io { program, source });
+                }
+            }
+        }
     }
 
     pub(crate) fn connect_cancellable(
@@ -335,7 +350,7 @@ fn terminate_process_group(child: &mut std::process::Child) {
 }
 
 fn terminate_process_tree(child: &mut std::process::Child) -> io::Result<()> {
-    if let Err(error) = kill_process_tree(child.id(), None) {
+    if let Err(error) = kill_process_tree(child.id()) {
         let _ = kill_direct_child(child);
         let _ = reap_child_bounded(child);
         return Err(error);
@@ -374,42 +389,124 @@ fn reap_child_bounded(child: &mut std::process::Child) -> io::Result<()> {
     }
 }
 
-fn kill_process_tree(pid: u32, parent: Option<libc::pid_t>) -> io::Result<()> {
-    let pid = libc::pid_t::try_from(pid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid process ID"))?;
-    let pidfd = open_pidfd(pid)?;
-    if let Some(parent) = parent
-        && !process_children(parent)?.contains(&(pid as u32))
-    {
-        return Ok(());
+/// Stops, then kills, `root` and all of its descendants.
+///
+/// Every process is stopped before its children are read so it cannot fork
+/// faster than the walk, and nothing is killed until the whole tree has been
+/// collected. Failures never abandon the walk: each process that could be
+/// reached is still killed, and the first error is reported afterwards.
+fn kill_process_tree(root: u32) -> io::Result<()> {
+    let mut first_error = None;
+    let mut stopped = Vec::new();
+    let mut pending = vec![(root, None)];
+    while let Some((pid, parent)) = pending.pop() {
+        let Some(process) = stop_process(pid, parent, &mut first_error) else {
+            continue;
+        };
+        let children = note(&mut first_error, process_children(process.pid));
+        pending.extend(
+            children
+                .into_iter()
+                .flatten()
+                .map(|child| (child, Some(process.pid))),
+        );
+        stopped.push(process);
     }
-    match signal_pidfd(&pidfd, libc::SIGSTOP) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
-        Err(error) => return Err(error),
-    }
-    let traversal = (|| {
-        if wait_until_stopped(pid)? {
-            for child in process_children(pid)? {
-                kill_process_tree(child, Some(pid))?;
+    for process in &stopped {
+        match process.signal(libc::SIGKILL) {
+            Err(error) if error.raw_os_error() != Some(libc::ESRCH) => {
+                first_error.get_or_insert(error);
             }
+            _ => {}
         }
-        Ok(())
-    })();
-    let kill = match signal_pidfd(&pidfd, libc::SIGKILL) {
-        Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-        Err(error) => Err(error),
-    };
-    match traversal {
-        Err(error) => Err(error),
-        Ok(()) => kill,
     }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Records the error of a best-effort step and yields its value on success.
+fn note<T>(first_error: &mut Option<io::Error>, result: io::Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            first_error.get_or_insert(error);
+            None
+        }
+    }
+}
+
+struct Process {
+    pid: libc::pid_t,
+    /// Pins the identity of the process; absent when no descriptor was available.
+    pidfd: Option<OwnedFd>,
+}
+
+impl Process {
+    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        match &self.pidfd {
+            Some(pidfd) => signal_pidfd(pidfd, signal),
+            // Without a descriptor the PID is still safe to signal: the
+            // process is `root`, which the caller has not reaped, or a child
+            // of a stopped process that therefore cannot have reaped it.
+            None if unsafe { libc::kill(self.pid, signal) } == 0 => Ok(()),
+            None => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+/// Stops `pid` and returns a handle to kill it, or `None` when it is gone or
+/// (for a descendant) no longer a child of `parent`. Errors are recorded.
+fn stop_process(
+    pid: u32,
+    parent: Option<libc::pid_t>,
+    first_error: &mut Option<io::Error>,
+) -> Option<Process> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        first_error.get_or_insert(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid process ID",
+        ));
+        return None;
+    };
+    let pidfd = match open_pidfd(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return None,
+        Err(error) => {
+            first_error.get_or_insert(error);
+            None
+        }
+    };
+    let process = Process { pid, pidfd };
+    if let Some(parent) = parent
+        && !note(first_error, process_children(parent))?.contains(&(pid as u32))
+    {
+        return None;
+    }
+    match process.signal(libc::SIGSTOP) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return None,
+        Err(error) => {
+            first_error.get_or_insert(error);
+            return None;
+        }
+    }
+    // A process that is slow to stop is still killed and its children read.
+    note(first_error, wait_until_stopped(pid));
+    Some(process)
 }
 
 fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     #[cfg(test)]
-    if FAIL_PIDFD_OPEN.with(|fail| fail.replace(false)) {
+    if FAIL_PIDFD_OPEN.with(|countdown| match countdown.get() {
+        Some(0) => {
+            countdown.set(None);
+            true
+        }
+        Some(remaining) => {
+            countdown.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    }) {
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -422,12 +519,13 @@ fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_PIDFD_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_PIDFD_OPEN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Makes the pidfd open after `skipped` successful ones fail with `EMFILE`.
 #[cfg(test)]
-fn fail_next_pidfd_open() {
-    FAIL_PIDFD_OPEN.with(|fail| fail.set(true));
+fn fail_pidfd_open_after(skipped: u32) {
+    FAIL_PIDFD_OPEN.with(|countdown| countdown.set(Some(skipped)));
 }
 
 fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
@@ -738,8 +836,31 @@ mod tests {
         );
         wait_for_contents(
             terminal.log(),
-            &format!("--\n{}\n--\n-external\n", ssh.path().display()),
+            &format!("{}\n--\n-external\n", ssh.path().display()),
         );
+    }
+
+    #[test]
+    fn early_launcher_failure_is_reported() {
+        let ssh = fake_ssh();
+        let terminal = fake_ssh();
+        fs::write(&terminal.path, "#!/bin/sh\nexit 7\n").unwrap();
+        let openssh = OpenSsh::new(ssh.path(), terminal.path());
+
+        assert!(matches!(
+            openssh.connect("dev", true).unwrap(),
+            ConnectionOutcome::LaunchFailed(status) if status.code() == Some(7)
+        ));
+    }
+
+    #[test]
+    fn missing_launcher_is_an_error() {
+        let openssh = OpenSsh::new("ssh".into(), "/nonexistent/xdg-terminal-exec".into());
+
+        assert!(matches!(
+            openssh.connect("dev", true),
+            Err(OpenSshError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
@@ -773,7 +894,7 @@ mod tests {
         );
         wait_for_contents(
             terminal.log(),
-            &format!("--\n{}\n--\ndev\n", ssh.path().display()),
+            &format!("{}\n--\ndev\n", ssh.path().display()),
         );
         fs::write(release, "").unwrap();
         wait_for_contents(&done, "");
@@ -838,7 +959,7 @@ mod tests {
                 signal.store(true, Ordering::Relaxed);
             }
         });
-        fail_next_pidfd_open();
+        fail_pidfd_open_after(0);
         let started = Instant::now();
 
         let result = openssh.connect_cancellable("dev", &cancelled);
@@ -855,6 +976,53 @@ mod tests {
             Err(OpenSshError::Io { source, .. }) if source.raw_os_error() == Some(libc::EMFILE)
         ));
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn pidfd_failure_for_a_descendant_still_kills_the_whole_tree() {
+        let fake = fake_ssh();
+        let marker = fake.log.with_file_name("tree-started");
+        fs::write(
+            &fake.path,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nfirst=$!\nsleep 30 &\nprintf '%s %s' \"$first\" \"$!\" > '{}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let cancel = thread::spawn({
+            let marker = marker.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !marker.exists() {
+                    assert!(Instant::now() < deadline, "connection did not start");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                signal.store(true, Ordering::Relaxed);
+            }
+        });
+        // The root's descriptor opens; the first descendant's does not.
+        fail_pidfd_open_after(1);
+
+        let result = openssh.connect_cancellable("dev", &cancelled);
+
+        cancel.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(OpenSshError::Io { source, .. }) if source.raw_os_error() == Some(libc::EMFILE)
+        ));
+        for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
+            let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit(')').next().map(|rest| rest.trim_start().into()));
+            assert!(
+                state.is_none_or(|state: String| state.starts_with('Z')),
+                "descendant {pid} survived"
+            );
+        }
     }
 
     #[test]

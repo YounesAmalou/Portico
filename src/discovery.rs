@@ -215,11 +215,12 @@ impl Scanner {
     }
 
     fn expand_include(&mut self, pattern: &str) {
-        let path = match self.include_path(pattern) {
-            Ok(path) => path,
+        let target = match self.include_target(pattern) {
+            Ok(target) => target,
             Err(message) => return self.warn_include(pattern.into(), message),
         };
-        let matches = match glob::glob(&path.to_string_lossy()) {
+        let path = target.path();
+        let matches = match glob::glob(&target.glob()) {
             Ok(matches) => matches,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
@@ -252,23 +253,22 @@ impl Scanner {
         }
     }
 
-    fn include_path(&self, pattern: &str) -> Result<PathBuf, String> {
+    fn include_target(&self, pattern: &str) -> Result<IncludeTarget, String> {
         let pattern = expand_environment(pattern)?;
         if pattern.contains('%') {
             return Err("unsupported Include token expansion".into());
         }
-        if let Some(path) = pattern.strip_prefix("~/") {
-            Ok(self.root.parent().unwrap_or(&self.root).join(path))
+        let home = self.root.parent().unwrap_or(&self.root);
+        if let Some(pattern) = pattern.strip_prefix("~/") {
+            Ok(IncludeTarget::under(home, pattern))
         } else if pattern == "~" {
-            Ok(self.root.parent().unwrap_or(&self.root).to_path_buf())
+            Ok(IncludeTarget::under(home, ""))
         } else if pattern.starts_with('~') {
             Err("unsupported Include user expansion".into())
+        } else if Path::new(&pattern).is_absolute() {
+            Ok(IncludeTarget::under(Path::new(""), &pattern))
         } else {
-            if Path::new(&pattern).is_absolute() {
-                Ok(pattern.into())
-            } else {
-                Ok(self.root.join(pattern))
-            }
+            Ok(IncludeTarget::under(&self.root, &pattern))
         }
     }
 
@@ -295,6 +295,35 @@ impl Scanner {
                 .warnings
                 .push(DiscoveryWarning::DuplicateAlias { alias, sources });
         }
+    }
+}
+
+/// An Include argument resolved against a literal base directory.
+///
+/// Only the user's own pattern may act as a glob; the base is a real path, so wildcard
+/// characters in the home or SSH directory name must not widen or hide matches.
+struct IncludeTarget {
+    base: PathBuf,
+    pattern: String,
+}
+
+impl IncludeTarget {
+    fn under(base: &Path, pattern: &str) -> Self {
+        Self {
+            base: base.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.base.join(&self.pattern)
+    }
+
+    fn glob(&self) -> String {
+        PathBuf::from(glob::Pattern::escape(&self.base.to_string_lossy()))
+            .join(&self.pattern)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -485,6 +514,38 @@ mod tests {
 
         assert_eq!(aliases, ["entry-root"]);
         assert!(result.aliases_complete);
+    }
+
+    #[test]
+    fn glob_characters_in_the_ssh_directory_are_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("me[work]*?");
+        let ssh = home.join(".ssh");
+        fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include conf.d/*.conf ~/.ssh/tilde.conf\n",
+        )
+        .unwrap();
+        fs::write(ssh.join("conf.d/a.conf"), "Host relative\n").unwrap();
+        fs::write(ssh.join("tilde.conf"), "Host tilde\n").unwrap();
+        // A directory the unescaped `me[work]*?` class would match instead.
+        let decoy = dir.path().join("mew/.ssh/conf.d");
+        fs::create_dir_all(&decoy).unwrap();
+        fs::write(decoy.join("a.conf"), "Host decoy\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("portico/config")).unwrap();
+
+        assert_eq!(
+            result
+                .hosts
+                .iter()
+                .map(|host| host.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["relative", "tilde"]
+        );
+        assert!(result.aliases_complete, "{:?}", result.warnings);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]

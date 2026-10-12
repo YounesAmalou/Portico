@@ -181,7 +181,7 @@ fn connection_modes_propagate_status_and_arguments() {
     env.run(["connect", "dev", "-n"]).assert_success();
     let log = std::fs::read_to_string(env.connection_log()).unwrap();
     assert!(log.contains("dev"));
-    assert!(log.contains("--\nssh\n--\ndev"));
+    assert!(log.contains("ssh\n--\ndev"));
 }
 
 #[test]
@@ -232,4 +232,39 @@ fn prompt_terminal_launcher_failure_is_propagated() {
     std::fs::write(env.bin().join("xdg-terminal-exec"), "#!/bin/sh\nexit 23\n").unwrap();
 
     env.run(["connect", "dev", "-n"]).assert_exit_code(23);
+}
+
+#[test]
+fn edit_rejects_setting_and_unsetting_the_same_field() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example", "-u", "deploy"])
+        .assert_success();
+    for (flag, field, value) in [
+        ("-u", "user", "other"),
+        ("-p", "port", "2222"),
+        ("-i", "identity", "~/.ssh/id_dev"),
+        ("-J", "jump", "bastion"),
+    ] {
+        env.run(["edit", "dev", flag, value, "-U", field])
+            .assert_failure_stderr_contains(&format!("--unset {field} conflicts with --{field}"));
+    }
+    env.run(["show", "dev"])
+        .assert_stdout_contains("Declared User: deploy");
+}
+
+#[test]
+fn remove_validates_the_alias_before_prompting() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\nHost legacy\n  HostName legacy.example\n",
+    )
+    .unwrap();
+
+    env.run(["remove", "missing"])
+        .assert_failure_stderr_contains("unknown host: missing");
+    env.run(["remove", "legacy"])
+        .assert_failure_stderr_contains("read-only");
 }

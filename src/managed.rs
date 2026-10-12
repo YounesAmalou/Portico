@@ -15,7 +15,7 @@ use thiserror::Error;
 use std::sync::Arc;
 
 use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
-use crate::host::{Host, HostChanges, HostError};
+use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
 const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
@@ -334,13 +334,9 @@ impl ManagedStore {
         V: Fn(&Path, &[String]) -> Result<(), String>,
     {
         let validate_installed = || {
-            let managed = self.init_managed()?;
-            let aliases = managed
-                .hosts()
-                .iter()
-                .map(|host| host.alias().to_owned())
-                .collect::<Vec<_>>();
-            validate(&self.paths.entry, &aliases).map_err(InitError::Validation)
+            self.init_managed()?;
+            // Existing hosts were validated when written; parsing the installed config is enough.
+            validate(&self.paths.entry, &[]).map_err(InitError::Validation)
         };
         let preview = self.plan_init()?;
         if !preview.requires_confirmation() {
@@ -583,6 +579,12 @@ impl ManagedStore {
         Ok(())
     }
 
+    /// Applies `mutate` to the managed config under the exclusive lock and activates the result.
+    ///
+    /// `validate` receives the candidate entry config and the aliases whose declarations the
+    /// transaction added or changed. Resolving one alias makes OpenSSH parse the whole candidate,
+    /// so only those aliases are probed; an empty slice (nothing changed, as for a removal)
+    /// asks for a syntax-only probe. Validation cost therefore does not grow with host count.
     pub fn transact<R, E, M, V>(&self, mutate: M, validate: V) -> Result<R, E>
     where
         E: From<TransactionError>,
@@ -628,6 +630,7 @@ impl ManagedStore {
             .map_err(|source| transaction_io(&self.paths.lock, source))?;
 
         let (active, mut config) = self.read_managed()?;
+        let previous = config.clone();
         let result = mutate(&mut config)?;
         let candidate = write_unique(
             &self.paths.portico_dir,
@@ -652,12 +655,8 @@ impl ManagedStore {
             entry_mode,
         )
         .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
-        let aliases = config
-            .hosts()
-            .iter()
-            .map(|host| host.alias().to_owned())
-            .collect::<Vec<_>>();
-        validate(validation_file.path(), &aliases).map_err(TransactionError::Validation)?;
+        validate(validation_file.path(), &config.changed_aliases(&previous))
+            .map_err(TransactionError::Validation)?;
         drop(validation_file);
 
         let backup_candidate = write_unique(
@@ -768,10 +767,8 @@ impl ManagedConfig {
             } else if directive.eq_ignore_ascii_case("User") {
                 set_once(&mut host.user, value, line, directive)?;
             } else if directive.eq_ignore_ascii_case("Port") {
-                let port = value.parse().map_err(|_| ManagedError::Parse {
-                    line,
-                    message: format!("invalid port: {value}"),
-                })?;
+                let port = parse_port(&value)
+                    .map_err(|source| ManagedError::InvalidHost { line, source })?;
                 set_once(&mut host.port, port, line, directive)?;
             } else if directive.eq_ignore_ascii_case("IdentityFile") {
                 set_once(&mut host.identity_file, value, line, directive)?;
@@ -799,6 +796,15 @@ impl ManagedConfig {
 
     pub fn hosts(&self) -> &[Host] {
         &self.hosts
+    }
+
+    /// Aliases declared here that are new or differ from their declaration in `previous`.
+    pub fn changed_aliases(&self, previous: &Self) -> Vec<String> {
+        self.hosts
+            .iter()
+            .filter(|host| previous.find(host.alias()) != Some(*host))
+            .map(|host| host.alias().to_owned())
+            .collect()
     }
 
     pub fn find(&self, alias: &str) -> Option<&Host> {
@@ -878,12 +884,14 @@ impl ManagedConfig {
         )
         .map_err(|source| {
             let line = match source {
-                HostError::InvalidAlias(_) => line,
-                HostError::InvalidHostname(_) => hostname_line,
-                HostError::InvalidUser(_) => user_line,
-                HostError::InvalidPort(_) => port_line,
-                HostError::InvalidIdentity(_) => identity_line,
-                HostError::InvalidJump(_) => jump_line,
+                HostError::Invalid { field, .. } => match field {
+                    HostField::Alias => line,
+                    HostField::Hostname => hostname_line,
+                    HostField::User => user_line,
+                    HostField::Port => port_line,
+                    HostField::IdentityFile => identity_line,
+                    HostField::ProxyJump => jump_line,
+                },
                 HostError::RequiredField(_) => line,
             };
             ManagedError::InvalidHost { line, source }
@@ -937,9 +945,13 @@ fn analyze_entry(contents: &[u8], paths: &ConfigPaths) -> Result<EntryAnalysis, 
             _ => retained.extend_from_slice(line),
         }
     }
+    // OpenSSH ignores trailing whitespace, so a CRLF-terminated first line is still exact.
     let is_normalized = matches == 1
-        && (contents == PORTICO_INCLUDE.as_bytes()
-            || contents.starts_with(format!("{PORTICO_INCLUDE}\n").as_bytes()));
+        && contents
+            .strip_prefix(PORTICO_INCLUDE.as_bytes())
+            .is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with(b"\n") || rest.starts_with(b"\r\n")
+            });
     Ok(EntryAnalysis {
         has_include: matches > 0,
         is_normalized,
@@ -2242,6 +2254,84 @@ mod tests {
 
         assert!(matches!(result, Err(TransactionError::Validation(_))));
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
+    }
+
+    #[test]
+    fn validation_probes_only_added_or_changed_aliases() {
+        let fixture = initialized_store();
+        let host = |alias: &str, hostname: &str| {
+            Host::new(alias, hostname, None, None, None, None).unwrap()
+        };
+        let probed = std::sync::Mutex::new(Vec::new());
+        let transact = |mutate: &dyn Fn(&mut ManagedConfig) -> Result<(), ManagedError>| {
+            probed.lock().unwrap().clear();
+            fixture
+                .store
+                .transact(
+                    |config| mutate(config).map_err(TransactionError::Operation),
+                    |_, aliases| {
+                        probed.lock().unwrap().extend_from_slice(aliases);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            probed.lock().unwrap().clone()
+        };
+
+        transact(&|config| {
+            for index in 0..5 {
+                config.insert(host(&format!("host{index}"), "a.example"))?;
+            }
+            Ok(())
+        });
+        assert_eq!(
+            transact(&|config| config.insert(host("extra", "x"))),
+            ["extra"]
+        );
+        assert_eq!(
+            transact(&|config| config.apply(
+                "host2",
+                HostChanges {
+                    hostname: crate::host::Change::Set("b.example".into()),
+                    ..HostChanges::default()
+                }
+            )),
+            ["host2"]
+        );
+        assert_eq!(
+            transact(&|config| config.replace("host3", host("Renamed", "a.example"))),
+            ["Renamed"]
+        );
+        assert!(transact(&|config| config.remove("host0").map(drop)).is_empty());
+    }
+
+    #[test]
+    fn crlf_terminated_include_line_is_normalized() {
+        let fixture = initialized_store();
+        let entry = b"Include ~/.ssh/portico/config\r\nHost legacy\r\n HostName legacy.example\r\n";
+        fs::write(&fixture.paths.entry, entry).unwrap();
+
+        assert!(!fixture.store.plan_init().unwrap().requires_confirmation());
+        assert!(fixture.store.load().is_ok());
+        assert_eq!(
+            fixture.store.apply_init(false, |_, _| Ok(())).unwrap(),
+            InitOutcome::Unchanged
+        );
+        assert_eq!(fs::read(&fixture.paths.entry).unwrap(), entry);
+    }
+
+    #[test]
+    fn invalid_port_text_in_the_fragment_reports_its_line() {
+        for value in ["0", "+22", "65536"] {
+            let input = format!("Host dev\n  HostName dev.example\n  Port {value}\n");
+            assert!(
+                matches!(
+                    ManagedConfig::parse(&input),
+                    Err(ManagedError::InvalidHost { line: 3, .. })
+                ),
+                "accepted {value:?}"
+            );
+        }
     }
 
     #[test]
