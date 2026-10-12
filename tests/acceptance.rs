@@ -216,17 +216,39 @@ fn tui_paste_and_terminal_lifecycle_work_on_a_real_pty() {
         .assert_success();
     env.run(["add", "beta", "-H", "beta.example"])
         .assert_success();
-    std::fs::write(env.bin().join("ssh"), "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  if [ \"$2\" != '-F' ] && [ -f \"$HOME/block-resolver\" ]; then\n    : > \"$HOME/resolver-started\"\n    sleep 4\n  fi\n  printf 'hostname fail.example\\nport 22\\n'\n  exit 0\nfi\nif [ -f \"$HOME/block-connection\" ]; then\n  python3 \"$HOME/threaded-connection.py\"\n  exit $?\nfi\nstty -g > \"$HOME/child-terminal-state\"\nexit 23\n").unwrap();
+    env.install_program(
+        "ssh",
+        r#"#!/bin/sh
+if [ "$1" = '-G' ]; then
+  if [ "$2" != '-F' ] && [ -f "$HOME/block-resolver" ]; then
+    : > "$HOME/resolver-started"
+    sleep 4
+  fi
+  printf 'hostname fail.example\nport 22\n'
+  exit 0
+fi
+if [ -f "$HOME/block-connection" ]; then
+  python3 "$HOME/threaded-connection.py"
+  exit $?
+fi
+if [ -f "$HOME/interrupt-connection" ]; then
+  trap 'exit 130' INT
+  : > "$HOME/interrupt-ready"
+  while :; do sleep 0.05; done
+fi
+stty -g > "$HOME/child-terminal-state"
+exit 23
+"#,
+    );
     std::fs::write(
         env.home().join("threaded-connection.py"),
         "import os, pathlib, queue, signal, threading\nstarted = queue.Queue()\ndef run():\n    child_pid = os.fork()\n    if child_pid == 0:\n        os.setsid()\n        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n        os.execlp('sleep', 'sleep', '30')\n    started.put((threading.get_native_id(), child_pid))\n    os.waitpid(child_pid, 0)\nthread = threading.Thread(target=run)\nthread.start()\nworker_tid, child_pid = started.get()\npathlib.Path(os.environ['HOME'], 'connection-started').write_text(f'{os.getppid()} {os.getpid()} {worker_tid} {child_pid}\\n')\nthread.join()\n",
     )
     .unwrap();
-    std::fs::write(
-        env.bin().join("xdg-terminal-exec"),
+    env.install_program(
+        "xdg-terminal-exec",
         "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$HOME/launcher-args\"\n[ -f \"$HOME/fail-launcher\" ] && exit 23\nexit 0\n",
-    )
-    .unwrap();
+    );
 
     let output = std::process::Command::new("python3")
         .arg("-I")

@@ -1,14 +1,18 @@
 #![allow(dead_code)]
 
+#[path = "executable.rs"]
+mod executable;
+
 use std::{
     ffi::OsStr,
     fs,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Command, Output},
 };
 
 use tempfile::TempDir;
+
+use executable::write_executable;
 
 pub struct TestEnv {
     _dir: TempDir,
@@ -50,6 +54,11 @@ impl TestEnv {
             home,
             bin,
         }
+    }
+
+    /// Replaces a program on the test `PATH` with the given script.
+    pub fn install_program(&self, name: &str, script: &str) {
+        write_executable(self.bin.join(name), script);
     }
 
     pub fn run<I, S>(&self, args: I) -> RunResult
@@ -155,9 +164,4 @@ impl RunResult {
             self.0.status,
         );
     }
-}
-
-fn write_executable(path: PathBuf, contents: &str) {
-    fs::write(&path, contents).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }

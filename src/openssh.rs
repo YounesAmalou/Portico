@@ -394,7 +394,9 @@ fn reap_child_bounded(child: &mut std::process::Child) -> io::Result<()> {
 /// Every process is stopped before its children are read so it cannot fork
 /// faster than the walk, and nothing is killed until the whole tree has been
 /// collected. Failures never abandon the walk: each process that could be
-/// reached is still killed, and the first error is reported afterwards.
+/// reached is still killed, and the first error is reported afterwards. Only
+/// failures that can leave a process alive are errors: a slow stop or a
+/// missing pidfd does not prevent the kill, so neither is reported.
 fn kill_process_tree(root: u32) -> io::Result<()> {
     let mut first_error = None;
     let mut stopped = Vec::new();
@@ -454,7 +456,8 @@ impl Process {
 }
 
 /// Stops `pid` and returns a handle to kill it, or `None` when it is gone or
-/// (for a descendant) no longer a child of `parent`. Errors are recorded.
+/// (for a descendant) no longer a child of `parent`. Errors that can leave
+/// the process alive are recorded.
 fn stop_process(
     pid: u32,
     parent: Option<libc::pid_t>,
@@ -470,10 +473,7 @@ fn stop_process(
     let pidfd = match open_pidfd(pid) {
         Ok(pidfd) => Some(pidfd),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return None,
-        Err(error) => {
-            first_error.get_or_insert(error);
-            None
-        }
+        Err(_) => None,
     };
     let process = Process { pid, pidfd };
     if let Some(parent) = parent
@@ -489,8 +489,7 @@ fn stop_process(
             return None;
         }
     }
-    // A process that is slow to stop is still killed and its children read.
-    note(first_error, wait_until_stopped(pid));
+    wait_until_stopped(pid);
     Some(process)
 }
 
@@ -545,69 +544,102 @@ fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn wait_until_stopped(pid: libc::pid_t) -> io::Result<bool> {
+/// Waits briefly for every thread of `pid` to stop. This only narrows the
+/// window in which the process can fork ahead of the walk, so a process that
+/// is slow to stop is still killed and its children read.
+fn wait_until_stopped(pid: libc::pid_t) {
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
-        let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
-            Ok(tasks) => tasks,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
+        let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+            return;
         };
-        let mut found = false;
-        let mut stopped = true;
-        for task in tasks.flatten() {
-            if task.file_name().to_string_lossy().parse::<u32>().is_err() {
-                continue;
-            }
-            found = true;
-            let state = fs::read_to_string(task.path().join("status"))
-                .ok()
-                .and_then(|status| {
-                    status
-                        .lines()
-                        .find_map(|line| line.strip_prefix("State:").map(str::trim_start))
-                        .and_then(|state| state.chars().next())
-                });
-            if !matches!(state, Some('T' | 't' | 'Z' | 'X')) {
-                stopped = false;
-                break;
-            }
-        }
-        if found && stopped {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out stopping child process",
-            ));
+        let stopped = tasks
+            .flatten()
+            .filter(|task| task.file_name().to_string_lossy().parse::<u32>().is_ok())
+            .all(|task| {
+                let state = fs::read_to_string(task.path().join("status"))
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .lines()
+                            .find_map(|line| line.strip_prefix("State:").map(str::trim_start))
+                            .and_then(|state| state.chars().next())
+                    });
+                matches!(state, Some('T' | 't' | 'Z' | 'X'))
+            });
+        if stopped || Instant::now() >= deadline {
+            return;
         }
         thread::sleep(Duration::from_millis(1));
     }
 }
 
 fn process_children(pid: libc::pid_t) -> io::Result<Vec<u32>> {
-    let mut children = Vec::new();
-    let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+    process_children_in(Path::new("/proc"), pid)
+}
+
+/// Reads the children of `pid` from the `proc` filesystem mounted at `proc`.
+///
+/// The per-task `children` files are exact but exist only on kernels built
+/// with `CONFIG_PROC_CHILDREN`. A task directory without one means the kernel
+/// lacks it (or the task just exited), so the parents of all processes are
+/// scanned instead: reporting no children would silently miss descendants.
+fn process_children_in(proc: &Path, pid: libc::pid_t) -> io::Result<Vec<u32>> {
+    let task_dir = proc.join(pid.to_string()).join("task");
+    let tasks = match fs::read_dir(&task_dir) {
         Ok(tasks) => tasks,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(children),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    let mut children = Vec::new();
     for task in tasks {
         let task = task?;
-        let contents = match fs::read_to_string(task.path().join("children")) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+        match fs::read_to_string(task.path().join("children")) {
+            Ok(contents) => children.extend(
+                contents
+                    .split_whitespace()
+                    .filter_map(|child| child.parse::<u32>().ok()),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if task.path().exists() {
+                    return children_by_parent_scan(proc, pid);
+                }
+            }
             Err(error) => return Err(error),
-        };
-        children.extend(
-            contents
-                .split_whitespace()
-                .filter_map(|child| child.parse::<u32>().ok()),
-        );
+        }
     }
     children.sort_unstable();
     children.dedup();
+    Ok(children)
+}
+
+fn children_by_parent_scan(proc: &Path, parent: libc::pid_t) -> io::Result<Vec<u32>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(proc)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        // The command name may contain spaces and parentheses; the fields
+        // after the last `)` are the state and then the parent PID.
+        let ppid = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|ppid| ppid.parse::<libc::pid_t>().ok());
+        if ppid == Some(parent) {
+            children.push(pid);
+        }
+    }
+    children.sort_unstable();
     Ok(children)
 }
 
@@ -672,7 +704,6 @@ fn finish_pipe_cancellable(
 mod tests {
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::Arc,
     };
@@ -680,6 +711,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_executable::write_executable;
 
     struct FakeProgram {
         _dir: TempDir,
@@ -709,16 +741,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ssh");
         let log = dir.path().join("args");
-        fs::write(
+        write_executable(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s' '{}' >&2\nexit 23\n",
                 message.replace('\'', "'\\''")
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        wait_until_executable(&path);
+        );
         FakeProgram {
             _dir: dir,
             path,
@@ -739,27 +768,11 @@ mod tests {
                 output.replace('\'', "'\\''")
             )
         };
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        wait_until_executable(&path);
+        write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         FakeProgram {
             _dir: dir,
             path,
             log,
-        }
-    }
-
-    fn wait_until_executable(path: &Path) {
-        loop {
-            match std::process::Command::new(path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Ok(_) => return,
-                Err(error) if error.raw_os_error() == Some(26) => std::thread::yield_now(),
-                Err(error) => panic!("could not execute fake program: {error}"),
-            }
         }
     }
 
@@ -844,7 +857,7 @@ mod tests {
     fn early_launcher_failure_is_reported() {
         let ssh = fake_ssh();
         let terminal = fake_ssh();
-        fs::write(&terminal.path, "#!/bin/sh\nexit 7\n").unwrap();
+        write_executable(&terminal.path, "#!/bin/sh\nexit 7\n");
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
 
         assert!(matches!(
@@ -869,16 +882,15 @@ mod tests {
         let terminal = fake_ssh();
         let release = terminal.log.with_file_name("release");
         let done = terminal.log.with_file_name("done");
-        fs::write(
+        write_executable(
             &terminal.path,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ \"$i\" -lt 200 ]; do i=$((i + 1)); sleep 0.01; done\n: > '{}'\n",
                 terminal.log.display(),
                 release.display(),
                 done.display(),
             ),
-        )
-        .unwrap();
+        );
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
         let started = std::time::Instant::now();
 
@@ -904,14 +916,13 @@ mod tests {
     fn cancellation_stops_descendant_holding_pipes_after_resolver_exits() {
         let fake = fake_ssh();
         let marker = fake.log.with_file_name("parent-exited");
-        fs::write(
+        write_executable(
             &fake.path,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n  sleep 3 &\n  printf 'hostname dev.example\\n'\n  : > '{}'\nfi\n",
                 marker.display(),
             ),
-        )
-        .unwrap();
+        );
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&cancelled);
@@ -934,17 +945,16 @@ mod tests {
     }
 
     #[test]
-    fn pidfd_failure_falls_back_to_bounded_direct_child_cleanup() {
+    fn cancellation_without_a_pidfd_still_kills_and_reports_cancelled() {
         let fake = fake_ssh();
         let marker = fake.log.with_file_name("connection-started");
-        fs::write(
+        write_executable(
             &fake.path,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsleep 2\n",
                 marker.display()
             ),
-        )
-        .unwrap();
+        );
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&cancelled);
@@ -971,25 +981,21 @@ mod tests {
             "cancellation blocked for {:?}",
             started.elapsed()
         );
-        assert!(matches!(
-            result,
-            Err(OpenSshError::Io { source, .. }) if source.raw_os_error() == Some(libc::EMFILE)
-        ));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)));
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]
-    fn pidfd_failure_for_a_descendant_still_kills_the_whole_tree() {
+    fn cancellation_without_a_descendant_pidfd_still_kills_the_whole_tree() {
         let fake = fake_ssh();
         let marker = fake.log.with_file_name("tree-started");
-        fs::write(
+        write_executable(
             &fake.path,
-            format!(
+            &format!(
                 "#!/bin/sh\nsleep 30 &\nfirst=$!\nsleep 30 &\nprintf '%s %s' \"$first\" \"$!\" > '{}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
                 marker.display()
             ),
-        )
-        .unwrap();
+        );
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&cancelled);
@@ -1010,10 +1016,7 @@ mod tests {
         let result = openssh.connect_cancellable("dev", &cancelled);
 
         cancel.join().unwrap();
-        assert!(matches!(
-            result,
-            Err(OpenSshError::Io { source, .. }) if source.raw_os_error() == Some(libc::EMFILE)
-        ));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)));
         for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
             let state = fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
@@ -1023,6 +1026,54 @@ mod tests {
                 "descendant {pid} survived"
             );
         }
+    }
+
+    fn fake_proc_task(proc: &Path, pid: u32, children: Option<&str>) {
+        let task = proc
+            .join(pid.to_string())
+            .join("task")
+            .join(pid.to_string());
+        fs::create_dir_all(&task).unwrap();
+        if let Some(children) = children {
+            fs::write(task.join("children"), children).unwrap();
+        }
+    }
+
+    fn fake_proc_stat(proc: &Path, pid: u32, command: &str, parent: u32) {
+        fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+        fs::write(
+            proc.join(pid.to_string()).join("stat"),
+            format!("{pid} ({command}) S {parent} {pid} {pid} 0 -1 0\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn children_come_from_the_task_children_files() {
+        let proc = tempfile::tempdir().unwrap();
+        fake_proc_task(proc.path(), 100, Some("300 200\n"));
+
+        assert_eq!(process_children_in(proc.path(), 100).unwrap(), [200, 300]);
+    }
+
+    #[test]
+    fn children_are_found_by_parent_scan_without_proc_children_support() {
+        let proc = tempfile::tempdir().unwrap();
+        fake_proc_task(proc.path(), 100, None);
+        fake_proc_stat(proc.path(), 100, "sh", 1);
+        fake_proc_stat(proc.path(), 200, "a) S 1 (b", 100);
+        fake_proc_stat(proc.path(), 300, "sleep", 200);
+        fake_proc_stat(proc.path(), 400, "other", 100);
+        fs::create_dir(proc.path().join("self")).unwrap();
+
+        assert_eq!(process_children_in(proc.path(), 100).unwrap(), [200, 400]);
+    }
+
+    #[test]
+    fn a_vanished_process_has_no_children() {
+        let proc = tempfile::tempdir().unwrap();
+
+        assert!(process_children_in(proc.path(), 100).unwrap().is_empty());
     }
 
     #[test]

@@ -206,11 +206,10 @@ fn new_terminal_detaches_launcher_streams() {
     env.run(["init", "-y"]).assert_success();
     env.run(["add", "dev", "-H", "dev.example"])
         .assert_success();
-    std::fs::write(
-        env.bin().join("xdg-terminal-exec"),
+    env.install_program(
+        "xdg-terminal-exec",
         "#!/bin/sh\nprintf 'launcher-noise\\n'\nprintf 'launcher-noise\\n' >&2\nsleep 2\n",
-    )
-    .unwrap();
+    );
     let started = std::time::Instant::now();
 
     let result = env.run(["connect", "dev", "-n"]);
@@ -229,7 +228,7 @@ fn prompt_terminal_launcher_failure_is_propagated() {
     env.run(["init", "-y"]).assert_success();
     env.run(["add", "dev", "-H", "dev.example"])
         .assert_success();
-    std::fs::write(env.bin().join("xdg-terminal-exec"), "#!/bin/sh\nexit 23\n").unwrap();
+    env.install_program("xdg-terminal-exec", "#!/bin/sh\nexit 23\n");
 
     env.run(["connect", "dev", "-n"]).assert_exit_code(23);
 }
