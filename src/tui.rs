@@ -1,5 +1,5 @@
 use std::{
-    io,
+    io, panic,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -35,7 +35,7 @@ use crate::{
     app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership},
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
-    managed::InitPlan,
+    managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, ResolvedConfig},
 };
 use thiserror::Error;
@@ -108,15 +108,25 @@ pub enum TuiError {
 }
 
 pub fn run(app: &App) -> Result<(), TuiError> {
-    let guard = TerminalGuard::enter()?;
+    let signals = Signals::install()?;
+    let terminated = signals.flag();
+    let session = Arc::new(TerminalSession::detect());
+    // Declared before the guard, so the terminal is restored before the hook is removed.
+    let _panic_hook = PanicHook::install({
+        let session = Arc::clone(&session);
+        move || {
+            let _ = session.leave();
+        }
+    });
+    let _guard = TerminalGuard(Arc::clone(&session));
+    session.enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let terminated = termination_flag()?;
     let plan = app.init_plan()?;
-    if plan.requires_confirmation() && !confirm_initialization(&mut terminal, &plan, &terminated)? {
+    if plan.requires_confirmation() && !confirm_initialization(&mut terminal, &plan, terminated)? {
         return Ok(());
     }
     if plan.requires_confirmation()
-        && let Err(error) = app.initialize_cancellable(true, &terminated)
+        && let Err(error) = app.initialize_cancellable(true, terminated)
     {
         if terminated.load(Ordering::Relaxed) {
             return Ok(());
@@ -124,7 +134,7 @@ pub fn run(app: &App) -> Result<(), TuiError> {
         return Err(error.into());
     }
 
-    browse(app, &mut terminal, &terminated, guard.keyboard_enhancement)
+    browse(app, &mut terminal, &signals, &session)
 }
 
 fn confirm_initialization<B: Backend>(
@@ -160,25 +170,26 @@ fn confirm_initialization<B: Backend>(
 fn browse<B: Backend>(
     app: &App,
     terminal: &mut Terminal<B>,
-    terminated: &AtomicBool,
-    keyboard_enhancement: bool,
+    signals: &Signals,
+    session: &TerminalSession,
 ) -> Result<(), TuiError> {
     // Host details come from `ssh -G`, so a worker resolves them while the UI keeps handling keys.
     // The resolver is dropped (cancelling any running `ssh -G`) before the scope waits for the worker.
     thread::scope(|scope| {
         let resolver = Resolver::spawn(scope, app);
-        browse_hosts(app, terminal, terminated, keyboard_enhancement, resolver)
+        browse_hosts(app, terminal, signals, session, resolver)
     })
 }
 
 fn browse_hosts<B: Backend>(
     app: &App,
     terminal: &mut Terminal<B>,
-    terminated: &AtomicBool,
-    keyboard_enhancement: bool,
+    signals: &Signals,
+    session: &TerminalSession,
     mut resolver: Resolver,
 ) -> Result<(), TuiError> {
-    let mut state = UiState::new(app.hosts()?, keyboard_enhancement);
+    let terminated = signals.flag();
+    let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
     sync_details(&mut state, &mut resolver, false);
     let mut redraw = true;
 
@@ -237,13 +248,15 @@ fn browse_hosts<B: Backend>(
                     app.connect(&alias, true).map_err(TuiError::from)
                 } else {
                     let result = suspend_for_child(
-                        || leave_terminal(keyboard_enhancement),
+                        || session.leave(),
                         || {
+                            // The terminal's Ctrl+C is for ssh now; Portico waits for it.
+                            let _foreground = signals.foreground_child();
                             app.connect_cancellable(&alias, terminated)
                                 .map(ConnectionOutcome::Exited)
                                 .map_err(TuiError::from)
                         },
-                        || enter_terminal(keyboard_enhancement),
+                        || session.enter(),
                     );
                     match result {
                         Err(TuiError::Io(error)) => return Err(TuiError::Io(error)),
@@ -304,7 +317,7 @@ fn browse_hosts<B: Backend>(
     }
 }
 
-/// Applies a mutation's outcome to the UI and reports whether the inventory changed.
+/// Applies a mutation's outcome to the UI and reports whether the inventory may have changed.
 fn finish_mutation(
     app: &App,
     state: &mut UiState,
@@ -317,10 +330,48 @@ fn finish_mutation(
             complete_mutation(state, preferred, status, || app.hosts());
             true
         }
-        Err(error) => {
-            state.report_error(&error);
-            false
-        }
+        Err(error) => fail_mutation(state, &error, || app.hosts()),
+    }
+}
+
+/// Reports a failed mutation and, when it may have altered the managed file, reloads the
+/// inventory so the list reflects what is actually on disk. Returns whether it may have changed.
+fn fail_mutation<E, F>(state: &mut UiState, error: &AppError, refresh: F) -> bool
+where
+    F: FnOnce() -> Result<HostInventory, E>,
+{
+    state.report_error(error);
+    let changed = may_have_changed_inventory(error);
+    if changed && let Ok(hosts) = refresh() {
+        state.replace_hosts(hosts);
+    }
+    changed
+}
+
+/// Whether a failed mutation may have left the managed file different from what was loaded.
+///
+/// Rejections before activation (validation, collisions, unknown hosts) leave it untouched. A
+/// filesystem failure can strike after the file was replaced or while rolling it back, and an
+/// unparsable managed file means it changed behind Portico's back, so those reload.
+fn may_have_changed_inventory(error: &AppError) -> bool {
+    match error {
+        AppError::Transaction(error) => match error {
+            TransactionError::NotInitialized
+            | TransactionError::Operation(_)
+            | TransactionError::Validation(_)
+            | TransactionError::Entry(_) => false,
+            TransactionError::Managed { .. }
+            | TransactionError::Io { .. }
+            | TransactionError::Rollback { .. } => true,
+        },
+        AppError::Init(_) => true,
+        AppError::Discovery(_)
+        | AppError::OpenSsh(_)
+        | AppError::InvalidHost(_)
+        | AppError::ReadOnlyExternal(_)
+        | AppError::UnknownHost(_)
+        | AppError::AliasCollision(_)
+        | AppError::IncompleteDiscovery(_) => false,
     }
 }
 
@@ -474,6 +525,9 @@ fn resolve_worker(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+        if request.cancelled.load(Ordering::Relaxed) {
+            continue;
+        }
         let details = load_details(app, &request.host, &request.cancelled);
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
@@ -489,81 +543,227 @@ fn resolve_worker(
     }
 }
 
-fn termination_flag() -> Result<Arc<AtomicBool>, TuiError> {
-    let terminated = Arc::new(AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(&terminated))?;
+/// The signals that end the TUI.
+///
+/// SIGTERM and SIGHUP always do. SIGINT does too, except while an in-place `ssh` owns the
+/// terminal: with raw mode off, the terminal's Ctrl+C reaches the whole foreground process
+/// group, so `ssh` and Portico both receive it, and it is `ssh`'s to act on.
+struct Signals {
+    terminated: Arc<AtomicBool>,
+    child_in_foreground: Arc<AtomicBool>,
+}
+
+impl Signals {
+    fn install() -> io::Result<Self> {
+        let signals = Self {
+            terminated: Arc::new(AtomicBool::new(false)),
+            child_in_foreground: Arc::new(AtomicBool::new(false)),
+        };
+        for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
+            signal_hook::flag::register(signal, Arc::clone(&signals.terminated))?;
+        }
+        let terminated = Arc::clone(&signals.terminated);
+        let child_in_foreground = Arc::clone(&signals.child_in_foreground);
+        // SAFETY: the handler only performs atomic loads and stores, which are async-signal-safe.
+        unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
+                if !child_in_foreground.load(Ordering::Relaxed) {
+                    terminated.store(true, Ordering::Relaxed);
+                }
+            })?;
+        }
+        Ok(signals)
     }
-    Ok(terminated)
+
+    /// Set once a signal asks the TUI to end.
+    fn flag(&self) -> &AtomicBool {
+        &self.terminated
+    }
+
+    /// Marks an in-place child as owning the terminal until the returned scope is dropped.
+    fn foreground_child(&self) -> ForegroundChild<'_> {
+        self.child_in_foreground.store(true, Ordering::Relaxed);
+        ForegroundChild(&self.child_in_foreground)
+    }
+}
+
+struct ForegroundChild<'a>(&'a AtomicBool);
+
+impl Drop for ForegroundChild<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The terminal operations a session performs, separated so the session's bookkeeping can be
+/// tested without a terminal.
+trait TerminalControl: Send + Sync {
+    fn enable_raw_mode(&self) -> io::Result<()>;
+    fn disable_raw_mode(&self) -> io::Result<()>;
+    fn enter_screen(&self) -> io::Result<()>;
+    fn leave_screen(&self) -> io::Result<()>;
+    fn push_keyboard_flags(&self) -> io::Result<()>;
+    fn pop_keyboard_flags(&self) -> io::Result<()>;
+}
+
+struct CrosstermControl;
+
+impl TerminalControl for CrosstermControl {
+    fn enable_raw_mode(&self) -> io::Result<()> {
+        enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+
+    fn enter_screen(&self) -> io::Result<()> {
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            Hide
+        )
+    }
+
+    fn leave_screen(&self) -> io::Result<()> {
+        let screen = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let cursor = execute!(io::stdout(), Show);
+        screen.and(cursor)
+    }
+
+    fn push_keyboard_flags(&self) -> io::Result<()> {
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+    }
+
+    fn pop_keyboard_flags(&self) -> io::Result<()> {
+        execute!(io::stdout(), PopKeyboardEnhancementFlags)
+    }
+}
+
+/// The terminal modes Portico has switched on, so each is switched off exactly once.
+///
+/// `enter` and `leave` are idempotent and each undoes only what is recorded as done. That keeps
+/// an error halfway through `enter`, a `leave` before the child runs and the final restore from
+/// ever popping keyboard flags that were not pushed (the kitty protocol keeps a stack).
+struct TerminalSession {
+    control: Box<dyn TerminalControl>,
+    /// Whether the terminal reports modifiers on keys such as Enter (the kitty keyboard protocol).
+    keyboard_enhancement: bool,
+    raw: AtomicBool,
+    screen: AtomicBool,
+    keyboard_flags: AtomicBool,
+}
+
+impl TerminalSession {
+    fn detect() -> Self {
+        // A terminal that cannot answer the query simply keeps its legacy key reporting.
+        let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+        Self::new(Box::new(CrosstermControl), keyboard_enhancement)
+    }
+
+    fn new(control: Box<dyn TerminalControl>, keyboard_enhancement: bool) -> Self {
+        Self {
+            control,
+            keyboard_enhancement,
+            raw: AtomicBool::new(false),
+            screen: AtomicBool::new(false),
+            keyboard_flags: AtomicBool::new(false),
+        }
+    }
+
+    fn keyboard_enhancement(&self) -> bool {
+        self.keyboard_enhancement
+    }
+
+    /// Switches on every mode not yet on; a failure leaves the terminal restored.
+    fn enter(&self) -> Result<(), TuiError> {
+        self.enter_modes().map_err(|error| {
+            let _ = self.leave();
+            error.into()
+        })
+    }
+
+    fn enter_modes(&self) -> io::Result<()> {
+        if !self.raw.load(Ordering::Relaxed) {
+            self.control.enable_raw_mode()?;
+            self.raw.store(true, Ordering::Relaxed);
+        }
+        if !self.screen.load(Ordering::Relaxed) {
+            // Recorded first: a write that failed partway may still have switched modes on.
+            self.screen.store(true, Ordering::Relaxed);
+            self.control.enter_screen()?;
+        }
+        // The kitty keyboard protocol keeps separate flags per screen, so push them after switching.
+        if self.keyboard_enhancement && !self.keyboard_flags.load(Ordering::Relaxed) {
+            self.control.push_keyboard_flags()?;
+            self.keyboard_flags.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Switches off every mode that is on, reporting the first failure after trying them all.
+    fn leave(&self) -> Result<(), TuiError> {
+        let keys = if self.keyboard_flags.swap(false, Ordering::Relaxed) {
+            self.control.pop_keyboard_flags()
+        } else {
+            Ok(())
+        };
+        let raw = if self.raw.swap(false, Ordering::Relaxed) {
+            self.control.disable_raw_mode()
+        } else {
+            Ok(())
+        };
+        let screen = if self.screen.swap(false, Ordering::Relaxed) {
+            self.control.leave_screen()
+        } else {
+            Ok(())
+        };
+        keys.and(raw).and(screen)?;
+        Ok(())
+    }
 }
 
 /// Restores the terminal when dropped, including while unwinding from a panic.
-struct TerminalGuard {
-    /// Whether the terminal reports modifiers on keys such as Enter (the kitty keyboard protocol).
-    keyboard_enhancement: bool,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<Self, TuiError> {
-        // A terminal that cannot answer the query simply keeps its legacy key reporting.
-        let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
-        enter_terminal(keyboard_enhancement)?;
-        Ok(Self {
-            keyboard_enhancement,
-        })
-    }
-}
+struct TerminalGuard(Arc<TerminalSession>);
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = leave_terminal(self.keyboard_enhancement);
+        let _ = self.0.leave();
     }
 }
 
-fn enter_terminal(keyboard_enhancement: bool) -> Result<(), TuiError> {
-    enable_raw_mode()?;
-    // The kitty keyboard protocol keeps separate flags per screen, so push them after switching.
-    let entered = execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        Hide
-    )
-    .and_then(|()| {
-        if keyboard_enhancement {
-            execute!(
-                io::stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-        } else {
-            Ok(())
+type PanicHandler = dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sync + 'static;
+
+/// Runs `restore` before the previous panic hook reports, so the message lands on the normal
+/// screen instead of vanishing with the alternate one. Dropping it removes the extra step.
+struct PanicHook {
+    previous: Arc<PanicHandler>,
+}
+
+impl PanicHook {
+    fn install(restore: impl Fn() + Send + Sync + 'static) -> Self {
+        let previous: Arc<PanicHandler> = Arc::from(panic::take_hook());
+        let delegate = Arc::clone(&previous);
+        panic::set_hook(Box::new(move |info| {
+            restore();
+            delegate(info);
+        }));
+        Self { previous }
+    }
+}
+
+impl Drop for PanicHook {
+    fn drop(&mut self) {
+        // The hook cannot be replaced while unwinding; the process is on its way out then.
+        if !thread::panicking() {
+            let previous = Arc::clone(&self.previous);
+            panic::set_hook(Box::new(move |info| previous(info)));
         }
-    });
-    if let Err(error) = entered {
-        let _ = leave_terminal(keyboard_enhancement);
-        return Err(error.into());
     }
-    Ok(())
-}
-
-fn leave_terminal(keyboard_enhancement: bool) -> Result<(), TuiError> {
-    let keys = if keyboard_enhancement {
-        execute!(io::stdout(), PopKeyboardEnhancementFlags)
-    } else {
-        Ok(())
-    };
-    let raw = disable_raw_mode();
-    let screen = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
-    let cursor = execute!(io::stdout(), Show);
-    keys?;
-    raw?;
-    screen?;
-    cursor?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -577,11 +777,14 @@ enum Mode {
 
 /// A single-line text field edited at a cursor.
 ///
-/// The cursor is a byte offset that always sits on a character boundary.
+/// The cursor is a byte offset that always sits on a character boundary. An input bound to a
+/// host field applies an edit only when the result is something that field accepts, so it never
+/// holds text the host model would reject for its characters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TextInput {
     text: String,
     cursor: usize,
+    field: Option<HostField>,
 }
 
 impl TextInput {
@@ -589,7 +792,19 @@ impl TextInput {
         Self {
             text: text.into(),
             cursor: text.len(),
+            field: None,
         }
+    }
+
+    fn for_field(field: HostField, text: &str) -> Self {
+        Self {
+            field: Some(field),
+            ..Self::new(text)
+        }
+    }
+
+    fn accepts(&self, text: &str) -> bool {
+        self.field.is_none_or(|field| field.accepts(text))
     }
 
     fn as_str(&self) -> &str {
@@ -611,14 +826,15 @@ impl TextInput {
                 self.insert(&character.to_string());
             }
             KeyCode::Backspace => {
-                if let Some(previous) = self.previous_boundary() {
-                    self.text.remove(previous);
+                if let Some(previous) = self.previous_boundary()
+                    && self.remove(previous)
+                {
                     self.cursor = previous;
                 }
             }
             KeyCode::Delete => {
                 if self.cursor < self.text.len() {
-                    self.text.remove(self.cursor);
+                    self.remove(self.cursor);
                 }
             }
             KeyCode::Left => self.cursor = self.previous_boundary().unwrap_or(0),
@@ -634,15 +850,35 @@ impl TextInput {
         true
     }
 
-    /// Inserts pasted text at the cursor. Fields are single-line, so line breaks and other
-    /// control characters (such as the newline that ends a copied line) are dropped.
+    /// Inserts pasted text at the cursor. Fields are single-line, so control characters (such as
+    /// the newline that ends a copied line) are dropped, and so is whatever the field never
+    /// permits. Text that would leave the field in a state it does not accept is refused whole.
     fn paste(&mut self, text: &str) {
-        self.insert(&text.chars().filter(|c| !c.is_control()).collect::<String>());
+        self.insert(text);
     }
 
     fn insert(&mut self, text: &str) {
-        self.text.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        let text: String = text
+            .chars()
+            .filter(|&c| !c.is_control() && self.field.is_none_or(|field| field.permits(c)))
+            .collect();
+        let mut edited = self.text.clone();
+        edited.insert_str(self.cursor, &text);
+        if self.accepts(&edited) {
+            self.text = edited;
+            self.cursor += text.len();
+        }
+    }
+
+    /// Removes the character at `index` unless the remainder would not be accepted.
+    fn remove(&mut self, index: usize) -> bool {
+        let mut edited = self.text.clone();
+        edited.remove(index);
+        let accepted = self.accepts(&edited);
+        if accepted {
+            self.text = edited;
+        }
+        accepted
     }
 
     fn previous_boundary(&self) -> Option<usize> {
@@ -716,7 +952,7 @@ struct UiState {
     ctrl_enter: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct FormState {
     values: [TextInput; 6],
     active: usize,
@@ -1009,21 +1245,34 @@ impl UiState {
     }
 }
 
+impl Default for FormState {
+    fn default() -> Self {
+        Self {
+            values: FORM_FIELDS.map(|row| TextInput::for_field(row.field, "")),
+            active: 0,
+            original: None,
+            error: None,
+        }
+    }
+}
+
 impl FormState {
     fn from_host(host: &Host) -> Self {
+        let port = host
+            .port()
+            .map_or_else(String::new, |port| port.to_string());
+        let texts = [
+            host.alias(),
+            host.hostname(),
+            host.user().unwrap_or_default(),
+            &port,
+            host.identity_file().unwrap_or_default(),
+            host.proxy_jump().unwrap_or_default(),
+        ];
         Self {
-            values: [
-                TextInput::new(host.alias()),
-                TextInput::new(host.hostname()),
-                TextInput::new(host.user().unwrap_or_default()),
-                TextInput::new(
-                    &host
-                        .port()
-                        .map_or_else(String::new, |port| port.to_string()),
-                ),
-                TextInput::new(host.identity_file().unwrap_or_default()),
-                TextInput::new(host.proxy_jump().unwrap_or_default()),
-            ],
+            values: std::array::from_fn(|index| {
+                TextInput::for_field(FORM_FIELDS[index].field, texts[index])
+            }),
             active: 0,
             original: Some(host.clone()),
             error: None,
@@ -1497,7 +1746,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
+    use std::{path::PathBuf, time::Instant};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -1935,6 +2184,92 @@ mod tests {
         }
     }
 
+    fn form_with_active_field(index: usize) -> UiState {
+        let mut state = test_state(Vec::new());
+        press(&mut state, KeyCode::Char('a'));
+        for _ in 0..index {
+            press(&mut state, KeyCode::Tab);
+        }
+        state
+    }
+
+    #[test]
+    fn form_fields_refuse_characters_their_rules_never_permit() {
+        for (index, typed, kept) in [
+            (0, "de v/1\t", "dev1"),
+            (1, "exa mple", "example"),
+            (2, "dep loy", "deploy"),
+            (3, "2 2a2", "222"),
+            (5, "a b,c d", "ab,cd"),
+        ] {
+            let mut state = form_with_active_field(index);
+            type_text(&mut state, typed);
+            assert_eq!(state.form.values[index].as_str(), kept, "field {index}");
+        }
+    }
+
+    #[test]
+    fn identity_file_takes_inner_spaces_but_never_at_either_edge() {
+        let mut state = form_with_active_field(4);
+        type_text(&mut state, " ");
+        assert_eq!(state.form.values[4].as_str(), "");
+        type_text(&mut state, "my");
+        type_text(&mut state, " ");
+        assert_eq!(
+            state.form.values[4].as_str(),
+            "my",
+            "trailing space refused"
+        );
+        press(&mut state, KeyCode::Left);
+        type_text(&mut state, " ");
+        assert_eq!(state.form.values[4].as_str(), "m y");
+        press(&mut state, KeyCode::End);
+        type_text(&mut state, "key");
+        assert_eq!(state.form.values[4].as_str(), "m ykey");
+    }
+
+    #[test]
+    fn identity_file_edits_cannot_leave_whitespace_at_an_edge() {
+        let mut state = form_with_active_field(4);
+        state.form.values[4] = TextInput::for_field(HostField::IdentityFile, "a b");
+        press(&mut state, KeyCode::Backspace);
+        assert_eq!(state.form.values[4].as_str(), "a b", "would leave 'a '");
+        press(&mut state, KeyCode::Home);
+        press(&mut state, KeyCode::Delete);
+        assert_eq!(state.form.values[4].as_str(), "a b", "would leave ' b'");
+    }
+
+    #[test]
+    fn pasted_text_is_filtered_per_field_and_never_leaves_an_invalid_edge() {
+        let mut state = form_with_active_field(5);
+        state.handle_paste("bastion, jump:22\n");
+        assert_eq!(state.form.values[5].as_str(), "bastion,jump:22");
+
+        let mut state = form_with_active_field(3);
+        state.handle_paste("22 22\n");
+        assert_eq!(state.form.values[3].as_str(), "2222");
+
+        let mut state = form_with_active_field(4);
+        state.handle_paste("/keys/my key\n");
+        assert_eq!(state.form.values[4].as_str(), "/keys/my key");
+        state.handle_paste(" ");
+        assert_eq!(state.form.values[4].as_str(), "/keys/my key");
+        state.handle_paste(" extra ");
+        assert_eq!(state.form.values[4].as_str(), "/keys/my key");
+        state.handle_paste(" extra");
+        assert_eq!(state.form.values[4].as_str(), "/keys/my key extra");
+    }
+
+    #[test]
+    fn editing_a_host_keeps_each_field_bound_to_its_rules() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        press(&mut state, KeyCode::Char('e'));
+        press(&mut state, KeyCode::Tab);
+        type_text(&mut state, " x");
+        assert!(!state.form.values[1].as_str().contains(' '));
+    }
+
     #[test]
     fn invalid_port_is_reported_on_the_port_field() {
         for port in ["0", "70000", " 22", "ssh"] {
@@ -2296,6 +2631,251 @@ mod tests {
         assert!(text.contains("y initialize"));
     }
 
+    /// Records the terminal operations it is asked for, optionally failing one.
+    #[derive(Clone, Default)]
+    struct RecordingControl {
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        failing: Option<&'static str>,
+    }
+
+    impl RecordingControl {
+        fn call(&self, name: &'static str) -> io::Result<()> {
+            self.calls.lock().unwrap().push(name);
+            if self.failing == Some(name) {
+                Err(io::Error::other(name))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TerminalControl for RecordingControl {
+        fn enable_raw_mode(&self) -> io::Result<()> {
+            self.call("raw on")
+        }
+        fn disable_raw_mode(&self) -> io::Result<()> {
+            self.call("raw off")
+        }
+        fn enter_screen(&self) -> io::Result<()> {
+            self.call("screen on")
+        }
+        fn leave_screen(&self) -> io::Result<()> {
+            self.call("screen off")
+        }
+        fn push_keyboard_flags(&self) -> io::Result<()> {
+            self.call("push")
+        }
+        fn pop_keyboard_flags(&self) -> io::Result<()> {
+            self.call("pop")
+        }
+    }
+
+    fn session(control: &RecordingControl) -> TerminalSession {
+        TerminalSession::new(Box::new(control.clone()), true)
+    }
+
+    #[test]
+    fn session_enter_and_leave_are_idempotent() {
+        let control = RecordingControl::default();
+        let session = session(&control);
+
+        session.leave().unwrap();
+        session.enter().unwrap();
+        session.enter().unwrap();
+        session.leave().unwrap();
+        session.leave().unwrap();
+        session.enter().unwrap();
+
+        assert_eq!(
+            control.calls(),
+            [
+                "raw on",
+                "screen on",
+                "push",
+                "pop",
+                "raw off",
+                "screen off",
+                "raw on",
+                "screen on",
+                "push"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_never_pops_flags_it_did_not_push() {
+        // The screen switch fails before the push, then the guard restores as well.
+        let control = RecordingControl {
+            failing: Some("screen on"),
+            ..RecordingControl::default()
+        };
+        let session = session(&control);
+
+        assert!(session.enter().is_err());
+        session.leave().unwrap();
+
+        assert!(!control.calls().contains(&"pop"));
+        assert!(control.calls().contains(&"raw off"));
+    }
+
+    #[test]
+    fn session_pops_once_when_reentering_fails_after_the_push() {
+        let control = RecordingControl {
+            failing: Some("push"),
+            ..RecordingControl::default()
+        };
+        let session = session(&control);
+
+        assert!(session.enter().is_err());
+        session.leave().unwrap();
+
+        assert_eq!(
+            control.calls(),
+            ["raw on", "screen on", "push", "raw off", "screen off"]
+        );
+    }
+
+    #[test]
+    fn session_without_keyboard_enhancement_never_touches_flags() {
+        let control = RecordingControl::default();
+        let session = TerminalSession::new(Box::new(control.clone()), false);
+
+        session.enter().unwrap();
+        session.leave().unwrap();
+
+        assert_eq!(
+            control.calls(),
+            ["raw on", "screen on", "raw off", "screen off"]
+        );
+    }
+
+    #[test]
+    fn leave_reports_a_failure_but_still_restores_every_mode() {
+        let control = RecordingControl {
+            failing: Some("pop"),
+            ..RecordingControl::default()
+        };
+        let session = session(&control);
+        session.enter().unwrap();
+
+        assert!(session.leave().is_err());
+
+        assert_eq!(&control.calls()[3..], ["pop", "raw off", "screen off"]);
+    }
+
+    #[test]
+    fn panic_hook_restores_the_terminal_before_the_message_is_reported() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let this_thread = thread::current().id();
+        let record = move |log: &Arc<std::sync::Mutex<Vec<&'static str>>>, entry| {
+            // The hook is process-wide; ignore panics from other tests' threads.
+            if thread::current().id() == this_thread {
+                log.lock().unwrap().push(entry);
+            }
+        };
+        let original = panic::take_hook();
+        let reported = Arc::clone(&log);
+        panic::set_hook(Box::new(move |_| record(&reported, "report")));
+        let restoring = Arc::clone(&log);
+        let hook = PanicHook::install(move || record(&restoring, "restore"));
+
+        let _ = panic::catch_unwind(|| panic!("boom"));
+        assert_eq!(*log.lock().unwrap(), ["restore", "report"]);
+
+        drop(hook);
+        let _ = panic::catch_unwind(|| panic!("boom"));
+        assert_eq!(*log.lock().unwrap(), ["restore", "report", "report"]);
+        panic::set_hook(original);
+    }
+
+    #[test]
+    fn sigint_ends_the_tui_unless_a_child_owns_the_terminal() {
+        let signals = Signals::install().unwrap();
+        {
+            let _child = signals.foreground_child();
+            signal_hook::low_level::raise(signal_hook::consts::SIGINT).unwrap();
+            assert!(!signals.flag().load(Ordering::Relaxed));
+        }
+        signal_hook::low_level::raise(signal_hook::consts::SIGINT).unwrap();
+        assert!(signals.flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn sigterm_and_sighup_end_the_tui_even_while_a_child_runs() {
+        for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
+            let signals = Signals::install().unwrap();
+            let _child = signals.foreground_child();
+            signal_hook::low_level::raise(signal).unwrap();
+            assert!(signals.flag().load(Ordering::Relaxed), "{signal}");
+        }
+    }
+
+    fn inventory_of(aliases: &[&str]) -> HostInventory {
+        HostInventory {
+            hosts: aliases
+                .iter()
+                .map(|alias| summary(alias, Ownership::Managed))
+                .collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failures_that_may_have_touched_the_file_reload_the_inventory() {
+        let uncertain = [
+            AppError::Transaction(TransactionError::Rollback {
+                path: "managed".into(),
+                recovery: "backup".into(),
+                sync: io::Error::other("sync"),
+                rollback: io::Error::other("rollback"),
+            }),
+            AppError::Transaction(TransactionError::Io {
+                path: "managed".into(),
+                source: io::Error::other("rename"),
+            }),
+            AppError::Transaction(TransactionError::Managed {
+                backup: "backup".into(),
+                source: crate::managed::ManagedError::Parse {
+                    line: 1,
+                    message: "bad".into(),
+                },
+            }),
+        ];
+        for error in uncertain {
+            let mut state = test_state(vec![summary("old", Ownership::Managed)]);
+            let changed = fail_mutation(&mut state, &error, || {
+                Ok::<_, AppError>(inventory_of(&["old", "new"]))
+            });
+            assert!(changed, "{error}");
+            assert_eq!(state.hosts.len(), 2, "{error}");
+            assert!(state.status.is_some());
+        }
+    }
+
+    #[test]
+    fn rejections_before_activation_leave_the_inventory_alone() {
+        let rejected = [
+            AppError::Transaction(TransactionError::Validation("bad".into())),
+            AppError::Transaction(TransactionError::NotInitialized),
+            AppError::Transaction(TransactionError::Entry("bad".into())),
+            AppError::AliasCollision("dev".into()),
+            AppError::UnknownHost("dev".into()),
+            AppError::ReadOnlyExternal("dev".into()),
+        ];
+        for error in rejected {
+            let mut state = test_state(vec![summary("old", Ownership::Managed)]);
+            let changed = fail_mutation(&mut state, &error, || -> Result<_, AppError> {
+                panic!("must not reload for {error}")
+            });
+            assert!(!changed, "{error}");
+            assert_eq!(state.hosts.len(), 1);
+        }
+    }
+
     #[test]
     fn restores_terminal_around_child_even_when_child_fails() {
         let events = std::cell::RefCell::new(Vec::new());
@@ -2326,15 +2906,13 @@ mod tests {
         std::fs::write(&paths.entry, "Include ~/.ssh/portico/config\nHost a b c\n").unwrap();
         let log = dir.join("resolved.log");
         let ssh = dir.join("ssh");
-        std::fs::write(
+        crate::test_executable::write_executable(
             &ssh,
-            format!(
+            &format!(
                 "#!/bin/sh\nfor alias do :; done\necho \"$alias\" >> '{}'\n{behaviour}\nprintf 'hostname %s.example\\n' \"$alias\"\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let app = App::new(
             store,
             crate::openssh::OpenSsh::new(ssh, "/usr/bin/false".into()),
@@ -2384,7 +2962,7 @@ mod tests {
     #[test]
     fn a_cancelled_request_never_delivers_a_result() {
         let dir = tempfile::tempdir().unwrap();
-        let (app, _) = logging_app(dir.path(), "");
+        let (app, log) = logging_app(dir.path(), "");
         thread::scope(|scope| {
             let mut resolver = Resolver::spawn(scope, &app);
             resolver.request(&summary_of(&app, "a"));
@@ -2394,6 +2972,7 @@ mod tests {
             thread::sleep(RESOLVE_DEBOUNCE * 4);
 
             assert!(resolver.poll().is_none());
+            assert!(!log.exists(), "a cancelled request must not start ssh");
             resolver.request(&summary_of(&app, "b"));
             assert_eq!(wait_for_result(&mut resolver).0.alias, "b");
         });

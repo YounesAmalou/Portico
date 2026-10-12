@@ -372,10 +372,12 @@ fn format_warning(warning: &DiscoveryWarning) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, os::unix::fs::PermissionsExt};
+    use std::{fs, io::Cursor};
 
     use clap::Parser;
     use tempfile::TempDir;
+
+    use crate::test_executable::write_executable;
 
     use super::*;
     use crate::{
@@ -518,12 +520,10 @@ mod tests {
     fn test_app() -> (TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
         let ssh = dir.path().join("ssh");
-        fs::write(
+        write_executable(
             &ssh,
             "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname resolved.example\\nport 22\\n'; fi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let app = App::new(
             ManagedStore::new(ConfigPaths::from_home(dir.path())),
             OpenSsh::new(ssh.clone(), ssh),

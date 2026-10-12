@@ -77,40 +77,58 @@ impl HostField {
         }
     }
 
+    /// Whether `character` may appear anywhere in a value of this field.
+    ///
+    /// Control characters never may. `rejection` and `accepts` both build on this, so what a form
+    /// refuses to take as input and what validation refuses to save cannot drift apart.
+    pub fn permits(self, character: char) -> bool {
+        if character.is_control() {
+            return false;
+        }
+        match self {
+            Self::Alias => character.is_ascii_alphanumeric() || ".-_".contains(character),
+            Self::Port => character.is_ascii_digit(),
+            Self::IdentityFile => true,
+            Self::Hostname | Self::User | Self::ProxyJump => !character.is_whitespace(),
+        }
+    }
+
+    /// Whether `text` could be this field's content while it is being typed: every character is
+    /// permitted, and a path never starts or ends with whitespace. Unlike `validate`, an
+    /// unfinished (even empty) value is acceptable.
+    pub fn accepts(self, text: &str) -> bool {
+        text.chars().all(|character| self.permits(character))
+            && (self != Self::IdentityFile || text.trim() == text)
+    }
+
     fn rejection(self, value: &str) -> Option<&'static str> {
         match self {
             Self::Alias => (!is_alias(value)).then_some(
                 "must start with a letter or digit and contain only letters, digits, '.', '_' or '-'",
             ),
-            Self::Hostname | Self::User => single_value_rejection(value),
             Self::Port => parse_port_text(value).err(),
+            Self::Hostname | Self::User | Self::IdentityFile | Self::ProxyJump
+                if value.trim().is_empty() =>
+            {
+                Some(if value.is_empty() {
+                    "must not be empty"
+                } else {
+                    "must not be blank"
+                })
+            }
             Self::IdentityFile => {
-                if value.trim().is_empty() {
-                    Some("must not be blank")
-                } else if value.chars().any(char::is_control) {
+                if value.chars().any(|character| !self.permits(character)) {
                     Some("must not contain control characters")
-                } else if value.trim() != value {
-                    Some("must not start or end with whitespace")
                 } else {
-                    None
+                    (!self.accepts(value)).then_some("must not start or end with whitespace")
                 }
             }
-            Self::ProxyJump => {
-                if value.trim().is_empty() {
-                    Some("must not be blank")
-                } else if value.chars().any(char::is_control) {
-                    Some("must not contain control characters")
-                } else if value.chars().any(char::is_whitespace) {
-                    Some("must not contain whitespace")
-                } else {
-                    None
-                }
-            }
+            Self::Hostname | Self::User | Self::ProxyJump => (!self.accepts(value))
+                .then_some("must not contain whitespace or control characters"),
         }
     }
 }
 
-/// Parses port text exactly as the host model accepts it: digits only, 1 through 65535.
 pub fn parse_port(value: &str) -> Result<u16, HostError> {
     parse_port_text(value).map_err(|reason| HostError::Invalid {
         field: HostField::Port,
@@ -235,24 +253,12 @@ fn is_alias(value: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
-}
-
-fn single_value_rejection(value: &str) -> Option<&'static str> {
-    if value.is_empty() {
-        Some("must not be empty")
-    } else if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        Some("must not contain whitespace or control characters")
-    } else {
-        None
-    }
+        && HostField::Alias.accepts(value)
 }
 
 fn parse_port_text(value: &str) -> Result<u16, &'static str> {
     const REASON: &str = "must be an integer from 1 through 65535";
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.is_empty() || !HostField::Port.accepts(value) {
         return Err(REASON);
     }
     value.parse().ok().filter(|port| *port != 0).ok_or(REASON)
@@ -396,6 +402,61 @@ mod tests {
             assert!(parse_port(value).is_err(), "{value:?}");
             assert!(rejected(HostField::Port, value), "{value:?}");
         }
+    }
+
+    #[test]
+    fn typing_rules_come_from_the_validation_rules() {
+        for field in [
+            HostField::Alias,
+            HostField::Hostname,
+            HostField::User,
+            HostField::Port,
+            HostField::IdentityFile,
+            HostField::ProxyJump,
+        ] {
+            for text in [
+                "dev-1",
+                "22",
+                "~/.ssh/my key",
+                "a,b@c:22",
+                "",
+                " x",
+                "x ",
+                "a b",
+                "a\tb",
+                "-x",
+                "é",
+            ] {
+                if field.validate(text).is_ok() {
+                    assert!(field.accepts(text), "{field}: {text:?}");
+                }
+                if text.chars().any(char::is_control) {
+                    assert!(!field.accepts(text), "{field}: {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fields_permit_exactly_their_characters() {
+        for field in [
+            HostField::Alias,
+            HostField::Hostname,
+            HostField::User,
+            HostField::Port,
+            HostField::ProxyJump,
+        ] {
+            assert!(!field.permits(' '), "{field}");
+            assert!(!field.permits('\t'), "{field}");
+        }
+        assert!(HostField::IdentityFile.permits(' '));
+        assert!(!HostField::IdentityFile.permits('\n'));
+        assert!(HostField::Port.permits('7') && !HostField::Port.permits('a'));
+        assert!(HostField::Alias.permits('_') && !HostField::Alias.permits('/'));
+        assert!(
+            HostField::IdentityFile.accepts("my key") && !HostField::IdentityFile.accepts(" key")
+        );
+        assert!(!HostField::IdentityFile.accepts("key "));
     }
 
     #[test]

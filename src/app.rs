@@ -385,6 +385,7 @@ mod tests {
         host::{Change, Host, HostChanges},
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
+        test_executable::write_executable,
     };
 
     use super::*;
@@ -419,16 +420,13 @@ mod tests {
         let paths = ConfigPaths::from_home(dir.path());
         let fake = dir.path().join("ssh");
         let fake_log = dir.path().join("ssh.args");
-        fs::write(
+        write_executable(
             &fake,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncase \"$1\" in\n  -G) if [ \"$2\" != '-F' ]; then printf 'hostname resolved.example\\nuser resolved\\nport 22\\n'; fi ;;\n  --) ;;\n  -*) exit 23 ;;\nesac\n",
                 fake_log.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-        wait_until_executable(&fake);
+        );
         let mut store = ManagedStore::new(paths.clone());
         if let Some(hook) = before_transaction_lock {
             store = store.with_before_transaction_lock(hook);
@@ -792,20 +790,6 @@ mod tests {
     impl Drop for OpenGateOnDrop {
         fn drop(&mut self) {
             self.0.open();
-        }
-    }
-
-    fn wait_until_executable(path: &std::path::Path) {
-        loop {
-            match std::process::Command::new(path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Ok(_) => return,
-                Err(error) if error.raw_os_error() == Some(26) => thread::yield_now(),
-                Err(error) => panic!("could not execute fake program: {error}"),
-            }
         }
     }
 }

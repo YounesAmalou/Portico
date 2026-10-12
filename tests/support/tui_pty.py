@@ -78,6 +78,8 @@ def check_terminal(scenario):
         Path(home, "block-resolver").touch()
     if scenario == "blocked_connection":
         Path(home, "block-connection").touch()
+    if scenario == "interrupt_connection":
+        Path(home, "interrupt-connection").touch()
     if scenario == "launcher_failure":
         Path(home, "fail-launcher").touch()
     master, slave = pty.openpty()
@@ -189,6 +191,35 @@ def check_terminal(scenario):
             _, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())
             assert str(child) not in Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
             assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
+        elif scenario == "interrupt_connection":
+            # Ctrl+C while ssh connects goes to the whole foreground group: ssh ends, Portico stays.
+            os.write(master, b"\r")
+            deadline = time.monotonic() + 5
+            while not Path(home, "interrupt-ready").exists():
+                assert time.monotonic() < deadline, "connection did not start"
+                time.sleep(0.01)
+            os.write(master, b"\x03")
+            read_screen("exited")
+            assert "alpha" in screen.text()
+            time.sleep(0.2)
+            assert process.poll() is None, "Ctrl+C during the connection quit the TUI"
+            assert b"\x1b[?1049h" in transcript[transcript.rindex(b"\x1b[?1049l"):]
+        elif scenario == "input_rules":
+            # Whitespace never enters a field, however it arrives; the saved host proves it.
+            os.write(master, b"a")
+            read_screen("Enter save")
+            os.write(master, b"my host\t")
+            os.write(master, b"\x1b[200~my.exa mple\x1b[201~\t")
+            os.write(master, b"de ploy\t2 2\t")
+            # A typed leading or trailing space is refused; a pasted inner one is kept.
+            os.write(master, b" ~/.ssh/my \x1b[200~ key\x1b[201~ \t")
+            os.write(master, b"\x1b[200~bas tion, jump\n\x1b[201~\r")
+            read_screen("Saved")
+            config = Path(home, ".ssh/portico/config").read_text()
+            block = config[config.index("Host myhost\n"):]
+            for line in ["HostName my.example", "User deploy", "Port 22", "ProxyJump bastion,jump"]:
+                assert line in block, block
+            assert 'IdentityFile "~/.ssh/my key"\n' in block, block
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")
@@ -274,6 +305,9 @@ def check_terminal(scenario):
                         pass
             Path(home, "block-connection").unlink(missing_ok=True)
             marker.unlink(missing_ok=True)
+        if scenario == "interrupt_connection":
+            Path(home, "interrupt-connection").unlink(missing_ok=True)
+            Path(home, "interrupt-ready").unlink(missing_ok=True)
         if scenario == "launcher_failure":
             Path(home, "fail-launcher").unlink(missing_ok=True)
         if scenario in ["launcher_failure", "ctrl_enter"]:
@@ -284,5 +318,5 @@ def check_terminal(scenario):
         os.close(slave)
 
 
-for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "launcher_failure", "ctrl_enter", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
     check_terminal(scenario)
