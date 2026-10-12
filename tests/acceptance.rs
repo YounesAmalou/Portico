@@ -224,7 +224,7 @@ fn tui_paste_and_terminal_lifecycle_work_on_a_real_pty() {
     .unwrap();
     std::fs::write(
         env.bin().join("xdg-terminal-exec"),
-        "#!/bin/sh\n[ -f \"$HOME/fail-launcher\" ] && exit 23\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$HOME/launcher-args\"\n[ -f \"$HOME/fail-launcher\" ] && exit 23\nexit 0\n",
     )
     .unwrap();
 
@@ -343,7 +343,7 @@ fn approved_v1_flow_works_in_an_isolated_home() {
         assert!(
             std::fs::read_to_string(env.connection_log())
                 .unwrap()
-                .contains("--\nssh\n--\ndev")
+                .contains("ssh\n--\ndev")
         );
         assert_eq!(file_mode(env.home().join(".ssh")), Some(0o700));
         assert_eq!(

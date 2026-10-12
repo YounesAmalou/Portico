@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    app::{App, HostDetails, Ownership},
+    app::{App, AppError, HostDetails, Ownership},
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
@@ -175,33 +175,33 @@ fn execute<I: BufRead, O: Write>(
             jump,
             unset,
         }) => {
-            let mut changes = HostChanges::from_clear_fields(unset);
             let updated_alias = new_alias.as_deref().unwrap_or(&alias).to_owned();
-            if let Some(value) = new_alias {
-                changes.alias = Change::Set(value);
-            }
-            if let Some(value) = hostname {
-                changes.hostname = Change::Set(value);
-            }
-            if let Some(value) = user {
-                changes.user = Change::Set(value);
-            }
-            if let Some(value) = port {
-                changes.port = Change::Set(value);
-            }
-            if let Some(value) = identity {
-                changes.identity_file = Change::Set(value);
-            }
-            if let Some(value) = jump {
-                changes.proxy_jump = Change::Set(value);
-            }
+            let changes = HostChanges {
+                alias: new_alias.map_or(Change::Keep, Change::Set),
+                hostname: hostname.map_or(Change::Keep, Change::Set),
+                user: field_change(user, "user", ClearField::User, &unset)?,
+                port: field_change(port, "port", ClearField::Port, &unset)?,
+                identity_file: field_change(identity, "identity", ClearField::Identity, &unset)?,
+                proxy_jump: field_change(jump, "jump", ClearField::Jump, &unset)?,
+            };
             app.edit(&alias, changes)
                 .map_err(|error| error.to_string())?;
             writeln!(output, "Updated {updated_alias}.").map_err(|error| error.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Remove { alias, force }) => {
-            app.hosts().map_err(|error| error.to_string())?;
+            let inventory = app.hosts().map_err(|error| error.to_string())?;
+            match inventory
+                .hosts
+                .iter()
+                .find(|host| host.alias.eq_ignore_ascii_case(&alias))
+            {
+                None => return Err(AppError::UnknownHost(alias).to_string()),
+                Some(host) if host.ownership == Ownership::External => {
+                    return Err(AppError::ReadOnlyExternal(alias).to_string());
+                }
+                Some(_) => {}
+            }
             if !force {
                 if !interactive {
                     return Err("removal requires --force in non-interactive mode".into());
@@ -232,6 +232,21 @@ fn execute<I: BufRead, O: Write>(
                 }
             })
         }
+    }
+}
+
+/// Resolves `--<flag> value` and `--unset <flag>` for one field, rejecting both together.
+fn field_change<T>(
+    value: Option<T>,
+    flag: &str,
+    field: ClearField,
+    unset: &[ClearField],
+) -> Result<Change<T>, String> {
+    match (value, unset.contains(&field)) {
+        (Some(_), true) => Err(format!("--unset {flag} conflicts with --{flag}")),
+        (Some(value), false) => Ok(Change::Set(value)),
+        (None, true) => Ok(Change::Clear),
+        (None, false) => Ok(Change::Keep),
     }
 }
 
@@ -364,7 +379,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{App, AppError},
+        app::App,
         host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
@@ -452,6 +467,52 @@ mod tests {
             true,
         );
         assert!(matches!(app.show("dev"), Err(AppError::UnknownHost(_))));
+    }
+
+    #[test]
+    fn remove_does_not_prompt_for_hosts_that_cannot_be_removed() {
+        let (dir, app) = test_app();
+        app.initialize(true).unwrap();
+        fs::write(
+            dir.path().join(".ssh/config"),
+            "Include ~/.ssh/portico/config\nHost legacy\n HostName legacy.example\n",
+        )
+        .unwrap();
+
+        for alias in ["missing", "legacy"] {
+            let mut output = Vec::new();
+            let mut error = Vec::new();
+            let exit = run(
+                Cli::try_parse_from(["portico", "remove", alias]).unwrap(),
+                &app,
+                &mut Cursor::new(b"y\n"),
+                &mut output,
+                &mut error,
+                true,
+            );
+            assert_eq!(exit, std::process::ExitCode::FAILURE);
+            assert!(output.is_empty(), "prompted for {alias}");
+        }
+    }
+
+    #[test]
+    fn field_change_rejects_setting_and_unsetting_together() {
+        assert_eq!(
+            field_change(Some(1), "port", ClearField::Port, &[]),
+            Ok(Change::Set(1))
+        );
+        assert_eq!(
+            field_change::<u16>(None, "port", ClearField::Port, &[ClearField::Port]),
+            Ok(Change::Clear)
+        );
+        assert_eq!(
+            field_change::<u16>(None, "port", ClearField::Port, &[ClearField::User]),
+            Ok(Change::Keep)
+        );
+        assert_eq!(
+            field_change(Some(1), "port", ClearField::Port, &[ClearField::Port]),
+            Err("--unset port conflicts with --port".into())
+        );
     }
 
     fn test_app() -> (TempDir, App) {

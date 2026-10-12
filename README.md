@@ -14,7 +14,7 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only.
 
-Portico owns only `~/.ssh/portico/config`. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`.
+Portico owns only `~/.ssh/portico/config`. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents.
 
@@ -113,6 +113,8 @@ Clear optional fields with repeatable `--unset`/`-U`. Accepted fields are `user`
 portico edit development -U jump -U port
 ```
 
+Setting and unsetting the same field in one command (for example `--user deploy --unset user`) is rejected.
+
 Inspect and connect:
 
 ```sh
@@ -122,9 +124,9 @@ portico connect development
 portico connect development --new-terminal
 ```
 
-New-terminal connections are launched in the background, so the CLI returns immediately and the TUI remains usable.
+New-terminal connections are handed to `xdg-terminal-exec` in the background, so the CLI returns without waiting for the session and the TUI remains usable. If the launcher fails right away (for example no terminal is available) its exit status is reported; once it has started, Portico can only report that the launch was requested, not whether the SSH session succeeds.
 
-Remove a managed host. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
+Remove a managed host. Unknown and external (read-only) aliases are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
 
 ```sh
 portico remove development
@@ -142,11 +144,17 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `a` | Add a host |
 | `e` | Edit the selected managed host |
 | `x` | Remove the selected managed host |
-| `Delete` | Erase text in a filter or form field |
-| `Backspace` / `Esc` | Cancel or return to the host list |
 | `Enter` | Connect in the current terminal |
-| `n` | Connect in a new terminal |
+| `Ctrl+Enter` / `n` | Connect in a new terminal |
+| `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |
+
+In the filter and the host form, type normally: `Backspace` and `Delete` erase text, `←` / `→` / `Home` / `End` move the cursor, `Enter` applies the filter or saves the form, and `Esc` cancels.
+Form errors appear next to the field they belong to. `ProxyJump` takes `[user@]host[:port]` or an existing alias, with commas between several hops and no spaces.
+
+`Ctrl+Enter` needs a terminal that reports modified keys, such as kitty, WezTerm, Ghostty, or foot, and is only shown in the footer when Portico detects one. `n` works everywhere.
+
+Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it.
 
 External hosts can be inspected and connected to, but Portico will not edit or remove them.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.

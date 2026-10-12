@@ -182,7 +182,7 @@ The TUI is a single master-detail screen:
 - External hosts expose inspect and connect actions only.
 - Destructive removal always requires an in-TUI confirmation.
 
-The primary keyboard actions are movement, `/` to filter, `a` to add, `e` to edit, `x` to remove, Enter to connect in place, `n` to connect in a new terminal, and `q` to quit. The footer always shows context-valid actions. Mouse selection is optional convenience; Ctrl-click is not a v1 contract because terminal emulators handle it inconsistently.
+The primary keyboard actions are movement, `/` to filter, `a` to add, `e` to edit, `x` to remove, Enter to connect in place, `n` (or Ctrl+Enter where the terminal reports it through the kitty keyboard protocol; `n` is the universal fallback) to connect in a new terminal, and `q` to quit. Text fields support Backspace/Delete and cursor movement; Esc cancels. The footer advertises Ctrl+Enter only when the terminal supports it. The footer always shows context-valid actions. Mouse selection is optional convenience; Ctrl-click is not a v1 contract because terminal emulators handle it inconsistently.
 
 If Portico is not initialized, the TUI presents the same initialization preview and confirmation as the CLI before showing host management.
 

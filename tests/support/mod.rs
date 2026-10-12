@@ -40,7 +40,7 @@ impl TestEnv {
         write_executable(
             bin.join("xdg-terminal-exec"),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n[ \"$4\" = 'fail' ] && exit 23\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n[ \"$3\" = 'fail' ] && exit 23\nexit 0\n",
                 log.display()
             ),
         );
