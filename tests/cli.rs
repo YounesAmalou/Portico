@@ -268,3 +268,30 @@ fn remove_validates_the_alias_before_prompting() {
     env.run(["remove", "legacy"])
         .assert_failure_stderr_contains("read-only");
 }
+
+#[test]
+fn blank_or_padded_jump_and_identity_values_are_never_written() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    for (flag, value) in [
+        ("-J", ""),
+        ("-J", " "),
+        ("-J", " bastion"),
+        ("-J", "bastion "),
+        ("-J", "one, two"),
+        ("-i", " "),
+        ("-i", " ~/.ssh/id_dev"),
+        ("-i", "~/.ssh/id_dev "),
+    ] {
+        env.run(["add", "dev", "-H", "dev.example", flag, value])
+            .assert_failure();
+        env.run(["show", "dev"]).assert_failure();
+    }
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    for (flag, value) in [("-J", "bastion "), ("-i", " ")] {
+        env.run(["edit", "dev", flag, value]).assert_failure();
+    }
+    env.run(["show", "dev"])
+        .assert_stdout_contains("dev.example");
+}
