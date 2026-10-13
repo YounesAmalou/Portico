@@ -20,11 +20,43 @@ Private keys remain where they already live. Portico stores identity-file refere
 
 ## Requirements
 
-- Linux
-- A recent stable Rust toolchain with Cargo
+- Linux on x86_64 (verified on Arch Linux; other platforms are on the [roadmap](ROADMAP.md))
 - OpenSSH client tools (`ssh`)
 - `xdg-terminal-exec` for the new-terminal option only
+- Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
+
+## Install
+
+### Release binary
+
+Download the tarball and its checksum from the [latest release](https://github.com/YounesAmalou/Portico/releases/latest), then verify and unpack it:
+
+```sh
+sha256sum -c portico-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf portico-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 portico-vX.Y.Z-x86_64-unknown-linux-gnu/portico ~/.local/bin/portico
+```
+
+Release binaries are built on current Arch Linux, so they need a similarly recent glibc. On an older distribution, install with Cargo instead.
+
+### Cargo
+
+The crate is published as `portico-ssh` and installs the `portico` binary:
+
+```sh
+cargo install portico-ssh
+```
+
+### From source
+
+```sh
+git clone https://github.com/YounesAmalou/Portico
+cd Portico
+cargo install --path .
+```
+
+Then run `portico init` to set up, or `portico` to open the TUI.
 
 ## Run from the repository
 
@@ -163,12 +195,16 @@ Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into
 ## Development checks
 
 ```sh
-cargo test --all-targets
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
+scripts/ci-checks.sh fmt
+scripts/ci-checks.sh clippy
+scripts/ci-checks.sh test
 ```
 
-The automated tests use temporary SSH homes and do not connect to remote machines.
+The same script also runs `msrv`, `audit`, `deny` and `package`, which is what continuous integration runs. The automated tests use temporary SSH homes, do not connect to remote machines, and must run as a regular user. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Contributions are accepted under the same terms.
 
 ## Current scope
 
