@@ -20,24 +20,44 @@ fn required_project_documents_exist() {
 }
 
 #[test]
-fn roadmap_keeps_every_follow_up_slice_from_the_v1_spec() {
+fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
     let spec = read("docs/superpowers/specs/2026-09-13-portico-host-management-design.md");
     let slices = spec
         .split("## Follow-up product slices")
         .nth(1)
         .expect("v1 spec lists follow-up slices");
+    let (pending, delivered) = slices
+        .split_once("### Delivered follow-up slices")
+        .expect("v1 spec records which follow-up slices are delivered");
     let roadmap = read("ROADMAP.md");
 
-    // Every bolded slice title in the spec must survive in the roadmap.
-    let titles: Vec<&str> = slices
-        .split("**")
-        .skip(1)
-        .step_by(2)
-        .map(|title| title.trim_end_matches(':'))
-        .collect();
-    assert!(titles.len() >= 6, "expected six slices, found {titles:?}");
-    for title in titles {
+    fn titles(section: &str) -> Vec<&str> {
+        section
+            .split("**")
+            .skip(1)
+            .step_by(2)
+            .map(|title| title.trim_end_matches(':'))
+            .collect()
+    }
+
+    // Every bolded slice title still pending in the spec must survive in the roadmap.
+    let pending = titles(pending);
+    assert!(
+        pending.len() >= 5,
+        "expected five slices, found {pending:?}"
+    );
+    for title in pending {
         assert!(roadmap.contains(title), "roadmap dropped slice {title:?}");
+    }
+
+    // A delivered slice leaves the roadmap.
+    let delivered = titles(delivered);
+    assert!(delivered.contains(&"TUI refresh"), "found {delivered:?}");
+    for title in delivered {
+        assert!(
+            !roadmap.contains(title),
+            "roadmap still lists delivered slice {title:?}"
+        );
     }
 
     for planned in [

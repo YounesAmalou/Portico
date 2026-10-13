@@ -230,6 +230,28 @@ def check_terminal(scenario):
             for line in ["HostName my.example", "User deploy", "Port 22", "ProxyJump bastion,jump"]:
                 assert line in block, block
             assert 'IdentityFile "~/.ssh/my key"\n' in block, block
+        elif scenario == "refresh":
+            # Edits made outside Portico stay invisible, details included, until `r` re-reads them.
+            read_screen("fail.example")
+            with Path(home, ".ssh/config").open("a") as config:
+                config.write("\nHost external-new\n    HostName new.example\n")
+            Path(home, "resolved-hostname").write_text("changed.example")
+            time.sleep(0.3)
+            assert "external-new" not in screen.text()
+            assert "changed.example" not in screen.text()
+            os.write(master, b"r")
+            read_screen("Refreshed: ")
+            read_screen("external-new")
+            read_screen("changed.example")
+            # A refresh that cannot read the inventory keeps the screen as it was.
+            managed = Path(home, ".ssh/portico/config")
+            managed.chmod(0)
+            os.write(master, b"\x1b[15~")
+            read_screen("Refresh failed")
+            assert "external-new" in screen.text() and "alpha" in screen.text()
+            managed.chmod(0o600)
+            os.write(master, b"r")
+            read_screen("Refreshed: ")
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")
@@ -315,6 +337,11 @@ def check_terminal(scenario):
         if scenario == "interrupt_connection":
             Path(home, "interrupt-connection").unlink(missing_ok=True)
             Path(home, "interrupt-ready").unlink(missing_ok=True)
+        if scenario == "refresh":
+            Path(home, "resolved-hostname").unlink(missing_ok=True)
+            Path(home, ".ssh/portico/config").chmod(0o600)
+            config = Path(home, ".ssh/config")
+            config.write_text(config.read_text().split("\nHost external-new\n")[0])
         if scenario == "launcher_failure":
             Path(home, "fail-launcher").unlink(missing_ok=True)
         if scenario in ["launcher_failure", "ctrl_enter"]:
@@ -325,5 +352,5 @@ def check_terminal(scenario):
         os.close(slave)
 
 
-for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "refresh", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
     check_terminal(scenario)

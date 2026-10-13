@@ -11,7 +11,6 @@ Carried over from the v1 design (`docs/superpowers/specs/2026-09-13-portico-host
 3. **Tunnels:** model local, remote, and dynamic forwards; detect local conflicts; and supervise explicitly started tunnels.
 4. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
 5. **Tool integration:** expose the minimum machine-readable contract required by herdr without granting credential access merely because a host is visible.
-6. **TUI refresh:** add a refresh key that discards cached host details and re-reads the inventory, so edits made outside Portico (including changes to external included configs) appear without restarting. v1 caches details until Portico itself changes the inventory.
 
 ## Production readiness
 

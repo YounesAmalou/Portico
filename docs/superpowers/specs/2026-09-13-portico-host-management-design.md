@@ -232,6 +232,8 @@ Later work retains these requirements without constraining their implementation 
 4. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
 5. **Tool integration:** expose the minimum machine-readable contract required by herdr without granting credential access merely because a host is visible.
 
-6. **TUI refresh:** add a refresh key that discards cached host details and re-reads the inventory, so edits made outside Portico (including changes to external included configs) appear without restarting. v1 caches details until Portico itself changes the inventory.
-
 Each slice requires its own design review before implementation.
+
+### Delivered follow-up slices
+
+- **TUI refresh:** a refresh key that discards cached host details and re-reads the inventory, so edits made outside Portico (including changes to external included configs) appear without restarting. v1 cached details until Portico itself changed the inventory. Designed in `2026-10-14-tui-refresh-design.md`.
