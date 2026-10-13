@@ -25,16 +25,20 @@ CI runs the seven jobs (`fmt`, `clippy`, `test`, `msrv`, `audit`, `deny`, `packa
 
 Release is not triggered by pull requests or pushes to branches. It has two modes:
 
-- **Pushing a `vX.Y.Z` tag** verifies that the tag matches the Cargo version and that `CHANGELOG.md` has a section for it, re-runs CI, builds the Linux x86_64 tarball and checksum, creates the GitHub Release, and publishes `portico-ssh` to crates.io. The publish job uses the `release` environment, where required reviewers can be configured. Publishing cannot be undone.
+- **Pushing a `vX.Y.Z` tag** verifies that the tag matches the Cargo version and that `CHANGELOG.md` has a section for it, re-runs CI, builds the Linux x86_64 tarball and checksum, creates the GitHub Release, and publishes `portico-ssh` to crates.io. The publish job runs in the `release` environment, which holds the crates.io token and requires the maintainer's approval before it starts, and only for tags. `v*` tags are protected: they can only be created by an administrator and can never be moved or deleted. Publishing cannot be undone.
 - **A manual run** (Actions, Release, Run workflow, or `gh workflow run release.yml --ref <branch>`) is a rehearsal: it verifies, runs CI and builds the tarball, but never creates a release or publishes. Use it to test workflow changes from a branch.
 
-CodeQL code scanning and Dependabot are managed in the repository's GitHub settings and appear in the Actions tab; they are not defined by files in this repository.
+CodeQL code scanning is managed in the repository's GitHub settings and appears in the Actions tab; it is not defined by files in this repository. Dependabot (`.github/dependabot.yml`) opens weekly pull requests for GitHub Actions and Cargo dependencies. Every action in the workflows is pinned to commit SHAs, with the version in a trailing comment, and the repository refuses to run an action that is not; update them through Dependabot, or look up the SHA of a release tag.
+
+### Changelog
+
+`CHANGELOG.md` is written by hand, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format: user-visible changes go under `Unreleased` in the pull request that makes them, grouped as Added, Changed, Fixed or Security. Nothing generates or edits it automatically, and CI does not check that a pull request touched it (the pull request template only reminds you). At release time `Unreleased` becomes the version's section, and the release workflow extracts the section for that version with `scripts/changelog-notes.sh` and uses it as the GitHub Release notes. A missing section aborts the release before anything is built.
 
 ### Cutting a release
 
-1. In a pull request, set `version` in `Cargo.toml` and turn `Unreleased` in `CHANGELOG.md` into a `## [X.Y.Z] - date` section.
+1. In a pull request, set `version` in `Cargo.toml`, run `cargo update -p portico-ssh` so `Cargo.lock` carries the same version (the release builds use `--locked` and fail otherwise), and turn `Unreleased` in `CHANGELOG.md` into a `## [X.Y.Z] - date` section above a fresh empty `Unreleased`.
 2. After it merges, tag the merge commit on `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. Watch the run (`gh run watch`). If only `publish` fails, use "Re-run failed jobs": re-running the whole workflow fails at release creation because the release already exists.
+3. The run verifies, checks and builds, then waits at `publish`. Open the run, choose **Review deployments**, select `release` and approve. Watch it with `gh run watch`. If only `publish` fails, use "Re-run failed jobs": re-running the whole workflow fails at release creation because the release already exists.
 4. Verify the GitHub Release and `cargo install portico-ssh` afterwards.
 
 ## Pull requests
@@ -49,4 +53,12 @@ Portico is dual-licensed under MIT OR Apache-2.0. Unless you state otherwise, an
 
 ## Repository settings (maintainers)
 
-Protect `main` and require the CI jobs `fmt`, `clippy`, `test`, `msrv`, `audit`, `deny` and `package` before merging.
+These GitHub settings are not stored in the repository. They are listed here so they can be recreated or audited:
+
+- **`main` branch protection:** pull request required; the seven CI jobs (`fmt`, `clippy`, `test`, `msrv`, `audit`, `deny`, `package`) must pass on an up-to-date branch; conversations must be resolved; force pushes and deletion are blocked; the rules apply to administrators too.
+- **Tag rulesets:** `release tags are immutable` blocks updating and deleting `v*` tags; `only admins create release tags` restricts creating them to the admin role.
+- **`release` environment:** requires the maintainer's approval, accepts deployments only from `v*` tags, and holds `CARGO_REGISTRY_TOKEN` as an environment secret (there is no repository-level copy). Prefer a crates.io token scoped to the `portico-ssh` crate with the `publish-update` scope.
+- **Actions:** read-only default permissions, actions must be pinned to commit SHAs, and first-time contributors' workflows need approval.
+- **Security features:** secret scanning with push protection, Dependabot security updates, and private vulnerability reporting (the channel named in `SECURITY.md`).
+
+Signed commits are not required.

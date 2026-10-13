@@ -17,9 +17,13 @@ Carried over from the v1 design (`docs/superpowers/specs/2026-09-13-portico-host
 
 | Item | Prerequisite |
 |---|---|
-| Automated end-to-end tests with a real OpenSSH and a real terminal in CI | First tagged release |
+| Automated end-to-end tests with a real OpenSSH and a real terminal in CI | Its own design; v0.1.0 is released |
 | aarch64 Linux builds | Native ARM runners in CI |
 | macOS support | The end-to-end tests, and a portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher |
 | Windows support | The same portability work, plus a Windows terminal launcher |
-| AUR package | First tagged release with a published tarball |
+| AUR package | A published release tarball (available since v0.1.0) |
 | Homebrew formula | macOS support |
+| Signed releases and SBOM/provenance attestations | A decision on signing keys and attestation format |
+| Trusted Publishing on crates.io | Configure the trust relationship on crates.io, then switch the publish job to OIDC and delete the stored token |
+| Release automation (a release pull request that bumps the version and changelog) | A commit-message or label convention to derive the changelog from |
+| Replace the initial crates.io token with a crate-scoped token | Maintainer action on crates.io (unnecessary once Trusted Publishing is in place) |
