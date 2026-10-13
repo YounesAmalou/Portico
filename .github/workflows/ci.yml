@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh fmt
+
+  clippy:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh clippy
+
+  test:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh test
+
+  msrv:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh msrv
+
+  audit:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh audit
+
+  deny:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh deny
+
+  package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - uses: actions/checkout@v4
+      - run: scripts/ci-container.sh package

@@ -1,3 +1,24 @@
+# Build output
+/target/
+/dist/
+*.crate
+
+# Local tooling and agent workspaces
 /.superpowers/
 /.worktrees/
-/target/
+/.claude/settings.local.json
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python caches from the PTY test harness
+__pycache__/
+*.pyc
+
+# Logs, editors and OS files
+*.log
+.idea/
+.vscode/
+.DS_Store

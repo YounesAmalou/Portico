@@ -25,7 +25,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -137,7 +137,16 @@ pub fn run(app: &App) -> Result<(), TuiError> {
     browse(app, &mut terminal, &signals, &session)
 }
 
-fn confirm_initialization<B: Backend>(
+/// Clears the alternate screen and forgets what was drawn, so the next frame repaints everything.
+///
+/// Unlike `Terminal::clear`, this never asks the terminal for the cursor position: the
+/// cursor is hidden here, and a terminal that is slow to answer must not abort the interface.
+fn redraw_from_scratch<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))
+}
+
+fn confirm_initialization<B: Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
     plan: &InitPlan,
     terminated: &AtomicBool,
@@ -167,7 +176,7 @@ fn confirm_initialization<B: Backend>(
     }
 }
 
-fn browse<B: Backend>(
+fn browse<B: Backend<Error = io::Error>>(
     app: &App,
     terminal: &mut Terminal<B>,
     signals: &Signals,
@@ -181,7 +190,7 @@ fn browse<B: Backend>(
     })
 }
 
-fn browse_hosts<B: Backend>(
+fn browse_hosts<B: Backend<Error = io::Error>>(
     app: &App,
     terminal: &mut Terminal<B>,
     signals: &Signals,
@@ -261,7 +270,7 @@ fn browse_hosts<B: Backend>(
                     match result {
                         Err(TuiError::Io(error)) => return Err(TuiError::Io(error)),
                         result => {
-                            terminal.clear()?;
+                            redraw_from_scratch(terminal)?;
                             result
                         }
                     }
@@ -2918,6 +2927,27 @@ mod tests {
             crate::openssh::OpenSsh::new(ssh, "/usr/bin/false".into()),
         );
         (app, log)
+    }
+
+    #[test]
+    fn redraw_from_scratch_repaints_a_screen_the_terminal_lost() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new("portico"), frame.area()))
+                .unwrap();
+        };
+        draw(&mut terminal);
+        // The terminal forgot the frame, as after leaving and re-entering the alternate screen.
+        terminal.backend_mut().clear().unwrap();
+        draw(&mut terminal);
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+
+        terminal.backend_mut().clear().unwrap();
+        redraw_from_scratch(&mut terminal).unwrap();
+        draw(&mut terminal);
+
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "p");
     }
 
     fn summary_of(app: &App, alias: &str) -> HostSummary {
