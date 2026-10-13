@@ -7,7 +7,8 @@ Spec: `docs/superpowers/specs/2026-10-14-aur-package-design.md`.
 3. Exclude `packaging/` from the crates.io package and extend `tests/package.rs`.
 4. Document: README, CONTRIBUTING release step 5, CHANGELOG, ROADMAP.
 5. Add the PKGBUILD and documentation tests to `tests/docs.rs`.
-6. Run `scripts/ci-checks.sh` checks as a regular user and open a pull request.
+6. Add `scripts/aur-publish.sh`, the pinned AUR host key, the `aur` environment and the `aur` release job; rehearse the script in an Arch container against a local bare repository (first publish, then an idempotent re-run).
+7. Run `scripts/ci-checks.sh` checks as a regular user and open a pull request.
 
 ## Deviations from this plan
 

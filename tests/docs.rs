@@ -88,7 +88,7 @@ fn security_policy_names_a_private_reporting_channel() {
 #[test]
 fn manual_runs_never_release_or_publish() {
     let workflow = read(".github/workflows/release.yml");
-    for job in ["release", "publish"] {
+    for job in ["release", "publish", "aur"] {
         let section = workflow
             .split(&format!("\n  {job}:\n"))
             .nth(1)
@@ -272,9 +272,10 @@ fn aur_package_builds_the_tagged_source_and_installs_the_binary() {
 
 #[test]
 fn aur_update_script_and_release_steps_are_documented() {
-    let script = read("scripts/aur-update.sh");
-    assert!(script.contains("makepkg --printsrcinfo"));
-    assert!(script.contains("sha256sum"));
+    let update = read("scripts/aur-update.sh");
+    assert!(update.contains("makepkg --printsrcinfo"));
+    assert!(update.contains("sha256sum"));
+    assert!(read("scripts/aur-publish.sh").contains("StrictHostKeyChecking=yes"));
 
     let contributing = read("CONTRIBUTING.md");
     for explained in [
@@ -287,4 +288,34 @@ fn aur_update_script_and_release_steps_are_documented() {
         );
     }
     assert!(read("README.md").contains("yay -S portico"));
+}
+
+#[test]
+fn aur_and_crates_publishing_are_independent_jobs_with_separate_secrets() {
+    let workflow = read(".github/workflows/release.yml");
+    let section = |job: &str| {
+        workflow
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("release workflow has no {job} job"))
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let aur = section("aur");
+    let publish = section("publish");
+    assert!(aur.contains("environment: aur") && aur.contains("AUR_SSH_PRIVATE_KEY"));
+    assert!(publish.contains("environment: release") && publish.contains("CARGO_REGISTRY_TOKEN"));
+    assert!(!aur.contains("CARGO_REGISTRY_TOKEN") && !publish.contains("AUR_SSH_PRIVATE_KEY"));
+    for (name, needs) in [("aur", &aur), ("publish", &publish)] {
+        assert!(
+            !needs.contains("publish]")
+                && !needs.contains("aur]")
+                && !needs.contains("needs: publish")
+                && !needs.contains("needs: aur"),
+            "{name} must not depend on the other publishing job"
+        );
+    }
+    assert!(read("packaging/aur/known_hosts").contains("ssh-ed25519"));
 }
