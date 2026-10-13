@@ -12,7 +12,6 @@ The TUI reads the host inventory once at startup and afterwards only when Portic
 - **Status:** a successful refresh shows `Refreshed: N hosts`, using the singular for one. The count is the number of hosts in the inventory, not the number matching the filter.
 - **Errors:** if the inventory cannot be read (unreadable or unparsable file, incomplete discovery), the UI state is untouched: the old list, selection, filter and cached details stay, and the status line shows `Refresh failed: <error>`. Nothing is discarded unless the new inventory was read.
 - **Scope:** the CLI reads files on every invocation and has no cache, so it gains nothing. Refresh never writes any file and does not re-run initialization.
-- **Pending edit:** if `e` was pressed before details loaded, refresh does not drop that intent; the edit form opens when the details of the refreshed host arrive, like any other resolution.
 
 ## Testing
 
