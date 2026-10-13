@@ -90,3 +90,27 @@ fn security_policy_describes_the_include_edit_accurately() {
     assert!(policy.contains("inserts an `Include` line as the first line"));
     assert!(!policy.contains("rewrites the first line"));
 }
+
+#[test]
+fn contributing_documents_every_workflow_and_how_it_is_triggered() {
+    let contributing = read("CONTRIBUTING.md");
+    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    for entry in fs::read_dir(workflows).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        assert!(
+            contributing.contains(&name),
+            "CONTRIBUTING.md does not document workflows/{name}"
+        );
+    }
+    for explained in [
+        "pull request",
+        "pushing a `vX.Y.Z` tag",
+        "manual run",
+        "never creates a release or publishes",
+    ] {
+        assert!(
+            contributing.contains(explained),
+            "CONTRIBUTING.md does not explain: {explained}"
+        );
+    }
+}

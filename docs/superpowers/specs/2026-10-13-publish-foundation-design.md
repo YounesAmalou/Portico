@@ -31,7 +31,7 @@ End-to-end test suite, cross-OS/architecture support and the process-control por
 
 ## Constraints and risks
 
-- The release workflow's crates.io token and any publish step are configured by the maintainer; Claude does not create secrets or publish. The first tag is pushed by the maintainer after reviewing the release dry run.
+- The release workflow's crates.io token and any publish step are configured by the maintainer; Claude does not create secrets or publish. The first tag is pushed by the maintainer after reviewing a manual release rehearsal.
 - The package rename changes `Cargo.toml` and any references to the crate name in docs and tests; behaviour is unchanged and the existing test suite must still pass.
 - CI must be deterministic: tests that depend on a real terminal or `xdg-terminal-exec` use the existing fakes; the PTY harness must pass in a container without a display.
 - Branch protection and required checks are recommended in `CONTRIBUTING.md` but are repository settings applied by the maintainer.
@@ -40,5 +40,5 @@ End-to-end test suite, cross-OS/architecture support and the process-control por
 
 - All CI jobs pass on a pull request branch before merge.
 - `cargo package --list` shows only intended files and `cargo publish --dry-run` succeeds.
-- The release workflow is exercised on a pre-release tag or via workflow dispatch in dry-run mode that stops before publishing; artifact contents and checksum are inspected.
+- The release workflow is exercised by a manual run (`workflow_dispatch`), which verifies, runs CI and builds the tarball but never creates a release or publishes because those jobs require a pushed tag; artifact contents and checksum are inspected.
 - A clean-machine smoke test installs from the tarball and from `cargo install --path .`, then runs `portico --version` and `portico init` in an isolated `HOME`.
