@@ -7,6 +7,10 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- AUR package `portico`, built from the tagged source (`yay -S portico`).
+
 ## [0.1.0] - 2026-10-13
 
 First public release.

@@ -21,7 +21,8 @@ Carried over from the v1 design (`docs/superpowers/specs/2026-09-13-portico-host
 | aarch64 Linux builds | Native ARM runners in CI |
 | macOS support | The end-to-end tests, and a portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher |
 | Windows support | The same portability work, plus a Windows terminal launcher |
-| AUR package | A published release tarball (available since v0.1.0) |
+| AUR package `portico-bin` (prebuilt binary) | Demand for faster installs; the source package `portico` ships first |
+| Automatic TUI refresh | Its own design: watch `~/.ssh/config` and every included file (or poll modification times), debounce editors that save by renaming, and never reshuffle the list while a form is open; manual `r`/`F5` ships first |
 | Homebrew formula | macOS support |
 | Signed releases and SBOM/provenance attestations | A decision on signing keys and attestation format |
 | Trusted Publishing on crates.io | Configure the trust relationship on crates.io, then switch the publish job to OIDC and delete the stored token |

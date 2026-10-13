@@ -224,3 +224,47 @@ fn the_publish_plan_records_where_the_work_deviated() {
         );
     }
 }
+
+#[test]
+fn aur_package_builds_the_tagged_source_and_installs_the_binary() {
+    let pkgbuild = read("packaging/aur/PKGBUILD");
+    for expected in [
+        "pkgname=portico\n",
+        "license=('MIT' 'Apache-2.0')",
+        "depends=('openssh'",
+        "makedepends=('cargo')",
+        "/archive/refs/tags/v$pkgver.tar.gz",
+        "cargo fetch --locked",
+        "cargo build --frozen --release",
+        "install -Dm755 target/release/portico \"$pkgdir/usr/bin/portico\"",
+        "LICENSE-MIT LICENSE-APACHE",
+    ] {
+        assert!(pkgbuild.contains(expected), "PKGBUILD lacks {expected}");
+    }
+    assert!(
+        !pkgbuild.contains("sha256sums=('SKIP')"),
+        "the source archive must be pinned by checksum"
+    );
+
+    let srcinfo = read("packaging/aur/.SRCINFO");
+    assert!(srcinfo.contains("pkgbase = portico"));
+}
+
+#[test]
+fn aur_update_script_and_release_steps_are_documented() {
+    let script = read("scripts/aur-update.sh");
+    assert!(script.contains("makepkg --printsrcinfo"));
+    assert!(script.contains("sha256sum"));
+
+    let contributing = read("CONTRIBUTING.md");
+    for explained in [
+        "scripts/aur-update.sh X.Y.Z",
+        "aur.archlinux.org/portico.git",
+    ] {
+        assert!(
+            contributing.contains(explained),
+            "CONTRIBUTING.md lacks {explained}"
+        );
+    }
+    assert!(read("README.md").contains("yay -S portico"));
+}
