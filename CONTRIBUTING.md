@@ -10,7 +10,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-The tests use temporary SSH homes and never connect to remote machines. The terminal tests need `python3` and OpenSSH installed. Continuous integration runs these same checks, plus `cargo audit`, `cargo deny`, a minimum-Rust-version check and `cargo package`.
+The tests use temporary SSH homes and never connect to remote machines. The terminal tests need `python3` and OpenSSH installed, and the suite must run as a regular user: several tests prove that Portico refuses unreadable or unwritable SSH files, which root can always access. `scripts/ci-container.sh <check>` runs a CI check as an unprivileged user from inside a root container. Continuous integration runs these same checks, plus `cargo audit`, `cargo deny`, a minimum-Rust-version check and `cargo package`.
 
 ## Pull requests
 
