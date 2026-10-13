@@ -16,7 +16,7 @@ Publish Portico v0.1 as a public, installable, continuously verified open-source
 ### Included
 
 1. **Repository hygiene:** license files, complete Cargo metadata (description, license, repository, homepage, readme, keywords, categories, `rust-version`, `exclude` for non-package files), `CHANGELOG.md` (Keep a Changelog), `CONTRIBUTING.md`, `SECURITY.md` (private reporting channel, scope: Portico edits `~/.ssh/config`), issue and PR templates.
-2. **CI** on every push and pull request, on Arch Linux x86_64 in a container, with cached Cargo artifacts:
+2. **CI** on every push and pull request, on Arch Linux x86_64 in a container, as an unprivileged user (permission tests cannot pass as root):
    - `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets` including PTY acceptance tests (requires OpenSSH and Python 3 in the image).
    - Minimum supported Rust version check at the declared `rust-version`.
    - `cargo audit` and `cargo deny` (licenses limited to those compatible with MIT/Apache-2.0, advisories, duplicate sources).

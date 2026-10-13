@@ -10,6 +10,17 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-13-publish-foundation-design.md` (also read `docs/superpowers/specs/2026-09-13-portico-host-management-design.md`, section "Follow-up product slices").
 
+## Deviations from this plan
+
+Recorded after execution; the original text below is kept as written.
+
+- **Minimum Rust version:** `rust-version = "1.88"`, not 1.85. The dependency tree requires 1.88, found by rehearsing the MSRV check.
+- **Dependencies:** `ratatui` 0.30 and `crossterm` 0.29 replace 0.29 and 0.28. `cargo deny` rejected the unmaintained `paste` and unsound `lru` that 0.29 pulled in. `Terminal::clear` in 0.30 queries the cursor, so the TUI redraws with `redraw_from_scratch` instead.
+- **CI:** jobs run through `scripts/ci-container.sh` as a non-root user, because four permission tests cannot pass as root. `rust-cache` was dropped. Hygiene tests that read unpublished files are excluded from the package.
+- **Release workflow:** a manual run has no inputs; it always only verifies, checks and builds, and `release` and `publish` require a pushed tag. Release builds are stripped by Cargo, and `publish` runs in the `release` environment.
+- **Test fixes found by CI:** the PTY harness treats zombies as dead (containers whose PID 1 never reaps), and the process-tree test waits for descendants to die instead of asserting the instant cancellation returns.
+- **Afterwards:** actions were pinned to commit SHAs with Dependabot added, and the repository settings listed in `CONTRIBUTING.md` were applied.
+
 ## Global Constraints
 
 - License: `MIT OR Apache-2.0`; files `LICENSE-MIT` and `LICENSE-APACHE`; copyright holder `Younes A. Amalou` (handle `Yousen` allowed in `authors` and README credits only).

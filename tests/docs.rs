@@ -166,3 +166,61 @@ fn contributing_explains_who_can_publish() {
         );
     }
 }
+
+#[test]
+fn contributing_describes_the_changelog_and_every_release_step() {
+    let contributing = read("CONTRIBUTING.md");
+    for explained in [
+        // The changelog is written by hand; the workflow only reads it.
+        "written by hand",
+        "extracts the section",
+        // A version bump must keep the lock file in step, or `--locked` builds fail.
+        "Cargo.lock",
+        "cargo update -p portico-ssh",
+        // The publish job waits for a human.
+        "Review deployments",
+        // The settings that protect the release are recorded so they can be recreated.
+        "release tags are immutable",
+        "only admins create release tags",
+        "CARGO_REGISTRY_TOKEN",
+        "private vulnerability reporting",
+    ] {
+        assert!(
+            contributing.contains(explained),
+            "CONTRIBUTING.md does not explain: {explained}"
+        );
+    }
+}
+
+#[test]
+fn roadmap_records_the_release_follow_ups_and_no_longer_waits_for_the_first_release() {
+    let roadmap = read("ROADMAP.md");
+    for planned in [
+        "Signed releases",
+        "Trusted Publishing",
+        "Release automation",
+        "crate-scoped token",
+    ] {
+        assert!(roadmap.contains(planned), "roadmap lacks {planned}");
+    }
+    assert!(
+        !roadmap.contains("First tagged release"),
+        "v0.1.0 is released; the roadmap must not wait for it"
+    );
+}
+
+#[test]
+fn the_publish_plan_records_where_the_work_deviated() {
+    let plan = read("docs/superpowers/plans/2026-10-13-publish-foundation.md");
+    for deviation in [
+        "rust-version = \"1.88\"",
+        "ratatui",
+        "non-root",
+        "manual run",
+    ] {
+        assert!(
+            plan.contains(deviation),
+            "the plan does not record the deviation: {deviation}"
+        );
+    }
+}
