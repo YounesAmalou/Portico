@@ -224,7 +224,7 @@ if [ "$1" = '-G' ]; then
     : > "$HOME/resolver-started"
     sleep 4
   fi
-  printf 'hostname fail.example\nport 22\n'
+  printf 'hostname %s\nport 22\n' "$(cat "$HOME/resolved-hostname" 2>/dev/null || echo fail.example)"
   exit 0
 fi
 if [ -f "$HOME/block-connection" ]; then
