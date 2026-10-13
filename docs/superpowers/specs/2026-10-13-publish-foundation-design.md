@@ -6,7 +6,7 @@ Publish Portico v0.1 as a public, installable, continuously verified open-source
 
 ## Decisions
 
-- **License:** dual `MIT OR Apache-2.0`, copyright Younes Amalou. SPDX expression `MIT OR Apache-2.0`. Files `LICENSE-MIT` and `LICENSE-APACHE`; contributions are accepted under the same terms.
+- **License:** dual `MIT OR Apache-2.0`, copyright Younes A. Amalou (the legal name; the public handle Yousen may appear in `authors` and README credits). SPDX expression `MIT OR Apache-2.0`. Files `LICENSE-MIT` and `LICENSE-APACHE`; contributions are accepted under the same terms.
 - **Names:** GitHub repository `Portico`; crates.io package `portico-ssh` (the name `portico` is taken by an unrelated crate); installed binary `portico` via an explicit `[[bin]]` entry; library crate name unchanged unless the package rename requires it.
 - **Targets for this slice:** Linux x86_64, verified on Arch Linux (Omarchy's base). Other targets are roadmap items.
 - **Version:** first public release is `0.1.0`, under Semantic Versioning, pre-1.0 so minor versions may break.
