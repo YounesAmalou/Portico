@@ -56,7 +56,15 @@ fn published_crate_contains_only_intended_files() {
             "{expected} missing from {files:?}"
         );
     }
-    for forbidden in [".superpowers", ".worktrees", "target/", "docs/superpowers"] {
+    // Repository-hygiene tests read files that are not published, so they must not ship either.
+    for forbidden in [
+        ".superpowers",
+        ".worktrees",
+        "target/",
+        "docs/superpowers",
+        "tests/docs.rs",
+        "tests/package.rs",
+    ] {
         assert!(
             !files.iter().any(|file| file.starts_with(forbidden)),
             "{forbidden} must not be published: {files:?}"

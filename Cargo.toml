@@ -11,7 +11,14 @@ readme = "README.md"
 authors = ["Younes A. Amalou (Yousen)"]
 keywords = ["ssh", "tui", "openssh", "cli", "config"]
 categories = ["command-line-utilities"]
-exclude = [".superpowers/", ".worktrees/", "docs/superpowers/", ".github/"]
+exclude = [
+    ".superpowers/",
+    ".worktrees/",
+    "docs/superpowers/",
+    ".github/",
+    "tests/docs.rs",
+    "tests/package.rs",
+]
 
 [lib]
 name = "portico"

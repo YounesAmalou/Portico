@@ -51,7 +51,7 @@ jobs:
           path: dist/*
 
   release:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -73,7 +73,7 @@ jobs:
           --title "Portico $GITHUB_REF_NAME" --notes-file notes.md
 
   publish:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: release
     runs-on: ubuntu-latest
     environment: release
