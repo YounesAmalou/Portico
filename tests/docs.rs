@@ -64,3 +64,29 @@ fn security_policy_names_a_private_reporting_channel() {
     assert!(policy.contains("private"));
     assert!(policy.contains("~/.ssh/config"));
 }
+
+#[test]
+fn manual_runs_never_release_or_publish() {
+    let workflow = read(".github/workflows/release.yml");
+    for job in ["release", "publish"] {
+        let section = workflow
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("release workflow has no {job} job"))
+            .split("\n\n")
+            .next()
+            .unwrap();
+        assert!(
+            section.contains("github.event_name == 'push'")
+                && section.contains("github.ref_type == 'tag'"),
+            "{job} must require a pushed tag, not a manual run on a tag ref"
+        );
+    }
+}
+
+#[test]
+fn security_policy_describes_the_include_edit_accurately() {
+    let policy = read("SECURITY.md");
+    assert!(policy.contains("inserts an `Include` line as the first line"));
+    assert!(!policy.contains("rewrites the first line"));
+}
