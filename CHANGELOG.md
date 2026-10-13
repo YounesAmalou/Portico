@@ -10,6 +10,13 @@ may contain breaking changes.
 ### Added
 
 - AUR package `portico`, built from the tagged source (`yay -S portico`), updated by the release workflow in its own job, independent of the crates.io publish.
+
+## [0.2.1] - 2026-10-13
+
+The `v0.2.0` tag was pushed before the version was bumped, so its release failed and published nothing; tags are immutable, so this release supersedes it.
+
+### Added
+
 - TUI refresh (`r` or `F5`) re-reads the host inventory and discards cached host details, so edits made outside Portico, including changes to included configs, appear without restarting. The selection and filter are kept, and a failed read leaves the list untouched and reports the error.
 
 ## [0.1.0] - 2026-10-13
