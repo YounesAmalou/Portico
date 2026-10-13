@@ -66,6 +66,16 @@ binary, home, fake_bin = sys.argv[1:]
 environment = dict(os.environ, HOME=home, PATH=fake_bin + os.pathsep + os.environ["PATH"])
 
 
+def is_running(pid):
+    """Whether `pid` can still run. A zombie is dead: containers whose PID 1 never reaps
+    orphans (as in CI) leave killed processes behind as zombies that signals still reach."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
 def check_terminal(scenario):
     scenario_home = Path(home, "uninitialized") if scenario == "blocked_init_lock" else Path(home)
     held_lock = None
@@ -280,11 +290,7 @@ def check_terminal(scenario):
             shell, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())
             for pid in [shell, parent, worker, child]:
                 deadline = time.monotonic() + 1
-                while True:
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        break
+                while is_running(pid):
                     assert time.monotonic() < deadline, f"connection process survived: {pid}"
                     time.sleep(0.01)
         print(f"PTY restored: {scenario}")
