@@ -14,6 +14,8 @@
 
 Recorded after execution; the original text below is kept as written.
 
+- The crates.io environment was later renamed `crates` (beside `aur`) and the required approval removed: release tags can only be created by an administrator, and a pushed tag is the approval.
+
 - **Minimum Rust version:** `rust-version = "1.88"`, not 1.85. The dependency tree requires 1.88, found by rehearsing the MSRV check.
 - **Dependencies:** `ratatui` 0.30 and `crossterm` 0.29 replace 0.29 and 0.28. `cargo deny` rejected the unmaintained `paste` and unsound `lru` that 0.29 pulled in. `Terminal::clear` in 0.30 queries the cursor, so the TUI redraws with `redraw_from_scratch` instead.
 - **CI:** jobs run through `scripts/ci-container.sh` as a non-root user, because four permission tests cannot pass as root. `rust-cache` was dropped. Hygiene tests that read unpublished files are excluded from the package.

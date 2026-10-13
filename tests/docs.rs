@@ -175,7 +175,7 @@ fn dependabot_keeps_actions_and_cargo_dependencies_current() {
 fn contributing_explains_who_can_publish() {
     let contributing = read("CONTRIBUTING.md");
     for explained in [
-        "requires the maintainer's approval",
+        "can only be created by an administrator",
         "`v*` tags are protected",
         "pinned to commit SHAs",
         "Dependabot",
@@ -197,8 +197,6 @@ fn contributing_describes_the_changelog_and_every_release_step() {
         // A version bump must keep the lock file in step, or `--locked` builds fail.
         "Cargo.lock",
         "cargo update -p portico-ssh",
-        // The publish job waits for a human.
-        "Review deployments",
         // The settings that protect the release are recorded so they can be recreated.
         "release tags are immutable",
         "only admins create release tags",
@@ -307,7 +305,7 @@ fn aur_and_crates_publishing_are_independent_jobs_with_separate_secrets() {
     let aur = section("aur");
     let publish = section("publish");
     assert!(aur.contains("environment: aur") && aur.contains("AUR_SSH_PRIVATE_KEY"));
-    assert!(publish.contains("environment: release") && publish.contains("CARGO_REGISTRY_TOKEN"));
+    assert!(publish.contains("environment: crates") && publish.contains("CARGO_REGISTRY_TOKEN"));
     assert!(!aur.contains("CARGO_REGISTRY_TOKEN") && !publish.contains("AUR_SSH_PRIVATE_KEY"));
     for (name, needs) in [("aur", &aur), ("publish", &publish)] {
         assert!(
