@@ -8,6 +8,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-14-tui-refresh-design.md` (v1 requirements in `2026-09-13-portico-host-management-design.md` are unchanged).
 
+## Deviations from this plan
+
+Recorded after execution; the original text below is kept as written.
+
+- The PTY scenario is named `refresh`. It appends the new host to `~/.ssh/config` and changes what the `ssh -G` fake answers (through a `resolved-hostname` file) instead of editing an included file, and it makes the managed file unreadable (`chmod 0`) instead of corrupting it. Both go through the same `App::hosts()` read.
+- `tests/docs.rs` splits the v1 spec at a new `### Delivered follow-up slices` heading rather than listing a delivered title in the follow-up list.
+- The minimum-Rust-version check could not run offline (the toolchain download failed); the other checks passed.
+
 ## Global Constraints
 
 - No change to the CLI, the managed file or the `App` API.
