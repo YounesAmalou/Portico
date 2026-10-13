@@ -19,7 +19,7 @@ Let Arch Linux users install Portico with `yay -S portico`, without having Rust 
 
 1. `packaging/aur/PKGBUILD` and `.SRCINFO`, excluded from the crates.io package.
 2. `scripts/aur-update.sh <version>`: downloads the tag archive, pins its checksum, resets `pkgrel`, regenerates `.SRCINFO`. It runs after the tag exists, because the archive does not exist before.
-3. Documentation: README install section, CONTRIBUTING release step 5, CHANGELOG, ROADMAP (the AUR package moves out; `portico-bin` and automatic TUI refresh are recorded).
+3. Documentation: README install section, CONTRIBUTING release step 5, CHANGELOG, ROADMAP (the AUR package moves out; `portico-bin` and live inventory reload are recorded).
 4. Tests in `tests/docs.rs` guard the PKGBUILD's shape and the documented steps.
 
 ## Maintainer actions
