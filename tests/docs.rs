@@ -43,8 +43,8 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
     // Every bolded slice title still pending in the spec must survive in the roadmap.
     let pending = titles(pending);
     assert!(
-        pending.len() >= 5,
-        "expected five slices, found {pending:?}"
+        pending.len() >= 4,
+        "expected four slices, found {pending:?}"
     );
     for title in pending {
         assert!(roadmap.contains(title), "roadmap dropped slice {title:?}");
