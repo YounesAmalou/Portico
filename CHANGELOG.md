@@ -11,9 +11,9 @@ may contain breaking changes.
 
 - AUR package `portico`, built from the tagged source (`yay -S portico`), updated by the release workflow in its own job, independent of the crates.io publish.
 
-## [0.2.1] - 2026-10-13
+## [0.2.3] - 2026-10-14
 
-The `v0.2.0` tag was pushed before the version was bumped, so its release failed and published nothing; tags are immutable, so this release supersedes it.
+The `v0.2.0`, `v0.2.1` and `v0.2.2` tags were pushed on commits whose `Cargo.toml` version did not match, so their releases failed and published nothing; tags are immutable, so this release supersedes them.
 
 ### Added
 
