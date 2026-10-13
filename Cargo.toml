@@ -1,7 +1,24 @@
 [package]
-name = "portico"
+name = "portico-ssh"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Keyboard-first terminal UI and CLI for managing OpenSSH hosts without taking over OpenSSH"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/YounesAmalou/Portico"
+homepage = "https://github.com/YounesAmalou/Portico"
+readme = "README.md"
+authors = ["Younes A. Amalou (Yousen)"]
+keywords = ["ssh", "tui", "openssh", "cli", "config"]
+categories = ["command-line-utilities"]
+exclude = [".superpowers/", ".worktrees/", "docs/superpowers/", ".github/"]
+
+[lib]
+name = "portico"
+
+[[bin]]
+name = "portico"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
