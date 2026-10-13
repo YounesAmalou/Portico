@@ -272,7 +272,8 @@ def check_terminal(scenario):
         else:
             assert b"\x1b[<1u" not in transcript
         read_until(b"\x1b[?25h", left)
-        assert process.wait(timeout=5) == 0, f"{scenario}: {transcript!r}"
+        status = process.wait(timeout=5)
+        assert status == 0, f"{scenario}: exit status {status}: {transcript!r}"
         assert termios.tcgetattr(slave) == before, f"{scenario}: termios was not restored"
         assert b"\x1b[?1049l" in transcript[start:]
         if scenario == "blocked_connection":

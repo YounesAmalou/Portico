@@ -51,7 +51,10 @@ fn published_crate_contains_only_intended_files() {
     let files: Vec<&str> = files.lines().collect();
 
     for expected in ["LICENSE-MIT", "LICENSE-APACHE", "README.md", "src/main.rs"] {
-        assert!(files.contains(&expected), "{expected} missing from {files:?}");
+        assert!(
+            files.contains(&expected),
+            "{expected} missing from {files:?}"
+        );
     }
     for forbidden in [".superpowers", ".worktrees", "target/", "docs/superpowers"] {
         assert!(
