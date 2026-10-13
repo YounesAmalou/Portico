@@ -289,6 +289,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Err(error) => error.to_string(),
                 });
             }
+            UiAction::Refresh => inventory_changed = apply_refresh(&mut state, || app.hosts()),
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
                 let result = app.add_cancellable(host, terminated);
@@ -381,6 +382,29 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
         | AppError::UnknownHost(_)
         | AppError::AliasCollision(_)
         | AppError::IncompleteDiscovery(_) => false,
+    }
+}
+
+/// Re-reads the inventory on request, so changes made outside Portico appear. Returns whether
+/// the inventory was replaced, which makes the caller discard the cached details. A failed read
+/// leaves everything as it was and only reports why.
+fn apply_refresh<E, F>(state: &mut UiState, read: F) -> bool
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<HostInventory, E>,
+{
+    match read() {
+        Ok(inventory) => {
+            let count = inventory.hosts.len();
+            state.replace_hosts(inventory);
+            let noun = if count == 1 { "host" } else { "hosts" };
+            state.status = Some(format!("Refreshed: {count} {noun}"));
+            true
+        }
+        Err(error) => {
+            state.status = Some(format!("Refresh failed: {error}"));
+            false
+        }
     }
 }
 
@@ -978,6 +1002,7 @@ enum UiAction {
     Add(Host),
     Edit { alias: String, changes: HostChanges },
     Remove(String),
+    Refresh,
 }
 
 impl UiState {
@@ -1053,8 +1078,18 @@ impl UiState {
         self.warnings = inventory.warnings;
         self.selected = None;
         self.refilter();
+        // The same row if it survived, otherwise the host of that name wherever it is now defined.
         if let Some(selected) = selected
-            && let Some(index) = self.hosts.iter().position(|host| host == &selected)
+            && let Some(index) = self
+                .hosts
+                .iter()
+                .position(|host| host == &selected)
+                .or_else(|| {
+                    self.hosts
+                        .iter()
+                        .position(|host| host.alias.eq_ignore_ascii_case(&selected.alias))
+                })
+                .filter(|index| self.visible.contains(index))
         {
             self.selected = Some(index);
         }
@@ -1111,6 +1146,7 @@ impl UiState {
                 return self.connect_action(true);
             }
             KeyCode::Char('n') => return self.connect_action(true),
+            KeyCode::Char('r') | KeyCode::F(5) => return UiAction::Refresh,
             KeyCode::Char('q') => return UiAction::Quit,
             _ => {}
         }
@@ -1487,6 +1523,7 @@ fn footer_text(state: &UiState) -> String {
             } else {
                 "n new terminal"
             };
+            let refresh = "r refresh";
             let connect = format!("Enter connect  {new_terminal}  q quit");
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -1499,15 +1536,19 @@ fn footer_text(state: &UiState) -> String {
                         .selected_details()
                         .is_some_and(|details| details.declared.is_some()) =>
                 {
-                    format!("↑↓ move  / filter{clear_filter}  a add  e edit  x remove  {connect}")
+                    format!(
+                        "↑↓ move  / filter{clear_filter}  a add  e edit  x remove  {refresh}  {connect}"
+                    )
                 }
                 Some(Ownership::Managed) => {
-                    format!("↑↓ move  / filter{clear_filter}  a add  x remove  {connect}")
+                    format!(
+                        "↑↓ move  / filter{clear_filter}  a add  x remove  {refresh}  {connect}"
+                    )
                 }
                 Some(Ownership::External) => {
-                    format!("↑↓ move  / filter{clear_filter}  a add  {connect}")
+                    format!("↑↓ move  / filter{clear_filter}  a add  {refresh}  {connect}")
                 }
-                None => format!("/ filter{clear_filter}  a add  q quit"),
+                None => format!("/ filter{clear_filter}  a add  {refresh}  q quit"),
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -2001,6 +2042,157 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
 
         assert!(text.contains("quit"), "{text}");
+    }
+
+    fn inventory(hosts: Vec<HostSummary>) -> HostInventory {
+        HostInventory {
+            hosts,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn summary_in(alias: &str, ownership: Ownership, source: &str) -> HostSummary {
+        HostSummary {
+            source: PathBuf::from(source),
+            ..summary(alias, ownership)
+        }
+    }
+
+    #[test]
+    fn r_and_f5_refresh_in_browse_mode_only() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert_eq!(press(&mut state, KeyCode::Char('r')), UiAction::Refresh);
+        assert_eq!(press(&mut state, KeyCode::F(5)), UiAction::Refresh);
+
+        press(&mut state, KeyCode::Char('/'));
+        assert_eq!(press(&mut state, KeyCode::Char('r')), UiAction::None);
+        assert_eq!(state.filter.as_str(), "r");
+        assert_eq!(press(&mut state, KeyCode::F(5)), UiAction::None);
+
+        press(&mut state, KeyCode::Esc);
+        press(&mut state, KeyCode::Char('a'));
+        assert_eq!(press(&mut state, KeyCode::Char('r')), UiAction::None);
+        assert_eq!(state.form.values[0].as_str(), "r");
+        assert_eq!(press(&mut state, KeyCode::F(5)), UiAction::None);
+    }
+
+    #[test]
+    fn footer_advertises_refresh_with_and_without_a_selection() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("legacy", Ownership::External),
+        ]);
+        assert!(rendered(&state).contains("r refresh"));
+        state.selected = Some(1);
+        assert!(rendered(&state).contains("r refresh"));
+        state.set_filter("missing");
+        assert!(rendered(&state).contains("r refresh"));
+    }
+
+    #[test]
+    fn refresh_replaces_the_inventory_and_its_warnings() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        let mut fresh = inventory(vec![
+            summary("dev", Ownership::Managed),
+            summary("added", Ownership::External),
+        ]);
+        fresh.warnings = vec![DiscoveryWarning::Include {
+            path: PathBuf::from("/home/test/.ssh/missing"),
+            message: "unreadable".into(),
+        }];
+
+        assert!(apply_refresh(&mut state, || Ok::<_, String>(fresh)));
+
+        assert_eq!(state.hosts.len(), 2);
+        assert_eq!(state.warnings.len(), 1);
+        assert_eq!(state.selected_alias(), Some("dev"));
+        assert_eq!(state.status.as_deref(), Some("Refreshed: 2 hosts"));
+    }
+
+    #[test]
+    fn refresh_status_counts_every_host_and_is_singular_for_one() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.set_filter("nomatch");
+        apply_refresh(&mut state, || {
+            Ok::<_, String>(inventory(vec![summary("dev", Ownership::Managed)]))
+        });
+        assert_eq!(state.status.as_deref(), Some("Refreshed: 1 host"));
+        assert_eq!(state.filter.as_str(), "nomatch");
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn refresh_keeps_the_selected_host_when_the_list_shifts_around_it() {
+        let mut state = test_state(vec![
+            summary("alpha", Ownership::Managed),
+            summary("beta", Ownership::Managed),
+        ]);
+        press(&mut state, KeyCode::Down);
+        apply_refresh(&mut state, || {
+            Ok::<_, String>(inventory(vec![
+                summary("aaa", Ownership::External),
+                summary("alpha", Ownership::Managed),
+                summary("beta", Ownership::Managed),
+            ]))
+        });
+        assert_eq!(state.selected_alias(), Some("beta"));
+    }
+
+    #[test]
+    fn refresh_follows_a_host_whose_definition_moved_to_another_file() {
+        let mut state = test_state(vec![
+            summary_in("alpha", Ownership::External, "/home/test/.ssh/config"),
+            summary_in("beta", Ownership::External, "/home/test/.ssh/config"),
+        ]);
+        press(&mut state, KeyCode::Down);
+        apply_refresh(&mut state, || {
+            Ok::<_, String>(inventory(vec![
+                summary_in("alpha", Ownership::External, "/home/test/.ssh/config"),
+                summary_in("BETA", Ownership::External, "/home/test/.ssh/extra"),
+            ]))
+        });
+        assert_eq!(state.selected_alias(), Some("BETA"));
+    }
+
+    #[test]
+    fn refresh_selects_the_first_host_when_the_selected_one_vanished() {
+        let mut state = test_state(vec![
+            summary("alpha", Ownership::Managed),
+            summary("beta", Ownership::Managed),
+        ]);
+        press(&mut state, KeyCode::Down);
+        apply_refresh(&mut state, || {
+            Ok::<_, String>(inventory(vec![summary("alpha", Ownership::Managed)]))
+        });
+        assert_eq!(state.selected_alias(), Some("alpha"));
+    }
+
+    #[test]
+    fn failed_refresh_changes_nothing_but_the_status() {
+        let mut state = test_state(vec![
+            summary("alpha", Ownership::Managed),
+            summary("beta", Ownership::Managed),
+        ]);
+        press(&mut state, KeyCode::Down);
+        resolve(&mut state, details("beta", Ownership::Managed));
+        state.set_filter("b");
+        let before = state.clone();
+
+        let changed = apply_refresh(&mut state, || Err::<HostInventory, _>("cannot read config"));
+
+        assert!(!changed);
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Refresh failed: cannot read config")
+        );
+        assert_eq!(state.hosts, before.hosts);
+        assert_eq!(state.selected, before.selected);
+        assert_eq!(state.filter.as_str(), "b");
+        assert!(
+            state.selected_details().is_some(),
+            "cached details are kept"
+        );
     }
 
     #[test]

@@ -7,6 +7,10 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- TUI refresh (`r` or `F5`) re-reads the host inventory and discards cached host details, so edits made outside Portico, including changes to included configs, appear without restarting. The selection and filter are kept, and a failed read leaves the list untouched and reports the error.
+
 ## [0.1.0] - 2026-10-13
 
 First public release.

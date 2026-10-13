@@ -176,6 +176,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `a` | Add a host |
 | `e` | Edit the selected managed host |
 | `x` | Remove the selected managed host |
+| `r` / `F5` | Refresh: re-read the inventory and discard cached host details |
 | `Enter` | Connect in the current terminal |
 | `Ctrl+Enter` / `n` | Connect in a new terminal |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
@@ -187,7 +188,7 @@ Form fields only accept characters they can hold, whether typed or pasted: alias
 
 `Ctrl+Enter` needs a terminal that reports modified keys, such as kitty, WezTerm, Ghostty, or foot, and is only shown in the footer when Portico detects one. `n` works everywhere.
 
-Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it.
+Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it. Portico re-reads the inventory and re-resolves details when it changes the configuration itself; edits made elsewhere, such as in `~/.ssh/config` or an included file, appear after `r` or `F5`. The selection and filter are kept, and if the files cannot be read the list stays as it was and the footer reports why.
 
 External hosts can be inspected and connected to, but Portico will not edit or remove them.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
