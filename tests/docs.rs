@@ -88,7 +88,7 @@ fn security_policy_names_a_private_reporting_channel() {
 #[test]
 fn manual_runs_never_release_or_publish() {
     let workflow = read(".github/workflows/release.yml");
-    for job in ["release", "publish", "aur"] {
+    for job in ["release", "crates", "aur"] {
         let section = workflow
             .split(&format!("\n  {job}:\n"))
             .nth(1)
@@ -303,15 +303,15 @@ fn aur_and_crates_publishing_are_independent_jobs_with_separate_secrets() {
             .to_owned()
     };
     let aur = section("aur");
-    let publish = section("publish");
+    let crates = section("crates");
     assert!(aur.contains("environment: aur") && aur.contains("AUR_SSH_PRIVATE_KEY"));
-    assert!(publish.contains("environment: crates") && publish.contains("CARGO_REGISTRY_TOKEN"));
-    assert!(!aur.contains("CARGO_REGISTRY_TOKEN") && !publish.contains("AUR_SSH_PRIVATE_KEY"));
-    for (name, needs) in [("aur", &aur), ("publish", &publish)] {
+    assert!(crates.contains("environment: crates") && crates.contains("CARGO_REGISTRY_TOKEN"));
+    assert!(!aur.contains("CARGO_REGISTRY_TOKEN") && !crates.contains("AUR_SSH_PRIVATE_KEY"));
+    for (name, needs) in [("aur", &aur), ("crates", &crates)] {
         assert!(
-            !needs.contains("publish]")
+            !needs.contains("crates]")
                 && !needs.contains("aur]")
-                && !needs.contains("needs: publish")
+                && !needs.contains("needs: crates")
                 && !needs.contains("needs: aur"),
             "{name} must not depend on the other publishing job"
         );

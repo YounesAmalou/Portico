@@ -73,7 +73,7 @@ jobs:
           --repo "$GITHUB_REPOSITORY" --verify-tag
           --title "Portico $GITHUB_REF_NAME" --notes-file notes.md
 
-  publish:
+  crates:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: release
     runs-on: ubuntu-latest
