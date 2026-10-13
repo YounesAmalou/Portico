@@ -1018,13 +1018,28 @@ mod tests {
         cancel.join().unwrap();
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
         for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
+            assert_dies(pid);
+        }
+    }
+
+    /// Asserts that `pid` is gone or a zombie, allowing it time to die. Teardown sends SIGKILL to
+    /// every process in the tree but cannot wait for descendants, and a process with SIGKILL
+    /// pending is still runnable for a moment, longer on a loaded machine.
+    fn assert_dies(pid: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let state = fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
-                .and_then(|stat| stat.rsplit(')').next().map(|rest| rest.trim_start().into()));
-            assert!(
-                state.is_none_or(|state: String| state.starts_with('Z')),
-                "descendant {pid} survived"
-            );
+                .and_then(|stat| {
+                    stat.rsplit(')')
+                        .next()
+                        .map(|rest| rest.trim_start().to_owned())
+                });
+            if state.is_none_or(|state| state.starts_with('Z')) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "descendant {pid} survived");
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
