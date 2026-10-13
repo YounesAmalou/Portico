@@ -62,6 +62,7 @@ fn published_crate_contains_only_intended_files() {
         ".worktrees",
         "target/",
         "docs/superpowers",
+        "packaging/",
         "tests/docs.rs",
         "tests/package.rs",
     ] {

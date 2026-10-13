@@ -16,6 +16,7 @@ exclude = [
     ".worktrees/",
     "docs/superpowers/",
     ".github/",
+    "packaging/",
     "tests/docs.rs",
     "tests/package.rs",
 ]

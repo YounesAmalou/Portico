@@ -28,6 +28,14 @@ Private keys remain where they already live. Portico stores identity-file refere
 
 ## Install
 
+### Arch Linux (AUR)
+
+```sh
+yay -S portico
+```
+
+The package builds from the tagged source; `cargo` is only a build dependency and is installed and removed for you.
+
 ### Release binary
 
 Download the tarball and its checksum from the [latest release](https://github.com/YounesAmalou/Portico/releases/latest), then verify and unpack it:

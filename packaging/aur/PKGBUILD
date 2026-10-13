@@ -1,0 +1,42 @@
+# Maintainer: Younes A. Amalou (Yousen)
+pkgname=portico
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Keyboard-first terminal manager for OpenSSH hosts'
+arch=('x86_64')
+url='https://github.com/YounesAmalou/Portico'
+license=('MIT' 'Apache-2.0')
+depends=('openssh' 'glibc' 'gcc-libs')
+makedepends=('cargo')
+options=('!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('acd3b31dd6600b49269c4a03389ff2ae862cb8a12774b34272715f3c28c6065f')
+
+_srcdir() { echo "Portico-$pkgver"; }
+
+prepare() {
+  cd "$(_srcdir)"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$(_srcdir)"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$(_srcdir)"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --lib
+}
+
+package() {
+  cd "$(_srcdir)"
+  install -Dm755 target/release/portico "$pkgdir/usr/bin/portico"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

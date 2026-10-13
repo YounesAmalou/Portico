@@ -1,0 +1,17 @@
+pkgbase = portico
+	pkgdesc = Keyboard-first terminal manager for OpenSSH hosts
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/YounesAmalou/Portico
+	arch = x86_64
+	license = MIT
+	license = Apache-2.0
+	makedepends = cargo
+	depends = openssh
+	depends = glibc
+	depends = gcc-libs
+	options = !debug
+	source = portico-0.1.0.tar.gz::https://github.com/YounesAmalou/Portico/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = acd3b31dd6600b49269c4a03389ff2ae862cb8a12774b34272715f3c28c6065f
+
+pkgname = portico

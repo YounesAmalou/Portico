@@ -40,6 +40,7 @@ CodeQL code scanning is managed in the repository's GitHub settings and appears 
 2. After it merges, tag the merge commit on `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. The run verifies, checks and builds, then waits at `publish`. Open the run, choose **Review deployments**, select `release` and approve. Watch it with `gh run watch`. If only `publish` fails, use "Re-run failed jobs": re-running the whole workflow fails at release creation because the release already exists.
 4. Verify the GitHub Release and `cargo install portico-ssh` afterwards.
+5. Update the AUR package once the tag exists (the source archive it pins does not exist before): run `scripts/aur-update.sh X.Y.Z`, which pins the tag archive's SHA-256 and regenerates `.SRCINFO`; test it with `makepkg --nodeps` in `packaging/aur` (use `BUILDDIR`/`PKGDEST`/`SRCDEST` to keep the tree clean); copy `PKGBUILD` and `.SRCINFO` into the `portico` AUR repository (`ssh://aur@aur.archlinux.org/portico.git`), push, and commit the updated files here through a pull request. The script resets `pkgrel` to 1; raise it by hand only for a packaging-only fix of an already released version.
 
 ## Pull requests
 
