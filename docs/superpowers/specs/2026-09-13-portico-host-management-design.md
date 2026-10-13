@@ -230,7 +230,8 @@ Later work retains these requirements without constraining their implementation 
 2. **Identity awareness:** discover file references and agent/provider identities, including 1Password, while keeping private keys with their provider. Identity knowledge must remain separate from credential possession.
 3. **Tunnels:** model local, remote, and dynamic forwards; detect local conflicts; and supervise explicitly started tunnels.
 4. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
-5. **Tool integration:** expose the minimum machine-readable contract required by herdr without granting credential access merely because a host is visible.
+
+_(The former fifth slice, herdr tool integration, was dropped on 2026-10-13. The machine-readable output it called for is now part of the desktop surface slice in `ROADMAP.md`.)_
 
 Each slice requires its own design review before implementation.
 
