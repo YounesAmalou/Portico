@@ -279,8 +279,9 @@ fn aur_update_script_and_release_steps_are_documented() {
 
     let contributing = read("CONTRIBUTING.md");
     for explained in [
-        "scripts/aur-update.sh X.Y.Z",
+        "scripts/aur-publish.sh",
         "aur.archlinux.org/portico.git",
+        "AUR_SSH_PRIVATE_KEY",
     ] {
         assert!(
             contributing.contains(explained),
