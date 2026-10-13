@@ -16,7 +16,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         name: Check that the tag, Cargo version and changelog agree
         run: |
@@ -27,7 +27,7 @@ jobs:
           fi
           scripts/changelog-notes.sh "$version" > notes.md
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-notes
           path: notes.md
@@ -42,10 +42,10 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git && rustup default stable
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo build --release --locked
       - run: scripts/package-release.sh "${{ needs.verify.outputs.version }}" target/release/portico dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-dist
           path: dist/*
@@ -57,10 +57,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-notes
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

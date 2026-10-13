@@ -22,7 +22,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh fmt
 
   clippy:
@@ -30,7 +30,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh clippy
 
   test:
@@ -38,7 +38,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh test
 
   msrv:
@@ -46,7 +46,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh msrv
 
   audit:
@@ -54,7 +54,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh audit
 
   deny:
@@ -62,7 +62,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh deny
 
   package:
@@ -70,5 +70,5 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/ci-container.sh package
