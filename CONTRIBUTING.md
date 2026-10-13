@@ -25,10 +25,10 @@ CI runs the seven jobs (`fmt`, `clippy`, `test`, `msrv`, `audit`, `deny`, `packa
 
 Release is not triggered by pull requests or pushes to branches. It has two modes:
 
-- **Pushing a `vX.Y.Z` tag** verifies that the tag matches the Cargo version and that `CHANGELOG.md` has a section for it, re-runs CI, builds the Linux x86_64 tarball and checksum, creates the GitHub Release, and publishes `portico-ssh` to crates.io. The publish job uses the `release` environment, where required reviewers can be configured. Publishing cannot be undone.
+- **Pushing a `vX.Y.Z` tag** verifies that the tag matches the Cargo version and that `CHANGELOG.md` has a section for it, re-runs CI, builds the Linux x86_64 tarball and checksum, creates the GitHub Release, and publishes `portico-ssh` to crates.io. The publish job runs in the `release` environment, which holds the crates.io token and requires the maintainer's approval before it starts, and only for tags. `v*` tags are protected: they can only be created by an administrator and can never be moved or deleted. Publishing cannot be undone.
 - **A manual run** (Actions, Release, Run workflow, or `gh workflow run release.yml --ref <branch>`) is a rehearsal: it verifies, runs CI and builds the tarball, but never creates a release or publishes. Use it to test workflow changes from a branch.
 
-CodeQL code scanning and Dependabot are managed in the repository's GitHub settings and appear in the Actions tab; they are not defined by files in this repository.
+CodeQL code scanning is managed in the repository's GitHub settings and appears in the Actions tab; it is not defined by files in this repository. Dependabot (`.github/dependabot.yml`) opens weekly pull requests for GitHub Actions and Cargo dependencies. Every action in the workflows is pinned to commit SHAs, with the version in a trailing comment, and the repository refuses to run an action that is not; update them through Dependabot, or look up the SHA of a release tag.
 
 ### Cutting a release
 

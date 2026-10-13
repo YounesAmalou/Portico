@@ -114,3 +114,55 @@ fn contributing_documents_every_workflow_and_how_it_is_triggered() {
         );
     }
 }
+
+#[test]
+fn actions_are_pinned_to_commit_shas() {
+    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    for entry in fs::read_dir(workflows).unwrap() {
+        let path = entry.unwrap().path();
+        for line in fs::read_to_string(&path).unwrap().lines() {
+            let Some(reference) = line
+                .trim()
+                .strip_prefix("- uses: ")
+                .or_else(|| line.trim().strip_prefix("uses: "))
+            else {
+                continue;
+            };
+            let reference = reference.split_whitespace().next().unwrap();
+            if reference.starts_with("./") {
+                continue;
+            }
+            let (_, revision) = reference.split_once('@').unwrap_or_else(|| {
+                panic!("{} uses {reference} without a revision", path.display())
+            });
+            assert!(
+                revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{} must pin {reference} to a full commit SHA",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn dependabot_keeps_actions_and_cargo_dependencies_current() {
+    let config = read(".github/dependabot.yml");
+    assert!(config.contains("package-ecosystem: github-actions"));
+    assert!(config.contains("package-ecosystem: cargo"));
+}
+
+#[test]
+fn contributing_explains_who_can_publish() {
+    let contributing = read("CONTRIBUTING.md");
+    for explained in [
+        "requires the maintainer's approval",
+        "`v*` tags are protected",
+        "pinned to commit SHAs",
+        "Dependabot",
+    ] {
+        assert!(
+            contributing.contains(explained),
+            "CONTRIBUTING.md does not explain: {explained}"
+        );
+    }
+}
