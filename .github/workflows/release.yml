@@ -1,6 +1,7 @@
 name: Release
 
-# A pushed vX.Y.Z tag verifies, builds, releases and publishes. A manual run is a
+# A pushed vX.Y.Z tag verifies, builds, releases and publishes to crates.io and the AUR
+# (independent jobs: one failing never blocks or reruns the other). A manual run is a
 # rehearsal: it verifies, builds and packages, but never creates a release or publishes.
 on:
   push:
@@ -72,13 +73,26 @@ jobs:
           --repo "$GITHUB_REPOSITORY" --verify-tag
           --title "Portico $GITHUB_REF_NAME" --notes-file notes.md
 
-  publish:
+  crates:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: release
     runs-on: ubuntu-latest
-    environment: release
+    environment: crates
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  aur:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    environment: aur
+    steps:
+      - run: pacman -Syu --noconfirm git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: scripts/aur-publish.sh "${{ needs.verify.outputs.version }}"
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

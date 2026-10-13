@@ -22,9 +22,11 @@ Let Arch Linux users install Portico with `yay -S portico`, without having Rust 
 3. Documentation: README install section, CONTRIBUTING release step 5, CHANGELOG, ROADMAP (the AUR package moves out; `portico-bin` and live inventory reload are recorded).
 4. Tests in `tests/docs.rs` guard the PKGBUILD's shape and the documented steps.
 
-## Maintainer actions
+## Publishing
 
-The first push to `ssh://aur@aur.archlinux.org/portico.git` needs the maintainer's AUR account and SSH key. Later releases follow CONTRIBUTING step 5. Automating the push from the release workflow, with an AUR SSH key as an environment secret, is a possible later slice.
+The release workflow gains an `aur` job beside `crates` (the crates.io job, formerly `publish`); both depend only on `release`, so neither blocks or re-runs the other. It runs in its own `aur` environment (`v*` tags only; creating a release tag is already restricted to administrators, so no second approval is added) so the AUR key and the crates.io token are never in the same job. `scripts/aur-publish.sh` pins the tag archive, builds the package with `makepkg` as a gate, and pushes `PKGBUILD` and `.SRCINFO` to the AUR; a version already on the AUR is a no-op, so a failed job can simply be re-run, for example after the maintainer's AUR account exists. The AUR host key is pinned in the repository rather than trusted on first use.
+
+The maintainer registers an AUR account, adds a dedicated SSH key, stores its private half as `AUR_SSH_PRIVATE_KEY` in the `aur` environment, and makes the first push by hand (or re-runs the first failed `aur` job).
 
 ## Verification
 

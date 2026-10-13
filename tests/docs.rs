@@ -88,7 +88,7 @@ fn security_policy_names_a_private_reporting_channel() {
 #[test]
 fn manual_runs_never_release_or_publish() {
     let workflow = read(".github/workflows/release.yml");
-    for job in ["release", "publish"] {
+    for job in ["release", "crates", "aur"] {
         let section = workflow
             .split(&format!("\n  {job}:\n"))
             .nth(1)
@@ -175,7 +175,7 @@ fn dependabot_keeps_actions_and_cargo_dependencies_current() {
 fn contributing_explains_who_can_publish() {
     let contributing = read("CONTRIBUTING.md");
     for explained in [
-        "requires the maintainer's approval",
+        "can only be created by an administrator",
         "`v*` tags are protected",
         "pinned to commit SHAs",
         "Dependabot",
@@ -197,8 +197,6 @@ fn contributing_describes_the_changelog_and_every_release_step() {
         // A version bump must keep the lock file in step, or `--locked` builds fail.
         "Cargo.lock",
         "cargo update -p portico-ssh",
-        // The publish job waits for a human.
-        "Review deployments",
         // The settings that protect the release are recorded so they can be recreated.
         "release tags are immutable",
         "only admins create release tags",
@@ -272,14 +270,16 @@ fn aur_package_builds_the_tagged_source_and_installs_the_binary() {
 
 #[test]
 fn aur_update_script_and_release_steps_are_documented() {
-    let script = read("scripts/aur-update.sh");
-    assert!(script.contains("makepkg --printsrcinfo"));
-    assert!(script.contains("sha256sum"));
+    let update = read("scripts/aur-update.sh");
+    assert!(update.contains("makepkg --printsrcinfo"));
+    assert!(update.contains("sha256sum"));
+    assert!(read("scripts/aur-publish.sh").contains("StrictHostKeyChecking=yes"));
 
     let contributing = read("CONTRIBUTING.md");
     for explained in [
-        "scripts/aur-update.sh X.Y.Z",
+        "scripts/aur-publish.sh",
         "aur.archlinux.org/portico.git",
+        "AUR_SSH_PRIVATE_KEY",
     ] {
         assert!(
             contributing.contains(explained),
@@ -287,4 +287,34 @@ fn aur_update_script_and_release_steps_are_documented() {
         );
     }
     assert!(read("README.md").contains("yay -S portico"));
+}
+
+#[test]
+fn aur_and_crates_publishing_are_independent_jobs_with_separate_secrets() {
+    let workflow = read(".github/workflows/release.yml");
+    let section = |job: &str| {
+        workflow
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("release workflow has no {job} job"))
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let aur = section("aur");
+    let crates = section("crates");
+    assert!(aur.contains("environment: aur") && aur.contains("AUR_SSH_PRIVATE_KEY"));
+    assert!(crates.contains("environment: crates") && crates.contains("CARGO_REGISTRY_TOKEN"));
+    assert!(!aur.contains("CARGO_REGISTRY_TOKEN") && !crates.contains("AUR_SSH_PRIVATE_KEY"));
+    for (name, needs) in [("aur", &aur), ("crates", &crates)] {
+        assert!(
+            !needs.contains("crates]")
+                && !needs.contains("aur]")
+                && !needs.contains("needs: crates")
+                && !needs.contains("needs: aur"),
+            "{name} must not depend on the other publishing job"
+        );
+    }
+    assert!(read("packaging/aur/known_hosts").contains("ssh-ed25519"));
 }
