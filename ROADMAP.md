@@ -34,13 +34,13 @@ Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/s
 
 | Item | Prerequisite |
 |---|---|
-| Release guard: a release that cannot be tagged from the wrong commit (the `v0.2.0` and `v0.2.1` tags both landed on a commit whose version had not been bumped) | A check that the tagged commit is on `main`, carries the matching Cargo version and has a changelog section, ideally before the tag can be pushed; extends the release automation item below |
-| Release automation (a release pull request that bumps the version and changelog) | A commit-message or label convention to derive the changelog from |
+| Release automation with release-plz: a release pull request kept open on `main` that bumps the version and changelog, and that tags, releases and publishes to crates.io when merged | A GitHub App (the default workflow token neither triggers CI on its pull requests nor starts the release on its tags) added to the tag ruleset's bypass list; a decision on the changelog format (generated from commit messages) and on how `release.yml` keeps building the release tarballs. The pull-request rule on `main` stays. Rehearsed on GitHub before a real release relies on it |
+| Project website and documentation: a static site that presents Portico (what it is, install, a short tour) and holds the user documentation now living in the README, kept in this repository and published from CI | A choice of generator (a docs-oriented static site tool) and hosting (GitHub Pages is the default candidate); the README stays the short entry point. Whatever is built is verified on GitHub, not only locally |
 | Automated end-to-end tests with a real OpenSSH and a real terminal in CI | Its own design |
 | AUR package `portico` (source build) | Built and merged; publishing is suspended until an AUR account and key exist. Then set the `aur` environment secret and re-run the failed job |
 | AUR package `portico-bin` (prebuilt binary) | Demand for faster installs; the source package ships first |
 | Live inventory reload when the config changes | Its own design: watch `~/.ssh/config` and every included file (or poll modification times), debounce editors that save by renaming, and never reshuffle the list while a form is open; the manual refresh key already ships |
-| aarch64 Linux builds | First check whether the build and distribution channels support the architecture natively; add native ARM runners in CI if needed, and decide the fallback only if they do not |
+| Release tarballs for several Linux systems, Arch Linux included, beyond the current x86_64 build (including aarch64), each ready to use without installing Rust | Its own design: which targets and package formats, whether the build needs native ARM runners in CI, and how each artifact is checksummed and attached to the GitHub Release; first check what the build and distribution channels already support natively |
 | macOS support, distributed through Homebrew | The end-to-end tests, and a portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher |
 | Windows support, distributed through winget | The same portability work, plus a Windows terminal launcher |
 | Signed releases and SBOM/provenance attestations | A decision on signing keys and attestation format |
