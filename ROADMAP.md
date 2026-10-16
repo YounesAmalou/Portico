@@ -16,7 +16,7 @@ These bind every item below. A design that needs to break one must say so and be
 
 Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/specs/2026-09-13-portico-host-management-design.md`) and adds what was decided since. Rough order, because later slices build on earlier ones:
 
-1. **Connection test.** When a host is added or edited, and again after it is saved, run a quick non-interactive check that the connection works, with a short timeout, and show the result next to the host (reachable, host key unknown, authentication refused, timed out). It must never prompt, never hang the TUI, and never send credentials Portico does not already use for a normal connection. Also available from the CLI. Open design questions: which exact check (`ssh` with `BatchMode` and a command-less handshake, or a plain TCP probe first), how to treat a first-time host key, and whether a failed test blocks saving (it should not; it warns).
+1. **Connection test (manual).** A command the user runs on demand to check that a host's connection works: `portico test <alias>` on the CLI and a single key (`t`) on the selected host in the TUI, offered from the host list, the details pane and the add and edit forms (testing the values currently typed). It runs a quick non-interactive check with a short timeout and shows the result next to the host (reachable, host key unknown, authentication refused, timed out). It is never triggered automatically, not on save and not on selection. It must never prompt, never hang the TUI, and never send credentials Portico does not already use for a normal connection. Open design questions: which exact check (`ssh` with `BatchMode` and a command-less handshake, or a plain TCP probe first), how to treat a first-time host key, and how the key behaves while a test is in flight (cancel with `Esc`).
 2. **Safe adoption:** losslessly migrate a concrete external block only after showing an exact preview, creating a backup, and providing rollback.
 3. **Tunnels (saved forwards, run on demand).** Model local, remote and dynamic forwards, save them, and start and stop them on demand. Requirements:
    - Saved tunnels live in Portico-owned configuration, are listed, edited, added and removed from both the CLI and the TUI, and the TUI treats them as a first-class screen: obvious add and edit forms with field validation, one key to start or stop, and a status column (stopped, running, failed, port in use).
@@ -55,6 +55,6 @@ Recorded so they are not mistaken for forgotten work:
 
 - Connection history and session management.
 - Key generation.
-- Background reachability polling (the connection test above covers the need on demand).
+- Background reachability polling (the manual connection test above covers the need on demand).
 - A daemon, a database, or a plugin system inside Portico (see the rules at the top).
 - herdr integration.
