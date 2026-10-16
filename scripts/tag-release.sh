@@ -6,7 +6,9 @@
 set -euo pipefail
 
 [ $# -eq 1 ] || { echo "usage: $0 <X.Y.Z>" >&2; exit 2; }
-version=$1
+version=${1#v}
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "'$1' is not a version like 0.2.3 (no trailing punctuation)" >&2; exit 2; }
 cd "$(dirname "$(readlink -f "$0")")/.."
 
 git fetch --quiet origin main
