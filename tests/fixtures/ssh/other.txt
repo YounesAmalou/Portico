@@ -1,0 +1,2 @@
+Unsupported KEX algorithm "none-such"
+command-line line 0: Bad SSH2 KexAlgorithms 'none-such'.
