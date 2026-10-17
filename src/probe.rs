@@ -219,22 +219,38 @@ fn host_part(jump: &str) -> &str {
     jump.split(':').next().unwrap_or(jump)
 }
 
+/// Whether `host` appears in `line` as a whole name, not inside a longer one.
+fn mentions_host(line: &str, host: &str) -> bool {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    !host.is_empty()
+        && line.match_indices(host).any(|(at, _)| {
+            let before = line[..at].chars().next_back();
+            let after = line[at + host.len()..].chars().next();
+            !before.is_some_and(is_name) && !after.is_some_and(is_name)
+        })
+}
+
 pub fn classify(stderr: &str, deadline_reached: bool, jump: Option<&str>) -> Failure {
     let lines: Vec<&str> = stderr.lines().collect();
     let first = classify_lines(&lines, deadline_reached);
-    if matches!(first, Failure::HostKeyChanged | Failure::HostKeyUnknown) {
-        return first;
-    }
     let Some(jump) = jump else {
         return first;
     };
+    let handed_off = lines.iter().any(|line| line.contains("UNKNOWN port 65535"));
+    // OpenSSH names no hop for a key failure, but when the jump child fails it
+    // is followed by "Connection closed by UNKNOWN port 65535", which a
+    // failure of the final host's own key is not.
+    if matches!(first, Failure::HostKeyChanged | Failure::HostKeyUnknown) && !handed_off {
+        return first;
+    }
     let host = host_part(jump);
     let named = lines
         .iter()
-        .any(|line| !is_progress(line) && !host.is_empty() && line.contains(host));
-    let marked = lines
-        .iter()
-        .any(|line| line.contains("channel 0: open failed") || line.contains("UNKNOWN port 65535"));
+        .any(|line| !is_progress(line) && mentions_host(line, host));
+    let marked = handed_off
+        || lines
+            .iter()
+            .any(|line| line.contains("channel 0: open failed"));
     if !named && !marked {
         return first;
     }
@@ -336,6 +352,39 @@ mod tests {
                     detail: detail.into()
                 },
                 "{name}"
+            );
+        }
+        for (name, detail) in [
+            ("jump-host-key-unknown", "host key not trusted"),
+            ("jump-host-key-changed", "host key changed"),
+        ] {
+            assert_eq!(
+                classify(&fixture(name), false, Some("127.0.0.1:22999")),
+                Failure::JumpHostFailed {
+                    jump: "127.0.0.1:22999".into(),
+                    detail: detail.into()
+                },
+                "{name}"
+            );
+        }
+        assert_eq!(
+            classify(
+                &fixture("target-key-unknown-via-jump"),
+                false,
+                Some("127.0.0.1:22999")
+            ),
+            Failure::HostKeyUnknown
+        );
+        for (line, jump) in [
+            ("user@db1.example: Permission denied (publickey).\n", "db"),
+            ("user@target: Permission denied (publickey).\n", "arg"),
+        ] {
+            assert_eq!(
+                classify(line, false, Some(jump)),
+                Failure::AuthRefused {
+                    methods: "publickey".into()
+                },
+                "{jump}"
             );
         }
         assert_eq!(
@@ -442,7 +491,7 @@ mod tests {
             let at = args.windows(2).any(|w| w[0] == "-o" && w[1] == option);
             assert!(at, "{option}");
         }
-        assert!(args.starts_with(&test_args(None, "dev")[..22]));
+        assert!(args.starts_with(&test_args(None, "dev")[..test_args(None, "dev").len() - 2]));
         assert_eq!(
             args[args.len() - 4..],
             ["-F", "/tmp/entry", "--", "dev"].map(OsString::from)
