@@ -1,16 +1,27 @@
 use std::{
-    fs,
-    io::{self, Read},
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::fs::OpenOptionsExt,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use thiserror::Error;
+
+use crate::managed::write_unique;
+use crate::probe::{
+    Authenticated, Failure, ProbeResult, TEST_DEADLINE, authenticated, classify, fetch_key_args,
+    test_args,
+};
 
 /// How long a new-terminal launcher may run before its launch counts as requested.
 const LAUNCH_GRACE: Duration = Duration::from_millis(500);
@@ -19,6 +30,7 @@ const LAUNCH_GRACE: Duration = Duration::from_millis(500);
 pub struct OpenSsh {
     ssh: PathBuf,
     terminal: PathBuf,
+    keygen: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +40,37 @@ pub struct ResolvedConfig {
     pub port: Option<u16>,
     pub identity_files: Vec<String>,
     pub proxy_jump: Option<String>,
+    pub known_hosts_files: Vec<String>,
+}
+
+/// One line of `ssh-keygen -l`: `<bits> <fingerprint> <host> (<TYPE>)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyFingerprint {
+    pub host: String,
+    pub fingerprint: String,
+    pub key_type: String,
+}
+
+/// The known-hosts lines a server presented, with their fingerprints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentedKey {
+    pub lines: Vec<u8>,
+    pub fingerprints: Vec<KeyFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyFetch {
+    Presented(PresentedKey),
+    Failed(Failure),
+}
+
+/// How a watched ssh run ended.
+enum Watched {
+    Authenticated(Authenticated),
+    Ended {
+        stderr: String,
+        deadline_reached: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,7 +106,15 @@ impl OpenSsh {
     }
 
     pub fn new(ssh: PathBuf, terminal: PathBuf) -> Self {
-        Self { ssh, terminal }
+        Self {
+            ssh,
+            terminal,
+            keygen: "ssh-keygen".into(),
+        }
+    }
+
+    pub fn with_keygen(self, keygen: PathBuf) -> Self {
+        Self { keygen, ..self }
     }
 
     pub fn validate(&self, entry: &Path, aliases: &[String]) -> Result<(), OpenSshError> {
@@ -112,8 +163,23 @@ impl OpenSsh {
         alias: &str,
         cancelled: Option<&AtomicBool>,
     ) -> Result<ResolvedConfig, OpenSshError> {
-        let output =
-            self.checked_output(Command::new(&self.ssh).args(["-G", "--", alias]), cancelled)?;
+        self.resolve_with(None, alias, cancelled)
+    }
+
+    /// Resolves `alias` with `ssh -G`, reading `entry` instead of the user's
+    /// configuration when given.
+    pub(crate) fn resolve_with(
+        &self,
+        entry: Option<&Path>,
+        alias: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<ResolvedConfig, OpenSshError> {
+        let mut command = Command::new(&self.ssh);
+        command.arg("-G");
+        if let Some(entry) = entry {
+            command.arg("-F").arg(entry);
+        }
+        let output = self.checked_output(command.arg("--").arg(alias), cancelled)?;
         let text = String::from_utf8(output.stdout)
             .map_err(|error| OpenSshError::InvalidOutput(error.to_string()))?;
         let mut hostname = None;
@@ -121,6 +187,7 @@ impl OpenSsh {
         let mut port = None;
         let mut identity_files = Vec::new();
         let mut proxy_jump = None;
+        let mut known_hosts_files = Vec::new();
         for line in text.lines() {
             let Some((key, value)) = line.split_once(char::is_whitespace) else {
                 continue;
@@ -139,6 +206,8 @@ impl OpenSsh {
                 identity_files.push(value.into());
             } else if key.eq_ignore_ascii_case("proxyjump") {
                 proxy_jump = Some(value.into());
+            } else if key.eq_ignore_ascii_case("userknownhostsfile") {
+                known_hosts_files = value.split_whitespace().map(String::from).collect();
             }
         }
         Ok(ResolvedConfig {
@@ -148,6 +217,179 @@ impl OpenSsh {
             port,
             identity_files,
             proxy_jump,
+            known_hosts_files,
+        })
+    }
+
+    /// Tries to log in to `alias` without a terminal, stopping as soon as
+    /// OpenSSH reports success. `jump` names the alias's jump host, if any,
+    /// so a failure there is told apart from one at the target.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the app's connection test calls this")
+    )]
+    pub(crate) fn probe(
+        &self,
+        entry: Option<&Path>,
+        alias: &str,
+        jump: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> Result<ProbeResult, OpenSshError> {
+        self.probe_with_deadline(entry, alias, jump, cancelled, TEST_DEADLINE)
+    }
+
+    fn probe_with_deadline(
+        &self,
+        entry: Option<&Path>,
+        alias: &str,
+        jump: Option<&str>,
+        cancelled: &AtomicBool,
+        deadline: Duration,
+    ) -> Result<ProbeResult, OpenSshError> {
+        Ok(
+            match self.watch_ssh(test_args(entry, alias), cancelled, deadline)? {
+                Watched::Authenticated(success) => ProbeResult::Authenticated(success),
+                Watched::Ended {
+                    stderr,
+                    deadline_reached,
+                } => ProbeResult::Failed(classify(&stderr, deadline_reached, jump)),
+            },
+        )
+    }
+
+    /// Connects to `alias` with every login method disabled, letting OpenSSH
+    /// record the server's host key in a private temporary file, and returns
+    /// that key with its fingerprints. Nothing is written to the user's own
+    /// known-hosts files.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the app's connection test calls this")
+    )]
+    pub(crate) fn fetch_host_key(
+        &self,
+        entry: Option<&Path>,
+        alias: &str,
+        jump: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> Result<KeyFetch, OpenSshError> {
+        let io_error = |source| OpenSshError::Io {
+            program: self.ssh.clone(),
+            source,
+        };
+        let known_hosts = write_unique(&std::env::temp_dir(), "portico-host-key", b"", 0o600)
+            .map_err(io_error)?;
+        let args = fetch_key_args(entry, known_hosts.path(), alias);
+        // Every login method is off, so the run can only end or time out.
+        let (stderr, deadline_reached) = match self.watch_ssh(args, cancelled, TEST_DEADLINE)? {
+            Watched::Authenticated(_) => (String::new(), false),
+            Watched::Ended {
+                stderr,
+                deadline_reached,
+            } => (stderr, deadline_reached),
+        };
+        let lines = fs::read(known_hosts.path()).map_err(io_error)?;
+        if lines.is_empty() {
+            return Ok(KeyFetch::Failed(classify(&stderr, deadline_reached, jump)));
+        }
+        let output = self.checked_output(
+            Command::new(&self.keygen)
+                .arg("-l")
+                .arg("-f")
+                .arg(known_hosts.path()),
+            Some(cancelled),
+        )?;
+        let fingerprints = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(parse_fingerprint)
+            .collect::<Result<_, _>>()?;
+        Ok(KeyFetch::Presented(PresentedKey {
+            lines,
+            fingerprints,
+        }))
+    }
+
+    /// Runs ssh with `args` in its own process group, reading stderr line by
+    /// line until a success line, its exit, `deadline` or cancellation. The
+    /// whole group is killed whichever way the run ends.
+    fn watch_ssh(
+        &self,
+        args: Vec<OsString>,
+        cancelled: &AtomicBool,
+        deadline: Duration,
+    ) -> Result<Watched, OpenSshError> {
+        let mut child = Command::new(&self.ssh)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .map_err(|source| OpenSshError::Io {
+                program: self.ssh.clone(),
+                source,
+            })?;
+        let lines = read_lines(child.stderr.take().expect("stderr is piped"));
+        let deadline = Instant::now() + deadline;
+        let mut stderr = String::new();
+        let deadline_reached = loop {
+            if cancelled.load(Ordering::Relaxed) {
+                terminate_process_group(&mut child);
+                return Err(OpenSshError::Cancelled);
+            }
+            match lines.recv_timeout(Duration::from_millis(20)) {
+                Ok(line) => {
+                    if let Some(success) = authenticated(&line) {
+                        terminate_process_group(&mut child);
+                        return Ok(Watched::Authenticated(success));
+                    }
+                    stderr.push_str(&line);
+                    stderr.push('\n');
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            match has_exited(&child) {
+                Ok(true) => break false,
+                Ok(false) if Instant::now() >= deadline => break true,
+                Ok(false) => {}
+                Err(source) => {
+                    terminate_process_group(&mut child);
+                    return Err(OpenSshError::Io {
+                        program: self.ssh.clone(),
+                        source,
+                    });
+                }
+            }
+        };
+        // Leftover processes in the group (a ProxyCommand, say) would hold
+        // stderr open; once they are gone the rest of it can be read. ssh is
+        // not reaped yet, so its PID still names this group.
+        terminate_process_group(&mut child);
+        let drain_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(OpenSshError::Cancelled);
+            }
+            match lines.recv_timeout(Duration::from_millis(20)) {
+                Ok(line) => {
+                    // ssh may log success just before the server drops it.
+                    if let Some(success) = authenticated(&line) {
+                        return Ok(Watched::Authenticated(success));
+                    }
+                    stderr.push_str(&line);
+                    stderr.push('\n');
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < drain_deadline => {}
+                Err(_) => break,
+            }
+        }
+        Ok(Watched::Ended {
+            stderr,
+            deadline_reached,
         })
     }
 
@@ -285,11 +527,12 @@ impl OpenSsh {
         command: &mut Command,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Output, OpenSshError> {
+        let program = PathBuf::from(command.get_program());
         let output = if let Some(cancelled) = cancelled {
             self.cancellable_output(command, cancelled)?
         } else {
             command.output().map_err(|source| OpenSshError::Io {
-                program: self.ssh.clone(),
+                program: program.clone(),
                 source,
             })?
         };
@@ -297,7 +540,7 @@ impl OpenSsh {
             Ok(output)
         } else {
             Err(OpenSshError::Failed {
-                program: self.ssh.clone(),
+                program,
                 status: output.status,
                 stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
             })
@@ -309,10 +552,11 @@ impl OpenSsh {
         command: &mut Command,
         cancelled: &AtomicBool,
     ) -> Result<Output, OpenSshError> {
+        let program = PathBuf::from(command.get_program());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.process_group(0);
         let mut child = command.spawn().map_err(|source| OpenSshError::Io {
-            program: self.ssh.clone(),
+            program: program.clone(),
             source,
         })?;
         let stdout = read_pipe(child.stdout.take().expect("stdout is piped"));
@@ -328,20 +572,82 @@ impl OpenSsh {
                 Ok(None) => thread::sleep(Duration::from_millis(20)),
                 Err(source) => {
                     terminate_process_group(&mut child);
-                    return Err(OpenSshError::Io {
-                        program: self.ssh.clone(),
-                        source,
-                    });
+                    return Err(OpenSshError::Io { program, source });
                 }
             }
         };
 
         Ok(Output {
             status,
-            stdout: finish_pipe_cancellable(stdout, &mut child, cancelled, &self.ssh)?,
-            stderr: finish_pipe_cancellable(stderr, &mut child, cancelled, &self.ssh)?,
+            stdout: finish_pipe_cancellable(stdout, &mut child, cancelled, &program)?,
+            stderr: finish_pipe_cancellable(stderr, &mut child, cancelled, &program)?,
         })
     }
+}
+
+/// Whether `child` has exited, leaving it unreaped so its PID, and so its
+/// process group, cannot be reused before the group is killed.
+fn has_exited(child: &std::process::Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+fn parse_fingerprint(line: &str) -> Result<KeyFingerprint, OpenSshError> {
+    let invalid = || OpenSshError::InvalidOutput(format!("invalid ssh-keygen line: {line}"));
+    let mut fields = line.split_whitespace();
+    let (_bits, fingerprint) = (fields.next(), fields.next().ok_or_else(invalid)?);
+    let rest: Vec<&str> = fields.collect();
+    let (key_type, host) = rest.split_last().ok_or_else(invalid)?;
+    let key_type = key_type
+        .strip_prefix('(')
+        .and_then(|key_type| key_type.strip_suffix(')'))
+        .ok_or_else(invalid)?;
+    if host.is_empty() {
+        return Err(invalid());
+    }
+    Ok(KeyFingerprint {
+        host: host.join(" "),
+        fingerprint: fingerprint.into(),
+        key_type: key_type.into(),
+    })
+}
+
+/// Appends `lines` to the known-hosts file at `path`, starting on a new line
+/// and creating the file private to the user when it is missing.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the app's connection test calls this")
+)]
+pub(crate) fn append_known_hosts(path: &Path, lines: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)?;
+    let mut contents = Vec::with_capacity(lines.len() + 1);
+    if file.metadata()?.len() > 0 {
+        let mut last = [0];
+        file.seek(SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+        if last != *b"\n" {
+            contents.push(b'\n');
+        }
+    }
+    contents.extend_from_slice(lines);
+    file.write_all(&contents)?;
+    file.sync_all()
 }
 
 fn terminate_process_group(child: &mut std::process::Child) {
@@ -654,6 +960,29 @@ fn kill_process_group(child: &mut std::process::Child) {
     }
 }
 
+/// Sends each line of `pipe` as it arrives; the channel closes at end of file.
+fn read_lines(pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut line = Vec::new();
+        while reader
+            .read_until(b'\n', &mut line)
+            .is_ok_and(|read| read > 0)
+        {
+            let text = String::from_utf8_lossy(&line);
+            if sender
+                .send(text.trim_end_matches(['\n', '\r']).to_string())
+                .is_err()
+            {
+                return;
+            }
+            line.clear();
+        }
+    });
+    receiver
+}
+
 fn read_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
     thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -711,6 +1040,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::probe::{Authenticated, test_args};
     use crate::test_executable::write_executable;
 
     struct FakeProgram {
@@ -1089,6 +1419,273 @@ mod tests {
         let proc = tempfile::tempdir().unwrap();
 
         assert!(process_children_in(proc.path(), 100).unwrap().is_empty());
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ssh")
+            .join(format!("{name}.txt"))
+    }
+
+    /// A fake ssh that starts `sleep 30` in its group, records the sleep's pid
+    /// at `<dir>/pid`, then prints `fixture` (if any) to stderr and waits.
+    fn fake_hanging_ssh(fixture: Option<&str>) -> (FakeProgram, PathBuf) {
+        let fake = fake_ssh();
+        let pid = fake.log.with_file_name("pid");
+        let print = fixture.map_or(String::new(), |name| {
+            format!("cat '{}' >&2\n", fixture_path(name).display())
+        });
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n{print}wait\n",
+                pid.display()
+            ),
+        );
+        (fake, pid)
+    }
+
+    fn wait_for_file(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = fs::read_to_string(path)
+                && !contents.is_empty()
+            {
+                return contents;
+            }
+            assert!(Instant::now() < deadline, "missing {}", path.display());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn probe_stops_at_the_success_line_and_kills_the_group() {
+        let (fake, pid) = fake_hanging_ssh(Some("authenticated"));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let started = Instant::now();
+
+        let result = openssh
+            .probe(None, "dev", None, &AtomicBool::new(false))
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe blocked for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result,
+            ProbeResult::Authenticated(Authenticated {
+                host: "127.0.0.1".into(),
+                address: "127.0.0.1".into(),
+                port: 22999,
+                method: "publickey".into(),
+            })
+        );
+        assert_dies(&fs::read_to_string(pid).unwrap());
+    }
+
+    #[test]
+    fn probe_passes_the_exact_options() {
+        let fake = fake_ssh();
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 255\n",
+                fake.log.display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+
+        openssh
+            .probe(None, "dev", None, &AtomicBool::new(false))
+            .unwrap();
+
+        let expected: String = test_args(None, "dev")
+            .iter()
+            .map(|arg| format!("{}\n", arg.to_string_lossy()))
+            .collect();
+        assert_eq!(fs::read_to_string(fake.log()).unwrap(), expected);
+    }
+
+    #[test]
+    fn probe_classifies_output_when_ssh_exits() {
+        let fake = fake_ssh();
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\ncat '{}' >&2\nexit 255\n",
+                fixture_path("auth-refused").display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+
+        assert_eq!(
+            openssh
+                .probe(None, "dev", None, &AtomicBool::new(false))
+                .unwrap(),
+            ProbeResult::Failed(Failure::AuthRefused {
+                methods: "publickey".into()
+            })
+        );
+    }
+
+    #[test]
+    fn probe_reports_a_timeout_at_the_deadline() {
+        let (fake, pid) = fake_hanging_ssh(None);
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+
+        let result = openssh
+            .probe_with_deadline(
+                None,
+                "dev",
+                None,
+                &AtomicBool::new(false),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+
+        assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
+        assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn probe_cancellation_kills_ssh() {
+        let (fake, pid) = fake_hanging_ssh(None);
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let cancel = thread::spawn({
+            let pid = pid.clone();
+            move || {
+                wait_for_file(&pid);
+                thread::sleep(Duration::from_millis(100));
+                signal.store(true, Ordering::Relaxed);
+            }
+        });
+        let started = Instant::now();
+
+        let result = openssh.probe(None, "dev", None, &cancelled);
+
+        cancel.join().unwrap();
+        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation blocked for {:?}",
+            started.elapsed()
+        );
+        assert_dies(&fs::read_to_string(pid).unwrap());
+    }
+
+    /// A fake ssh that records the temporary known-hosts path at `<dir>/args`,
+    /// runs `body` with it in `$f`, and exits 255.
+    fn fake_fetching_ssh(body: &str) -> FakeProgram {
+        let fake = fake_ssh();
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in UserKnownHostsFile=*) f=\"${{a#UserKnownHostsFile=}}\";; esac; done\nprintf '%s' \"$f\" > '{}'\n{body}\nexit 255\n",
+                fake.log.display()
+            ),
+        );
+        fake
+    }
+
+    #[test]
+    fn fetch_reads_the_key_written_to_the_temporary_file_and_removes_it() {
+        let ssh = fake_fetching_ssh("printf '[h]:22 ssh-ed25519 AAAA\\n' > \"$f\"");
+        let keygen = fake_ssh();
+        write_executable(
+            &keygen.path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '256 SHA256:abc [h]:22 (ED25519)\\n'\n",
+                keygen.log.display()
+            ),
+        );
+        let openssh =
+            OpenSsh::new(ssh.path(), "xdg-terminal-exec".into()).with_keygen(keygen.path());
+
+        let result = openssh
+            .fetch_host_key(None, "dev", None, &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(
+            result,
+            KeyFetch::Presented(PresentedKey {
+                lines: b"[h]:22 ssh-ed25519 AAAA\n".to_vec(),
+                fingerprints: vec![KeyFingerprint {
+                    host: "[h]:22".into(),
+                    fingerprint: "SHA256:abc".into(),
+                    key_type: "ED25519".into(),
+                }],
+            })
+        );
+        let temporary = fs::read_to_string(ssh.log()).unwrap();
+        assert!(temporary.starts_with(&std::env::temp_dir().display().to_string()));
+        assert_eq!(
+            fs::read_to_string(keygen.log()).unwrap(),
+            format!("-l\n-f\n{temporary}\n")
+        );
+        assert!(!Path::new(&temporary).exists());
+    }
+
+    #[test]
+    fn fetch_with_nothing_written_reports_why() {
+        let ssh = fake_fetching_ssh(&format!(
+            "cat '{}' >&2",
+            fixture_path("connection-refused").display()
+        ));
+        let openssh = OpenSsh::new(ssh.path(), "xdg-terminal-exec".into())
+            .with_keygen("/nonexistent/ssh-keygen".into());
+
+        assert_eq!(
+            openssh
+                .fetch_host_key(None, "dev", None, &AtomicBool::new(false))
+                .unwrap(),
+            KeyFetch::Failed(Failure::ConnectionRefused)
+        );
+        assert!(!Path::new(&fs::read_to_string(ssh.log()).unwrap()).exists());
+    }
+
+    #[test]
+    fn append_adds_a_separating_newline_and_creates_missing_files_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("known_hosts");
+        fs::write(&existing, "a b c").unwrap();
+        append_known_hosts(&existing, b"x y z\n").unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "a b c\nx y z\n");
+
+        let missing = dir.path().join("new_hosts");
+        append_known_hosts(&missing, b"x y z\n").unwrap();
+        assert_eq!(fs::read(&missing).unwrap(), b"x y z\n");
+        assert_eq!(
+            fs::metadata(&missing).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        assert!(append_known_hosts(&dir.path().join("absent/known_hosts"), b"x y z\n").is_err());
+    }
+
+    #[test]
+    fn resolve_with_reads_the_known_hosts_files() {
+        let fake = fake_resolver(
+            "hostname h\nuserknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2\n",
+        );
+        let entry = fake.log().with_file_name("entry config");
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+
+        let resolved = openssh.resolve_with(Some(&entry), "dev", None).unwrap();
+
+        assert_eq!(
+            resolved.known_hosts_files,
+            ["~/.ssh/known_hosts", "~/.ssh/known_hosts2"]
+        );
+        assert_eq!(
+            fs::read_to_string(fake.log()).unwrap(),
+            format!("-G\n-F\n{}\n--\ndev\n", entry.display())
+        );
     }
 
     #[test]

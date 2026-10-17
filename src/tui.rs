@@ -1849,6 +1849,7 @@ mod tests {
                 port: Some(22),
                 identity_files: vec!["~/.ssh/id_ed25519".into()],
                 proxy_jump: Some("bastion".into()),
+                known_hosts_files: vec!["~/.ssh/known_hosts".into()],
             }),
             warnings: Vec::new(),
         }

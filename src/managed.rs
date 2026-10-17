@@ -1125,12 +1125,12 @@ fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
     }
 }
 
-struct PendingFile {
+pub(crate) struct PendingFile {
     path: Option<PathBuf>,
 }
 
 impl PendingFile {
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.path.as_deref().expect("pending file has a path")
     }
 
@@ -1149,7 +1149,12 @@ impl Drop for PendingFile {
     }
 }
 
-fn write_unique(dir: &Path, stem: &str, contents: &[u8], mode: u32) -> io::Result<PendingFile> {
+pub(crate) fn write_unique(
+    dir: &Path,
+    stem: &str,
+    contents: &[u8],
+    mode: u32,
+) -> io::Result<PendingFile> {
     #[cfg(test)]
     if stem == ".config.portico-rollback"
         && FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.replace(false))
