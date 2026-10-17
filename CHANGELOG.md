@@ -7,10 +7,6 @@ may contain breaking changes.
 
 ## [Unreleased]
 
-### Added
-
-- AUR package `portico`, built from the tagged source (`yay -S portico`), updated by the release workflow in its own job, independent of the crates.io publish.
-
 ## [0.2.3] - 2026-10-14
 
 The `v0.2.0`, `v0.2.1` and `v0.2.2` tags were pushed on commits whose `Cargo.toml` version did not match, so their releases failed and published nothing; tags are immutable, so this release supersedes them.

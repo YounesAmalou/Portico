@@ -14,11 +14,13 @@ The tests use temporary SSH homes and never connect to remote machines. The term
 
 ## Continuous integration and releases
 
-Two workflows live in `.github/workflows/`:
+Four workflows live in `.github/workflows/`:
 
 | Workflow | File | Runs when |
 |---|---|---|
 | CI | `ci.yml` | on every pull request, on every push to `main`, and when called by the release workflow |
+| Release PR | `release-plz.yml` | on every push to `main` |
+| Pull request title | `pr-title.yml` | when a pull request is opened or its title changes |
 | Release | `release.yml` | on pushing a `vX.Y.Z` tag, and on a manual run |
 
 CI runs the seven jobs (`fmt`, `clippy`, `test`, `msrv`, `audit`, `deny`, `package`) in an Arch Linux container, as an unprivileged user. A pull request, a merge to `main` and a release all go through the same checks, so a green pull request is what a release will see.
@@ -30,22 +32,26 @@ Release is not triggered by pull requests or pushes to branches. It has two mode
 
 CodeQL code scanning is managed in the repository's GitHub settings and appears in the Actions tab; it is not defined by files in this repository. Dependabot (`.github/dependabot.yml`) opens weekly pull requests for GitHub Actions and Cargo dependencies. Every action in the workflows is pinned to commit SHAs, with the version in a trailing comment, and the repository refuses to run an action that is not; update them through Dependabot, or look up the SHA of a release tag.
 
-### Changelog
+### Commit messages and the changelog
 
-`CHANGELOG.md` is written by hand, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format: user-visible changes go under `Unreleased` in the pull request that makes them, grouped as Added, Changed, Fixed or Security. Nothing generates or edits it automatically, and CI does not check that a pull request touched it (the pull request template only reminds you). At release time `Unreleased` becomes the version's section, and the release workflow extracts the section for that version with `scripts/changelog-notes.sh` and uses it as the GitHub Release notes. A missing section aborts the release before anything is built.
+Versions and `CHANGELOG.md` come from commit messages, which follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:` (listed under Added), `fix:` (Fixed), `changed:`, `refactor:` and `perf:` (Changed) and `security:` (Security), plus `docs:`, `test:`, `ci:`, `build:`, `chore:`, `style:` and `revert:`, which never appear in the changelog. Add `!` after the type (`feat!:`) or a `BREAKING CHANGE:` footer for a breaking change. Only `feat`, `fix`, `security`, `perf`, `refactor` and `changed` commits cause a release. A squash merge uses the pull request title, and the `Pull request title` check rejects titles that do not follow the convention, so write the title as the changelog line you want users to read.
+
+Nothing edits `CHANGELOG.md` by hand any more: release-plz writes each version's section when the release pull request is prepared, and the `Unreleased` heading stays as the marker where new sections are inserted. The release workflow extracts the section for that version with `scripts/changelog-notes.sh` and uses it as the GitHub Release notes; a missing section aborts the release before anything is built.
 
 ### Cutting a release
 
-1. In a pull request, set `version` in `Cargo.toml`, run `cargo update -p portico-ssh` so `Cargo.lock` carries the same version (the release builds use `--locked` and fail otherwise), and turn `Unreleased` in `CHANGELOG.md` into a `## [X.Y.Z] - date` section above a fresh empty `Unreleased`.
-2. After it merges, run `git checkout main && git pull`, then `scripts/tag-release.sh X.Y.Z`. It refuses unless `HEAD` is the tip of `origin/main`, `Cargo.toml` and `CHANGELOG.md` carry the version and the tag is new, then creates and pushes `vX.Y.Z`. Tags are immutable, so do not tag by hand: a tag on the wrong commit burns that version.
-3. Nothing else is needed: the run verifies, checks, builds, creates the release and publishes to crates.io and the AUR by itself. Watch it with `gh run watch`. If only `crates` or `aur` fails, use "Re-run failed jobs": re-running the whole workflow fails at release creation because the release already exists.
+1. After a user-visible change merges to `main`, the `Release PR` workflow opens (or updates) a release pull request that sets the version in `Cargo.toml` and `Cargo.lock` and adds the version's changelog section. Before 1.0, a breaking change raises the minor version and anything else raises the patch version.
+2. Review it like any pull request. Merging it is the release decision: the same workflow then tags the merge commit `vX.Y.Z`.
+3. The tag starts the release run, which verifies that the tag matches the Cargo version and that the changelog has a section for it, re-runs CI, builds the Linux x86_64 tarball and checksum, creates the GitHub Release, and publishes in two independent jobs, each starting automatically and each failing or being re-run without affecting the other: `crates` sends `portico-ssh` to crates.io and `aur` updates the AUR package `portico`. Both run only for tags. `v*` tags are protected: they can only be created by an administrator or the release automation and can never be moved or deleted. Publishing cannot be undone. Watch the run with `gh run watch`; if only `crates` or `aur` fails, use "Re-run failed jobs" (re-running the whole workflow fails at release creation because the release already exists), and never re-tag.
 4. Verify the GitHub Release and `cargo install portico-ssh` afterwards.
-5. The `aur` job runs `scripts/aur-publish.sh`, which pins the tag archive's SHA-256 with `scripts/aur-update.sh`, proves the package builds with `makepkg`, and pushes `PKGBUILD` and `.SRCINFO` to `ssh://aur@aur.archlinux.org/portico.git`. It is independent of `crates` and safe to re-run (a version already on the AUR changes nothing), so if it fails, for example because the key is missing, fix the cause and use "Re-run failed jobs". The copy in `packaging/aur/` is the template: it is only edited when the packaging itself changes, and the version and checksum in it are rewritten at release time.
+5. The `aur` job runs `scripts/aur-publish.sh`, which pins the tag archive's SHA-256 with `scripts/aur-update.sh`, proves the package builds with `makepkg`, and pushes `PKGBUILD` and `.SRCINFO` to `ssh://aur@aur.archlinux.org/portico.git`. It is independent of `crates` and safe to re-run (a version already on the AUR changes nothing). The copy in `packaging/aur/` is the template: it is only edited when the packaging itself changes, and the version and checksum in it are rewritten at release time.
+
+If the release automation is unavailable, `scripts/tag-release.sh X.Y.Z` is the manual fallback: in a pull request set the version in `Cargo.toml`, run `cargo update -p portico-ssh` so `Cargo.lock` carries the same version (release builds use `--locked`), and add a `## [X.Y.Z] - date` changelog section; merge it, run `git checkout main && git pull`, then the script. It refuses unless `HEAD` is the tip of `origin/main`, `Cargo.toml` and `CHANGELOG.md` carry the version and the tag is new. Never tag by hand: a tag on the wrong commit burns that version.
 
 ## Pull requests
 
 - Keep changes focused and include tests for behaviour changes.
-- Update `CHANGELOG.md` under `Unreleased`.
+- Give the pull request a conventional title (see above); the changelog is generated from it.
 - Larger features follow the project's spec, plan, implementation flow in `docs/superpowers/`.
 
 ## Licensing

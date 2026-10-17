@@ -1,0 +1,47 @@
+# Configuration of release-plz (see .github/workflows/release-plz.yml).
+# release-plz keeps a release pull request open and creates the version tag when it
+# merges. Publishing and the GitHub Release stay in release.yml, started by that tag.
+
+[workspace]
+publish = false
+git_release_enable = false
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+# Create the tag only when the release pull request has merged.
+release_always = false
+semver_check = false
+# Only user-visible commits open or update a release pull request.
+release_commits = "^(feat|fix|security|perf|refactor|changed)"
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
+follows [Semantic Versioning](https://semver.org/). Before 1.0, minor versions
+may contain breaking changes.
+
+## [Unreleased]
+"""
+# The heading must stay "## [X.Y.Z] - date": scripts/changelog-notes.sh finds a
+# version's notes by that prefix.
+body = """
+
+## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+
+{% for commit in commits -%}
+- {% if commit.breaking %}**Breaking:** {% endif %}{{ commit.message | upper_first }}
+{% endfor %}
+{%- endfor %}
+"""
+trim = true
+commit_parsers = [
+  { message = "^Merge", skip = true },
+  { message = "^feat", group = "Added" },
+  { message = "^(changed|refactor|perf)", group = "Changed" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^security", group = "Security" },
+  { message = "^.*", skip = true },
+]

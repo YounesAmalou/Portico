@@ -4,4 +4,4 @@
 
 - [ ] `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --all-targets` pass
 - [ ] Tests cover the behaviour change
-- [ ] `CHANGELOG.md` updated under `Unreleased`
+- [ ] The title follows Conventional Commits (`feat:`, `fix:`, `docs:` ...): the changelog is generated from it
