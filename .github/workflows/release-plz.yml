@@ -1,0 +1,56 @@
+name: Release PR
+
+# On every push to main, release-plz keeps one release pull request open (version bump,
+# lockfile and changelog) and, once that pull request has merged, creates the vX.Y.Z tag
+# on its merge commit. The tag starts release.yml, which builds, releases and publishes.
+# A token minted for a GitHub App is used because pull requests and tags created with the
+# default token do not start workflows (the pull request would get no CI, the tag no release).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

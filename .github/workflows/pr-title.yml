@@ -1,0 +1,24 @@
+name: Pull request title
+
+# Release versions and the changelog are derived from commit messages, and a squash merge
+# uses the pull request title, so the title must follow the convention.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title follows type(scope)!: description
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|security|perf|refactor|changed|docs|test|ci|build|chore|style|revert)(\([a-z0-9._-]+\))?!?: .+'
+          if ! printf '%s\n' "$TITLE" | grep -Eq "$pattern"; then
+            echo "Title '$TITLE' must look like 'feat: add tunnels' or 'fix(tui): keep the filter' (types: feat, fix, security, perf, refactor, changed, docs, test, ci, build, chore, style, revert)." >&2
+            exit 1
+          fi

@@ -191,8 +191,8 @@ fn contributing_explains_who_can_publish() {
 fn contributing_describes_the_changelog_and_every_release_step() {
     let contributing = read("CONTRIBUTING.md");
     for explained in [
-        // The changelog is written by hand; the workflow only reads it.
-        "written by hand",
+        // The changelog is generated from commit messages; the release workflow only reads it.
+        "Conventional Commits",
         "extracts the section",
         // A version bump must keep the lock file in step, or `--locked` builds fail.
         "Cargo.lock",
@@ -317,4 +317,32 @@ fn aur_and_crates_publishing_are_independent_jobs_with_separate_secrets() {
         );
     }
     assert!(read("packaging/aur/known_hosts").contains("ssh-ed25519"));
+}
+
+#[test]
+fn changelog_header_matches_what_release_plz_writes_above_each_release() {
+    let config = read("release-plz.toml");
+    let header = config
+        .split("header = \"\"\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\"\"\"").next())
+        .expect("release-plz.toml defines a changelog header");
+    let changelog = read("CHANGELOG.md");
+    assert!(
+        changelog.starts_with(header.trim_end()),
+        "CHANGELOG.md must start with the header in release-plz.toml, or release-plz will duplicate it"
+    );
+}
+
+#[test]
+fn release_plz_leaves_publishing_and_the_release_to_the_tag_workflow() {
+    let config = read("release-plz.toml");
+    for setting in [
+        "publish = false",
+        "git_release_enable = false",
+        "git_tag_name = \"v{{ version }}\"",
+        "release_always = false",
+    ] {
+        assert!(config.contains(setting), "release-plz.toml lacks {setting}");
+    }
 }
