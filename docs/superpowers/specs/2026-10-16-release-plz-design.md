@@ -31,7 +31,7 @@ Rehearsed on GitHub before a real release relies on it, and not before the next 
 
 1. The release pull request opens against `main` and its seven required checks run (proving the App token triggers CI).
 2. Its diff changes only the version, the lockfile entry and the changelog, and `scripts/changelog-notes.sh` extracts the new section from it.
-3. After merging it, the `v*` tag appears on the merge commit and `release.yml` starts from it (proving the bypass and the tag trigger).
+3. After merging it, the `v*` tag appears on the merge commit and `release.yml` starts from it (proving the App may create the tag and that the tag starts the release).
 4. `release.yml` completes: GitHub Release, tarball, checksum, and `crates` publish; `aur` stays red while AUR publishing is suspended.
 
 If step 3 fails because the App may not create the tag, fix the App's access in the repository settings, never the tag.
