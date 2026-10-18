@@ -72,7 +72,11 @@ impl Lister {
         if let Some(cancelled) = self.start(target.clone()) {
             panel.abandon(cancelled);
         }
-        panel.set_listing(target);
+        if self.is_running() {
+            panel.set_listing(target);
+        } else {
+            panel.fail(target, "the container listing worker stopped");
+        }
     }
 
     /// Abandons the running listing, killing its `ssh`, and returns its target.
@@ -249,5 +253,30 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             assert!(lister.try_finished().is_none());
         });
+    }
+
+    #[test]
+    fn a_stopped_worker_fails_the_listing() {
+        let (requests, receiver) = mpsc::channel();
+        let (_sender, results) = mpsc::channel();
+        drop(receiver);
+        let mut lister = Lister {
+            requests,
+            results,
+            generation: 0,
+            running: None,
+        };
+        let mut panel = Panel::default();
+        panel.follow(Some("dev"));
+
+        lister.list(&mut panel, Target::Host("dev".into()));
+
+        assert!(!lister.is_running());
+        let text: Vec<String> = panel
+            .lines(false, 10)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(text, ["the container listing worker stopped"]);
     }
 }

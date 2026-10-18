@@ -133,6 +133,7 @@ impl Panel {
                 if !self.pinned_local {
                     self.pinned_local = true;
                     self.selected = 0;
+                    self.scroll.set(0);
                 }
                 self.on_focus()
             }
@@ -179,6 +180,25 @@ impl Panel {
         {
             self.refreshing.insert(target, previous);
         }
+    }
+
+    /// Pastes into the user while it is being edited; otherwise a paste means nothing here.
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.editing_user {
+            self.user.paste(text);
+        }
+    }
+
+    /// Shows that `target` could not be listed for a reason of Portico's own.
+    pub(super) fn fail(&mut self, target: Target, line: &str) {
+        self.refreshing.remove(&target);
+        self.lists.insert(
+            target,
+            PanelState::Failed(PanelFailure {
+                lines: vec![line.to_owned()],
+                offer: None,
+            }),
+        );
     }
 
     /// Forgets a listing that will not finish: a refreshed listing comes back, anything else

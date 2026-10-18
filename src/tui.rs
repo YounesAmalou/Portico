@@ -288,23 +288,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 let result = if new_terminal {
                     app.connect(&alias, true).map_err(TuiError::from)
                 } else {
-                    let result = suspend_for_child(
-                        || session.leave(),
-                        || {
-                            // The terminal's Ctrl+C is for ssh now; Portico waits for it.
-                            let _foreground = signals.foreground_child();
-                            app.connect_cancellable(&alias, terminated)
-                                .map_err(TuiError::from)
-                        },
-                        || session.enter(),
-                    );
-                    match result {
-                        Err(TuiError::Io(error)) => return Err(TuiError::Io(error)),
-                        result => {
-                            redraw_from_scratch(terminal)?;
-                            result
-                        }
-                    }
+                    suspended(terminal, session, signals, || {
+                        app.connect_cancellable(&alias, terminated)
+                            .map_err(TuiError::from)
+                    })?
                 };
                 state.finish_connect(&alias, result);
             }
@@ -328,36 +315,14 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 let result = if new_terminal {
                     Ok(shell(None))
                 } else {
-                    let result = suspend_for_child(
-                        || session.leave(),
-                        || {
-                            let _foreground = signals.foreground_child();
-                            Ok(shell(Some(terminated)))
-                        },
-                        || session.enter(),
-                    );
-                    if let Err(TuiError::Io(error)) = result {
-                        return Err(TuiError::Io(error));
-                    }
-                    redraw_from_scratch(terminal)?;
-                    result
+                    suspended(terminal, session, signals, || Ok(shell(Some(terminated))))?
                 };
                 state.status = Some(shell_status(&target, result));
             }
             UiAction::Containers(PanelAction::Fix { target, offer }) => {
-                let result = suspend_for_child(
-                    || session.leave(),
-                    || {
-                        // sudo may prompt, and the terminal's Ctrl+C is for it now.
-                        let _foreground = signals.foreground_child();
-                        Ok(app.docker_fix(&target, &offer))
-                    },
-                    || session.enter(),
-                );
-                if let Err(TuiError::Io(error)) = result {
-                    return Err(TuiError::Io(error));
-                }
-                redraw_from_scratch(terminal)?;
+                let result = suspended(terminal, session, signals, || {
+                    Ok(app.docker_fix(&target, &offer))
+                })?;
                 state.status = fix_status(&offer, result);
                 lister.list(&mut state.containers, target);
             }
@@ -437,6 +402,30 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         sync_details(&mut state, &mut resolver, inventory_changed);
         redraw = true;
     }
+}
+
+/// Runs `child` in the terminal with the interface suspended and the terminal's Ctrl+C left to
+/// the child (Portico waits for it), then redraws. Failing to leave or re-enter the screen is
+/// the outer error; the child's own result is passed through.
+fn suspended<B: Backend<Error = io::Error>, T>(
+    terminal: &mut Terminal<B>,
+    session: &TerminalSession,
+    signals: &Signals,
+    child: impl FnOnce() -> Result<T, TuiError>,
+) -> Result<Result<T, TuiError>, TuiError> {
+    let result = suspend_for_child(
+        || session.leave(),
+        || {
+            let _foreground = signals.foreground_child();
+            child()
+        },
+        || session.enter(),
+    );
+    if let Err(TuiError::Io(error)) = result {
+        return Err(TuiError::Io(error));
+    }
+    redraw_from_scratch(terminal)?;
+    Ok(result)
 }
 
 /// Cancels a running test of one of `aliases`, whose configuration just changed.
@@ -1403,7 +1392,7 @@ impl UiState {
                 action => UiAction::Containers(action),
             };
         }
-        if self.mode == Mode::Browse && key.code == KeyCode::Tab {
+        if self.mode == Mode::Browse && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.focus = Focus::Containers;
             return UiAction::Containers(self.containers.on_focus());
         }
@@ -1440,6 +1429,7 @@ impl UiState {
                 input.paste(text);
                 return self.form_input_changed(&before, cursor);
             }
+            Mode::Browse if self.focus == Focus::Containers => self.containers.paste(text),
             Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
         UiAction::None
@@ -5497,6 +5487,33 @@ mod tests {
             UiAction::Containers(PanelAction::Leave)
         );
         assert_eq!(state.focus, Focus::Hosts);
+        assert_eq!(
+            press(&mut state, KeyCode::BackTab),
+            UiAction::Containers(PanelAction::List(Target::Host("dev".into())))
+        );
+        assert_eq!(state.focus, Focus::Containers);
+        assert_eq!(
+            press(&mut state, KeyCode::BackTab),
+            UiAction::Containers(PanelAction::Leave)
+        );
+        assert_eq!(state.focus, Focus::Hosts);
+    }
+
+    #[test]
+    fn paste_goes_to_the_panel_user_while_editing() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Tab);
+        let dev = Target::Host("dev".into());
+        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+        state.handle_paste("ignored");
+        press(&mut state, KeyCode::Char('u'));
+        state.handle_paste("root\n");
+        press(&mut state, KeyCode::Enter);
+        assert!(
+            state.containers.details().unwrap().ends_with("user: root"),
+            "{:?}",
+            state.containers.details()
+        );
     }
 
     #[test]
@@ -5547,10 +5564,7 @@ mod tests {
         state.containers.finish(dev.clone(), Ok(shop_list(dev)));
         let text = rendered(&state);
         assert!(text.contains("Containers: dev"), "{text}");
-        assert!(
-            text.contains("Tab to list") || text.contains("shop"),
-            "{text}"
-        );
+        assert!(text.contains("shop"), "{text}");
         assert!(!text.contains("image: db:latest"), "{text}");
 
         press(&mut state, KeyCode::Tab);
