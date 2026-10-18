@@ -1,0 +1,22 @@
+//! End-to-end tests: the real `portico` binary against a real, unprivileged
+//! `sshd`, through a real pseudo-terminal where a terminal is involved.
+//!
+//! Every test is ignored by a plain `cargo test`; run the suite with
+//! `scripts/ci-checks.sh e2e`. It needs OpenSSH's server installed and runs as
+//! a regular user. Each test owns its server, its keys and its home, all in
+//! temporary directories, and proves that the real `~/.ssh/known_hosts` was
+//! not touched.
+
+#[path = "support/executable.rs"]
+mod executable;
+
+// Fixtures grow with the suite; Task 6 removes this once every helper is used.
+#[allow(dead_code)]
+#[path = "e2e/client.rs"]
+mod client;
+#[allow(dead_code)]
+#[path = "e2e/sshd.rs"]
+mod sshd;
+
+#[path = "e2e/cli_test.rs"]
+mod cli_test;

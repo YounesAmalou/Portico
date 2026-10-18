@@ -39,7 +39,9 @@ signal-hook = "0.4"
 thiserror = "2"
 
 [dev-dependencies]
+portable-pty = "0.9"
 tempfile = "3"
+vt100 = "0.17"
 
 [profile.release]
 strip = true
