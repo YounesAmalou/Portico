@@ -31,6 +31,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+mod containers;
 mod tester;
 
 use crate::{
