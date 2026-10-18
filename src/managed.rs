@@ -343,16 +343,10 @@ impl ManagedStore {
             self.init_managed()?;
             // Existing hosts were validated when written; parsing the installed config is enough.
             validate(&self.paths.entry, &[]).map_err(|stderr| {
-                let managed_text =
-                    String::from_utf8_lossy(&fs::read(&self.paths.managed).unwrap_or_default())
-                        .into_owned();
-                InitError::Validation(interpret(
+                InitError::Validation(interpret_rejection(
                     &stderr,
-                    &ConfigFiles {
-                        managed: &self.paths.managed,
-                        managed_text: &managed_text,
-                        entry: &self.paths.entry,
-                    },
+                    &self.paths.managed,
+                    &self.paths.entry,
                 ))
             })
         };
@@ -649,16 +643,10 @@ impl ManagedStore {
             },
         ) = self.stage(mutate, cancelled)?;
         validate(validation_file.path(), &changed_aliases).map_err(|stderr| {
-            let managed_text =
-                String::from_utf8_lossy(&fs::read(candidate.path()).unwrap_or_default())
-                    .into_owned();
-            TransactionError::Validation(interpret(
+            TransactionError::Validation(interpret_rejection(
                 &stderr,
-                &ConfigFiles {
-                    managed: candidate.path(),
-                    managed_text: &managed_text,
-                    entry: validation_file.path(),
-                },
+                candidate.path(),
+                validation_file.path(),
             ))
         })?;
         drop(validation_file);
@@ -812,8 +800,7 @@ impl ManagedStore {
             validation_file
         };
         drop(lock);
-        let managed_text =
-            String::from_utf8_lossy(&fs::read(candidate.path()).unwrap_or_default()).into_owned();
+        let managed_text = read_lossy(candidate.path());
         let result = use_entry(ConfigFiles {
             managed: candidate.path(),
             managed_text: &managed_text,
@@ -1252,6 +1239,28 @@ fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
 
 /// A staged change: the candidate managed config and an entry config including it, written but
 /// not activated, with the transaction lock still held.
+/// Reads a managed config for mapping OpenSSH's line numbers back to hosts.
+///
+/// A read failure yields empty text: the line then maps to no host, so the rejection degrades
+/// to an unmapped one, which is still reported verbatim. Nothing depends on the text otherwise.
+fn read_lossy(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+/// Interprets ssh's stderr against the managed config at `managed` and the entry at `entry`.
+fn interpret_rejection(stderr: &str, managed: &Path, entry: &Path) -> ConfigRejection {
+    interpret(
+        stderr,
+        &ConfigFiles {
+            managed,
+            managed_text: &read_lossy(managed),
+            entry,
+        },
+    )
+}
+
 struct Staged {
     lock: File,
     active: Vec<u8>,

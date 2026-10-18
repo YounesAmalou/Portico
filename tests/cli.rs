@@ -528,7 +528,8 @@ fn a_save_rejected_by_the_users_own_config_names_that_file() {
     );
 
     env.run(["add", "x", "-H", "h"])
-        .assert_failure_stderr_contains(
-            "line 3 of ~/.ssh/config: Bad configuration option: bogus; nothing was saved",
+        .assert_exit_code_and_stderr_contains(
+            1,
+            "line 3 of ~/.ssh/config: Bad configuration option: bogus; nothing was saved; fix that line, then save again",
         );
 }
