@@ -31,13 +31,18 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+mod tester;
+
 use crate::{
-    app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership},
+    app::{
+        App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
+    },
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, ResolvedConfig},
 };
+use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
 
 /// One row of the Add/Edit form.
@@ -182,11 +187,13 @@ fn browse<B: Backend<Error = io::Error>>(
     signals: &Signals,
     session: &TerminalSession,
 ) -> Result<(), TuiError> {
-    // Host details come from `ssh -G`, so a worker resolves them while the UI keeps handling keys.
-    // The resolver is dropped (cancelling any running `ssh -G`) before the scope waits for the worker.
+    // Host details come from `ssh -G` and connection tests run `ssh`, so workers do both while
+    // the UI keeps handling keys. The resolver and the tester are dropped (cancelling any running
+    // `ssh`) before the scope waits for the workers.
     thread::scope(|scope| {
         let resolver = Resolver::spawn(scope, app);
-        browse_hosts(app, terminal, signals, session, resolver)
+        let tester = Tester::spawn(scope, app);
+        browse_hosts(app, terminal, signals, session, resolver, tester)
     })
 }
 
@@ -196,6 +203,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     signals: &Signals,
     session: &TerminalSession,
     mut resolver: Resolver,
+    mut tester: Tester,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
@@ -211,12 +219,21 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             state.open_pending_edit();
             redraw = true;
         }
+        if let Some(finished) = tester.poll() {
+            state.record_test(finished, local_time());
+            redraw = true;
+        }
+        let testing = tester.running().map(str::to_owned);
+        if state.testing != testing {
+            state.testing = testing;
+            redraw = true;
+        }
         if redraw {
             terminal.draw(|frame| render(frame, &state))?;
             redraw = false;
         }
-        // Poll quickly while a resolution is running so its result appears promptly.
-        let wait = if resolver.is_pending() {
+        // Poll quickly while a resolution or a test is running so its result appears promptly.
+        let wait = if resolver.is_pending() || tester.running().is_some() {
             Duration::from_millis(25)
         } else {
             Duration::from_millis(100)
@@ -289,7 +306,12 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Err(error) => error.to_string(),
                 });
             }
-            UiAction::Refresh => inventory_changed = apply_refresh(&mut state, || app.hosts()),
+            UiAction::Refresh => {
+                inventory_changed = apply_refresh(&mut state, || app.hosts());
+                if inventory_changed {
+                    tester.cancel_if(|origin, _| matches!(origin, Origin::Host(_)));
+                }
+            }
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
                 let result = app.add_cancellable(host, terminated);
@@ -298,6 +320,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     &mut state,
                     result,
                     Some(&alias),
+                    &[],
                     format!("Saved {alias}"),
                 );
             }
@@ -307,19 +330,39 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Change::Keep | Change::Clear => alias.clone(),
                 };
                 let result = app.edit_cancellable(&alias, changes, terminated);
+                let edited = [alias.as_str(), selected.as_str()];
+                if result.is_ok() {
+                    cancel_host_test(&mut tester, &edited);
+                }
                 inventory_changed = finish_mutation(
                     app,
                     &mut state,
                     result,
                     Some(&selected),
+                    &edited,
                     format!("Saved {selected}"),
                 );
             }
             UiAction::Remove(alias) => {
                 let result = app.remove_cancellable(&alias, terminated);
-                inventory_changed =
-                    finish_mutation(app, &mut state, result, None, format!("Removed {alias}"));
+                if result.is_ok() {
+                    cancel_host_test(&mut tester, &[&alias]);
+                }
+                inventory_changed = finish_mutation(
+                    app,
+                    &mut state,
+                    result,
+                    None,
+                    &[&alias],
+                    format!("Removed {alias}"),
+                );
             }
+            UiAction::Test { origin, target } => tester.start(origin, Job::Test(target)),
+            UiAction::CancelTest => tester.cancel(),
+        }
+        // A form's result is only shown in that form.
+        if !state.in_form() {
+            tester.cancel_if(|origin, _| *origin == Origin::Form);
         }
 
         sync_details(&mut state, &mut resolver, inventory_changed);
@@ -327,17 +370,29 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     }
 }
 
+/// Cancels a running test of one of `aliases`, whose configuration just changed.
+fn cancel_host_test(tester: &mut Tester, aliases: &[&str]) {
+    tester.cancel_if(|origin, tested| {
+        matches!(origin, Origin::Host(_))
+            && aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(tested))
+    });
+}
+
 /// Applies a mutation's outcome to the UI and reports whether the inventory may have changed.
+/// On success, the test results of `changed` aliases are dropped.
 fn finish_mutation(
     app: &App,
     state: &mut UiState,
     result: Result<(), AppError>,
     preferred: Option<&str>,
+    changed: &[&str],
     status: String,
 ) -> bool {
     match result {
         Ok(()) => {
-            complete_mutation(state, preferred, status, || app.hosts());
+            complete_mutation(state, preferred, changed, status, || app.hosts());
             true
         }
         Err(error) => fail_mutation(state, &error, || app.hosts()),
@@ -398,6 +453,7 @@ where
         Ok(inventory) => {
             let count = inventory.hosts.len();
             state.replace_hosts(inventory);
+            state.results.clear();
             let noun = if count == 1 { "host" } else { "hosts" };
             state.status = Some(format!("Refreshed: {count} {noun}"));
             true
@@ -409,13 +465,21 @@ where
     }
 }
 
-fn complete_mutation<E, F>(state: &mut UiState, preferred: Option<&str>, status: String, refresh: F)
-where
+fn complete_mutation<E, F>(
+    state: &mut UiState,
+    preferred: Option<&str>,
+    changed: &[&str],
+    status: String,
+    refresh: F,
+) where
     E: std::fmt::Display,
     F: FnOnce() -> Result<HostInventory, E>,
 {
     state.mode = Mode::Browse;
     state.form = FormState::default();
+    for alias in changed {
+        state.results.forget(alias);
+    }
     match refresh() {
         Ok(hosts) => {
             state.replace_hosts(hosts);
@@ -984,6 +1048,52 @@ struct UiState {
     edit_pending: bool,
     /// Whether the terminal reports Ctrl+Enter, so the footer may advertise it.
     ctrl_enter: bool,
+    /// The alias under test while a connection test runs.
+    testing: Option<String>,
+    /// Connection test results of saved hosts, kept for the session.
+    results: TestResults,
+}
+
+/// The outcome of a host's last connection test.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestMark {
+    passed: bool,
+    line: String,
+    finished_at: String,
+}
+
+/// Connection test results by host. Like `DetailsCache`, lookup is linear.
+#[derive(Clone, Debug, Default)]
+struct TestResults {
+    entries: Vec<(HostSummary, TestMark)>,
+}
+
+impl TestResults {
+    fn get(&self, host: &HostSummary) -> Option<&TestMark> {
+        self.entries
+            .iter()
+            .find(|(tested, _)| tested == host)
+            .map(|(_, mark)| mark)
+    }
+
+    fn insert(&mut self, host: HostSummary, mark: TestMark) {
+        self.forget_host(&host);
+        self.entries.push((host, mark));
+    }
+
+    fn forget_host(&mut self, host: &HostSummary) {
+        self.entries.retain(|(tested, _)| tested != host);
+    }
+
+    /// Drops every result for `alias`, whichever file defines it.
+    fn forget(&mut self, alias: &str) {
+        self.entries
+            .retain(|(tested, _)| !tested.alias.eq_ignore_ascii_case(alias));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -993,6 +1103,8 @@ struct FormState {
     original: Option<Host>,
     /// The reason the last save was rejected, shown until the form is edited.
     error: Option<String>,
+    /// The last connection test of the typed values, shown until the form is edited.
+    test_result: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1004,6 +1116,8 @@ enum UiAction {
     Edit { alias: String, changes: HostChanges },
     Remove(String),
     Refresh,
+    Test { origin: Origin, target: TestTarget },
+    CancelTest,
 }
 
 impl UiState {
@@ -1024,6 +1138,8 @@ impl UiState {
             details: DetailsCache::default(),
             edit_pending: false,
             ctrl_enter,
+            testing: None,
+            results: TestResults::default(),
         }
     }
 
@@ -1099,6 +1215,10 @@ impl UiState {
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         self.status = None;
         self.edit_pending = false;
+        if key.code == KeyCode::Esc && self.testing.is_some() {
+            self.status = Some("Test cancelled".into());
+            return UiAction::CancelTest;
+        }
         match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Filter => self.handle_filter_key(key),
@@ -1117,6 +1237,7 @@ impl UiState {
             Mode::AddForm | Mode::EditForm => {
                 self.form.values[self.form.active].paste(text);
                 self.form.error = None;
+                self.form.test_result = None;
             }
             Mode::Browse | Mode::ConfirmRemove => {}
         }
@@ -1148,6 +1269,9 @@ impl UiState {
             }
             KeyCode::Char('n') => return self.connect_action(true),
             KeyCode::Char('r') | KeyCode::F(5) => return UiAction::Refresh,
+            KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.test_selected();
+            }
             KeyCode::Char('q') => return UiAction::Quit,
             _ => {}
         }
@@ -1207,9 +1331,13 @@ impl UiState {
                 self.form.active = (self.form.active + 1).min(FORM_FIELDS.len() - 1)
             }
             KeyCode::Enter if key.modifiers.is_empty() => return self.submit_form(),
+            KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+                return self.test_form();
+            }
             _ => {
                 if self.form.values[self.form.active].handle_key(key) {
                     self.form.error = None;
+                    self.form.test_result = None;
                 }
             }
         }
@@ -1224,6 +1352,73 @@ impl UiState {
                 UiAction::None
             }
         }
+    }
+
+    /// Tests the values typed into the form, without saving them.
+    fn test_form(&mut self) -> UiAction {
+        let target = match self.form.submission(&self.mode) {
+            Ok(UiAction::Add(host)) => TestTarget::Add(host),
+            Ok(UiAction::Edit { alias, changes }) => TestTarget::Edit { alias, changes },
+            Ok(other) => unreachable!("a form submits an add or an edit, not {other:?}"),
+            Err(error) => {
+                self.report_form_error(&error);
+                return UiAction::None;
+            }
+        };
+        UiAction::Test {
+            origin: Origin::Form,
+            target,
+        }
+    }
+
+    fn test_selected(&self) -> UiAction {
+        self.selected_summary()
+            .map_or(UiAction::None, |host| UiAction::Test {
+                origin: Origin::Host(host.clone()),
+                target: TestTarget::Saved(host.alias.clone()),
+            })
+    }
+
+    fn in_form(&self) -> bool {
+        matches!(self.mode, Mode::AddForm | Mode::EditForm)
+    }
+
+    /// Shows a finished test: a saved host's result marks it in the list and the details pane
+    /// and goes to the status line; a form's result goes to the form, if it is still open.
+    fn record_test(&mut self, finished: Finished, finished_at: String) {
+        let (passed, line) = match &finished.outcome {
+            Ok(TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. }) => {
+                (report.passed(), report.summary())
+            }
+            Err(error) => (false, format!("failed \u{2014} {error}")),
+        };
+        match finished.origin {
+            Origin::Host(host) => {
+                self.status = Some(format!("{}: {line}", finished.target.alias()));
+                self.results.insert(
+                    host,
+                    TestMark {
+                        passed,
+                        line,
+                        finished_at,
+                    },
+                );
+            }
+            Origin::Form => {
+                if self.in_form() {
+                    self.form.test_result = Some(line);
+                }
+            }
+        }
+    }
+
+    /// The status line: the last message, otherwise the test in flight.
+    fn status_line(&self) -> Option<String> {
+        self.status.clone().or_else(|| {
+            self.testing
+                .as_ref()
+                .map(|alias| format!("Testing {alias}\u{2026} (Esc to cancel)"))
+        })
     }
 
     /// Shows an error on the form field it is about, and a plain status otherwise.
@@ -1298,6 +1493,7 @@ impl Default for FormState {
             active: 0,
             original: None,
             error: None,
+            test_result: None,
         }
     }
 }
@@ -1322,6 +1518,7 @@ impl FormState {
             active: 0,
             original: Some(host.clone()),
             error: None,
+            test_result: None,
         }
     }
 
@@ -1422,6 +1619,7 @@ fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> Hos
 
 fn render(frame: &mut Frame<'_>, state: &UiState) {
     let footer = footer_text(state);
+    let status = state.status_line();
     let footer_height = (footer.chars().count() as u16)
         .div_ceil(frame.area().width.max(1))
         .max(1);
@@ -1435,7 +1633,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                     .len()
                     .min(usize::from(frame.area().height / 3)) as u16,
             ),
-            Constraint::Length(u16::from(state.status.is_some())),
+            Constraint::Length(u16::from(status.is_some())),
             Constraint::Length(footer_height),
         ])
         .split(frame.area());
@@ -1449,7 +1647,16 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         .iter()
         .map(|&index| {
             let host = &state.hosts[index];
-            ListItem::new(format!("{}  {}", host.alias, ownership(host.ownership)))
+            let mark = match state.results.get(host) {
+                Some(mark) if mark.passed => "\u{2713} ",
+                Some(_) => "\u{2717} ",
+                None => "  ",
+            };
+            ListItem::new(format!(
+                "{mark}{}  {}",
+                host.alias,
+                ownership(host.ownership)
+            ))
         })
         .collect::<Vec<_>>();
     let mut list_state = ListState::default().with_selected(
@@ -1509,10 +1716,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         .collect::<Vec<_>>()
         .join("\n");
     frame.render_widget(Paragraph::new(warnings), areas[1]);
-    frame.render_widget(
-        Paragraph::new(state.status.as_deref().unwrap_or_default()),
-        areas[2],
-    );
+    frame.render_widget(Paragraph::new(status.unwrap_or_default()), areas[2]);
     frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), areas[3]);
 }
 
@@ -1525,7 +1729,7 @@ fn footer_text(state: &UiState) -> String {
                 "n new terminal"
             };
             let refresh = "r refresh";
-            let connect = format!("Enter connect  {new_terminal}  q quit");
+            let connect = format!("t test  Enter connect  {new_terminal}  q quit");
             let clear_filter = if state.filter.is_empty() {
                 ""
             } else {
@@ -1553,7 +1757,9 @@ fn footer_text(state: &UiState) -> String {
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
-        Mode::AddForm | Mode::EditForm => "↑↓ field  ←→ move  Enter save  Esc cancel".into(),
+        Mode::AddForm | Mode::EditForm => {
+            "↑↓ field  ←→ move  Enter save  Ctrl+T test  Esc cancel".into()
+        }
         Mode::ConfirmRemove => "Enter remove  Esc cancel".into(),
     }
 }
@@ -1594,6 +1800,9 @@ fn form_lines(form: &FormState) -> Vec<Line<'static>> {
             Style::default().fg(Color::Red),
         ));
     }
+    if let Some(result) = &form.test_result {
+        lines.push(Line::raw(format!("Connection test: {result}")));
+    }
     lines
 }
 
@@ -1601,10 +1810,32 @@ fn details_text(state: &UiState) -> String {
     let Some(selected) = state.selected_summary() else {
         return "No host selected".into();
     };
-    match state.details.get(selected) {
+    let text = match state.details.get(selected) {
         Some(Ok(details)) => detail_text(details),
         Some(Err(error)) => format!("Could not load details: {error}"),
         None => "Resolving…".into(),
+    };
+    match state.results.get(selected) {
+        Some(mark) => format!(
+            "{}\n\nConnection test: {} at {}",
+            text.trim_end(),
+            mark.line,
+            mark.finished_at
+        ),
+        None => text,
+    }
+}
+
+/// The current local time as `HH:MM`.
+fn local_time() -> String {
+    // SAFETY: `time` accepts a null pointer, and `localtime_r` only writes the `tm` it is given.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return "--:--".into();
+        }
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     }
 }
 
@@ -1803,11 +2034,13 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use crate::{
+        app::TestReport,
         app::{HostDetails, HostSummary, Ownership},
         discovery::DiscoveryWarning,
         host::{Change, Host},
         managed::InitPlan,
         openssh::ResolvedConfig,
+        probe::ProbeResult,
     };
 
     use super::*;
@@ -2791,7 +3024,7 @@ mod tests {
         press(&mut state, KeyCode::Char('e'));
         assert_eq!(state.mode, Mode::EditForm);
 
-        complete_mutation(&mut state, Some("dev"), "Saved dev".into(), || {
+        complete_mutation(&mut state, Some("dev"), &[], "Saved dev".into(), || {
             Err::<HostInventory, _>("inventory unavailable")
         });
 
@@ -3240,6 +3473,289 @@ mod tests {
             assert!(state.selected_details().is_none());
             assert!(resolver.is_pending());
         });
+    }
+
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    fn report(alias: &str, result: ProbeResult) -> TestReport {
+        TestReport {
+            alias: alias.into(),
+            user: Some("u".into()),
+            result,
+            key_fetch_failure: None,
+        }
+    }
+
+    fn authenticated(alias: &str) -> TestOutcome {
+        TestOutcome::Done(report(
+            alias,
+            ProbeResult::Authenticated(crate::probe::Authenticated {
+                host: "10.0.0.5".into(),
+                address: "10.0.0.5".into(),
+                port: 22,
+                method: "publickey".into(),
+            }),
+        ))
+    }
+
+    fn host_finished(host: HostSummary, outcome: Result<TestOutcome, String>) -> Finished {
+        Finished {
+            target: TestTarget::Saved(host.alias.clone()),
+            origin: Origin::Host(host),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn t_starts_a_test_of_the_selected_host_in_browse_mode_only() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+
+        assert_eq!(
+            press(&mut state, KeyCode::Char('t')),
+            UiAction::Test {
+                origin: Origin::Host(dev),
+                target: TestTarget::Saved("dev".into()),
+            }
+        );
+
+        press(&mut state, KeyCode::Char('/'));
+        assert_eq!(press(&mut state, KeyCode::Char('t')), UiAction::None);
+        assert_eq!(state.filter.as_str(), "t");
+        press(&mut state, KeyCode::Esc);
+
+        press(&mut state, KeyCode::Char('a'));
+        assert_eq!(press(&mut state, KeyCode::Char('t')), UiAction::None);
+        assert_eq!(state.form.values[0].as_str(), "t");
+
+        let mut empty = test_state(Vec::new());
+        assert_eq!(press(&mut empty, KeyCode::Char('t')), UiAction::None);
+    }
+
+    #[test]
+    fn ctrl_t_tests_the_typed_values_in_forms() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert_eq!(state.handle_key(ctrl('t')), UiAction::None, "browse");
+
+        press(&mut state, KeyCode::Char('a'));
+        fill_form(&mut state, ["new", "h", "", "", "", ""]);
+        assert_eq!(
+            state.handle_key(ctrl('t')),
+            UiAction::Test {
+                origin: Origin::Form,
+                target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+            }
+        );
+        assert_eq!(state.mode, Mode::AddForm);
+
+        press(&mut state, KeyCode::Esc);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        press(&mut state, KeyCode::Char('e'));
+        state.form.values[0] = TextInput::new("renamed");
+        let UiAction::Test {
+            origin: Origin::Form,
+            target: TestTarget::Edit { alias, changes },
+        } = state.handle_key(ctrl('t'))
+        else {
+            panic!("expected a test of the edit");
+        };
+        assert_eq!(alias, "dev");
+        assert_eq!(changes.alias, Change::Set("renamed".into()));
+        assert_eq!(state.mode, Mode::EditForm);
+    }
+
+    #[test]
+    fn ctrl_t_with_an_invalid_form_reports_the_field_error() {
+        let mut state = test_state(Vec::new());
+        press(&mut state, KeyCode::Char('a'));
+        fill_form(&mut state, ["new", "", "", "", "", ""]);
+
+        assert_eq!(state.handle_key(ctrl('t')), UiAction::None);
+
+        assert_eq!(state.form.active, 1);
+        assert!(state.form.error.is_some());
+        assert_eq!(state.mode, Mode::AddForm);
+    }
+
+    #[test]
+    fn esc_cancels_a_running_test_before_leaving_a_form() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        press(&mut state, KeyCode::Char('e'));
+        state.testing = Some("dev".into());
+
+        assert_eq!(press(&mut state, KeyCode::Esc), UiAction::CancelTest);
+        assert_eq!(state.mode, Mode::EditForm);
+        assert_eq!(state.status.as_deref(), Some("Test cancelled"));
+
+        state.testing = None;
+        assert_eq!(press(&mut state, KeyCode::Esc), UiAction::None);
+        assert_eq!(state.mode, Mode::Browse);
+
+        // In browse mode too, Esc cancels before it clears the filter.
+        state.set_filter("de");
+        state.testing = Some("dev".into());
+        assert_eq!(press(&mut state, KeyCode::Esc), UiAction::CancelTest);
+        assert_eq!(state.filter.as_str(), "de");
+    }
+
+    #[test]
+    fn results_mark_the_host_and_appear_in_details_and_status() {
+        let dev = summary("dev", Ownership::Managed);
+        let prod = summary("prod", Ownership::Managed);
+        let web = summary("web", Ownership::External);
+        let mut state = test_state(vec![dev.clone(), prod.clone(), web]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+
+        state.record_test(
+            host_finished(dev.clone(), Ok(authenticated("dev"))),
+            "12:34".into(),
+        );
+
+        let text = rendered(&state);
+        assert!(text.contains("✓ dev  managed"), "{text}");
+        assert!(text.contains("  web  external"), "{text}");
+        assert!(
+            text.contains("dev: authenticated as u@10.0.0.5:22 (publickey)"),
+            "{text}"
+        );
+        assert!(
+            details_text(&state)
+                .contains("Connection test: authenticated as u@10.0.0.5:22 (publickey) at 12:34"),
+            "{}",
+            details_text(&state)
+        );
+
+        let unknown_key = TestOutcome::UnknownHostKey {
+            report: report(
+                "prod",
+                ProbeResult::Failed(crate::probe::Failure::HostKeyUnknown),
+            ),
+            key: crate::openssh::PresentedKey {
+                lines: Vec::new(),
+                fingerprints: Vec::new(),
+            },
+        };
+        state.record_test(host_finished(prod.clone(), Ok(unknown_key)), "12:35".into());
+        let text = rendered(&state);
+        assert!(text.contains("✗ prod  managed"), "{text}");
+        assert!(
+            text.contains("prod: failed — host key not trusted"),
+            "{text}"
+        );
+
+        state.record_test(
+            host_finished(prod, Err("unknown host: prod".into())),
+            "12:36".into(),
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("prod: failed — unknown host: prod")
+        );
+        assert!(state.form.test_result.is_none());
+    }
+
+    #[test]
+    fn a_result_for_a_closed_form_is_dropped() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let form_finished = || Finished {
+            origin: Origin::Form,
+            target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+            outcome: Ok(authenticated("new")),
+        };
+
+        state.record_test(form_finished(), "12:34".into());
+        assert!(state.form.test_result.is_none());
+        assert!(state.status.is_none());
+        assert!(!rendered(&state).contains('✓'));
+
+        press(&mut state, KeyCode::Char('a'));
+        state.record_test(form_finished(), "12:34".into());
+        assert_eq!(
+            state.form.test_result.as_deref(),
+            Some("authenticated as u@10.0.0.5:22 (publickey)")
+        );
+        let text = rendered(&state);
+        assert!(text.contains("Connection test: authenticated"), "{text}");
+        assert!(state.status.is_none());
+
+        // Editing the form clears the result, as it clears an error.
+        press(&mut state, KeyCode::Char('x'));
+        assert!(state.form.test_result.is_none());
+    }
+
+    #[test]
+    fn results_are_cleared_on_edit_removal_and_refresh() {
+        let dev = summary("dev", Ownership::Managed);
+        let prod = summary("prod", Ownership::Managed);
+        let inventory = || HostInventory {
+            hosts: vec![
+                summary("dev", Ownership::Managed),
+                summary("prod", Ownership::Managed),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut state = test_state(inventory().hosts);
+        for host in [&dev, &prod] {
+            state.record_test(
+                host_finished(host.clone(), Ok(authenticated(&host.alias))),
+                "12:34".into(),
+            );
+        }
+
+        complete_mutation(
+            &mut state,
+            Some("dev"),
+            &["DEV"],
+            "Saved dev".into(),
+            || Ok::<_, String>(inventory()),
+        );
+        assert!(state.results.get(&dev).is_none());
+        assert!(state.results.get(&prod).is_some());
+
+        state.record_test(
+            host_finished(dev.clone(), Ok(authenticated("dev"))),
+            "12:34".into(),
+        );
+        assert!(apply_refresh(&mut state, || Ok::<_, String>(inventory())));
+        assert!(state.results.get(&dev).is_none());
+        assert!(state.results.get(&prod).is_none());
+    }
+
+    #[test]
+    fn footers_advertise_the_test_keys() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert!(footer_text(&state).contains("t test"));
+
+        state.set_filter("missing");
+        assert!(!footer_text(&state).contains("t test"));
+
+        press(&mut state, KeyCode::Char('a'));
+        assert!(footer_text(&state).contains("Ctrl+T test"));
+    }
+
+    #[test]
+    fn the_status_shows_the_test_in_flight() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.testing = Some("dev".into());
+
+        assert!(rendered(&state).contains("Testing dev… (Esc to cancel)"));
+
+        state.status = Some("Saved prod".into());
+        let text = rendered(&state);
+        assert!(text.contains("Saved prod"), "{text}");
+        assert!(!text.contains("Testing dev"), "{text}");
+    }
+
+    #[test]
+    fn local_time_is_hours_and_minutes() {
+        let time = local_time();
+        let (hours, minutes) = time.split_once(':').unwrap();
+        assert_eq!((hours.len(), minutes.len()), (2, 2), "{time}");
+        assert!(hours.parse::<u8>().unwrap() < 24);
+        assert!(minutes.parse::<u8>().unwrap() < 60);
     }
 
     fn key(code: KeyCode) -> KeyEvent {

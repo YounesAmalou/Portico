@@ -81,6 +81,27 @@ pub struct TestReport {
     pub key_fetch_failure: Option<Failure>,
 }
 
+impl TestReport {
+    pub fn passed(&self) -> bool {
+        matches!(self.result, ProbeResult::Authenticated(_))
+    }
+
+    /// The outcome in one line, without the alias: `authenticated as user@address:port (method)`
+    /// or `failed — reason`.
+    pub fn summary(&self) -> String {
+        match &self.result {
+            ProbeResult::Authenticated(success) => {
+                let (address, port, method) = (&success.address, success.port, &success.method);
+                match &self.user {
+                    Some(user) => format!("authenticated as {user}@{address}:{port} ({method})"),
+                    None => format!("authenticated to {address}:{port} ({method})"),
+                }
+            }
+            ProbeResult::Failed(failure) => format!("failed \u{2014} {failure}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TestOutcome {
     Done(TestReport),

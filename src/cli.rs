@@ -322,31 +322,20 @@ fn print_untrusted_key(
 }
 
 fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
-    let alias = &report.alias;
-    let text = match &report.result {
-        ProbeResult::Authenticated(success) => {
-            let (address, port, method) = (&success.address, success.port, &success.method);
-            let line = match &report.user {
-                Some(user) => {
-                    format!("{alias}: authenticated as {user}@{address}:{port} ({method})")
-                }
-                None => format!("{alias}: authenticated to {address}:{port} ({method})"),
-            };
-            writeln!(output, "{line}").map_err(|error| error.to_string())?;
-            return Ok(ExitCode::SUCCESS);
+    let mut text = format!("{}: {}\n", report.alias, report.summary());
+    if let ProbeResult::Failed(failure) = &report.result {
+        if let Some(fetch) = &report.key_fetch_failure {
+            text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
+        } else if let Some(hint) = failure.hint() {
+            text.push_str(&format!("hint: {hint}\n"));
         }
-        ProbeResult::Failed(failure) => {
-            let mut text = format!("{alias}: failed \u{2014} {failure}\n");
-            if let Some(fetch) = &report.key_fetch_failure {
-                text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
-            } else if let Some(hint) = failure.hint() {
-                text.push_str(&format!("hint: {hint}\n"));
-            }
-            text
-        }
-    };
+    }
     write!(output, "{text}").map_err(|error| error.to_string())?;
-    Ok(ExitCode::from(1))
+    Ok(if report.passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 /// Resolves `--<flag> value` and `--unset <flag>` for one field, rejecting both together.
