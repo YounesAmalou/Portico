@@ -152,7 +152,15 @@ exec /usr/bin/ssh -F "$flat" "$@"
             .find(|word| word.starts_with("SHA256:"))
             .unwrap_or_else(|| panic!("no fingerprint in:\n{first_text}"))
             .trim_end_matches(['.', ',', ')']);
-        self.run_ok(&["test", alias, "--accept-host-key", fingerprint]);
+        // The login itself may still fail (a password-only server): trusting
+        // is done once the key is recorded.
+        let accepted = self.run(&["test", alias, "--accept-host-key", fingerprint]);
+        let known = fs::read_to_string(self.known_hosts()).unwrap_or_default();
+        assert!(
+            !known.trim().is_empty(),
+            "the host key of {alias} was not recorded:\n{}",
+            text(&accepted)
+        );
     }
 
     pub fn append_config(&self, text: &str) {

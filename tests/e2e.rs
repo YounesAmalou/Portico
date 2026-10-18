@@ -25,3 +25,5 @@ mod terminal;
 mod cli_connect;
 #[path = "e2e/cli_test.rs"]
 mod cli_test;
+#[path = "e2e/explanations.rs"]
+mod explanations;
