@@ -739,7 +739,6 @@ impl ManagedStore {
     /// When `paths.system_config` exists, the handed-over entry ends with `Match all` and an
     /// Include of it, because `ssh -F` would otherwise skip the system configuration. The lock is
     /// released before `use_entry` runs, so a slow test does not block a concurrent save.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn preview<R, E, M, U>(
         &self,
         mutate: M,

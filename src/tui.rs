@@ -381,7 +381,8 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
         | AppError::ReadOnlyExternal(_)
         | AppError::UnknownHost(_)
         | AppError::AliasCollision(_)
-        | AppError::IncompleteDiscovery(_) => false,
+        | AppError::IncompleteDiscovery(_)
+        | AppError::KnownHosts { .. } => false,
     }
 }
 

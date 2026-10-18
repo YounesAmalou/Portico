@@ -1,12 +1,20 @@
-use std::{path::PathBuf, process::ExitStatus, sync::atomic::AtomicBool};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitStatus,
+    sync::atomic::AtomicBool,
+};
 
 use thiserror::Error;
 
 use crate::{
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
-    host::{Host, HostChanges, HostError},
+    host::{Change, Host, HostChanges, HostError},
     managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
-    openssh::{ConnectionOutcome, OpenSsh, OpenSshError, ResolvedConfig},
+    openssh::{
+        ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
+        append_known_hosts,
+    },
+    probe::{Failure, ProbeResult, known_hosts_path},
 };
 
 pub struct App {
@@ -41,6 +49,47 @@ pub struct HostDetails {
     pub warnings: Vec<DiscoveryWarning>,
 }
 
+/// What a connection test runs against: a saved host as OpenSSH resolves it,
+/// or the values of an add or edit form, staged but not saved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestTarget {
+    Saved(String),
+    Add(Host),
+    Edit { alias: String, changes: HostChanges },
+}
+
+impl TestTarget {
+    /// The alias the test connects to.
+    pub fn alias(&self) -> &str {
+        match self {
+            TestTarget::Saved(alias) => alias,
+            TestTarget::Add(host) => host.alias(),
+            TestTarget::Edit { alias, changes } => match &changes.alias {
+                Change::Set(new) => new,
+                Change::Keep | Change::Clear => alias,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestReport {
+    pub alias: String,
+    pub user: Option<String>,
+    pub result: ProbeResult,
+    /// Why the server's key could not be fetched after an untrusted-key failure.
+    pub key_fetch_failure: Option<Failure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestOutcome {
+    Done(TestReport),
+    UnknownHostKey {
+        report: TestReport,
+        key: PresentedKey,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -61,6 +110,8 @@ pub enum AppError {
     AliasCollision(String),
     #[error("host inventory is incomplete: {0:?}")]
     IncompleteDiscovery(Vec<DiscoveryWarning>),
+    #[error("cannot update known hosts file {path}: {reason}")]
+    KnownHosts { path: PathBuf, reason: String },
 }
 
 impl App {
@@ -200,13 +251,7 @@ impl App {
     }
 
     fn add_inner(&self, host: Host, cancelled: Option<&AtomicBool>) -> Result<(), AppError> {
-        self.transact(
-            |config| {
-                self.ensure_alias_available(config, host.alias(), None)?;
-                Ok(config.insert(host).map_err(TransactionError::Operation)?)
-            },
-            cancelled,
-        )
+        self.transact(|config| self.add_mutation(config, host), cancelled)
     }
 
     pub fn edit(&self, alias: &str, changes: HostChanges) -> Result<(), AppError> {
@@ -229,19 +274,7 @@ impl App {
         cancelled: Option<&AtomicBool>,
     ) -> Result<(), AppError> {
         self.transact(
-            |config| {
-                let current = match config.find(alias) {
-                    Some(host) => host,
-                    None => return Err(self.missing_host_error(alias)?),
-                };
-                let changed = current.apply(changes)?;
-                if changed.alias() != current.alias() {
-                    self.ensure_alias_available(config, changed.alias(), Some(current.alias()))?;
-                }
-                Ok(config
-                    .replace(alias, changed)
-                    .map_err(TransactionError::Operation)?)
-            },
+            |config| self.edit_mutation(config, alias, changes),
             cancelled,
         )
     }
@@ -293,6 +326,148 @@ impl App {
             .find(|host| host.alias.eq_ignore_ascii_case(alias))
             .ok_or_else(|| AppError::UnknownHost(alias.into()))?;
         Ok(self.openssh.connect_cancellable(&host.alias, cancelled)?)
+    }
+
+    fn add_mutation(&self, config: &mut ManagedConfig, host: Host) -> Result<(), AppError> {
+        self.ensure_alias_available(config, host.alias(), None)?;
+        Ok(config.insert(host).map_err(TransactionError::Operation)?)
+    }
+
+    fn edit_mutation(
+        &self,
+        config: &mut ManagedConfig,
+        alias: &str,
+        changes: HostChanges,
+    ) -> Result<(), AppError> {
+        let current = match config.find(alias) {
+            Some(host) => host,
+            None => return Err(self.missing_host_error(alias)?),
+        };
+        let changed = current.apply(changes)?;
+        if changed.alias() != current.alias() {
+            self.ensure_alias_available(config, changed.alias(), Some(current.alias()))?;
+        }
+        Ok(config
+            .replace(alias, changed)
+            .map_err(TransactionError::Operation)?)
+    }
+
+    pub fn test(&self, target: &TestTarget) -> Result<TestOutcome, AppError> {
+        self.test_cancellable(target, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn test_cancellable(
+        &self,
+        target: &TestTarget,
+        cancelled: &AtomicBool,
+    ) -> Result<TestOutcome, AppError> {
+        self.run_test(target, None, cancelled)
+    }
+
+    /// Adds `key` to the known hosts file the target's configuration names,
+    /// then tests again.
+    pub fn trust_and_retest(
+        &self,
+        target: &TestTarget,
+        key: &PresentedKey,
+    ) -> Result<TestOutcome, AppError> {
+        self.trust_and_retest_cancellable(target, key, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn trust_and_retest_cancellable(
+        &self,
+        target: &TestTarget,
+        key: &PresentedKey,
+        cancelled: &AtomicBool,
+    ) -> Result<TestOutcome, AppError> {
+        self.run_test(target, Some(key), cancelled)
+    }
+
+    fn run_test(
+        &self,
+        target: &TestTarget,
+        trust: Option<&PresentedKey>,
+        cancelled: &AtomicBool,
+    ) -> Result<TestOutcome, AppError> {
+        let alias = target.alias();
+        let run =
+            |entry: Option<&Path>, alias: &str| self.test_entry(entry, alias, trust, cancelled);
+        match target {
+            TestTarget::Saved(alias) => {
+                let alias = self
+                    .hosts()?
+                    .hosts
+                    .into_iter()
+                    .find(|host| host.alias.eq_ignore_ascii_case(alias))
+                    .ok_or_else(|| AppError::UnknownHost(alias.clone()))?
+                    .alias;
+                run(None, &alias)
+            }
+            TestTarget::Add(host) => self.store.preview(
+                |config| self.add_mutation(config, host.clone()),
+                |entry| run(Some(entry), alias),
+                Some(cancelled),
+            ),
+            TestTarget::Edit {
+                alias: saved,
+                changes,
+            } => self.store.preview(
+                |config| self.edit_mutation(config, saved, changes.clone()),
+                |entry| run(Some(entry), alias),
+                Some(cancelled),
+            ),
+        }
+    }
+
+    fn test_entry(
+        &self,
+        entry: Option<&Path>,
+        alias: &str,
+        trust: Option<&PresentedKey>,
+        cancelled: &AtomicBool,
+    ) -> Result<TestOutcome, AppError> {
+        let resolved = self.openssh.resolve_with(entry, alias, Some(cancelled))?;
+        if let Some(key) = trust {
+            let paths = self.store.paths();
+            let home = paths.ssh_dir.parent().unwrap_or(&paths.ssh_dir);
+            let path = known_hosts_path(&resolved.known_hosts_files, home).map_err(|reason| {
+                AppError::KnownHosts {
+                    path: resolved
+                        .known_hosts_files
+                        .first()
+                        .map(PathBuf::from)
+                        .unwrap_or_default(),
+                    reason,
+                }
+            })?;
+            append_known_hosts(&path, &key.lines).map_err(|error| AppError::KnownHosts {
+                path: path.clone(),
+                reason: error.to_string(),
+            })?;
+        }
+        let jump = resolved
+            .proxy_jump
+            .as_deref()
+            .filter(|jump| !jump.eq_ignore_ascii_case("none"));
+        let result = self.openssh.probe(entry, alias, jump, cancelled)?;
+        let mut report = TestReport {
+            alias: alias.into(),
+            user: resolved.user,
+            result,
+            key_fetch_failure: None,
+        };
+        if report.result != ProbeResult::Failed(Failure::HostKeyUnknown) {
+            return Ok(TestOutcome::Done(report));
+        }
+        Ok(
+            match self.openssh.fetch_host_key(entry, alias, jump, cancelled)? {
+                KeyFetch::Presented(key) => TestOutcome::UnknownHostKey { report, key },
+                KeyFetch::Failed(failure) => {
+                    report.key_fetch_failure = Some(failure);
+                    TestOutcome::Done(report)
+                }
+            },
+        )
     }
 
     fn discover(&self) -> Result<Discovery, AppError> {
@@ -431,7 +606,12 @@ mod tests {
         if let Some(hook) = before_transaction_lock {
             store = store.with_before_transaction_lock(hook);
         }
-        let app = App::new(store, OpenSsh::new(fake.clone(), fake));
+        let keygen = dir.path().join("ssh-keygen");
+        write_executable(
+            &keygen,
+            "#!/bin/sh\nprintf '256 SHA256:abc h (ED25519)\\n'\n",
+        );
+        let app = App::new(store, OpenSsh::new(fake.clone(), fake).with_keygen(keygen));
         app.initialize(true).unwrap();
         if let Some(contents) = external {
             let mut entry = fs::read_to_string(&paths.entry).unwrap();
@@ -443,6 +623,210 @@ mod tests {
             app,
             fake_log,
         }
+    }
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ssh")
+            .join(format!("{name}.txt"))
+    }
+
+    fn print_fixture(name: &str) -> String {
+        format!("cat '{}' >&2", fixture_path(name).display())
+    }
+
+    impl TestApp {
+        /// Replaces the fake ssh. `-G` prints `resolved`; a run that sets
+        /// `UserKnownHostsFile` is a key fetch and runs `fetch` with `$kh`
+        /// naming that file; any other run is a probe and runs `probe`.
+        fn install_ssh(&self, resolved: &str, probe: &str, fetch: &str) {
+            write_executable(
+                self._dir.path().join("ssh"),
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{log}'\ncase \"$1\" in\n  -G) printf '{resolved}' ;;\n  *)\n    kh=; prev=\n    for a in \"$@\"; do\n      case \"$prev$a\" in -oUserKnownHostsFile=*) kh=${{a#UserKnownHostsFile=}} ;; esac\n      prev=; [ \"$a\" = -o ] && prev=-o\n    done\n    if [ -n \"$kh\" ]; then\n{fetch}\n    else\n      echo probe >> '{probes}'\n{probe}\n    fi ;;\nesac\n",
+                    log = self.fake_log.display(),
+                    probes = self.probes().display(),
+                ),
+            );
+        }
+
+        fn probes(&self) -> std::path::PathBuf {
+            self._dir.path().join("probes")
+        }
+
+        fn known_hosts(&self) -> std::path::PathBuf {
+            self.store.paths().ssh_dir.join("known_hosts")
+        }
+    }
+
+    const USER_DEPLOY: &str = "hostname h\\nuser deploy\\nport 22\\n";
+
+    fn host(alias: &str) -> Host {
+        Host::new(alias, "h.example", None, None, None, None).unwrap()
+    }
+
+    #[test]
+    fn a_saved_host_is_tested_with_the_users_configuration() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        app.install_ssh(USER_DEPLOY, &print_fixture("authenticated"), ":");
+
+        let outcome = app.test(&TestTarget::Saved("DEV".into())).unwrap();
+
+        let TestOutcome::Done(report) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(report.alias, "dev");
+        assert_eq!(report.user.as_deref(), Some("deploy"));
+        assert!(matches!(report.result, ProbeResult::Authenticated(_)));
+        let args = fs::read_to_string(&app.fake_log).unwrap();
+        assert!(!args.lines().any(|arg| arg == "-F"), "{args}");
+        assert!(args.ends_with("--\ndev\n"), "{args}");
+    }
+
+    #[test]
+    fn an_unknown_alias_is_an_unknown_host_error() {
+        let app = initialized_test_app();
+        let error = app.test(&TestTarget::Saved("nope".into())).unwrap_err();
+        assert!(matches!(error, AppError::UnknownHost(alias) if alias == "nope"));
+    }
+
+    #[test]
+    fn an_add_form_is_tested_against_the_staged_config_and_nothing_is_saved() {
+        let app = initialized_test_app();
+        let before = fs::read(&app.store.paths().managed).unwrap();
+        app.install_ssh(USER_DEPLOY, &print_fixture("authenticated"), ":");
+
+        let outcome = app.test(&TestTarget::Add(host("new"))).unwrap();
+
+        assert!(matches!(outcome, TestOutcome::Done(_)));
+        let args = fs::read_to_string(&app.fake_log).unwrap();
+        assert!(args.lines().any(|arg| arg == "-F"), "{args}");
+        assert!(args.ends_with("--\nnew\n"), "{args}");
+        assert_eq!(fs::read(&app.store.paths().managed).unwrap(), before);
+        assert!(app.hosts().unwrap().hosts.iter().all(|h| h.alias != "new"));
+    }
+
+    #[test]
+    fn an_edit_form_tests_the_renamed_alias() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        let before = fs::read(&app.store.paths().managed).unwrap();
+        app.install_ssh(USER_DEPLOY, &print_fixture("authenticated"), ":");
+        let target = TestTarget::Edit {
+            alias: "dev".into(),
+            changes: HostChanges {
+                alias: Change::Set("prod".into()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(target.alias(), "prod");
+
+        app.test(&target).unwrap();
+
+        let args = fs::read_to_string(&app.fake_log).unwrap();
+        assert!(args.ends_with("--\nprod\n"), "{args}");
+        assert_eq!(fs::read(&app.store.paths().managed).unwrap(), before);
+    }
+
+    #[test]
+    fn form_errors_surface_as_on_save() {
+        let app = test_app_with_external("Host legacy\n  HostName legacy.example\n");
+        let error = app.test(&TestTarget::Add(host("legacy"))).unwrap_err();
+        assert!(matches!(error, AppError::AliasCollision(_)), "{error:?}");
+    }
+
+    const FETCH_KEY: &str = "printf 'h ssh-ed25519 AAAA\\n' >> \"$kh\"";
+
+    #[test]
+    fn an_unknown_key_comes_back_with_its_fingerprint() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        app.install_ssh(USER_DEPLOY, &print_fixture("host-key-unknown"), FETCH_KEY);
+
+        let outcome = app.test(&TestTarget::Saved("dev".into())).unwrap();
+
+        let TestOutcome::UnknownHostKey { report, key } = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(report.result, ProbeResult::Failed(Failure::HostKeyUnknown));
+        assert_eq!(key.fingerprints.len(), 1);
+        assert_eq!(key.lines, b"h ssh-ed25519 AAAA\n");
+    }
+
+    #[test]
+    fn a_failed_fetch_keeps_host_key_not_trusted_and_says_why() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        app.install_ssh(
+            USER_DEPLOY,
+            &print_fixture("host-key-unknown"),
+            &print_fixture("connection-refused"),
+        );
+
+        let outcome = app.test(&TestTarget::Saved("dev".into())).unwrap();
+
+        let TestOutcome::Done(report) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(report.result, ProbeResult::Failed(Failure::HostKeyUnknown));
+        assert_eq!(report.key_fetch_failure, Some(Failure::ConnectionRefused));
+    }
+
+    #[test]
+    fn trusting_appends_to_the_resolved_known_hosts_file_and_retests() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        let probe = format!(
+            "if grep -qs AAAA '{}'; then {}; else {}; fi",
+            app.known_hosts().display(),
+            print_fixture("authenticated"),
+            print_fixture("host-key-unknown"),
+        );
+        app.install_ssh(
+            "hostname h\\nuserknownhostsfile ~/.ssh/known_hosts\\n",
+            &probe,
+            FETCH_KEY,
+        );
+        let target = TestTarget::Saved("dev".into());
+        let TestOutcome::UnknownHostKey { key, .. } = app.test(&target).unwrap() else {
+            panic!("expected an unknown key")
+        };
+
+        let outcome = app.trust_and_retest(&target, &key).unwrap();
+
+        assert!(matches!(
+            outcome,
+            TestOutcome::Done(TestReport {
+                result: ProbeResult::Authenticated(_),
+                ..
+            })
+        ));
+        assert_eq!(fs::read(app.known_hosts()).unwrap(), key.lines);
+        assert_eq!(fs::read_to_string(app.probes()).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn tokens_in_the_known_hosts_path_are_refused() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        app.install_ssh(
+            "hostname h\\nuserknownhostsfile ~/.ssh/%%u\\n",
+            &print_fixture("authenticated"),
+            ":",
+        );
+        let key = PresentedKey {
+            lines: b"h ssh-ed25519 AAAA\n".to_vec(),
+            fingerprints: Vec::new(),
+        };
+
+        let error = app
+            .trust_and_retest(&TestTarget::Saved("dev".into()), &key)
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::KnownHosts { .. }), "{error:?}");
+        assert!(!app.known_hosts().exists());
+        assert!(!app.store.paths().ssh_dir.join("%u").exists());
     }
 
     #[test]

@@ -224,10 +224,6 @@ impl OpenSsh {
     /// Tries to log in to `alias` without a terminal, stopping as soon as
     /// OpenSSH reports success. `jump` names the alias's jump host, if any,
     /// so a failure there is told apart from one at the target.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the app's connection test calls this")
-    )]
     pub(crate) fn probe(
         &self,
         entry: Option<&Path>,
@@ -261,10 +257,6 @@ impl OpenSsh {
     /// record the server's host key in a private temporary file, and returns
     /// that key with its fingerprints. Nothing is written to the user's own
     /// known-hosts files.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the app's connection test calls this")
-    )]
     pub(crate) fn fetch_host_key(
         &self,
         entry: Option<&Path>,
@@ -625,10 +617,6 @@ fn parse_fingerprint(line: &str) -> Result<KeyFingerprint, OpenSshError> {
 
 /// Appends `lines` to the known-hosts file at `path`, starting on a new line
 /// and creating the file private to the user when it is missing.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the app's connection test calls this")
-)]
 pub(crate) fn append_known_hosts(path: &Path, lines: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
