@@ -74,6 +74,7 @@ jobs:
               esac
             done <<< "$files"
           fi
+          rust=false docs=false deps=false # TEMP probe
           echo "rust=$rust docs=$docs deps=$deps"
           { echo "rust=$rust"; echo "docs=$docs"; echo "deps=$deps"; } >> "$GITHUB_OUTPUT"
 
