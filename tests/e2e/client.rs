@@ -142,6 +142,19 @@ exec /usr/bin/ssh -F "$flat" "$@"
         ]);
     }
 
+    /// Trusts `alias`'s host key the way a user would: read the fingerprint
+    /// `portico test` reports, then accept exactly that one.
+    pub fn trust(&self, alias: &str) {
+        let first = self.run(&["test", alias]);
+        let first_text = text(&first);
+        let fingerprint = first_text
+            .split_whitespace()
+            .find(|word| word.starts_with("SHA256:"))
+            .unwrap_or_else(|| panic!("no fingerprint in:\n{first_text}"))
+            .trim_end_matches(['.', ',', ')']);
+        self.run_ok(&["test", alias, "--accept-host-key", fingerprint]);
+    }
+
     pub fn append_config(&self, text: &str) {
         fs::OpenOptions::new()
             .append(true)

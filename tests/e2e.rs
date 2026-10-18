@@ -17,6 +17,11 @@ mod client;
 #[allow(dead_code)]
 #[path = "e2e/sshd.rs"]
 mod sshd;
+#[allow(dead_code)]
+#[path = "e2e/terminal.rs"]
+mod terminal;
 
+#[path = "e2e/cli_connect.rs"]
+mod cli_connect;
 #[path = "e2e/cli_test.rs"]
 mod cli_test;
