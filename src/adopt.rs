@@ -1925,8 +1925,9 @@ mod tests {
         let (locked, released) = mpsc::channel();
         let holder = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            FileExt::unlock(&lock).unwrap();
+            // Recorded before unlocking: migrate may finish before this thread runs again.
             locked.send(Instant::now()).unwrap();
+            FileExt::unlock(&lock).unwrap();
         });
         let not_cancelled = AtomicBool::new(false);
         let result = fixture
