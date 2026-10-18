@@ -552,25 +552,12 @@ impl ManagedStore {
     }
 
     fn entry_target(&self) -> Result<PathBuf, InitError> {
-        let mut path = self.paths.entry.clone();
-        for _ in 0..40 {
-            match fs::read_link(&path) {
-                Ok(target) => path = path.parent().expect("entry has a parent").join(target),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
-                    ) =>
-                {
-                    return Ok(path);
-                }
-                Err(source) => return Err(init_io(&path, source)),
-            }
-        }
-        Err(init_io(
-            &path,
-            io::Error::other("too many symbolic links; correct the entry target"),
-        ))
+        symlink_target(&self.paths.entry).map_err(|(path, source)| init_io(&path, source))
+    }
+
+    /// The file a write to the entry config replaces: the entry, or the end of its symlink chain.
+    pub(crate) fn entry_file(&self) -> Result<PathBuf, TransactionError> {
+        symlink_target(&self.paths.entry).map_err(|(path, source)| transaction_io(&path, source))
     }
 
     fn init_managed(&self) -> Result<ManagedConfig, InitError> {
@@ -594,7 +581,7 @@ impl ManagedStore {
         ManagedConfig::parse(text).map_err(invalid)
     }
 
-    fn ensure_ready(&self) -> Result<(), TransactionError> {
+    pub(crate) fn ensure_ready(&self) -> Result<(), TransactionError> {
         let entry = fs::read(&self.paths.entry)
             .map_err(|source| transaction_storage_io(&self.paths.entry, source))?;
         if !self.paths.managed.is_file()
@@ -763,10 +750,9 @@ impl ManagedStore {
                 lock,
                 active,
                 candidate,
-                validation_entry,
+                entry,
                 validation_file,
                 portico_lines,
-                entry_mode,
                 changed_aliases,
             },
         ))
@@ -794,37 +780,14 @@ impl ManagedStore {
             Staged {
                 lock,
                 candidate,
-                mut validation_entry,
+                entry,
                 validation_file,
-                mut portico_lines,
-                entry_mode,
                 ..
             },
         ) = self.stage(mutate, cancelled)?;
-        let preview_file = if self.paths.system_config.exists() {
-            if !validation_entry.is_empty() && !validation_entry.ends_with(b"\n") {
-                validation_entry.push(b'\n');
-            }
-            let lines = line_count(&validation_entry);
-            portico_lines.extend([lines + 1, lines + 2]);
-            validation_entry.extend_from_slice(
-                format!(
-                    "Match all\nInclude {}\n",
-                    quote_path(&self.paths.system_config.to_string_lossy())
-                )
-                .as_bytes(),
-            );
-            drop(validation_file);
-            write_unique(
-                &self.paths.ssh_dir,
-                ".config.portico-preview",
-                &validation_entry,
-                entry_mode,
-            )
-            .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?
-        } else {
-            validation_file
-        };
+        drop(validation_file);
+        let (preview_file, portico_lines) =
+            self.stage_entry_as(&entry, candidate.path(), ".config.portico-preview")?;
         drop(lock);
         let managed_text = read_lossy(candidate.path());
         let result = use_entry(ConfigFiles {
@@ -841,7 +804,51 @@ impl ManagedStore {
         result
     }
 
-    fn read_managed(&self) -> Result<(Vec<u8>, ManagedConfig), TransactionError> {
+    /// Writes a copy of the entry config `entry` whose Portico Include points at `managed`,
+    /// ending with `Match all` and an Include of the system configuration when it exists, as
+    /// `preview` hands to OpenSSH. Nothing is activated; the file is removed when dropped.
+    pub(crate) fn stage_entry(
+        &self,
+        entry: &[u8],
+        managed: &Path,
+    ) -> Result<PendingFile, TransactionError> {
+        self.stage_entry_as(entry, managed, ".config.portico-adopt-entry")
+            .map(|(file, _)| file)
+    }
+
+    /// `stage_entry` under the temporary name `stem`, also returning the lines Portico wrote.
+    fn stage_entry_as(
+        &self,
+        entry: &[u8],
+        managed: &Path,
+        stem: &str,
+    ) -> Result<(PendingFile, Vec<u32>), TransactionError> {
+        let (mut contents, mut portico_lines) =
+            substitute_include(entry, &self.paths, managed).map_err(transaction_entry_error)?;
+        if self.paths.system_config.exists() {
+            if !contents.is_empty() && !contents.ends_with(b"\n") {
+                contents.push(b'\n');
+            }
+            let lines = line_count(&contents);
+            portico_lines.extend([lines + 1, lines + 2]);
+            contents.extend_from_slice(
+                format!(
+                    "Match all\nInclude {}\n",
+                    quote_path(&self.paths.system_config.to_string_lossy())
+                )
+                .as_bytes(),
+            );
+        }
+        let mode = fs::metadata(&self.paths.entry)
+            .map_err(|source| transaction_io(&self.paths.entry, source))?
+            .permissions()
+            .mode();
+        let file = write_unique(&self.paths.ssh_dir, stem, &contents, mode)
+            .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
+        Ok((file, portico_lines))
+    }
+
+    pub(crate) fn read_managed(&self) -> Result<(Vec<u8>, ManagedConfig), TransactionError> {
         self.ensure_ready()?;
         reject_symlink(&self.paths.managed)
             .map_err(|source| transaction_io(&self.paths.managed, source))?;
@@ -1200,7 +1207,7 @@ fn append_include(output: &mut Vec<u8>, arguments: &[String], original: &[u8]) {
 /// Copies the entry config `contents`, pointing Portico's Include at `target` instead, and
 /// returns the copy with the 1-based numbers of the lines it rewrote. Each rewritten line stays a
 /// single line, so every other line keeps its number.
-fn substitute_include(
+pub(crate) fn substitute_include(
     contents: &[u8],
     paths: &ConfigPaths,
     target: &Path,
@@ -1241,7 +1248,7 @@ fn substitute_include(
 }
 
 /// The number of lines in `contents` as OpenSSH counts them.
-fn line_count(contents: &[u8]) -> u32 {
+pub(crate) fn line_count(contents: &[u8]) -> u32 {
     let count = contents.split_inclusive(|byte| *byte == b'\n').count();
     u32::try_from(count).unwrap_or(u32::MAX)
 }
@@ -1265,6 +1272,30 @@ fn is_managed_include(argument: &str, paths: &ConfigPaths) -> bool {
         paths.ssh_dir.join(argument)
     };
     normalize_path(&path) == normalize_path(&paths.managed)
+}
+
+/// Follows the symbolic link chain at `path` to the file a write must replace, which may not
+/// exist yet. An error names the path it occurred at.
+pub(crate) fn symlink_target(path: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::read_link(&path) {
+            Ok(target) => path = path.parent().unwrap_or(Path::new("")).join(target),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+                ) =>
+            {
+                return Ok(path);
+            }
+            Err(source) => return Err((path, source)),
+        }
+    }
+    Err((
+        path,
+        io::Error::other("too many symbolic links; correct the entry target"),
+    ))
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -1305,7 +1336,7 @@ fn reject_symlink(path: &Path) -> io::Result<()> {
     }
 }
 
-fn open_lock(path: &Path) -> io::Result<File> {
+pub(crate) fn open_lock(path: &Path) -> io::Result<File> {
     reject_symlink(path)?;
     match OpenOptions::new()
         .read(true)
@@ -1326,7 +1357,7 @@ fn open_lock(path: &Path) -> io::Result<File> {
     }
 }
 
-fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
+pub(crate) fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
     let Some(cancelled) = cancelled else {
         return FileExt::lock_exclusive(file);
     };
@@ -1380,11 +1411,11 @@ struct Staged {
     lock: File,
     active: Vec<u8>,
     candidate: PendingFile,
-    validation_entry: Vec<u8>,
+    /// The entry config as read while staging.
+    entry: Vec<u8>,
     validation_file: PendingFile,
     /// The lines of the validation entry Portico wrote rather than copied from the user's.
     portico_lines: Vec<u32>,
-    entry_mode: u32,
     changed_aliases: Vec<String>,
 }
 
@@ -1397,7 +1428,7 @@ impl PendingFile {
         self.path.as_deref().expect("pending file has a path")
     }
 
-    fn rename_to(mut self, destination: &Path) -> io::Result<()> {
+    pub(crate) fn rename_to(mut self, destination: &Path) -> io::Result<()> {
         fs::rename(self.path(), destination)?;
         self.path = None;
         Ok(())
@@ -1470,7 +1501,7 @@ fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     result
 }
 
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if DIRECTORY_SYNC_FAILURES.with(|failures| {
         let mut failures = failures.borrow_mut();
@@ -1652,7 +1683,7 @@ pub(crate) fn parse_value(input: &str, line: usize) -> Result<String, ManagedErr
     Ok(value)
 }
 
-fn render_host(host: &Host, comments: Option<&HostComments>) -> String {
+pub(crate) fn render_host(host: &Host, comments: Option<&HostComments>) -> String {
     let mut lines = Vec::new();
     if let Some(comments) = comments {
         lines.extend(comments.leading.iter().cloned());
@@ -1697,7 +1728,7 @@ fn quote(value: &str) -> String {
     }
 }
 
-fn quote_path(value: &str) -> String {
+pub(crate) fn quote_path(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
