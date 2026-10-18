@@ -1,6 +1,6 @@
 # Container Shells Design
 
-**Status:** Draft, awaiting review
+**Status:** Approved; implemented
 
 ## Purpose
 

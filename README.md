@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico is currently an early V1 focused on host management. Tunnels, identity-provider discovery, and a Quickshell integration are planned follow-up work.
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, and opens shells in Docker containers. Tunnels, identity-provider discovery, and a Quickshell integration are planned follow-up work (see the [roadmap](ROADMAP.md)).
 
 ## What V1 does
 

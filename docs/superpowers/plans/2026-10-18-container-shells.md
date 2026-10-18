@@ -48,16 +48,16 @@
   - `pub fn group(containers: &[Container]) -> Vec<Group<'_>>`
   - `pub fn display_name(container: &Container, all: &[Container]) -> String`
 
-- [ ] **Step 1: Write the failing tests** in `src/container.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `src/container.rs` `mod tests`:
   - `parses_a_ps_line`: a line with every key yields the matching `Container`. `number: "2"` becomes `Some(2)`, and `project: ""` becomes `None`.
   - `parses_escapes`: values containing `\"`, `\\`, `\n`, `\t`, `é` and `…` decode to `"`, `\`, a newline, a tab, `é` and `…`.
   - `ignores_shell_noise_and_counts_broken_objects`: the input `"welcome!\n{\"id\":\"a\"...valid...}\n{\"id\": broken\n"` gives 1 container and `skipped == 1`. Also, `parse_listing("")` gives an empty listing with `skipped == 0`.
   - `groups_projects_then_other`: containers `web`/`shop#1`, `db`/`shop#1`, `api`/`alpha#1` and a plain `pgadmin` group as `[alpha:[api], shop:[db, web], Other:[pgadmin]]`, where `project` is `None` for Other.
   - `display_names_number_replicas_only`: `shop/web#1` and `shop/web#2` display `web#1` and `web#2`, the single `shop/db#1` displays `db`, and the plain container shows its name.
-- [ ] **Step 2: Run** `cargo test --lib container::` and expect a compile failure (module missing).
-- [ ] **Step 3: Implement.** The parser reads one object of string values: whitespace, `{`, then `"key"` `:` `"value"` pairs separated by `,`, then `}`. It returns `None` on anything else, and a missing key is an empty string. Sort within a project by `(service, number)`, and sort Other by name.
-- [ ] **Step 4: Run** `cargo test --lib container::` and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: parse and group running docker containers"`
+- [x] **Step 2: Run** `cargo test --lib container::` and expect a compile failure (module missing).
+- [x] **Step 3: Implement.** The parser reads one object of string values: whitespace, `{`, then `"key"` `:` `"value"` pairs separated by `,`, then `}`. It returns `None` on anything else, and a missing key is an empty string. Sort within a project by `(service, number)`, and sort Other by name.
+- [x] **Step 4: Run** `cargo test --lib container::` and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: parse and group running docker containers"`
 
 ### Task 2: Container references
 
@@ -68,17 +68,17 @@
   - `pub enum ResolveError { NotFound, Ambiguous(Vec<String>) }`, where `Ambiguous` holds the candidates' container names, sorted.
   - `pub fn resolve<'a>(reference: &str, containers: &'a [Container]) -> Result<&'a Container, ResolveError>`
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `resolves_exact_name_first`: a container named `web` wins over a service called `web` in another container.
   - `resolves_project_service_and_number`: `shop/web` (single replica), and `shop/web#2` among two replicas.
   - `resolves_unique_service`: `db` when only `shop` has `db`.
   - `ambiguous_service_lists_names`: `web` in projects `shop` and `blog` gives `Ambiguous(["blog-web-1","shop-web-1"])`. `shop/web` with two replicas is also ambiguous.
   - `resolves_id_prefix_of_four_or_more_hex`: `3174` matches. `317` gives `NotFound`, and `zzzz` gives `NotFound`. A prefix matching two IDs is `Ambiguous`.
   - `unknown_reference_is_not_found`
-- [ ] **Step 2: Run** `cargo test --lib container::` and expect FAIL.
-- [ ] **Step 3: Implement** `resolve` with the order from the spec. Name, then `project/service[#n]`, then `service`, then ID prefix. The first form that matches anything decides: one match means `Ok`, several mean `Ambiguous`.
-- [ ] **Step 4: Run the tests** and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: resolve container references by name, service or id"`
+- [x] **Step 2: Run** `cargo test --lib container::` and expect FAIL.
+- [x] **Step 3: Implement** `resolve` with the order from the spec. Name, then `project/service[#n]`, then `service`, then ID prefix. The first form that matches anything decides: one match means `Ok`, several mean `Ambiguous`.
+- [x] **Step 4: Run the tests** and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: resolve container references by name, service or id"`
 
 ### Task 3: Quoting, shell command and problem classification
 
@@ -93,7 +93,7 @@
   - `pub enum DockerProblem { NotInstalled, DaemonDown, PermissionDenied, Other }`, deriving `Clone, Copy, Debug, Eq, PartialEq`
   - `pub fn classify(code: Option<i32>, stderr: &str) -> DockerProblem`
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `quotes_only_when_needed`: `quote("web")=="web"`, `quote("a b")=="'a b'"`, `quote("o'brien")=="'o'\\''brien'"` and `quote("")=="''"`.
   - `remote_command_round_trips_through_sh`: for the words `["printf","%s|","a b","o'brien","","$HOME"]`, run `sh -c <remote_command>` and assert stdout is `a b|o'brien||$HOME|`.
   - `exec_words_with_and_without_user`
@@ -104,10 +104,10 @@
     - `permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: ...` gives PermissionDenied
     - `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock` gives PermissionDenied
     - code 1 with `Error response from daemon: x` gives Other
-- [ ] **Step 2: Run the tests** and expect FAIL.
-- [ ] **Step 3: Implement.** Match case-insensitively on `cannot connect to the docker daemon`, `permission denied while trying to connect to the docker`, and, for code 127, `not found`.
-- [ ] **Step 4: Run the tests** and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: build container shell commands and classify docker failures"`
+- [x] **Step 2: Run the tests** and expect FAIL.
+- [x] **Step 3: Implement.** Match case-insensitively on `cannot connect to the docker daemon`, `permission denied while trying to connect to the docker`, and, for code 127, `not found`.
+- [x] **Step 4: Run the tests** and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: build container shell commands and classify docker failures"`
 
 ### Task 4: Group probe, decision and fix commands
 
@@ -136,17 +136,17 @@
   - `pub fn join_group_words(user: &str, socket: &str) -> Vec<String>`, which returns `["sudo","sh","-c",JOIN_SCRIPT,"sh",user,socket]`
   - `pub fn start_daemon_words() -> Vec<String>`, which returns `["sudo","systemctl","start","docker"]`
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `parses_probe_output`
   - `decides_rerun_with_sg_then_newgrp_then_login`
   - `offers_join_when_socket_is_docker_or_root_or_group_missing`
   - `no_offer_for_other_socket_group_or_already_member`
   - `probe_script_runs_under_sh`: run `sh -c PROBE_SCRIPT` locally and assert `parse_probe` yields `Some` whose `user` equals the output of `id -un`.
   - `in_group_and_join_words`
-- [ ] **Step 2: Run the tests** and expect FAIL.
-- [ ] **Step 3: Implement** the items above.
-- [ ] **Step 4: Run the tests** and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: detect docker group access and build the fixes"`
+- [x] **Step 2: Run the tests** and expect FAIL.
+- [x] **Step 3: Implement** the items above.
+- [x] **Step 4: Run the tests** and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: detect docker group access and build the fixes"`
 
 ### Task 5: OpenSSH variants for remote commands
 
@@ -166,15 +166,15 @@
     - `launch_in_new_terminal(alias)` calls it with `["connect","--hold","--",alias]` and `[ssh,"--",alias]`.
   - `pub fn ssh_program(&self) -> &Path`
 
-- [ ] **Step 1: Write the failing tests**, next to the existing `fake_ssh` tests:
+- [x] **Step 1: Write the failing tests**, next to the existing `fake_ssh` tests:
   - `run_remote_passes_remote_command_none_and_batch`: assert the recorded arguments are `-o RemoteCommand=none -o BatchMode=yes -- dev docker ps`, and that a non-zero exit returns `Ok(output)` with its status.
   - `connect_mirrored_command_requests_a_tty`: assert the arguments are `-t -o RemoteCommand=none -- dev 'docker exec …'`.
   - `new_terminal_with_custom_portico_args`: assert the terminal receives `<portico> shell --hold x`, and the fallback arguments when Portico's path is unknown.
   - The existing connect and new-terminal tests stay green, unchanged.
-- [ ] **Step 2: Run** `cargo test --lib openssh::` and expect FAIL.
-- [ ] **Step 3: Implement** the items above.
-- [ ] **Step 4: Run** `cargo test --lib openssh::` and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: run remote commands through the ssh connect paths"`
+- [x] **Step 2: Run** `cargo test --lib openssh::` and expect FAIL.
+- [x] **Step 3: Implement** the items above.
+- [x] **Step 4: Run** `cargo test --lib openssh::` and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: run remote commands through the ssh connect paths"`
 
 ### Task 6: App layer: targets, listing, shells and fixes
 
@@ -218,10 +218,10 @@
     - New terminal: `launch_new_terminal_with`, with portico args `["shell","--hold",("--on",alias)?,("-u",user)?,("--via",sg|newgrp)?,"--",id]` and the ssh or docker words as the fallback.
   - **Fix:** runs `offer.words()` locally with the terminal inherited, or as `ssh -t` through `connect_mirrored_command`, and returns its status.
 
-- [ ] **Step 1: Write failing integration tests** in a new `tests/containers.rs`, using `TestEnv::install_program` fakes for `docker`, `ssh`, `sudo` and `sg` that record their arguments to files under `env.home()`. Drive them through the CLI commands from Tasks 7 and 8, so these tests are written there. This task's own unit test is `target_describe` in `app.rs`.
-- [ ] **Step 2: Implement** the items above. Most of the behaviour is proved by the tests in Tasks 7 and 8, which compile against these signatures.
-- [ ] **Step 3: Run** `cargo test --lib` and `cargo clippy --all-targets -- -D warnings`, and expect PASS.
-- [ ] **Step 4: Commit** with `git commit -m "feat: list containers and open shells on this machine or a host"`
+- [x] **Step 1: Write failing integration tests** in a new `tests/containers.rs`, using `TestEnv::install_program` fakes for `docker`, `ssh`, `sudo` and `sg` that record their arguments to files under `env.home()`. Drive them through the CLI commands from Tasks 7 and 8, so these tests are written there. This task's own unit test is `target_describe` in `app.rs`.
+- [x] **Step 2: Implement** the items above. Most of the behaviour is proved by the tests in Tasks 7 and 8, which compile against these signatures.
+- [x] **Step 3: Run** `cargo test --lib` and `cargo clippy --all-targets -- -D warnings`, and expect PASS.
+- [x] **Step 4: Commit** with `git commit -m "feat: list containers and open shells on this machine or a host"`
 
 ### Task 7: `portico containers`
 
@@ -240,7 +240,7 @@
     On yes, it runs `docker_fix` and then lists once more. On `Ssh`, it prints like `print_connection_failure`.
 - Exit codes: success 0, every error 1.
 
-- [ ] **Step 1: Write the failing tests** in `tests/containers.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/containers.rs`:
   - `lists_local_containers_grouped`: a fake `docker` prints two `shop` lines and one plain line. Assert stdout contains `shop`, `  db`, `  web` and `Other`, with the rows in that order.
   - `lists_remote_containers_over_ssh`: init plus `add dev -H dev.example`, and a fake `ssh` that records its arguments and prints the lines. Assert the arguments contain `-o RemoteCommand=none -- dev docker ps --no-trunc --format '{"id":…'` (quoted), and that `BatchMode` is absent.
   - `alias_case_uses_inventory_spelling`: `--on DEV` records `-- dev`.
@@ -250,10 +250,10 @@
   - `permission_denied_rerun_through_sg`: the fake `docker` fails with permission denied unless run through `sg`. Locally the probe runs `sh -c PROBE_SCRIPT`, so install fake `id`, `getent`, `stat` and `sg` programs that report docker in the database but not in the process. Assert the listing prints and the note mentions `sg docker`.
   - `join_offer_accepted_runs_sudo_then_lists`: an interactive run (`run_with_stdin`, with interactivity forced the same way the existing remove-confirmation tests do), answering `y`. The fake `sudo` records its arguments, which must equal the `join_group_words`.
   - `join_offer_declined_lists_options`
-- [ ] **Step 2: Run** `cargo test --test containers` and expect FAIL.
-- [ ] **Step 3: Implement** the items above.
-- [ ] **Step 4: Run** `cargo test --test containers` and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: add portico containers"`
+- [x] **Step 2: Run** `cargo test --test containers` and expect FAIL.
+- [x] **Step 3: Implement** the items above.
+- [x] **Step 4: Run** `cargo test --test containers` and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: add portico containers"`
 
 ### Task 8: `portico shell` with picker
 
@@ -271,7 +271,7 @@
   - With a reference, `resolve`, mapping its errors to `NoMatch` and `Ambiguous`. Without one, `pick` when interactive. Otherwise the error is `choose a container: portico shell <container> (no terminal for the picker)`, and a cancelled pick exits 130.
   - Then `container_shell`. The outcome is handled exactly like `Command::Connect`: explanation, `--hold` wait, and `exit_code`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `shell_local_by_service`: the fake `docker` records the `exec` arguments: `exec -it <full id> sh -c 'command -v bash…'`.
   - `shell_with_user`: `-u o'brien` on a host, and the ssh arguments contain `-t -o RemoteCommand=none -- dev` followed by the quoted remote command containing `-u 'o'\''brien'`.
   - `shell_ambiguous_lists_candidates` and `shell_unknown_reference`
@@ -281,10 +281,10 @@
   - `numbered_picker_selects_second`: no `fzf` on PATH and stdin `2\n` gives an exec of the second row's ID. Empty stdin gives exit 130 and no exec.
   - `fzf_picker_used_when_present`: a fake `fzf` echoes its second stdin line, and the exec uses that ID.
   - `no_containers_shell_exits_one`
-- [ ] **Step 2: Run** `cargo test --test containers` and expect FAIL.
-- [ ] **Step 3: Implement** the items above.
-- [ ] **Step 4: Run** `cargo test --test containers` and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: open a container shell from the CLI with a picker"`
+- [x] **Step 2: Run** `cargo test --test containers` and expect FAIL.
+- [x] **Step 3: Implement** the items above.
+- [x] **Step 4: Run** `cargo test --test containers` and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: open a container shell from the CLI with a picker"`
 
 ### Task 9: TUI containers panel (state, keys, rendering)
 
@@ -316,7 +316,7 @@
     - Tab, Shift+Tab (`BackTab`) and Esc give `Leave`. While listing, Esc gives `CancelList` and also leaves.
     - `q` gives `Quit`.
 
-- [ ] **Step 1: Write the failing tests** in `src/tui/containers.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `src/tui/containers.rs` `mod tests`:
   - `focus_lists_once_per_target`: `on_focus` gives `List`, then after `finish`, `on_focus` gives `None`.
   - `follow_unpins_local`
   - `selection_skips_headers`
@@ -326,10 +326,10 @@
   - `renders_groups_and_hint`
   - `details_for_selected_container`
   - `failure_lines_for_ssh_and_docker`
-- [ ] **Step 2: Run** `cargo test --lib tui::containers` and expect FAIL.
-- [ ] **Step 3: Implement** the items above.
-- [ ] **Step 4: Run the tests** and expect PASS.
-- [ ] **Step 5: Commit** with `git commit -m "feat: add the TUI containers panel"`
+- [x] **Step 2: Run** `cargo test --lib tui::containers` and expect FAIL.
+- [x] **Step 3: Implement** the items above.
+- [x] **Step 4: Run the tests** and expect PASS.
+- [x] **Step 5: Commit** with `git commit -m "feat: add the TUI containers panel"`
 
 ### Task 10: TUI wiring: layout, focus, worker, shells and fixes
 
@@ -351,27 +351,27 @@
   - **Render:** the left column splits vertically into hosts (`Min(3)`) and containers (`Length(max(6, 40% of height))`). The details pane shows `panel.details()` while the panel is focused, and the footer shows `panel.footer()` while it is focused. The browse footer gains `Tab containers`.
   - The worker's results are polled in the same loop iteration that polls `tester`.
 
-- [ ] **Step 1: Write the failing tests** in `src/tui.rs` tests:
+- [x] **Step 1: Write the failing tests** in `src/tui.rs` tests:
   - `tab_focuses_containers_and_lists`: `press(Tab)` gives `UiAction::Containers(PanelAction::List(Target::Host("dev")))`.
   - `panel_keys_route_when_focused`: `j` moves the panel's selection and leaves the host selection unchanged.
   - `moving_host_selection_follows`
   - `details_pane_shows_container_when_focused`: rendered with `TestBackend`, as the existing render tests are.
   - `browse_footer_mentions_tab_containers`
   - Every existing TUI test stays green.
-- [ ] **Step 2: Run** `cargo test --lib tui::` and expect FAIL.
-- [ ] **Step 3: Implement** the items above.
-- [ ] **Step 4: Run** `cargo test --all-targets` and expect PASS.
-- [ ] **Step 5: Manual check** of `cargo run` with the local Docker (`pgadmin` is running): Tab, `L`, the details, Enter opening a shell, and `exit` returning to the TUI.
-- [ ] **Step 6: Commit** with `git commit -m "feat: list containers and open shells from the TUI"`
+- [x] **Step 2: Run** `cargo test --lib tui::` and expect FAIL.
+- [x] **Step 3: Implement** the items above.
+- [x] **Step 4: Run** `cargo test --all-targets` and expect PASS.
+- [x] **Step 5: Manual check** of `cargo run` with the local Docker (`pgadmin` is running): Tab, `L`, the details, Enter opening a shell, and `exit` returning to the TUI.
+- [x] **Step 6: Commit** with `git commit -m "feat: list containers and open shells from the TUI"`
 
 ### Task 11: Documentation and final checks
 
 **Files:** Modify `README.md`
 
-- [ ] **Step 1:** Edit the README:
+- [x] **Step 1:** Edit the README:
   - Add `portico containers [--on <alias>]` and `portico shell [<container>] [--on <alias>] [-u <user>] [-n]` to the CLI table, with examples.
   - Add a "Container shells" paragraph: Docker only, nothing stored, the reference forms, the fzf picker, and the offers (group join, daemon start, `sg`/`newgrp`).
   - Add the containers panel's keys to "TUI keys".
   - Add the optional `docker` and `fzf` to Requirements.
-- [ ] **Step 2:** Run `scripts/ci-checks.sh fmt`, `scripts/ci-checks.sh clippy`, `scripts/ci-checks.sh test` and `scripts/ci-checks.sh docs` as the regular user, and expect all to pass.
-- [ ] **Step 3: Commit** with `git commit -m "docs: document container shells"`
+- [x] **Step 2:** Run `scripts/ci-checks.sh fmt`, `scripts/ci-checks.sh clippy`, `scripts/ci-checks.sh test` and `scripts/ci-checks.sh docs` as the regular user, and expect all to pass.
+- [x] **Step 3: Commit** with `git commit -m "docs: document container shells"`
