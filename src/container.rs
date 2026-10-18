@@ -240,6 +240,68 @@ pub fn display_name(container: &Container, all: &[Container]) -> String {
     }
 }
 
+/// Why a container reference did not pick exactly one container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolveError {
+    NotFound,
+    /// Several containers match; holds their names, sorted.
+    Ambiguous(Vec<String>),
+}
+
+/// Finds the container a user means. The first form that matches anything
+/// decides: the exact name, `project/service` or `project/service#n`, a bare
+/// service name, then an ID prefix of at least four hex digits.
+pub fn resolve<'a>(
+    reference: &str,
+    containers: &'a [Container],
+) -> Result<&'a Container, ResolveError> {
+    let by_name = matching(containers, |c| c.name == reference);
+    if !by_name.is_empty() {
+        return pick(by_name);
+    }
+    if let Some((project, rest)) = reference.split_once('/') {
+        let (service, number) = match rest.split_once('#') {
+            Some((service, number)) => (service, number.parse::<u32>().ok()),
+            None => (rest, None),
+        };
+        let wants_number = rest.contains('#');
+        let found = matching(containers, |c| {
+            c.project.as_deref() == Some(project)
+                && c.service.as_deref() == Some(service)
+                && (!wants_number || (number.is_some() && c.number == number))
+        });
+        if !found.is_empty() {
+            return pick(found);
+        }
+    }
+    let by_service = matching(containers, |c| c.service.as_deref() == Some(reference));
+    if !by_service.is_empty() {
+        return pick(by_service);
+    }
+    let is_id_prefix = reference.len() >= 4 && reference.chars().all(|c| c.is_ascii_hexdigit());
+    if is_id_prefix {
+        return pick(matching(containers, |c| c.id.starts_with(reference)));
+    }
+    Err(ResolveError::NotFound)
+}
+
+fn matching(containers: &[Container], test: impl Fn(&Container) -> bool) -> Vec<&Container> {
+    containers.iter().filter(|c| test(c)).collect()
+}
+
+fn pick(mut found: Vec<&Container>) -> Result<&Container, ResolveError> {
+    match found.len() {
+        0 => Err(ResolveError::NotFound),
+        1 => Ok(found[0]),
+        _ => {
+            found.sort_by(|a, b| a.name.cmp(&b.name));
+            Err(ResolveError::Ambiguous(
+                found.into_iter().map(|c| c.name.clone()).collect(),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +443,97 @@ mod tests {
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(names, ["shop-web-a", "shop-web-b"]);
+    }
+
+    fn with_id(mut container: Container, id: &str) -> Container {
+        container.id = id.into();
+        container
+    }
+
+    fn resolved<'a>(reference: &str, all: &'a [Container]) -> Result<&'a str, ResolveError> {
+        resolve(reference, all).map(|c| c.name.as_str())
+    }
+
+    fn ambiguous(names: &[&str]) -> Result<&'static str, ResolveError> {
+        Err(ResolveError::Ambiguous(
+            names.iter().map(|n| n.to_string()).collect(),
+        ))
+    }
+
+    #[test]
+    fn resolves_exact_name_first() {
+        let all = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("web", None, None, 0),
+        ];
+        assert_eq!(resolved("web", &all), Ok("web"));
+    }
+
+    #[test]
+    fn resolves_project_service_and_number() {
+        let all = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("shop-db-1", Some("shop"), Some("db"), 1),
+        ];
+        assert_eq!(resolved("shop/web", &all), Ok("shop-web-1"));
+        let replicas = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("shop-web-2", Some("shop"), Some("web"), 2),
+        ];
+        assert_eq!(resolved("shop/web#2", &replicas), Ok("shop-web-2"));
+        assert_eq!(
+            resolved("shop/web#3", &replicas),
+            Err(ResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn resolves_unique_service() {
+        let all = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("shop-db-1", Some("shop"), Some("db"), 1),
+        ];
+        assert_eq!(resolved("db", &all), Ok("shop-db-1"));
+    }
+
+    #[test]
+    fn ambiguous_service_lists_names() {
+        let all = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("blog-web-1", Some("blog"), Some("web"), 1),
+        ];
+        assert_eq!(
+            resolved("web", &all),
+            ambiguous(&["blog-web-1", "shop-web-1"])
+        );
+        let replicas = vec![
+            container("shop-web-2", Some("shop"), Some("web"), 2),
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+        ];
+        assert_eq!(
+            resolved("shop/web", &replicas),
+            ambiguous(&["shop-web-1", "shop-web-2"])
+        );
+    }
+
+    #[test]
+    fn resolves_id_prefix_of_four_or_more_hex() {
+        let all = vec![
+            with_id(container("a", None, None, 0), "3174abcdef"),
+            with_id(container("b", None, None, 0), "9f00112233"),
+            with_id(container("c", None, None, 0), "9f00998877"),
+        ];
+        assert_eq!(resolved("3174", &all), Ok("a"));
+        assert_eq!(resolved("317", &all), Err(ResolveError::NotFound));
+        assert_eq!(resolved("zzzz", &all), Err(ResolveError::NotFound));
+        assert_eq!(resolved("9f00", &all), ambiguous(&["b", "c"]));
+    }
+
+    #[test]
+    fn unknown_reference_is_not_found() {
+        let all = vec![container("shop-web-1", Some("shop"), Some("web"), 1)];
+        assert_eq!(resolved("nope", &all), Err(ResolveError::NotFound));
+        assert_eq!(resolved("nope/web", &all), Err(ResolveError::NotFound));
+        assert_eq!(resolved("web", &[]), Err(ResolveError::NotFound));
     }
 }
