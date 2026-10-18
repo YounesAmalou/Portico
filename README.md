@@ -10,6 +10,7 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Adds, edits, inspects, renames, and removes managed hosts.
 - Shows the effective configuration reported by `ssh -G`.
 - Connects in the current terminal or through `xdg-terminal-exec`.
+- Tests on demand whether a host's login works, without opening a shell.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only.
@@ -116,6 +117,7 @@ portico add <alias> -H <host>   Add a managed host
 portico edit <alias> [options]  Change only the supplied fields
 portico remove <alias> [-f]     Remove a managed host
 portico connect <alias> [-n]    Connect using OpenSSH
+portico test <alias>            Check that logging in works, without a shell
 ```
 
 Host fields and their aliases:
@@ -166,6 +168,17 @@ portico connect development --new-terminal
 
 New-terminal connections are handed to `xdg-terminal-exec` in the background, so the CLI returns without waiting for the session and the TUI remains usable. If the launcher fails right away (for example no terminal is available) its exit status is reported; once it has started, Portico can only report that the launch was requested, not whether the SSH session succeeds.
 
+Test a connection:
+
+```sh
+portico test development
+portico test development --accept-host-key SHA256:...
+```
+
+A test passes only when OpenSSH completes authentication. It never opens a shell or runs a command, so hosts that only allow port forwarding pass too, and it is never run automatically. It works for managed and external hosts, prints one line (`development: authenticated as deploy@10.0.0.5:22 (publickey)`) and exits 0 on a pass, or prints the reason and exits 1. The test never prompts for a password or passphrase, so a key with a passphrase must be loaded in an agent.
+
+The first time a host is tested its key is usually unknown. In a terminal, Portico shows the key's fingerprint and asks before trusting it. Without a terminal it trusts nothing, prints the fingerprint and fails; `--accept-host-key` trusts the key only if its fingerprint matches the one given exactly, then tests again. A changed host key is never offered for trust.
+
 Remove a managed host. Unknown and external (read-only) aliases are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
 
 ```sh
@@ -187,6 +200,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `r` / `F5` | Refresh: re-read the inventory and discard cached host details |
 | `Enter` | Connect in the current terminal |
 | `Ctrl+Enter` / `n` | Connect in a new terminal |
+| `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |
 
@@ -198,7 +212,9 @@ Form fields only accept characters they can hold, whether typed or pasted: alias
 
 Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it. Portico re-reads the inventory and re-resolves details when it changes the configuration itself; edits made elsewhere, such as in `~/.ssh/config` or an included file, appear after `r` or `F5`. The selection and filter are kept, and if the files cannot be read the list stays as it was and the footer reports why.
 
-External hosts can be inspected and connected to, but Portico will not edit or remove them.
+A test shows `✓` or `✗` beside the host and its result in the details until the host is edited or removed or the inventory is refreshed. `Esc` cancels a running test. An unknown host key opens a prompt showing its fingerprint: `y` trusts it and tests again, `n` or `Esc` declines.
+
+External hosts can be inspected, tested and connected to, but Portico will not edit or remove them.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
 
 ## Development checks
