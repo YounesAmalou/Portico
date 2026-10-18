@@ -70,3 +70,4 @@ These GitHub settings are not stored in the repository. They are listed here so 
 - **Security features:** secret scanning with push protection, Dependabot security updates, and private vulnerability reporting (the channel named in `SECURITY.md`).
 
 Signed commits are not required.
+
