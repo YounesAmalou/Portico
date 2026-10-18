@@ -825,3 +825,60 @@ fn adopt_refuses_a_block_whose_effective_configuration_would_change() {
     assert_eq!(std::fs::read_to_string(env.ssh_config()).unwrap(), entry);
     assert_eq!(std::fs::read(env.managed_config()).unwrap(), managed);
 }
+
+/// `ssh -G` for `alias` through a copy of the entry config whose Portico include names an
+/// absolute path, because OpenSSH expands `~` from the passwd home rather than `$HOME`.
+fn ssh_g(env: &TestEnv, alias: &str) -> String {
+    let entry = std::fs::read_to_string(env.ssh_config()).unwrap();
+    let staged = entry.replace(
+        "Include ~/.ssh/portico/config",
+        &format!("Include {}", env.managed_config().display()),
+    );
+    let path = env.home().join("staged-ssh-config");
+    std::fs::write(&path, staged).unwrap();
+    let output = std::process::Command::new("/usr/bin/ssh")
+        .args(["-G", "-F"])
+        .arg(&path)
+        .arg(alias)
+        .env("HOME", env.home())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn adopt_and_export_keep_ssh_g_identical_with_real_openssh() {
+    if !std::path::Path::new("/usr/bin/ssh").exists() {
+        eprintln!("skipped: /usr/bin/ssh is not installed");
+        return;
+    }
+    let env = TestEnv::new();
+    env.install_program("ssh", "#!/bin/sh\nexec /usr/bin/ssh \"$@\"\n");
+    env.run(["init", "-y"]).assert_success();
+    let entry = format!(
+        "{INCLUDE}# the dev box\nHost dev\n  HostName dev.example\n  # deploys only\n  User alice\n  Port 2222\n"
+    );
+    std::fs::write(env.ssh_config(), &entry).unwrap();
+    let before = ssh_g(&env, "dev");
+    assert!(before.contains("hostname dev.example\n"), "{before}");
+
+    env.run(["adopt", "dev", "-y"])
+        .assert_stdout_contains("Adopted: dev");
+    assert_eq!(ssh_g(&env, "dev"), before);
+    let managed = std::fs::read_to_string(env.managed_config()).unwrap();
+    assert!(managed.contains("# the dev box"), "{managed}");
+    assert!(managed.contains("# deploys only"), "{managed}");
+    assert!(
+        !std::fs::read_to_string(env.ssh_config())
+            .unwrap()
+            .contains("Host dev")
+    );
+
+    env.run(["export", "dev", "-y"])
+        .assert_stdout_contains("Exported: dev");
+    assert_eq!(ssh_g(&env, "dev"), before);
+    let exported = std::fs::read_to_string(env.ssh_config()).unwrap();
+    assert!(exported.contains("# the dev box"), "{exported}");
+    assert!(exported.contains("# deploys only"), "{exported}");
+}
