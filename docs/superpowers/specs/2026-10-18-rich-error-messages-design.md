@@ -1,6 +1,6 @@
 # Rich Error Messages Design
 
-**Status:** Approved for planning
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -68,7 +68,7 @@ dev: failed — the server refused the login
 ### Connection test
 
 - `LogLevel=VERBOSE` becomes `LogLevel=DEBUG1`. Every other option, the success line, the deadline, cancellation and the trust flow are unchanged.
-- OpenSSH passes the raised level to the `ssh` it runs for a `ProxyJump` hop, so the hop's own key lines are mixed in. On a proxied route, key facts are taken only from lines after the hop's own `Authenticated to <host> ([<address>]:<port>)` line. If that line never appears the result is "jump host failed", and any key facts belong to the jump host.
+- OpenSSH does not pass `-o LogLevel=DEBUG1` on to the `ssh` it runs for a `ProxyJump` hop (verified in the `jump-target-key-refused` fixture), so the debug key lines on a proxied route are the target's. Only when the user has configured the jump host itself verbose does the hop's `ssh` also log a direct-form `Authenticated to <host> ([<address>]:<port>)` line; key facts are then taken only after that line. The absence of that line never by itself means "jump host failed".
 - The stderr kept for classification is capped at 256 KiB, keeping the newest lines.
 - The CLI keeps the success line and exit codes; a failure prints the layout above. `--raw` adds the ssh lines.
 
@@ -98,6 +98,7 @@ Applies to add, edit and `portico init`, and to a test or connect that fails bec
   - **The staged managed file:** Portico reads the staged content, finds the `Host` block and directive at that line, and names the host and field, for example `Port for dev: OpenSSH rejects '99999'`. In the TUI the error appears on that field of the form.
   - **The staged validation entry:** reported as an internal Portico error with the raw text. It is not expected to happen.
   - **Any other file:** the user's own configuration, for example `line 12 of ~/.ssh/config (not written by Portico): Bad configuration option: bogus`, with the next step `nothing was saved; fix that line, then save again` (for `init`: `then rerun portico init`).
+  - `ConfigFiles.entry` is Portico's staged validation wrapper only. `portico init`, saved-host tests and `connect` treat the user's entry file (`~/.ssh/config`) as the user's own file.
 - Output that does not parse falls back to today's message with the raw lines.
 
 ## Code layout
