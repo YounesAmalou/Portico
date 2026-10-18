@@ -1,5 +1,7 @@
 use std::{
+    collections::BTreeSet,
     io::{self, BufRead, Write},
+    path::Path,
     process::ExitCode,
     sync::{
         Arc,
@@ -8,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    adopt::{Candidate, Direction},
     app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
     discovery::DiscoveryWarning,
     explain::Explanation,
@@ -75,6 +78,22 @@ enum Command {
         /// Wait for Enter after an explained failure; used in a new terminal.
         #[arg(long, hide = true)]
         hold: bool,
+    },
+    /// Move external hosts into Portico's managed configuration.
+    Adopt {
+        aliases: Vec<String>,
+        #[arg(short = 'A', long, conflicts_with = "aliases")]
+        all: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Move managed hosts back into the entry configuration.
+    Export {
+        aliases: Vec<String>,
+        #[arg(short = 'A', long, conflicts_with = "aliases")]
+        all: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     Test {
         alias: String,
@@ -361,6 +380,28 @@ fn execute<I: BufRead, O: Write, E: Write>(
             };
             Ok(exit_code(status))
         }
+        Some(Command::Adopt { aliases, all, yes }) => {
+            let interrupts = Interrupts::install(handle_signals)
+                .map_err(|error| format!("cannot handle signals: {error}"))?;
+            let migration = Migration {
+                direction: Direction::Adopt,
+                aliases,
+                all,
+                yes,
+            };
+            run_migration(&migration, app, &interrupts, input, output, interactive)
+        }
+        Some(Command::Export { aliases, all, yes }) => {
+            let interrupts = Interrupts::install(handle_signals)
+                .map_err(|error| format!("cannot handle signals: {error}"))?;
+            let migration = Migration {
+                direction: Direction::Export,
+                aliases,
+                all,
+                yes,
+            };
+            run_migration(&migration, app, &interrupts, input, output, interactive)
+        }
         Some(Command::Test {
             alias,
             accept_host_key,
@@ -465,6 +506,224 @@ fn test_command<I: BufRead, O: Write>(
             print_report(output, &report, raw)
         }
     }
+}
+
+/// What `portico adopt` or `portico export` was asked to do.
+struct Migration {
+    direction: Direction,
+    aliases: Vec<String>,
+    all: bool,
+    yes: bool,
+}
+
+impl Migration {
+    fn verb(&self) -> &'static str {
+        match self.direction {
+            Direction::Adopt => "adopt",
+            Direction::Export => "export",
+        }
+    }
+
+    fn participle(&self) -> &'static str {
+        match self.direction {
+            Direction::Adopt => "adopted",
+            Direction::Export => "exported",
+        }
+    }
+
+    fn past(&self) -> &'static str {
+        match self.direction {
+            Direction::Adopt => "Adopted",
+            Direction::Export => "Exported",
+        }
+    }
+
+    fn cancelled(&self) -> &'static str {
+        match self.direction {
+            Direction::Adopt => "Adoption cancelled.",
+            Direction::Export => "Export cancelled.",
+        }
+    }
+}
+
+/// `portico adopt` and `portico export`: choose the hosts, show the exact preview, ask, move.
+fn run_migration<I: BufRead, O: Write>(
+    migration: &Migration,
+    app: &App,
+    interrupts: &Interrupts,
+    input: &mut I,
+    output: &mut O,
+    interactive: bool,
+) -> Result<ExitCode, String> {
+    let verb = migration.verb();
+    let named = !migration.aliases.is_empty() || migration.all;
+    if !named && !interactive {
+        return Err(format!(
+            "{verb} requires host aliases or --all in non-interactive mode"
+        ));
+    }
+    let plan = match migration.direction {
+        Direction::Adopt => app.adoption_plan(),
+        Direction::Export => app.export_plan(),
+    }
+    .map_err(|error| error.to_string())?;
+    let home = app.home();
+    let eligible = plan.eligible().collect::<Vec<_>>();
+    let ineligible = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.reason.is_some())
+        .collect::<Vec<_>>();
+    let write_error = |error: io::Error| error.to_string();
+
+    let selection = if !migration.aliases.is_empty() {
+        migration.aliases.clone()
+    } else if migration.all {
+        for candidate in &ineligible {
+            let reason = candidate.reason.as_deref().unwrap_or_default();
+            writeln!(output, "Skipped {}: {reason}", candidate.alias).map_err(write_error)?;
+        }
+        if eligible.is_empty() {
+            writeln!(output, "No host can be {}.", migration.participle()).map_err(write_error)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        eligible
+            .iter()
+            .map(|candidate| candidate.alias.clone())
+            .collect()
+    } else {
+        if eligible.is_empty() {
+            writeln!(output, "No host can be {}.", migration.participle()).map_err(write_error)?;
+        } else {
+            writeln!(output, "Eligible hosts:").map_err(write_error)?;
+            for (index, candidate) in eligible.iter().enumerate() {
+                writeln!(
+                    output,
+                    "  {}. {}  {}",
+                    index + 1,
+                    candidate.alias,
+                    describe_source(migration.direction, candidate, home)
+                )
+                .map_err(write_error)?;
+            }
+        }
+        if !ineligible.is_empty() {
+            writeln!(output, "Not eligible:").map_err(write_error)?;
+            for candidate in &ineligible {
+                writeln!(
+                    output,
+                    "  {}  {}: {}",
+                    candidate.alias,
+                    describe_source(migration.direction, candidate, home),
+                    candidate.reason.as_deref().unwrap_or_default()
+                )
+                .map_err(write_error)?;
+            }
+        }
+        if eligible.is_empty() {
+            return Ok(ExitCode::SUCCESS);
+        }
+        write!(
+            output,
+            "{} which hosts? (all, numbers like 1,3-4, or none) ",
+            capitalized(verb)
+        )
+        .map_err(write_error)?;
+        output.flush().map_err(write_error)?;
+        let mut answer = String::new();
+        input.read_line(&mut answer).map_err(write_error)?;
+        parse_selection(&answer, eligible.len())?
+            .into_iter()
+            .map(|index| eligible[index].alias.clone())
+            .collect()
+    };
+
+    if selection.is_empty() {
+        writeln!(output, "Nothing to {verb}.").map_err(write_error)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let preview = plan
+        .preview(&selection)
+        .map_err(|error| error.to_string())?;
+    write!(output, "{}", preview.render(Some(home))).map_err(write_error)?;
+    if !migration.yes {
+        if !interactive {
+            return Err(format!("{verb} requires --yes in non-interactive mode"));
+        }
+        let count = selection
+            .iter()
+            .map(|alias| alias.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let noun = if count == 1 { "host" } else { "hosts" };
+        if !confirm(
+            input,
+            output,
+            &format!("{} {count} {noun}? [y/N] ", capitalized(verb)),
+        )? {
+            writeln!(output, "{}", migration.cancelled()).map_err(write_error)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    // A signal after the migration finished leaves its result standing.
+    let (Step::Done(moved) | Step::Late(moved)) =
+        interrupts.during(|cancelled| app.migrate_cancellable(&plan, &selection, cancelled));
+    let moved = moved.map_err(|error| error.to_string())?;
+    writeln!(output, "{}: {}", migration.past(), moved.join(", ")).map_err(write_error)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The file a candidate comes from, with the home directory as `~`; `managed` for export.
+fn describe_source(direction: Direction, candidate: &Candidate, home: &Path) -> String {
+    match direction {
+        Direction::Export => "managed".into(),
+        Direction::Adopt => match candidate.source.strip_prefix(home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => candidate.source.display().to_string(),
+        },
+    }
+}
+
+/// The 0-based indexes an answer to the selection prompt picks out of `count` hosts: `all`,
+/// `none` or nothing, or comma-separated 1-based numbers and `a-b` ranges.
+fn parse_selection(answer: &str, count: usize) -> Result<Vec<usize>, String> {
+    let invalid = || format!("invalid selection: {}", answer.trim());
+    let compact = answer
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match compact.as_str() {
+        "" | "none" => return Ok(Vec::new()),
+        "all" => return Ok((0..count).collect()),
+        _ => {}
+    }
+    let number = |text: &str| {
+        text.parse::<usize>()
+            .ok()
+            .filter(|number| (1..=count).contains(number))
+            .ok_or_else(invalid)
+    };
+    let mut picked = BTreeSet::new();
+    for part in compact.split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (number(first)?, number(last)?),
+            None => (number(part)?, number(part)?),
+        };
+        if first > last {
+            return Err(invalid());
+        }
+        picked.extend(first - 1..last);
+    }
+    Ok(picked.into_iter().collect())
+}
+
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    characters
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + characters.as_str())
+        .unwrap_or_default()
 }
 
 fn print_untrusted_key(
@@ -867,6 +1126,186 @@ mod tests {
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(output.ends_with("Trust this host key? [y/N] Host key not trusted.\n"));
         assert!(!dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    #[test]
+    fn parse_selection_accepts_all_none_numbers_and_ranges() {
+        assert_eq!(parse_selection("1,3-4", 5), Ok(vec![0, 2, 3]));
+        assert_eq!(parse_selection(" 2 , 4 - 5 ", 5), Ok(vec![1, 3, 4]));
+        assert_eq!(parse_selection("3,1,3", 5), Ok(vec![0, 2]));
+        assert_eq!(parse_selection("", 5), Ok(vec![]));
+        assert_eq!(parse_selection("none", 5), Ok(vec![]));
+        assert_eq!(parse_selection("all", 3), Ok(vec![0, 1, 2]));
+        for bad in ["0", "6", "2-1", "x", "1,,2", "1-", "-1"] {
+            assert_eq!(
+                parse_selection(bad, 5),
+                Err(format!("invalid selection: {bad}"))
+            );
+        }
+    }
+
+    /// An initialized app whose entry config declares `hosts` below the Portico include.
+    fn adoption_app(hosts: &str) -> (TempDir, App) {
+        let (dir, app) = test_app();
+        app.initialize(true).unwrap();
+        fs::write(
+            dir.path().join(".ssh/config"),
+            format!("Include ~/.ssh/portico/config\n{hosts}"),
+        )
+        .unwrap();
+        (dir, app)
+    }
+
+    const THREE_HOSTS: &str = "Host one\n  HostName one.example\n\nHost two\n  HostName two.example\n\nHost three\n  HostName three.example\n\nHost multi other\n  HostName m.example\n";
+
+    fn run_command(
+        app: &App,
+        args: &[&str],
+        input: &str,
+        interactive: bool,
+    ) -> (std::process::ExitCode, String, String) {
+        let (mut output, mut error) = (Vec::new(), Vec::new());
+        let exit = run(
+            Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied())).unwrap(),
+            app,
+            &mut Cursor::new(input.as_bytes().to_vec()),
+            &mut output,
+            &mut error,
+            interactive,
+            false,
+        );
+        (
+            exit,
+            String::from_utf8(output).unwrap(),
+            String::from_utf8(error).unwrap(),
+        )
+    }
+
+    fn aliases_of(app: &App, ownership: Ownership) -> Vec<String> {
+        app.hosts()
+            .unwrap()
+            .hosts
+            .into_iter()
+            .filter(|host| host.ownership == ownership)
+            .map(|host| host.alias)
+            .collect()
+    }
+
+    #[test]
+    fn adopt_parses_aliases_flags_and_rejects_all_with_aliases() {
+        let cli = Cli::try_parse_from(["portico", "adopt", "a", "b", "-y"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Adopt { aliases, all: false, yes: true }) if aliases == ["a", "b"]
+        ));
+        let cli = Cli::try_parse_from(["portico", "export", "-A"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Export { all: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["portico", "adopt", "a", "--all"]).is_err());
+    }
+
+    #[test]
+    fn interactive_adopt_moves_the_chosen_hosts() {
+        let (_dir, app) = adoption_app(THREE_HOSTS);
+        let (exit, output, error) = run_command(&app, &["adopt"], "2\ny\n", true);
+        assert_eq!(exit, std::process::ExitCode::SUCCESS, "{error}");
+        assert!(output.starts_with(
+            "Eligible hosts:\n  1. one  ~/.ssh/config\n  2. two  ~/.ssh/config\n  3. three  ~/.ssh/config\n\
+             Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n\
+             Adopt which hosts? (all, numbers like 1,3-4, or none) "
+        ), "{output}");
+        assert!(output.contains("Adopt 1 host? [y/N] "));
+        assert!(output.ends_with("Adopted: two\n"));
+        assert_eq!(aliases_of(&app, Ownership::Managed), ["two"]);
+    }
+
+    #[test]
+    fn interactive_adopt_accepts_ranges_and_all() {
+        let (_dir, app) = adoption_app(THREE_HOSTS);
+        let (_, output, _) = run_command(&app, &["adopt"], "1-2\ny\n", true);
+        assert!(output.contains("Adopt 2 hosts? [y/N] "));
+        assert!(output.ends_with("Adopted: one, two\n"));
+        let (_, output, _) = run_command(&app, &["adopt"], "all\ny\n", true);
+        assert!(output.ends_with("Adopted: three\n"), "{output}");
+    }
+
+    #[test]
+    fn interactive_adopt_changes_nothing_on_none_decline_or_invalid_answers() {
+        let (dir, app) = adoption_app(THREE_HOSTS);
+        let entry = fs::read(dir.path().join(".ssh/config")).unwrap();
+        for (input, success, ending) in [
+            ("none\n", true, "Nothing to adopt.\n"),
+            ("\n", true, "Nothing to adopt.\n"),
+            ("", true, "Nothing to adopt.\n"),
+            ("1\nn\n", true, "Adoption cancelled.\n"),
+            ("1\n", true, "Adoption cancelled.\n"),
+        ] {
+            let (exit, output, _) = run_command(&app, &["adopt"], input, true);
+            assert_eq!(exit == std::process::ExitCode::SUCCESS, success, "{input}");
+            assert!(output.ends_with(ending), "{input}: {output}");
+        }
+        let (exit, _, error) = run_command(&app, &["adopt"], "9\n", true);
+        assert_eq!(exit, std::process::ExitCode::FAILURE);
+        assert_eq!(error, "error: invalid selection: 9\n");
+        assert_eq!(fs::read(dir.path().join(".ssh/config")).unwrap(), entry);
+        assert!(aliases_of(&app, Ownership::Managed).is_empty());
+    }
+
+    #[test]
+    fn adopt_without_eligible_hosts_says_so_and_succeeds() {
+        let (_dir, app) = adoption_app("Host multi other\n  HostName m.example\n");
+        let (exit, output, _) = run_command(&app, &["adopt"], "", true);
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert_eq!(
+            output,
+            "No host can be adopted.\nNot eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+        );
+        let (exit, output, _) = run_command(&app, &["adopt", "--all", "-y"], "", false);
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert_eq!(
+            output,
+            "Skipped multi: Host line declares 2 aliases\nSkipped other: Host line declares 2 aliases\nNo host can be adopted.\n"
+        );
+    }
+
+    #[test]
+    fn non_interactive_adopt_needs_aliases_or_all_and_yes() {
+        let (_dir, app) = adoption_app(THREE_HOSTS);
+        let (exit, output, error) = run_command(&app, &["adopt"], "", false);
+        assert_eq!(exit, std::process::ExitCode::FAILURE);
+        assert!(output.is_empty());
+        assert_eq!(
+            error,
+            "error: adopt requires host aliases or --all in non-interactive mode\n"
+        );
+        let (_, _, error) = run_command(&app, &["adopt", "one"], "y\n", false);
+        assert_eq!(
+            error,
+            "error: adopt requires --yes in non-interactive mode\n"
+        );
+        assert!(aliases_of(&app, Ownership::Managed).is_empty());
+    }
+
+    #[test]
+    fn interactive_export_moves_managed_hosts_back() {
+        let (_dir, app) = adoption_app("");
+        app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+            .unwrap();
+        let (exit, output, error) = run_command(&app, &["export"], "all\ny\n", true);
+        assert_eq!(exit, std::process::ExitCode::SUCCESS, "{error}");
+        assert!(
+            output.starts_with("Eligible hosts:\n  1. dev  managed\n"),
+            "{output}"
+        );
+        assert!(output.contains("Export which hosts?"));
+        assert!(output.contains("Export 1 host? [y/N] "));
+        assert!(output.ends_with("Exported: dev\n"));
+        assert_eq!(aliases_of(&app, Ownership::External), ["dev"]);
+
+        let (_, output, _) = run_command(&app, &["export"], "", true);
+        assert_eq!(output, "No host can be exported.\n");
     }
 
     #[test]

@@ -10,6 +10,8 @@ use thiserror::Error;
 pub struct ExternalHost {
     pub alias: String,
     pub source: PathBuf,
+    pub line: usize,
+    pub conditional: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -52,6 +54,7 @@ pub enum DiscoveryError {
 pub(crate) enum ConfigDirective {
     Include(Vec<String>),
     Host(Vec<String>),
+    Match(Vec<String>),
     Other,
 }
 
@@ -88,6 +91,8 @@ pub(crate) fn parse_directive(line: &str) -> Result<Option<ConfigDirective>, Dis
             return Err(DiscoveryError::Parse("Host requires an alias".into()));
         }
         Ok(Some(ConfigDirective::Host(arguments)))
+    } else if directive.eq_ignore_ascii_case("Match") {
+        Ok(Some(ConfigDirective::Match(arguments)))
     } else {
         Ok(Some(ConfigDirective::Other))
     }
@@ -164,11 +169,11 @@ impl Scanner {
             path: path.clone(),
             source,
         })?;
-        self.scan_contents(&contents, &path);
+        self.scan_contents(&contents, &path, false);
         Ok(())
     }
 
-    fn scan_include(&mut self, path: PathBuf) {
+    fn scan_include(&mut self, path: PathBuf, conditional: bool) {
         let canonical = match path.canonicalize() {
             Ok(path) => path,
             Err(error) => return self.warn_include(path, error.to_string()),
@@ -180,23 +185,30 @@ impl Scanner {
             Ok(contents) => contents,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
-        self.scan_contents(&contents, &path);
+        self.scan_contents(&contents, &path, conditional);
     }
 
-    fn scan_contents(&mut self, contents: &[u8], source: &Path) {
+    fn scan_contents(&mut self, contents: &[u8], source: &Path, conditional: bool) {
+        let mut in_block = false;
         for (index, line) in contents.split(|byte| *byte == b'\n').enumerate() {
             match parse_directive_bytes(line) {
                 Ok(Some(ConfigDirective::Include(patterns))) => {
                     for pattern in patterns {
-                        self.expand_include(&pattern);
+                        self.expand_include(&pattern, conditional || in_block);
                     }
                 }
+                Ok(Some(ConfigDirective::Match(arguments))) => {
+                    in_block = !(arguments.len() == 1 && arguments[0].eq_ignore_ascii_case("all"));
+                }
                 Ok(Some(ConfigDirective::Host(aliases))) => {
+                    in_block = aliases != ["*"];
                     for alias in aliases {
                         if !alias.contains(['*', '?', '!']) {
                             self.discovery.hosts.push(ExternalHost {
                                 alias,
                                 source: source.into(),
+                                line: index + 1,
+                                conditional,
                             });
                         }
                     }
@@ -214,7 +226,7 @@ impl Scanner {
         }
     }
 
-    fn expand_include(&mut self, pattern: &str) {
+    fn expand_include(&mut self, pattern: &str, conditional: bool) {
         let target = match self.include_target(pattern) {
             Ok(target) => target,
             Err(message) => return self.warn_include(pattern.into(), message),
@@ -248,7 +260,7 @@ impl Scanner {
             }
         } else {
             for path in paths {
-                self.scan_include(path);
+                self.scan_include(path, conditional);
             }
         }
     }
@@ -662,5 +674,61 @@ mod tests {
             ["relative", "tilde"]
         );
         assert!(result.aliases_complete, "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn records_host_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        let managed = ssh.join("portico/config");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "Host owned\n").unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include portico/config\n\nHost a\n  HostName x\nHost b c\n",
+        )
+        .unwrap();
+
+        let result = discover(&ssh.join("config"), &managed).unwrap();
+        let found: Vec<_> = result
+            .hosts
+            .iter()
+            .map(|host| (host.alias.as_str(), host.line, host.conditional))
+            .collect();
+
+        assert_eq!(found, [("a", 3, false), ("b", 5, false), ("c", 5, false)]);
+    }
+
+    #[test]
+    fn includes_inside_a_block_are_conditional() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        let managed = ssh.join("portico/config");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "Host owned\n").unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include portico/config\nInclude top.conf\nHost *\n  Include star.conf\nHost gate\n  Include inner.conf\n",
+        )
+        .unwrap();
+        fs::write(ssh.join("top.conf"), "Host t\n").unwrap();
+        fs::write(ssh.join("star.conf"), "Host s\n").unwrap();
+        fs::write(ssh.join("inner.conf"), "Host i\nInclude deeper.conf\n").unwrap();
+        fs::write(ssh.join("deeper.conf"), "Host d\n").unwrap();
+
+        let result = discover(&ssh.join("config"), &managed).unwrap();
+        let conditional = |alias: &str| {
+            result
+                .hosts
+                .iter()
+                .find(|host| host.alias == alias)
+                .unwrap()
+                .conditional
+        };
+
+        assert!(!conditional("t"));
+        assert!(!conditional("s"));
+        assert!(conditional("i"));
+        assert!(conditional("d"));
     }
 }

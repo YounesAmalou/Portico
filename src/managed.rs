@@ -1,6 +1,8 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    mem,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -51,9 +53,26 @@ pub enum ManagedError {
     },
 }
 
+/// Comment lines attached to a managed host, each a full `#` line without indentation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostComments {
+    /// Rendered directly above the `Host` line.
+    pub leading: Vec<String>,
+    /// Rendered directly above the directive of the field.
+    pub fields: BTreeMap<HostField, Vec<String>>,
+}
+
+impl HostComments {
+    pub fn is_empty(&self) -> bool {
+        self.leading.is_empty() && self.fields.values().all(Vec::is_empty)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ManagedConfig {
     hosts: Vec<Host>,
+    /// Keyed by lowercase alias; a host without comments has no entry.
+    comments: BTreeMap<String, HostComments>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -533,25 +552,12 @@ impl ManagedStore {
     }
 
     fn entry_target(&self) -> Result<PathBuf, InitError> {
-        let mut path = self.paths.entry.clone();
-        for _ in 0..40 {
-            match fs::read_link(&path) {
-                Ok(target) => path = path.parent().expect("entry has a parent").join(target),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
-                    ) =>
-                {
-                    return Ok(path);
-                }
-                Err(source) => return Err(init_io(&path, source)),
-            }
-        }
-        Err(init_io(
-            &path,
-            io::Error::other("too many symbolic links; correct the entry target"),
-        ))
+        symlink_target(&self.paths.entry).map_err(|(path, source)| init_io(&path, source))
+    }
+
+    /// The file a write to the entry config replaces: the entry, or the end of its symlink chain.
+    pub(crate) fn entry_file(&self) -> Result<PathBuf, TransactionError> {
+        symlink_target(&self.paths.entry).map_err(|(path, source)| transaction_io(&path, source))
     }
 
     fn init_managed(&self) -> Result<ManagedConfig, InitError> {
@@ -575,7 +581,7 @@ impl ManagedStore {
         ManagedConfig::parse(text).map_err(invalid)
     }
 
-    fn ensure_ready(&self) -> Result<(), TransactionError> {
+    pub(crate) fn ensure_ready(&self) -> Result<(), TransactionError> {
         let entry = fs::read(&self.paths.entry)
             .map_err(|source| transaction_storage_io(&self.paths.entry, source))?;
         if !self.paths.managed.is_file()
@@ -744,10 +750,9 @@ impl ManagedStore {
                 lock,
                 active,
                 candidate,
-                validation_entry,
+                entry,
                 validation_file,
                 portico_lines,
-                entry_mode,
                 changed_aliases,
             },
         ))
@@ -775,37 +780,14 @@ impl ManagedStore {
             Staged {
                 lock,
                 candidate,
-                mut validation_entry,
+                entry,
                 validation_file,
-                mut portico_lines,
-                entry_mode,
                 ..
             },
         ) = self.stage(mutate, cancelled)?;
-        let preview_file = if self.paths.system_config.exists() {
-            if !validation_entry.is_empty() && !validation_entry.ends_with(b"\n") {
-                validation_entry.push(b'\n');
-            }
-            let lines = line_count(&validation_entry);
-            portico_lines.extend([lines + 1, lines + 2]);
-            validation_entry.extend_from_slice(
-                format!(
-                    "Match all\nInclude {}\n",
-                    quote_path(&self.paths.system_config.to_string_lossy())
-                )
-                .as_bytes(),
-            );
-            drop(validation_file);
-            write_unique(
-                &self.paths.ssh_dir,
-                ".config.portico-preview",
-                &validation_entry,
-                entry_mode,
-            )
-            .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?
-        } else {
-            validation_file
-        };
+        drop(validation_file);
+        let (preview_file, portico_lines) =
+            self.stage_entry_as(&entry, candidate.path(), ".config.portico-preview")?;
         drop(lock);
         let managed_text = read_lossy(candidate.path());
         let result = use_entry(ConfigFiles {
@@ -822,7 +804,51 @@ impl ManagedStore {
         result
     }
 
-    fn read_managed(&self) -> Result<(Vec<u8>, ManagedConfig), TransactionError> {
+    /// Writes a copy of the entry config `entry` whose Portico Include points at `managed`,
+    /// ending with `Match all` and an Include of the system configuration when it exists, as
+    /// `preview` hands to OpenSSH. Nothing is activated; the file is removed when dropped.
+    pub(crate) fn stage_entry(
+        &self,
+        entry: &[u8],
+        managed: &Path,
+    ) -> Result<PendingFile, TransactionError> {
+        self.stage_entry_as(entry, managed, ".config.portico-adopt-entry")
+            .map(|(file, _)| file)
+    }
+
+    /// `stage_entry` under the temporary name `stem`, also returning the lines Portico wrote.
+    fn stage_entry_as(
+        &self,
+        entry: &[u8],
+        managed: &Path,
+        stem: &str,
+    ) -> Result<(PendingFile, Vec<u32>), TransactionError> {
+        let (mut contents, mut portico_lines) =
+            substitute_include(entry, &self.paths, managed).map_err(transaction_entry_error)?;
+        if self.paths.system_config.exists() {
+            if !contents.is_empty() && !contents.ends_with(b"\n") {
+                contents.push(b'\n');
+            }
+            let lines = line_count(&contents);
+            portico_lines.extend([lines + 1, lines + 2]);
+            contents.extend_from_slice(
+                format!(
+                    "Match all\nInclude {}\n",
+                    quote_path(&self.paths.system_config.to_string_lossy())
+                )
+                .as_bytes(),
+            );
+        }
+        let mode = fs::metadata(&self.paths.entry)
+            .map_err(|source| transaction_io(&self.paths.entry, source))?
+            .permissions()
+            .mode();
+        let file = write_unique(&self.paths.ssh_dir, stem, &contents, mode)
+            .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
+        Ok((file, portico_lines))
+    }
+
+    pub(crate) fn read_managed(&self) -> Result<(Vec<u8>, ManagedConfig), TransactionError> {
         self.ensure_ready()?;
         reject_symlink(&self.paths.managed)
             .map_err(|source| transaction_io(&self.paths.managed, source))?;
@@ -851,11 +877,17 @@ impl ManagedConfig {
     pub fn parse(input: &str) -> Result<Self, ManagedError> {
         let mut config = Self::empty();
         let mut current = None;
+        let mut pending: Vec<String> = Vec::new();
 
         for (index, raw_line) in input.lines().enumerate() {
             let line = index + 1;
             let trimmed = raw_line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() {
+                pending.clear();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                pending.push(trimmed.to_owned());
                 continue;
             }
 
@@ -865,7 +897,7 @@ impl ManagedConfig {
                     config.push_parsed(host)?;
                 }
                 let alias = parse_value(argument, line)?;
-                current = Some(ParsedHost::new(alias, line));
+                current = Some(ParsedHost::new(alias, line, mem::take(&mut pending)));
                 continue;
             }
 
@@ -885,18 +917,27 @@ impl ManagedConfig {
             } else {
                 parse_value(argument, line)?
             };
-            if directive.eq_ignore_ascii_case("HostName") {
+            let field = if directive.eq_ignore_ascii_case("HostName") {
                 set_once(&mut host.hostname, value, line, directive)?;
+                HostField::Hostname
             } else if directive.eq_ignore_ascii_case("User") {
                 set_once(&mut host.user, value, line, directive)?;
+                HostField::User
             } else if directive.eq_ignore_ascii_case("Port") {
                 let port = parse_port(&value)
                     .map_err(|source| ManagedError::InvalidHost { line, source })?;
                 set_once(&mut host.port, port, line, directive)?;
+                HostField::Port
             } else if directive.eq_ignore_ascii_case("IdentityFile") {
                 set_once(&mut host.identity_file, value, line, directive)?;
-            } else if directive.eq_ignore_ascii_case("ProxyJump") {
+                HostField::IdentityFile
+            } else {
                 set_once(&mut host.proxy_jump, value, line, directive)?;
+                HostField::ProxyJump
+            };
+            let attached = mem::take(&mut pending);
+            if !attached.is_empty() {
+                host.field_comments.insert(field, attached);
             }
         }
 
@@ -909,7 +950,10 @@ impl ManagedConfig {
     pub fn render(&self) -> String {
         let mut hosts = self.hosts.iter().collect::<Vec<_>>();
         hosts.sort_by_key(|host| host.alias().to_ascii_lowercase());
-        let blocks = hosts.into_iter().map(render_host).collect::<Vec<_>>();
+        let blocks = hosts
+            .into_iter()
+            .map(|host| render_host(host, self.comments(host.alias())))
+            .collect::<Vec<_>>();
         if blocks.is_empty() {
             format!("{HEADER}\n")
         } else {
@@ -919,6 +963,10 @@ impl ManagedConfig {
 
     pub fn hosts(&self) -> &[Host] {
         &self.hosts
+    }
+
+    pub fn comments(&self, alias: &str) -> Option<&HostComments> {
+        self.comments.get(&alias.to_ascii_lowercase())
     }
 
     /// Aliases declared here that are new or differ from their declaration in `previous`.
@@ -937,9 +985,18 @@ impl ManagedConfig {
     }
 
     pub fn insert(&mut self, host: Host) -> Result<(), ManagedError> {
+        self.insert_with_comments(host, HostComments::default())
+    }
+
+    pub fn insert_with_comments(
+        &mut self,
+        host: Host,
+        comments: HostComments,
+    ) -> Result<(), ManagedError> {
         if self.find(host.alias()).is_some() {
             return Err(ManagedError::DuplicateAlias(host.alias().into()));
         }
+        self.set_comments(&host, comments);
         self.hosts.push(host);
         self.sort_hosts();
         Ok(())
@@ -955,6 +1012,9 @@ impl ManagedConfig {
             other != index && existing.alias().eq_ignore_ascii_case(host.alias())
         }) {
             return Err(ManagedError::DuplicateAlias(host.alias().into()));
+        }
+        if let Some(comments) = self.comments.remove(&old_alias.to_ascii_lowercase()) {
+            self.set_comments(&host, comments);
         }
         self.hosts[index] = host;
         Ok(())
@@ -973,12 +1033,21 @@ impl ManagedConfig {
     }
 
     pub fn remove(&mut self, alias: &str) -> Result<Host, ManagedError> {
+        self.remove_entry(alias).map(|(host, _)| host)
+    }
+
+    pub fn remove_entry(&mut self, alias: &str) -> Result<(Host, HostComments), ManagedError> {
         let index = self
             .hosts
             .iter()
             .position(|host| host.alias().eq_ignore_ascii_case(alias))
             .ok_or_else(|| ManagedError::UnknownAlias(alias.into()))?;
-        Ok(self.hosts.remove(index))
+        let host = self.hosts.remove(index);
+        let comments = self
+            .comments
+            .remove(&alias.to_ascii_lowercase())
+            .unwrap_or_default();
+        Ok((host, comments))
     }
 
     fn push_parsed(&mut self, parsed: ParsedHost) -> Result<(), ManagedError> {
@@ -990,6 +1059,8 @@ impl ManagedConfig {
             port,
             identity_file,
             proxy_jump,
+            leading_comments,
+            field_comments,
         } = parsed;
         let hostname = hostname.ok_or(ManagedError::MissingHostName { line })?;
         let hostname_line = hostname.1;
@@ -1025,9 +1096,35 @@ impl ManagedConfig {
                 alias: host.alias().into(),
             });
         }
+        let comments = HostComments {
+            leading: leading_comments,
+            fields: field_comments,
+        };
+        self.set_comments(&host, comments);
         self.hosts.push(host);
         self.sort_hosts();
         Ok(())
+    }
+
+    /// Stores the comments of `host`, dropping those of fields it does not set.
+    fn set_comments(&mut self, host: &Host, mut comments: HostComments) {
+        comments.fields.retain(|field, lines| {
+            !lines.is_empty()
+                && match field {
+                    HostField::User => host.user().is_some(),
+                    HostField::Port => host.port().is_some(),
+                    HostField::IdentityFile => host.identity_file().is_some(),
+                    HostField::ProxyJump => host.proxy_jump().is_some(),
+                    HostField::Hostname => true,
+                    HostField::Alias => false,
+                }
+        });
+        let key = host.alias().to_ascii_lowercase();
+        if comments.is_empty() {
+            self.comments.remove(&key);
+        } else {
+            self.comments.insert(key, comments);
+        }
     }
 
     fn sort_hosts(&mut self) {
@@ -1110,7 +1207,7 @@ fn append_include(output: &mut Vec<u8>, arguments: &[String], original: &[u8]) {
 /// Copies the entry config `contents`, pointing Portico's Include at `target` instead, and
 /// returns the copy with the 1-based numbers of the lines it rewrote. Each rewritten line stays a
 /// single line, so every other line keeps its number.
-fn substitute_include(
+pub(crate) fn substitute_include(
     contents: &[u8],
     paths: &ConfigPaths,
     target: &Path,
@@ -1151,7 +1248,7 @@ fn substitute_include(
 }
 
 /// The number of lines in `contents` as OpenSSH counts them.
-fn line_count(contents: &[u8]) -> u32 {
+pub(crate) fn line_count(contents: &[u8]) -> u32 {
     let count = contents.split_inclusive(|byte| *byte == b'\n').count();
     u32::try_from(count).unwrap_or(u32::MAX)
 }
@@ -1177,7 +1274,34 @@ fn is_managed_include(argument: &str, paths: &ConfigPaths) -> bool {
     normalize_path(&path) == normalize_path(&paths.managed)
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
+/// Follows the symbolic link chain at `path` to the file a write must replace, which may not
+/// exist yet. An error names the path it occurred at.
+pub(crate) fn symlink_target(start: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
+    let mut path = start.to_path_buf();
+    for _ in 0..40 {
+        match fs::read_link(&path) {
+            Ok(target) => path = path.parent().unwrap_or(Path::new("")).join(target),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+                ) =>
+            {
+                return Ok(path);
+            }
+            Err(source) => return Err((path, source)),
+        }
+    }
+    Err((
+        path,
+        io::Error::other(format!(
+            "too many levels of symbolic links from {}",
+            start.display()
+        )),
+    ))
+}
+
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1215,7 +1339,7 @@ fn reject_symlink(path: &Path) -> io::Result<()> {
     }
 }
 
-fn open_lock(path: &Path) -> io::Result<File> {
+pub(crate) fn open_lock(path: &Path) -> io::Result<File> {
     reject_symlink(path)?;
     match OpenOptions::new()
         .read(true)
@@ -1236,7 +1360,7 @@ fn open_lock(path: &Path) -> io::Result<File> {
     }
 }
 
-fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
+pub(crate) fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
     let Some(cancelled) = cancelled else {
         return FileExt::lock_exclusive(file);
     };
@@ -1290,11 +1414,11 @@ struct Staged {
     lock: File,
     active: Vec<u8>,
     candidate: PendingFile,
-    validation_entry: Vec<u8>,
+    /// The entry config as read while staging.
+    entry: Vec<u8>,
     validation_file: PendingFile,
     /// The lines of the validation entry Portico wrote rather than copied from the user's.
     portico_lines: Vec<u32>,
-    entry_mode: u32,
     changed_aliases: Vec<String>,
 }
 
@@ -1307,10 +1431,15 @@ impl PendingFile {
         self.path.as_deref().expect("pending file has a path")
     }
 
-    fn rename_to(mut self, destination: &Path) -> io::Result<()> {
+    pub(crate) fn rename_to(mut self, destination: &Path) -> io::Result<()> {
         fs::rename(self.path(), destination)?;
         self.path = None;
         Ok(())
+    }
+
+    /// Keeps the file instead of removing it when dropped, and returns its path.
+    pub(crate) fn keep(mut self) -> PathBuf {
+        self.path.take().expect("pending file has a path")
     }
 }
 
@@ -1380,7 +1509,7 @@ fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     result
 }
 
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if DIRECTORY_SYNC_FAILURES.with(|failures| {
         let mut failures = failures.borrow_mut();
@@ -1458,10 +1587,12 @@ struct ParsedHost {
     port: Option<(u16, usize)>,
     identity_file: Option<(String, usize)>,
     proxy_jump: Option<(String, usize)>,
+    leading_comments: Vec<String>,
+    field_comments: BTreeMap<HostField, Vec<String>>,
 }
 
 impl ParsedHost {
-    fn new(alias: String, line: usize) -> Self {
+    fn new(alias: String, line: usize, leading_comments: Vec<String>) -> Self {
         Self {
             alias,
             line,
@@ -1470,6 +1601,8 @@ impl ParsedHost {
             port: None,
             identity_file: None,
             proxy_jump: None,
+            leading_comments,
+            field_comments: BTreeMap::new(),
         }
     }
 }
@@ -1503,7 +1636,7 @@ fn set_once<T>(
     Ok(())
 }
 
-fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
+pub(crate) fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
     if input.is_empty() {
         return Err(ManagedError::Parse {
             line,
@@ -1558,22 +1691,36 @@ fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
     Ok(value)
 }
 
-fn render_host(host: &Host) -> String {
-    let mut lines = vec![
-        format!("Host {}", quote(host.alias())),
-        format!("    HostName {}", quote(host.hostname())),
-    ];
+pub(crate) fn render_host(host: &Host, comments: Option<&HostComments>) -> String {
+    let mut lines = Vec::new();
+    if let Some(comments) = comments {
+        lines.extend(comments.leading.iter().cloned());
+    }
+    lines.push(format!("Host {}", quote(host.alias())));
+    let mut directive = |field: HostField, line: String| {
+        if let Some(comments) = comments.and_then(|comments| comments.fields.get(&field)) {
+            lines.extend(comments.iter().map(|comment| format!("    {comment}")));
+        }
+        lines.push(format!("    {line}"));
+    };
+    directive(
+        HostField::Hostname,
+        format!("HostName {}", quote(host.hostname())),
+    );
     if let Some(user) = host.user() {
-        lines.push(format!("    User {}", quote(user)));
+        directive(HostField::User, format!("User {}", quote(user)));
     }
     if let Some(port) = host.port() {
-        lines.push(format!("    Port {port}"));
+        directive(HostField::Port, format!("Port {port}"));
     }
     if let Some(identity_file) = host.identity_file() {
-        lines.push(format!("    IdentityFile {}", quote(identity_file)));
+        directive(
+            HostField::IdentityFile,
+            format!("IdentityFile {}", quote(identity_file)),
+        );
     }
     if let Some(proxy_jump) = host.proxy_jump() {
-        lines.push(format!("    ProxyJump {proxy_jump}"));
+        directive(HostField::ProxyJump, format!("ProxyJump {proxy_jump}"));
     }
     lines.join("\n")
 }
@@ -1589,13 +1736,14 @@ fn quote(value: &str) -> String {
     }
 }
 
-fn quote_path(value: &str) -> String {
+pub(crate) fn quote_path(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::Change;
     use tempfile::TempDir;
 
     struct InitializedStore {
@@ -1614,6 +1762,104 @@ mod tests {
             store,
             paths,
         }
+    }
+
+    #[test]
+    fn comments_round_trip_through_parse_and_render() {
+        let text = "# Managed by Portico. Do not edit manually.\n\n# work box\nHost dev\n    HostName dev.example\n    # old account\n    User bob\n";
+        let config = ManagedConfig::parse(text).unwrap();
+        assert_eq!(config.comments("dev").unwrap().leading, vec!["# work box"]);
+        assert_eq!(
+            config.comments("DEV").unwrap().fields[&HostField::User],
+            vec!["# old account"]
+        );
+        assert_eq!(config.render(), text);
+    }
+
+    #[test]
+    fn header_and_detached_comments_never_attach() {
+        let text = "# Managed by Portico. Do not edit manually.\n\n# detached\n\nHost dev\n    HostName dev.example\n";
+        let config = ManagedConfig::parse(text).unwrap();
+        assert!(config.comments("dev").is_none_or(HostComments::is_empty));
+        assert!(!config.render().contains("# detached"));
+    }
+
+    #[test]
+    fn rename_keeps_comments_and_clear_drops_field_comments() {
+        let mut config = ManagedConfig::empty();
+        let comments = HostComments {
+            leading: vec!["# lead".into()],
+            fields: BTreeMap::from([
+                (HostField::User, vec!["# who".into()]),
+                (HostField::Port, vec!["# p".into()]),
+            ]),
+        };
+        config
+            .insert_with_comments(
+                Host::new("dev", "h", Some("bob".into()), Some(2222), None, None).unwrap(),
+                comments,
+            )
+            .unwrap();
+        config
+            .apply(
+                "dev",
+                HostChanges {
+                    alias: Change::Set("box".into()),
+                    user: Change::Clear,
+                    ..HostChanges::default()
+                },
+            )
+            .unwrap();
+        let kept = config.comments("box").unwrap();
+        assert_eq!(kept.leading, vec!["# lead"]);
+        assert!(!kept.fields.contains_key(&HostField::User));
+        assert_eq!(kept.fields[&HostField::Port], vec!["# p"]);
+        assert!(config.comments("dev").is_none());
+    }
+
+    #[test]
+    fn replace_drops_comments_of_fields_the_new_host_lacks() {
+        let mut config = ManagedConfig::empty();
+        let comments = HostComments {
+            leading: vec!["# lead".into()],
+            fields: BTreeMap::from([
+                (HostField::User, vec!["# who".into()]),
+                (HostField::Port, vec!["# p".into()]),
+            ]),
+        };
+        let host = Host::new("dev", "h", Some("bob".into()), Some(2222), None, None).unwrap();
+        config.insert_with_comments(host.clone(), comments).unwrap();
+        let edited = host
+            .apply(HostChanges {
+                user: Change::Clear,
+                ..HostChanges::default()
+            })
+            .unwrap();
+        config.replace("dev", edited).unwrap();
+        let kept = config.comments("dev").unwrap();
+        assert_eq!(kept.leading, vec!["# lead"]);
+        assert!(!kept.fields.contains_key(&HostField::User));
+        assert_eq!(kept.fields[&HostField::Port], vec!["# p"]);
+        assert_eq!(ManagedConfig::parse(&config.render()).unwrap(), config);
+    }
+
+    #[test]
+    fn remove_entry_returns_the_comments() {
+        let mut config = ManagedConfig::empty();
+        let comments = HostComments {
+            leading: vec!["# lead".into()],
+            fields: BTreeMap::from([(HostField::Hostname, vec!["# where".into()])]),
+        };
+        config
+            .insert_with_comments(
+                Host::new("dev", "h", None, None, None, None).unwrap(),
+                comments.clone(),
+            )
+            .unwrap();
+        let (host, returned) = config.remove_entry("dev").unwrap();
+        assert_eq!(host.alias(), "dev");
+        assert_eq!(returned, comments);
+        assert!(config.comments("dev").is_none());
     }
 
     #[test]
@@ -3060,5 +3306,18 @@ mod tests {
 
         saved.expect("a save during the test is not blocked by the preview");
         assert!(fixture.store.load().unwrap().find("saved").is_some());
+    }
+    #[test]
+    fn a_symbolic_link_loop_names_the_path_it_started_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let (_, error) = symlink_target(&first).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("too many levels of symbolic links from {}", first.display())
+        );
     }
 }

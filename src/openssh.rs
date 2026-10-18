@@ -219,6 +219,21 @@ impl OpenSsh {
         Ok(())
     }
 
+    /// The raw `ssh -G` output for `alias` when reading `entry`, for comparing
+    /// effective configurations.
+    pub(crate) fn effective(
+        &self,
+        entry: &Path,
+        alias: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<String, OpenSshError> {
+        let mut command = Command::new(&self.ssh);
+        command.arg("-G").arg("-F").arg(entry);
+        let output = self.checked_output(command.arg("--").arg(alias), cancelled)?;
+        String::from_utf8(output.stdout)
+            .map_err(|error| OpenSshError::InvalidOutput(error.to_string()))
+    }
+
     pub fn resolve(&self, alias: &str) -> Result<ResolvedConfig, OpenSshError> {
         self.resolve_inner(alias, None)
     }
@@ -2253,5 +2268,18 @@ mod tests {
         assert_eq!(sink.contents(), b"gone\n");
         let pid: libc::pid_t = fs::read_to_string(pid).unwrap().parse().unwrap();
         unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn effective_returns_raw_output_of_ssh_g_with_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("ssh");
+        write_executable(&ssh, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let entry = dir.path().join("config");
+        let openssh = OpenSsh::new(ssh, "xdg-terminal-exec".into());
+
+        let output = openssh.effective(&entry, "dev", None).unwrap();
+
+        assert_eq!(output, format!("-G\n-F\n{}\n--\ndev\n", entry.display()));
     }
 }
