@@ -117,6 +117,21 @@ jobs:
       # A documentation-only change runs just the doc guards.
       - run: scripts/ci-container.sh ${{ needs.changes.outputs.rust == 'false' && 'docs' || 'test' }}
 
+  e2e:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The real binary against a real sshd, through a real pseudo-terminal.
+      - run: scripts/ci-container.sh e2e
+
   msrv:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}

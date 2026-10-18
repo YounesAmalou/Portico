@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test|docs|msrv|audit|deny|package>" >&2
+    echo "usage: $0 <fmt|clippy|test|e2e|docs|msrv|audit|deny|package>" >&2
     exit 2
 }
 
@@ -27,6 +27,7 @@ case "$1" in
     fmt) cargo fmt --check ;;
     clippy) cargo clippy --all-targets --all-features -- -D warnings ;;
     test) cargo test --all-targets ;;
+    e2e) cargo test --test e2e -- --ignored ;;
     docs) cargo test --test docs ;;
     msrv) msrv ;;
     audit) ensure_tool audit && cargo audit ;;

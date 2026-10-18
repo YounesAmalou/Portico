@@ -123,10 +123,22 @@ const CANCELLED: u8 = 130;
 ///
 /// `ssh` runs in its own process group, out of reach of the terminal's Ctrl+C, so while it runs
 /// these signals only set `cancelled`, and the test kills it and returns. Anywhere else, such as at
-/// the trust prompt, they end Portico as they would without these handlers.
+/// the trust prompt, they end Portico as they would without these handlers. One that arrives after
+/// a step stopped checking, but before the default action is back, stops Portico before the next
+/// step; it never carries over into that step.
 struct Interrupts {
     cancelled: Arc<AtomicBool>,
     default_action: Arc<AtomicBool>,
+    /// Counts steps down to the one just after which `during` raises the flag, as a signal in
+    /// that window would; 0 never does.
+    #[cfg(test)]
+    signal_after: std::cell::Cell<usize>,
+}
+
+/// A step's result, `Late` when a signal arrived after the step stopped checking for one.
+enum Step<T> {
+    Done(T),
+    Late(T),
 }
 
 impl Interrupts {
@@ -134,6 +146,8 @@ impl Interrupts {
         let interrupts = Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             default_action: Arc::new(AtomicBool::new(true)),
+            #[cfg(test)]
+            signal_after: std::cell::Cell::new(0),
         };
         if handle_signals {
             for signal in [
@@ -151,12 +165,35 @@ impl Interrupts {
         Ok(interrupts)
     }
 
-    /// Runs `test` with the cancel flag the signals set.
-    fn during<T>(&self, test: impl FnOnce(&AtomicBool) -> T) -> T {
+    /// Interrupts without handlers whose flag is raised just after the `step`th step (1-based).
+    #[cfg(test)]
+    fn signalled_after(step: usize) -> Self {
+        let interrupts = Self::install(false).expect("no handlers to install");
+        interrupts.signal_after.set(step);
+        interrupts
+    }
+
+    /// Runs `step` with the cancel flag the signals set.
+    fn during<T>(&self, step: impl FnOnce(&AtomicBool) -> T) -> Step<T> {
+        // A signal acted on after an earlier step must not cancel this one.
+        self.cancelled.store(false, Ordering::SeqCst);
         self.default_action.store(false, Ordering::SeqCst);
-        let result = test(&self.cancelled);
+        let result = step(&self.cancelled);
+        #[cfg(test)]
+        match self.signal_after.get() {
+            0 => {}
+            1 => {
+                self.signal_after.set(0);
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            later => self.signal_after.set(later - 1),
+        }
         self.default_action.store(true, Ordering::SeqCst);
-        result
+        if self.cancelled.swap(false, Ordering::SeqCst) {
+            Step::Late(result)
+        } else {
+            Step::Done(result)
+        }
     }
 }
 
@@ -370,71 +407,103 @@ fn execute<I: BufRead, O: Write, E: Write>(
             accept_host_key,
             raw,
         }) => {
-            let target = TestTarget::Saved(alias);
             let interrupts = Interrupts::install(handle_signals)
                 .map_err(|error| format!("cannot handle signals: {error}"))?;
-            let outcome =
-                match interrupts.during(|cancelled| app.test_cancellable(&target, cancelled)) {
-                    Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
-                        return print_cancelled(output, target.alias());
-                    }
-                    outcome => outcome.map_err(|error| error.to_string())?,
-                };
-            let (report, key) = match outcome {
-                TestOutcome::Done(report) => return print_report(output, &report, raw),
-                TestOutcome::UnknownHostKey { report, key } => (report, key),
-            };
-            print_untrusted_key(output, &report.alias, &key)?;
-            let trusted = match accept_host_key {
-                Some(expected) => {
-                    let matches = !key.fingerprints.is_empty()
-                        && key
-                            .fingerprints
-                            .iter()
-                            .all(|presented| presented.fingerprint == expected);
-                    if !matches {
-                        writeln!(
-                            output,
-                            "{}: failed \u{2014} the host key fingerprint does not match --accept-host-key",
-                            report.alias
-                        )
-                        .map_err(|error| error.to_string())?;
-                        return Ok(ExitCode::from(1));
-                    }
-                    true
-                }
-                None if interactive => confirm(input, output, "Trust this host key? [y/N] ")?,
-                None => {
-                    // --accept-host-key needs one fingerprint that every key shares.
-                    let shared = match key.fingerprints.split_first() {
-                        Some((first, rest))
-                            if rest.iter().all(|key| key.fingerprint == first.fingerprint) =>
-                        {
-                            first.fingerprint.as_str()
-                        }
-                        _ => "<fingerprint>",
-                    };
-                    writeln!(output, "hint: pass --accept-host-key {shared} to trust it")
-                        .map_err(|error| error.to_string())?;
-                    return Ok(ExitCode::from(1));
-                }
-            };
-            if !trusted {
-                writeln!(output, "Host key not trusted.").map_err(|error| error.to_string())?;
+            test_command(
+                app,
+                alias,
+                accept_host_key,
+                raw,
+                input,
+                output,
+                interactive,
+                &interrupts,
+            )
+        }
+    }
+}
+
+/// `portico test`: tests `alias`, offers to trust an unknown host key and tests again.
+#[allow(clippy::too_many_arguments)]
+fn test_command<I: BufRead, O: Write>(
+    app: &App,
+    alias: String,
+    accept_host_key: Option<String>,
+    raw: bool,
+    input: &mut I,
+    output: &mut O,
+    interactive: bool,
+    interrupts: &Interrupts,
+) -> Result<ExitCode, String> {
+    let target = TestTarget::Saved(alias);
+    let (outcome, late) =
+        match interrupts.during(|cancelled| app.test_cancellable(&target, cancelled)) {
+            Step::Done(outcome) => (outcome, false),
+            Step::Late(outcome) => (outcome, true),
+        };
+    let outcome = match outcome {
+        Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+            return print_cancelled(output, target.alias());
+        }
+        outcome => outcome.map_err(|error| error.to_string())?,
+    };
+    let (report, key) = match outcome {
+        TestOutcome::Done(report) => return print_report(output, &report, raw),
+        TestOutcome::UnknownHostKey { report, key } => (report, key),
+    };
+    print_untrusted_key(output, &report.alias, &key)?;
+    if late {
+        return print_cancelled(output, target.alias());
+    }
+    let trusted = match accept_host_key {
+        Some(expected) => {
+            let matches = !key.fingerprints.is_empty()
+                && key
+                    .fingerprints
+                    .iter()
+                    .all(|presented| presented.fingerprint == expected);
+            if !matches {
+                writeln!(
+                    output,
+                    "{}: failed \u{2014} the host key fingerprint does not match --accept-host-key",
+                    report.alias
+                )
+                .map_err(|error| error.to_string())?;
                 return Ok(ExitCode::from(1));
             }
-            let retested = interrupts
-                .during(|cancelled| app.trust_and_retest_cancellable(&target, &key, cancelled));
-            match match retested {
-                Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
-                    return print_cancelled(output, target.alias());
+            true
+        }
+        None if interactive => confirm(input, output, "Trust this host key? [y/N] ")?,
+        None => {
+            // --accept-host-key needs one fingerprint that every key shares.
+            let shared = match key.fingerprints.split_first() {
+                Some((first, rest))
+                    if rest.iter().all(|key| key.fingerprint == first.fingerprint) =>
+                {
+                    first.fingerprint.as_str()
                 }
-                retested => retested.map_err(|error| error.to_string())?,
-            } {
-                TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
-                    print_report(output, &report, raw)
-                }
-            }
+                _ => "<fingerprint>",
+            };
+            writeln!(output, "hint: pass --accept-host-key {shared} to trust it")
+                .map_err(|error| error.to_string())?;
+            return Ok(ExitCode::from(1));
+        }
+    };
+    if !trusted {
+        writeln!(output, "Host key not trusted.").map_err(|error| error.to_string())?;
+        return Ok(ExitCode::from(1));
+    }
+    // The key is trusted by now, so a signal after the retest leaves its result standing.
+    let (Step::Done(retested) | Step::Late(retested)) =
+        interrupts.during(|cancelled| app.trust_and_retest_cancellable(&target, &key, cancelled));
+    match match retested {
+        Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+            return print_cancelled(output, target.alias());
+        }
+        retested => retested.map_err(|error| error.to_string())?,
+    } {
+        TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
+            print_report(output, &report, raw)
         }
     }
 }
@@ -596,9 +665,10 @@ fn run_migration<I: BufRead, O: Write>(
             return Ok(ExitCode::SUCCESS);
         }
     }
-    let moved = interrupts
-        .during(|cancelled| app.migrate_cancellable(&plan, &selection, cancelled))
-        .map_err(|error| error.to_string())?;
+    // A signal after the migration finished leaves its result standing.
+    let (Step::Done(moved) | Step::Late(moved)) =
+        interrupts.during(|cancelled| app.migrate_cancellable(&plan, &selection, cancelled));
+    let moved = moved.map_err(|error| error.to_string())?;
     writeln!(output, "{}: {}", migration.past(), moved.join(", ")).map_err(write_error)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1237,6 +1307,85 @@ mod tests {
 
         let (_, output, _) = run_command(&app, &["export"], "", true);
         assert_eq!(output, "No host can be exported.\n");
+    }
+
+    #[test]
+    fn each_step_starts_with_a_clear_flag_and_a_late_flag_is_reported() {
+        let interrupts = Interrupts::install(false).unwrap();
+        interrupts.cancelled.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            interrupts.during(|cancelled| cancelled.load(Ordering::SeqCst)),
+            Step::Done(false)
+        ));
+        assert!(matches!(
+            interrupts.during(|cancelled| cancelled.store(true, Ordering::SeqCst)),
+            Step::Late(())
+        ));
+        assert!(matches!(
+            interrupts.during(|cancelled| cancelled.load(Ordering::SeqCst)),
+            Step::Done(false)
+        ));
+    }
+
+    fn run_interrupted(
+        app: &App,
+        accept_host_key: Option<&str>,
+        input: &[u8],
+        interrupts: &Interrupts,
+    ) -> (ExitCode, String) {
+        let mut output = Vec::new();
+        let exit = test_command(
+            app,
+            "dev".into(),
+            accept_host_key.map(String::from),
+            false,
+            &mut Cursor::new(input),
+            &mut output,
+            true,
+            interrupts,
+        )
+        .unwrap();
+        (exit, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn a_late_signal_after_an_unknown_key_cancels_before_the_prompt() {
+        let (dir, app) = unknown_key_app();
+
+        let (exit, output) = run_interrupted(&app, None, b"y\n", &Interrupts::signalled_after(1));
+
+        assert_eq!(exit, ExitCode::from(CANCELLED), "{output}");
+        assert!(output.contains("SHA256:abc"), "{output}");
+        assert!(output.ends_with("dev: cancelled\n"), "{output}");
+        assert!(!output.contains("Trust this host key?"), "{output}");
+        assert!(!dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    #[test]
+    fn a_late_signal_after_the_retest_keeps_its_result() {
+        let (dir, app) = unknown_key_app();
+
+        let (exit, output) = run_interrupted(
+            &app,
+            Some("SHA256:abc"),
+            b"",
+            &Interrupts::signalled_after(2),
+        );
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{output}");
+        assert!(output.contains("authenticated"), "{output}");
+        assert!(dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    #[test]
+    fn a_late_signal_after_an_ordinary_result_keeps_it() {
+        let (dir, app) = unknown_key_app();
+        fs::write(dir.path().join(".ssh/known_hosts"), "").unwrap();
+
+        let (exit, output) = run_interrupted(&app, None, b"", &Interrupts::signalled_after(1));
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{output}");
+        assert!(output.contains("authenticated"), "{output}");
     }
 
     fn test_app() -> (TempDir, App) {
