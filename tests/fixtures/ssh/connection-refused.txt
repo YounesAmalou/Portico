@@ -1,1 +1,8 @@
+debug1: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+debug1: Reading configuration data /dev/null
+debug1: loaded pubkey from /tmp/portico-fixture/good: ED25519 SHA256:yI4qJASExMXp5jXZZ/Z9O1U+6XsYogCoyPz3sfR4kho
+debug1: identity file /tmp/portico-fixture/good type 2
+debug1: no identity pubkey loaded from /tmp/portico-fixture/good
+debug1: Connecting to 127.0.0.1 [127.0.0.1] port 22998.
+debug1: connect to address 127.0.0.1 port 22998: Connection refused
 ssh: connect to host 127.0.0.1 port 22998: Connection refused

@@ -117,7 +117,7 @@ portico add <alias> -H <host>   Add a managed host
 portico edit <alias> [options]  Change only the supplied fields
 portico remove <alias> [-f]     Remove a managed host
 portico connect <alias> [-n]    Connect using OpenSSH
-portico test <alias>            Check that logging in works, without a shell
+portico test <alias> [--raw]    Check that logging in works, without a shell
 ```
 
 Host fields and their aliases:
@@ -175,9 +175,16 @@ portico test development
 portico test development --accept-host-key SHA256:...
 ```
 
-A test passes only when OpenSSH completes authentication. It never opens a shell or runs a command, so hosts that only allow port forwarding pass too, and it is never run automatically. It works for managed and external hosts, prints one line (`development: authenticated as deploy@10.0.0.5:22 (publickey)`, with `via bastion` before the method when the host is reached through a jump host, or `via proxy` through a `ProxyCommand`) and exits 0 on a pass, or prints the reason and exits 1. Interrupting a test (`Ctrl+C`) stops its `ssh`, prints `<alias>: cancelled` and exits 130. The test never prompts for a password or passphrase, so a key with a passphrase must be loaded in an agent.
+A test passes only when OpenSSH completes authentication. It never opens a shell or runs a command, so hosts that only allow port forwarding pass too, and it is never run automatically. It works for managed and external hosts, prints one line on a pass (`development: authenticated as deploy@10.0.0.5:22 (publickey)`, with `via bastion` before the method when the host is reached through a jump host, or `via proxy` through a `ProxyCommand`) and exits 0. A failure exits 1 and prints `development: failed — <what went wrong>` followed by labelled lines such as `user:`, `offered:` (the keys ssh tried), `key:`, `file:`, `line:`, `jump:` and `next:` (what to do about it). `--raw` also prints ssh's own output under `ssh said:`; for a failure Portico does not recognise, that output is always shown. Interrupting a test (`Ctrl+C`) stops its `ssh`, prints `<alias>: cancelled` and exits 130. The test never prompts for a password or passphrase, so a key with a passphrase must be loaded in an agent; if it is not, the test says so and suggests `ssh-add`.
 
 The first time a host is tested its key is usually unknown. In a terminal, Portico shows the key's fingerprint and asks before trusting it. Without a terminal it trusts nothing, prints the fingerprint and fails; `--accept-host-key` trusts the key only if its fingerprint matches the one given exactly, then tests again. A changed host key is never offered for trust.
+
+### When something fails
+
+- **`portico test`** explains the failure as described above: the cause, the facts that matter (user, keys offered, jump host) and a next step. Add `--raw` to see ssh's output too.
+- **`portico connect`** shows ssh's own output unchanged and always exits with ssh's exit code, or 128 plus the signal number when a signal ends ssh, as a shell reports it. When ssh exits with 255 for a cause Portico recognises, it adds a blank line and the explanation. A connection opened in a new terminal stays open after such a failure, showing `Press Enter to close`, so the message can be read.
+- **Saving** (`add`, `edit`, `init`): when OpenSSH rejects a value, the error names the host and the field (the TUI form focuses that field). When the problem is a line in your own SSH configuration, it names that file and line (`line 12 of ~/.ssh/config`), and nothing is saved until you fix it. `portico test` and `portico connect` explain a configuration OpenSSH rejects the same way, naming the file and line.
+- **In the TUI**, the status line shows the short explanation and the details pane shows the facts and next steps for the last test and the last connection. Press `o` to unfold ssh's own output in the details pane and `o` again to fold it; in a form, `Ctrl+O` does the same for the test result. The footer offers the key only when there is output to show.
 
 Remove a managed host. Unknown and external (read-only) aliases are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
 
@@ -200,6 +207,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `r` / `F5` | Refresh: re-read the inventory and discard cached host details |
 | `Enter` | Connect in the current terminal |
 | `Ctrl+Enter` / `n` | Connect in a new terminal |
+| `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |

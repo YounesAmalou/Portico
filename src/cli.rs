@@ -10,10 +10,10 @@ use std::{
 use crate::{
     app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
     discovery::DiscoveryWarning,
+    explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
-    probe::ProbeResult,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -72,12 +72,29 @@ enum Command {
         alias: String,
         #[arg(short = 'n', long = "new-terminal")]
         new_terminal: bool,
+        /// Wait for Enter after an explained failure; used in a new terminal.
+        #[arg(long, hide = true)]
+        hold: bool,
     },
     Test {
         alias: String,
         #[arg(long = "accept-host-key", value_name = "FINGERPRINT")]
         accept_host_key: Option<String>,
+        /// Show what ssh itself said, below the explanation.
+        #[arg(long)]
+        raw: bool,
     },
+}
+
+/// ssh's exit status as Portico's: its code, or 128 plus the signal that killed it, as a shell
+/// reports it.
+fn exit_code(status: std::process::ExitStatus) -> ExitCode {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .and_then(|code| u8::try_from(code).ok())
+        .map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 /// The exit status of a `portico test` that a signal cancelled, as for SIGINT.
@@ -140,7 +157,7 @@ where
     O: Write,
     E: Write,
 {
-    match execute(cli, app, input, output, interactive, handle_signals) {
+    match execute(cli, app, input, output, error, interactive, handle_signals) {
         Ok(exit) => exit,
         Err(message) => {
             let _ = writeln!(error, "error: {message}");
@@ -149,11 +166,12 @@ where
     }
 }
 
-fn execute<I: BufRead, O: Write>(
+fn execute<I: BufRead, O: Write, E: Write>(
     cli: Cli,
     app: &App,
     input: &mut I,
     output: &mut O,
+    error: &mut E,
     interactive: bool,
     handle_signals: bool,
 ) -> Result<ExitCode, String> {
@@ -276,23 +294,40 @@ fn execute<I: BufRead, O: Write>(
         Some(Command::Connect {
             alias,
             new_terminal,
+            hold,
         }) => {
-            let status = app
-                .connect(&alias, new_terminal)
-                .map_err(|error| error.to_string())?;
-            Ok(match status {
-                ConnectionOutcome::LaunchRequested => ExitCode::SUCCESS,
-                ConnectionOutcome::Exited(status) | ConnectionOutcome::LaunchFailed(status) => {
+            // A held connection already runs in the terminal it was opened in.
+            let status = match app
+                .connect(&alias, new_terminal && !hold)
+                .map_err(|error| error.to_string())?
+            {
+                ConnectionOutcome::LaunchRequested => return Ok(ExitCode::SUCCESS),
+                ConnectionOutcome::Exited {
+                    alias,
+                    status,
+                    explanation,
+                } => {
+                    if let Some(explanation) = explanation {
+                        print_connection_failure(error, &alias, &explanation)?;
+                        if hold {
+                            writeln!(error, "Press Enter to close")
+                                .map_err(|error| error.to_string())?;
+                            error.flush().map_err(|error| error.to_string())?;
+                            // Best effort: end of input or a read error ends the wait, and
+                            // the exit code stays ssh's either way.
+                            let _ = input.read_line(&mut String::new());
+                        }
+                    }
                     status
-                        .code()
-                        .and_then(|code| u8::try_from(code).ok())
-                        .map_or(ExitCode::FAILURE, ExitCode::from)
                 }
-            })
+                ConnectionOutcome::LaunchFailed(status) => status,
+            };
+            Ok(exit_code(status))
         }
         Some(Command::Test {
             alias,
             accept_host_key,
+            raw,
         }) => {
             let target = TestTarget::Saved(alias);
             let interrupts = Interrupts::install(handle_signals)
@@ -305,7 +340,7 @@ fn execute<I: BufRead, O: Write>(
                     outcome => outcome.map_err(|error| error.to_string())?,
                 };
             let (report, key) = match outcome {
-                TestOutcome::Done(report) => return print_report(output, &report),
+                TestOutcome::Done(report) => return print_report(output, &report, raw),
                 TestOutcome::UnknownHostKey { report, key } => (report, key),
             };
             print_untrusted_key(output, &report.alias, &key)?;
@@ -356,7 +391,7 @@ fn execute<I: BufRead, O: Write>(
                 retested => retested.map_err(|error| error.to_string())?,
             } {
                 TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
-                    print_report(output, &report)
+                    print_report(output, &report, raw)
                 }
             }
         }
@@ -382,16 +417,31 @@ fn print_cancelled(output: &mut impl Write, alias: &str) -> Result<ExitCode, Str
     Ok(ExitCode::from(CANCELLED))
 }
 
-fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
-    let mut text = format!("{}: {}\n", report.alias, report.summary());
-    if let ProbeResult::Failed(failure) = &report.result {
-        if let Some(fetch) = &report.key_fetch_failure {
-            text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
-        } else if let Some(hint) = failure.hint() {
-            text.push_str(&format!("hint: {hint}\n"));
-        }
+/// Explains a failed connection below what ssh already wrote to the same stream.
+fn print_connection_failure(
+    error: &mut impl Write,
+    alias: &str,
+    explanation: &Explanation,
+) -> Result<(), String> {
+    writeln!(error).map_err(|error| error.to_string())?;
+    for line in explanation.render(alias, false) {
+        writeln!(error, "{line}").map_err(|error| error.to_string())?;
     }
-    write!(output, "{text}").map_err(|error| error.to_string())?;
+    error.flush().map_err(|error| error.to_string())
+}
+
+fn print_report(
+    output: &mut impl Write,
+    report: &TestReport,
+    raw: bool,
+) -> Result<ExitCode, String> {
+    let lines = match &report.explanation {
+        Some(explanation) => explanation.render(&report.alias, raw),
+        None => vec![format!("{}: {}", report.alias, report.summary())],
+    };
+    for line in lines {
+        writeln!(output, "{line}").map_err(|error| error.to_string())?;
+    }
     Ok(if report.passed() {
         ExitCode::SUCCESS
     } else {

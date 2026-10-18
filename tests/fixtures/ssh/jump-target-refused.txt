@@ -1,3 +1,12 @@
+debug1: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+debug1: Reading configuration data /tmp/portico-fixture/c_jtr
+debug1: /tmp/portico-fixture/c_jtr line 10: Applying options for target
+debug1: Setting implicit ProxyCommand from ProxyJump: /usr/bin/ssh -F /tmp/portico-fixture/c_jtr -W '[%h]:%p' jump
+debug1: loaded pubkey from /tmp/portico-fixture/good: ED25519 SHA256:yI4qJASExMXp5jXZZ/Z9O1U+6XsYogCoyPz3sfR4kho
+debug1: identity file /tmp/portico-fixture/good type 2
+debug1: no identity pubkey loaded from /tmp/portico-fixture/good
+debug1: Executing proxy command: exec /usr/bin/ssh -F /tmp/portico-fixture/c_jtr -W '[127.0.0.1]:22998' jump
+debug1: Local version string SSH-2.0-OpenSSH_10.6
 channel 0: open failed: connect failed: Connection refused
 stdio forwarding failed
 kex_exchange_identification: Connection closed by remote host

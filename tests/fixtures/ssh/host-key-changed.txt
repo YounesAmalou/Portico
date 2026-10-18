@@ -1,3 +1,28 @@
+debug1: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+debug1: Reading configuration data /dev/null
+debug1: loaded pubkey from /tmp/portico-fixture/good: ED25519 SHA256:yI4qJASExMXp5jXZZ/Z9O1U+6XsYogCoyPz3sfR4kho
+debug1: identity file /tmp/portico-fixture/good type 2
+debug1: no identity pubkey loaded from /tmp/portico-fixture/good
+debug1: Connecting to 127.0.0.1 [127.0.0.1] port 22999.
+debug1: fd 3 clearing O_NONBLOCK
+debug1: Connection established.
+debug1: Local version string SSH-2.0-OpenSSH_10.6
+debug1: Remote protocol version 2.0, remote software version OpenSSH_10.6
+debug1: compat_banner: match: OpenSSH_10.6 pat OpenSSH* compat 0x04000000
+debug1: Authenticating to 127.0.0.1:22999 as 'user'
+debug1: load_hostkeys: fopen /etc/ssh/ssh_known_hosts: No such file or directory
+debug1: load_hostkeys: fopen /etc/ssh/ssh_known_hosts2: No such file or directory
+debug1: SSH2_MSG_KEXINIT sent
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: mlkem768x25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:wHaGZwkfKNWQkp6hJWK2xOjSmY7ogMw+8egI0Cf9Za8
+debug1: load_hostkeys: fopen /etc/ssh/ssh_known_hosts: No such file or directory
+debug1: load_hostkeys: fopen /etc/ssh/ssh_known_hosts2: No such file or directory
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -5,9 +30,9 @@ IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
 Someone could be eavesdropping on you right now (man-in-the-middle attack)!
 It is also possible that a host key has just been changed.
 The fingerprint for the ED25519 key sent by the remote host is
-SHA256:3B9Dr0+XcF/TcGg1+6uOtxT0Xy9agDlnr2LuxV5SAaU.
+SHA256:wHaGZwkfKNWQkp6hJWK2xOjSmY7ogMw+8egI0Cf9Za8.
 Please contact your system administrator.
-Add correct host key in /scratch/k to get rid of this message.
-Offending ED25519 key in /scratch/kh_bad:1
+Add correct host key in /tmp/portico-fixture/k to get rid of this message.
+Offending ED25519 key in /tmp/portico-fixture/kh_bad:1
 Host key for [127.0.0.1]:22999 has changed and you have requested strict checking.
 Host key verification failed.

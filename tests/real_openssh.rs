@@ -48,9 +48,18 @@ fn passwd_entry() -> (String, PathBuf) {
     }
 }
 
-fn keygen(path: &Path) {
+fn keygen(path: &Path, passphrase: &str) {
     let status = Command::new("/usr/bin/ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", "portico-test", "-f"])
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            passphrase,
+            "-C",
+            "portico-test",
+            "-f",
+        ])
         .arg(path)
         .status()
         .unwrap();
@@ -91,10 +100,16 @@ fn portico_test_against_a_real_sshd() {
 
     let server = tempfile::tempdir().unwrap();
     let dir = server.path();
-    keygen(&dir.join("host_key"));
-    keygen(&dir.join("client_key"));
+    keygen(&dir.join("host_key"), "");
+    keygen(&dir.join("client_key"), "");
+    keygen(&dir.join("locked_key"), "pw");
     let authorized = dir.join("authorized_keys");
-    fs::copy(dir.join("client_key.pub"), &authorized).unwrap();
+    fs::write(
+        &authorized,
+        fs::read_to_string(dir.join("client_key.pub")).unwrap()
+            + &fs::read_to_string(dir.join("locked_key.pub")).unwrap(),
+    )
+    .unwrap();
 
     let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
@@ -154,8 +169,12 @@ fn portico_test_against_a_real_sshd() {
         "\nHost realjump\n  ProxyJump real\n\
          \nHost real realjump\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  \
          IdentityFile {key}\n  IdentitiesOnly yes\n  IdentityAgent none\n  \
+         UserKnownHostsFile {known}\n  GlobalKnownHostsFile /dev/null\n\
+         \nHost locked\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  \
+         IdentityFile {locked}\n  IdentitiesOnly yes\n  IdentityAgent none\n  \
          UserKnownHostsFile {known}\n  GlobalKnownHostsFile /dev/null\n",
         key = dir.join("client_key").display(),
+        locked = dir.join("locked_key").display(),
         known = env_known_hosts.display(),
     );
     let config = fs::read_to_string(env.ssh_config()).unwrap() + &external;
@@ -221,13 +240,33 @@ fn portico_test_against_a_real_sshd() {
         started.elapsed()
     );
 
+    // A key that needs a passphrase, with no agent to supply it, says so and
+    // how to load it.
+    let locked_key = dir.join("locked_key");
+    let locked = portico(&env, &["test", "locked"]);
+    let locked_text = text(&locked);
+    assert_eq!(locked.status.code(), Some(1), "{locked_text}");
+    assert!(
+        locked_text.contains("the key needs a passphrase"),
+        "{locked_text}"
+    );
+    assert!(
+        locked_text.contains(&format!("`ssh-add {}`", locked_key.display())),
+        "{locked_text}"
+    );
+
     // A key the server no longer accepts is an authentication failure.
     fs::write(&authorized, "").unwrap();
     let refused = portico(&env, &["test", "real"]);
     let refused_text = text(&refused);
     assert_eq!(refused.status.code(), Some(1), "{refused_text}");
     assert!(
-        refused_text.contains("authentication refused"),
+        refused_text.contains("the server refused the login"),
+        "{refused_text}"
+    );
+    assert!(refused_text.contains("offered:"), "{refused_text}");
+    assert!(
+        refused_text.contains(&dir.join("client_key").display().to_string()),
         "{refused_text}"
     );
 

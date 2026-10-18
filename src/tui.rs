@@ -37,11 +37,12 @@ use crate::{
     app::{
         App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
     },
+    config_error::ConfigRejection,
     discovery::DiscoveryWarning,
+    explain::Explanation,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
-    probe::ProbeResult,
 };
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
@@ -282,7 +283,6 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                             // The terminal's Ctrl+C is for ssh now; Portico waits for it.
                             let _foreground = signals.foreground_child();
                             app.connect_cancellable(&alias, terminated)
-                                .map(ConnectionOutcome::Exited)
                                 .map_err(TuiError::from)
                         },
                         || session.enter(),
@@ -295,19 +295,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                         }
                     }
                 };
-                state.status = Some(match result {
-                    Ok(ConnectionOutcome::LaunchRequested) => {
-                        format!("Launch requested for {alias}")
-                    }
-                    Ok(ConnectionOutcome::LaunchFailed(status)) => {
-                        format!("terminal launcher exited with {status}")
-                    }
-                    Ok(ConnectionOutcome::Exited(status)) if status.success() => {
-                        format!("Disconnected from {alias}")
-                    }
-                    Ok(ConnectionOutcome::Exited(status)) => format!("ssh exited with {status}"),
-                    Err(error) => error.to_string(),
-                });
+                state.finish_connect(&alias, result);
             }
             UiAction::Refresh => {
                 inventory_changed = apply_refresh(&mut state, || app.hosts());
@@ -469,6 +457,7 @@ where
             let count = inventory.hosts.len();
             state.replace_hosts(inventory);
             state.results.clear();
+            state.connections.clear();
             let noun = if count == 1 { "host" } else { "hosts" };
             state.status = Some(format!("Refreshed: {count} {noun}"));
             true
@@ -494,7 +483,9 @@ fn complete_mutation<E, F>(
     state.form = FormState::default();
     for alias in changed {
         state.results.forget(alias);
+        state.connections.forget(alias);
     }
+    state.show_raw = false;
     match refresh() {
         Ok(hosts) => {
             state.replace_hosts(hosts);
@@ -1068,6 +1059,10 @@ struct UiState {
     testing: Option<String>,
     /// Connection test results of saved hosts, kept for the session.
     results: TestResults,
+    /// The explanation of each saved host's last failed connection, kept for the session.
+    connections: PerHost<Explanation>,
+    /// Whether the selected host's (or the form's) ssh output is unfolded.
+    show_raw: bool,
     /// The host key awaiting the user's decision while in `Mode::ConfirmTrust`.
     trust: Option<PendingTrust>,
 }
@@ -1078,23 +1073,34 @@ struct TestMark {
     passed: bool,
     line: String,
     finished_at: String,
+    explanation: Option<Explanation>,
 }
 
-/// Connection test results by host. Like `DetailsCache`, lookup is linear.
-#[derive(Clone, Debug, Default)]
-struct TestResults {
-    entries: Vec<(HostSummary, TestMark)>,
+type TestResults = PerHost<TestMark>;
+
+/// Something remembered per host, such as test results. Like `DetailsCache`, lookup is linear.
+#[derive(Clone, Debug)]
+struct PerHost<T> {
+    entries: Vec<(HostSummary, T)>,
 }
 
-impl TestResults {
-    fn get(&self, host: &HostSummary) -> Option<&TestMark> {
+impl<T> Default for PerHost<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> PerHost<T> {
+    fn get(&self, host: &HostSummary) -> Option<&T> {
         self.entries
             .iter()
             .find(|(tested, _)| tested == host)
             .map(|(_, mark)| mark)
     }
 
-    fn insert(&mut self, host: HostSummary, mark: TestMark) {
+    fn insert(&mut self, host: HostSummary, mark: T) {
         self.forget_host(&host);
         self.entries.push((host, mark));
     }
@@ -1125,11 +1131,11 @@ struct FormState {
     test_result: Option<FormTestResult>,
 }
 
-/// A form's connection test result, with the hint shown under it.
+/// A form's connection test result, with the explanation shown under it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FormTestResult {
     line: String,
-    hint: Option<String>,
+    explanation: Option<Explanation>,
 }
 
 /// A host key the server presented that the user is deciding whether to trust.
@@ -1188,6 +1194,8 @@ impl UiState {
             ctrl_enter,
             testing: None,
             results: TestResults::default(),
+            connections: PerHost::default(),
+            show_raw: false,
             trust: None,
         }
     }
@@ -1240,6 +1248,7 @@ impl UiState {
 
     fn replace_hosts(&mut self, inventory: HostInventory) {
         let selected = self.selected_summary().cloned();
+        self.show_raw = false;
         self.hosts = inventory.hosts;
         self.warnings = inventory.warnings;
         self.selected = None;
@@ -1268,13 +1277,19 @@ impl UiState {
             self.status = Some("Test cancelled".into());
             return UiAction::CancelTest;
         }
-        match self.mode {
+        let (selected, in_form) = (self.selected, self.in_form());
+        let action = match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Filter => self.handle_filter_key(key),
             Mode::AddForm | Mode::EditForm => self.handle_form_key(key),
             Mode::ConfirmRemove => self.handle_remove_key(key),
             Mode::ConfirmTrust => self.handle_trust_key(key),
+        };
+        // Unfolded output belongs to one selection, or to one open form.
+        if (selected, in_form) != (self.selected, self.in_form()) {
+            self.show_raw = false;
         }
+        action
     }
 
     fn handle_paste(&mut self, text: &str) -> UiAction {
@@ -1291,6 +1306,7 @@ impl UiState {
                 let edited = input.as_str() != before;
                 self.form.error = None;
                 self.form.test_result = None;
+                self.show_raw = false;
                 if edited {
                     return UiAction::FormEdited;
                 }
@@ -1328,6 +1344,9 @@ impl UiState {
             KeyCode::Char('r') | KeyCode::F(5) => return UiAction::Refresh,
             KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.test_selected();
+            }
+            KeyCode::Char('o') if key.modifiers.is_empty() && self.selected_has_foldable_raw() => {
+                self.show_raw = !self.show_raw;
             }
             KeyCode::Char('q') => return UiAction::Quit,
             _ => {}
@@ -1391,6 +1410,11 @@ impl UiState {
             KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
                 return self.test_form();
             }
+            KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+                if self.form_has_foldable_raw() {
+                    self.show_raw = !self.show_raw;
+                }
+            }
             _ => {
                 let input = &mut self.form.values[self.form.active];
                 let before = input.as_str().to_owned();
@@ -1398,6 +1422,7 @@ impl UiState {
                     let edited = input.as_str() != before;
                     self.form.error = None;
                     self.form.test_result = None;
+                    self.show_raw = false;
                     if edited {
                         return UiAction::FormEdited;
                     }
@@ -1446,6 +1471,72 @@ impl UiState {
         matches!(self.mode, Mode::AddForm | Mode::EditForm)
     }
 
+    /// Whether the selected host has an explanation whose ssh output `o` can unfold.
+    fn selected_has_foldable_raw(&self) -> bool {
+        self.selected_summary().is_some_and(|host| {
+            self.results
+                .get(host)
+                .and_then(|mark| mark.explanation.as_ref())
+                .into_iter()
+                .chain(self.connections.get(host))
+                .any(has_foldable_raw)
+        })
+    }
+
+    fn form_has_foldable_raw(&self) -> bool {
+        self.form
+            .test_result
+            .as_ref()
+            .and_then(|result| result.explanation.as_ref())
+            .is_some_and(has_foldable_raw)
+    }
+
+    /// Shows how a connection attempt ended, and remembers a failure for the details pane.
+    fn finish_connect(&mut self, alias: &str, result: Result<ConnectionOutcome, TuiError>) {
+        self.status = Some(match result {
+            Ok(ConnectionOutcome::LaunchRequested) => format!("Launch requested for {alias}"),
+            Ok(ConnectionOutcome::LaunchFailed(status)) => {
+                format!("terminal launcher exited with {status}")
+            }
+            Ok(ConnectionOutcome::Exited {
+                alias: spelled,
+                status,
+                explanation,
+            }) => {
+                let host = self
+                    .selected_summary()
+                    .filter(|host| host.alias.eq_ignore_ascii_case(&spelled))
+                    .or_else(|| {
+                        self.hosts
+                            .iter()
+                            .find(|host| host.alias.eq_ignore_ascii_case(&spelled))
+                    })
+                    .cloned();
+                match explanation {
+                    Some(explanation) => {
+                        let line = format!("{alias}: failed \u{2014} {}", explanation.headline);
+                        if let Some(host) = host {
+                            self.connections.insert(host, explanation);
+                        }
+                        line
+                    }
+                    None => {
+                        // A connection that got through supersedes an earlier failure.
+                        if let Some(host) = host {
+                            self.connections.forget_host(&host);
+                        }
+                        if status.success() {
+                            format!("Disconnected from {alias}")
+                        } else {
+                            format!("ssh exited with {status}")
+                        }
+                    }
+                }
+            }
+            Err(error) => error.to_string(),
+        });
+    }
+
     /// Shows a finished test: a saved host's result marks it in the list and the details pane
     /// and goes to the status line; a form's result goes to the form, if it is still open.
     fn record_test(&mut self, finished: Finished, finished_at: String) {
@@ -1454,7 +1545,7 @@ impl UiState {
             target,
             outcome,
         } = finished;
-        let (passed, line, hint) = match &outcome {
+        let (passed, line, explanation, status_hint) = match &outcome {
             Ok(TestOutcome::UnknownHostKey { key, .. }) if self.can_prompt(&origin) => {
                 self.trust = Some(PendingTrust {
                     origin,
@@ -1469,27 +1560,27 @@ impl UiState {
             Ok(TestOutcome::UnknownHostKey { report, .. }) => (
                 false,
                 report.summary(),
-                Some("press t to review the host key".to_owned()),
+                report.explanation.clone(),
+                Some("press t to review the host key"),
             ),
-            Ok(TestOutcome::Done(report)) => {
-                let hint = match &report.result {
-                    ProbeResult::Failed(failure) => report
-                        .key_fetch_failure
-                        .as_ref()
-                        .map(|fetch| format!("could not fetch the host key: {fetch}"))
-                        .or_else(|| failure.hint().map(str::to_owned)),
-                    ProbeResult::Authenticated(_) => None,
-                };
-                (report.passed(), report.summary(), hint)
-            }
-            Err(error) => (false, format!("failed \u{2014} {error}"), None),
+            Ok(TestOutcome::Done(report)) => (
+                report.passed(),
+                report.summary(),
+                report.explanation.clone(),
+                None,
+            ),
+            Err(error) => (false, format!("failed \u{2014} {error}"), None, None),
         };
-        let status = match (&origin, &hint) {
-            (Origin::Host(_), Some(hint)) => format!("{}: {line} ({hint})", target.alias()),
-            (Origin::Host(_), None) => format!("{}: {line}", target.alias()),
+        let reason = match &explanation {
+            Some(explanation) => format!("failed \u{2014} {}", explanation.headline),
+            None => line.clone(),
+        };
+        let status = match (&origin, status_hint) {
+            (Origin::Host(_), Some(hint)) => format!("{}: {reason} ({hint})", target.alias()),
+            (Origin::Host(_), None) => format!("{}: {reason}", target.alias()),
             (Origin::Form, _) => String::new(),
         };
-        self.show_result(origin, passed, line, hint, finished_at);
+        self.show_result(origin, passed, line, explanation, finished_at);
         if !status.is_empty() {
             self.status = Some(status);
         }
@@ -1506,29 +1597,35 @@ impl UiState {
     }
 
     /// Records a result: a saved host's marks it in the list and the details pane; a form's goes
-    /// to the form with its `hint`, if the form is still open.
+    /// to the form with its `explanation`, if the form is still open.
     fn show_result(
         &mut self,
         origin: Origin,
         passed: bool,
         line: String,
-        hint: Option<String>,
+        explanation: Option<Explanation>,
         finished_at: String,
     ) {
         match origin {
             Origin::Host(host) => {
+                // Output unfolded for the old result is not a request to see the new one's.
+                if self.selected_summary() == Some(&host) {
+                    self.show_raw = false;
+                }
                 self.results.insert(
                     host,
                     TestMark {
                         passed,
                         line,
                         finished_at,
+                        explanation,
                     },
                 );
             }
             Origin::Form => {
                 if self.in_form() {
-                    self.form.test_result = Some(FormTestResult { line, hint });
+                    self.show_raw = false;
+                    self.form.test_result = Some(FormTestResult { line, explanation });
                 }
             }
         }
@@ -1574,6 +1671,16 @@ impl UiState {
                 if matches!(self.mode, Mode::AddForm | Mode::EditForm) =>
             {
                 self.report_form_error(host_error);
+            }
+            AppError::Transaction(TransactionError::Validation(
+                rejection @ ConfigRejection::Managed {
+                    field: Some(field), ..
+                },
+            )) if matches!(self.mode, Mode::AddForm | Mode::EditForm) => {
+                if let Some(index) = FORM_FIELDS.iter().position(|row| row.field == *field) {
+                    self.form.active = index;
+                }
+                self.form.error = Some(rejection.to_string());
             }
             AppError::AliasCollision(_) if matches!(self.mode, Mode::AddForm | Mode::EditForm) => {
                 self.form.active = 0;
@@ -1831,7 +1938,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             } else {
                 "Edit host"
             },
-            form_lines(&state.form),
+            form_lines(&state.form, state.show_raw),
         ),
         Mode::ConfirmRemove => (
             "Remove host",
@@ -1895,7 +2002,12 @@ fn footer_text(state: &UiState) -> String {
                 "n new terminal"
             };
             let refresh = "r refresh";
-            let connect = format!("t test  Enter connect  {new_terminal}  q quit");
+            let output = if state.selected_has_foldable_raw() {
+                "o ssh output  "
+            } else {
+                ""
+            };
+            let connect = format!("{output}t test  Enter connect  {new_terminal}  q quit");
             let clear_filter = if state.filter.is_empty() {
                 ""
             } else {
@@ -1924,14 +2036,19 @@ fn footer_text(state: &UiState) -> String {
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
         Mode::AddForm | Mode::EditForm => {
-            "↑↓ field  ←→ move  Enter save  Ctrl+T test  Esc cancel".into()
+            let output = if state.form_has_foldable_raw() {
+                "  Ctrl+O ssh output"
+            } else {
+                ""
+            };
+            format!("↑↓ field  ←→ move  Enter save  Ctrl+T test{output}  Esc cancel")
         }
         Mode::ConfirmRemove => "Enter remove  Esc cancel".into(),
         Mode::ConfirmTrust => "y trust and test again  n/Esc keep it untrusted".into(),
     }
 }
 
-fn form_lines(form: &FormState) -> Vec<Line<'static>> {
+fn form_lines(form: &FormState, show_raw: bool) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = FORM_FIELDS
         .iter()
@@ -1968,9 +2085,15 @@ fn form_lines(form: &FormState) -> Vec<Line<'static>> {
         ));
     }
     if let Some(result) = &form.test_result {
-        lines.push(Line::raw(format!("Connection test: {}", result.line)));
-        if let Some(hint) = &result.hint {
-            lines.push(Line::styled(hint.clone(), dim));
+        match &result.explanation {
+            Some(explanation) => {
+                lines.push(Line::raw(format!(
+                    "Connection test: failed \u{2014} {}",
+                    explanation.headline
+                )));
+                lines.extend(explanation_lines(explanation, show_raw).map(Line::raw));
+            }
+            None => lines.push(Line::raw(format!("Connection test: {}", result.line))),
         }
     }
     lines
@@ -1985,15 +2108,47 @@ fn details_text(state: &UiState) -> String {
         Some(Err(error)) => format!("Could not load details: {error}"),
         None => "Resolving…".into(),
     };
-    match state.results.get(selected) {
-        Some(mark) => format!(
-            "{}\n\nConnection test: {} at {}",
-            text.trim_end(),
-            mark.line,
-            mark.finished_at
-        ),
-        None => text,
+    let mut text = text.trim_end().to_owned();
+    if let Some(mark) = state.results.get(selected) {
+        match &mark.explanation {
+            Some(explanation) => {
+                text.push_str(&format!(
+                    "\n\nConnection test: failed \u{2014} {} at {}",
+                    explanation.headline, mark.finished_at
+                ));
+                for line in explanation_lines(explanation, state.show_raw) {
+                    text.push('\n');
+                    text.push_str(&line);
+                }
+            }
+            None => text.push_str(&format!(
+                "\n\nConnection test: {} at {}",
+                mark.line, mark.finished_at
+            )),
+        }
     }
+    if let Some(explanation) = state.connections.get(selected) {
+        text.push_str(&format!(
+            "\n\nLast connection: failed \u{2014} {}",
+            explanation.headline
+        ));
+        for line in explanation_lines(explanation, state.show_raw) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
+    text
+}
+
+/// The explanation's lines below its first, which the caller words itself.
+fn explanation_lines(explanation: &Explanation, show_raw: bool) -> impl Iterator<Item = String> {
+    explanation.render("", show_raw).into_iter().skip(1)
+}
+
+/// Whether the explanation has ssh output that is folded away unless asked for. Output that
+/// `always_raw` shows anyway (the facts alone do not explain the failure) has nothing to unfold.
+fn has_foldable_raw(explanation: &Explanation) -> bool {
+    !explanation.raw.is_empty() && !explanation.always_raw
 }
 
 /// The current local time as `HH:MM`.
@@ -3477,9 +3632,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_field_is_focused_in_the_form() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.mode = Mode::EditForm;
+
+        state.report_error(&AppError::Transaction(TransactionError::Validation(
+            ConfigRejection::Managed {
+                alias: "dev".into(),
+                field: Some(HostField::Port),
+                directive: "Port".into(),
+                message: "Bad port '99999'.".into(),
+            },
+        )));
+
+        let port = FORM_FIELDS
+            .iter()
+            .position(|row| row.field == HostField::Port)
+            .unwrap();
+        assert_eq!(state.form.active, port);
+        assert_eq!(
+            state.form.error.as_deref(),
+            Some("Port for dev: Bad port '99999'.")
+        );
+    }
+
+    #[test]
     fn rejections_before_activation_leave_the_inventory_alone() {
         let rejected = [
-            AppError::Transaction(TransactionError::Validation("bad".into())),
+            AppError::Transaction(TransactionError::Validation(
+                ConfigRejection::Unrecognised { raw: "bad".into() },
+            )),
             AppError::Transaction(TransactionError::NotInitialized),
             AppError::Transaction(TransactionError::Entry("bad".into())),
             AppError::AliasCollision("dev".into()),
@@ -3669,6 +3851,7 @@ mod tests {
             user: Some("u".into()),
             result,
             key_fetch_failure: None,
+            explanation: None,
         }
     }
 
@@ -4042,19 +4225,44 @@ mod tests {
     fn a_changed_key_shows_its_warning_without_a_prompt() {
         let dev = summary("dev", Ownership::Managed);
         let mut state = test_state(vec![dev.clone()]);
-        let changed = TestOutcome::Done(report(
+        resolve(&mut state, details("dev", Ownership::Managed));
+        let home = std::path::PathBuf::from("/home/me");
+        let mut changed = report(
             "dev",
-            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged),
+            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged { known_hosts: None }),
+        );
+        changed.explanation = Some(crate::explain::explain(
+            &crate::probe::Diagnosis {
+                failure: crate::probe::Failure::HostKeyChanged { known_hosts: None },
+                raw: Vec::new(),
+            },
+            &crate::explain::Context {
+                alias: "dev",
+                operation: crate::explain::Operation::Test,
+                user: None,
+                hostname: Some("dev.example"),
+                port: None,
+                identity_files: &[],
+                jump_is_known: false,
+                home: &home,
+                managed_file: None,
+                adding: false,
+                in_tui: true,
+            },
         ));
+        let changed = TestOutcome::Done(changed);
 
         state.record_test(host_finished(dev.clone(), Ok(changed)), "12:34".into());
 
         assert_eq!(state.mode, Mode::Browse);
         assert!(state.trust.is_none());
         assert!(!state.results.get(&dev).unwrap().passed);
-        let status = state.status.unwrap();
-        assert!(status.starts_with("dev: failed"), "{status}");
-        assert!(status.contains("can mean an attack"), "{status}");
+        assert_eq!(
+            state.status.as_deref(),
+            Some("dev: failed \u{2014} the host key changed, which can mean an attack")
+        );
+        let text = details_text(&state);
+        assert!(text.contains("`ssh-keygen -R dev.example`"), "{text}");
     }
 
     #[test]
@@ -4131,39 +4339,75 @@ mod tests {
     }
 
     #[test]
-    fn a_form_result_shows_its_hint_under_it() {
+    fn a_form_test_failure_shows_its_explanation() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         press(&mut state, KeyCode::Char('a'));
-        let changed = TestOutcome::Done(report(
-            "new",
-            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged),
-        ));
+        let form_finished = |outcome| Finished {
+            origin: Origin::Form,
+            target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+            outcome: Ok(outcome),
+        };
+        let lines = |state: &UiState| -> Vec<String> {
+            form_lines(&state.form, state.show_raw)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect()
+        };
 
         state.record_test(
-            Finished {
-                origin: Origin::Form,
-                target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
-                outcome: Ok(changed),
-            },
+            form_finished(explained(
+                "new",
+                "the host key has changed",
+                &["Offending key"],
+                false,
+            )),
             "12:34".into(),
         );
 
-        let lines: Vec<String> = form_lines(&state.form)
+        let shown = lines(&state);
+        let at = shown
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect()
-            })
-            .collect();
-        let at = lines
-            .iter()
-            .position(|line| line == "Connection test: failed \u{2014} host key changed")
-            .unwrap_or_else(|| panic!("{lines:#?}"));
-        assert!(lines[at + 1].contains("can mean an attack"), "{lines:#?}");
-        assert!(rendered(&state).contains("can mean an attack"));
+            .position(|line| line == "Connection test: failed \u{2014} the host key has changed")
+            .unwrap_or_else(|| panic!("{shown:#?}"));
+        assert_eq!(shown[at + 1], "  user: u", "{shown:#?}");
+        assert_eq!(shown[at + 2], "  next: try this", "{shown:#?}");
+        assert!(!shown.join("\n").contains("ssh said"), "{shown:#?}");
         assert!(state.status.is_none());
+
+        // `o` is text in a form; Ctrl+O unfolds the output, and the footer offers it.
+        assert!(footer_text(&state).contains("Ctrl+O ssh output"));
+        press(&mut state, KeyCode::Char('o'));
+        assert_eq!(state.form.values[0].as_str(), "o");
+        assert!(state.form.test_result.is_none(), "editing clears it");
+        assert!(!footer_text(&state).contains("Ctrl+O"));
+
+        state.record_test(
+            form_finished(explained(
+                "new",
+                "the host key has changed",
+                &["Offending key"],
+                false,
+            )),
+            "12:34".into(),
+        );
+        state.handle_key(ctrl('o'));
+        let shown = lines(&state).join("\n");
+        assert!(shown.contains("ssh said:"), "{shown}");
+        assert!(shown.contains("    Offending key"), "{shown}");
+        state.handle_key(ctrl('o'));
+        assert!(!lines(&state).join("\n").contains("ssh said"));
+
+        // Without raw output there is nothing to offer.
+        state.record_test(
+            form_finished(explained("new", "the host key has changed", &[], false)),
+            "12:34".into(),
+        );
+        assert!(!footer_text(&state).contains("Ctrl+O"));
     }
 
     #[test]
@@ -4177,6 +4421,239 @@ mod tests {
         assert_eq!(press(&mut state, KeyCode::Left), UiAction::None, "no edit");
         assert_eq!(press(&mut state, KeyCode::Tab), UiAction::None);
         assert_eq!(state.form.values[0].as_str(), "xy");
+    }
+
+    fn explanation(headline: &str, raw: &[&str], always_raw: bool) -> crate::explain::Explanation {
+        crate::explain::Explanation {
+            headline: headline.into(),
+            facts: vec![(crate::explain::Label::User, vec!["u".into()])],
+            next: vec!["try this".into()],
+            raw: raw.iter().map(|line| (*line).into()).collect(),
+            always_raw,
+        }
+    }
+
+    fn explained(alias: &str, headline: &str, raw: &[&str], always_raw: bool) -> TestOutcome {
+        let mut failed = report(
+            alias,
+            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged { known_hosts: None }),
+        );
+        failed.explanation = Some(explanation(headline, raw, always_raw));
+        TestOutcome::Done(failed)
+    }
+
+    fn exited_255(
+        alias: &str,
+        explanation: Option<crate::explain::Explanation>,
+    ) -> ConnectionOutcome {
+        use std::os::unix::process::ExitStatusExt;
+        ConnectionOutcome::Exited {
+            alias: alias.into(),
+            status: std::process::ExitStatus::from_raw(255 << 8),
+            explanation,
+        }
+    }
+
+    #[test]
+    fn a_failed_test_shows_its_explanation_in_the_details() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+
+        state.record_test(
+            host_finished(
+                dev,
+                Ok(explained(
+                    "dev",
+                    "the server refused the login",
+                    &["denied"],
+                    false,
+                )),
+            ),
+            "12:34".into(),
+        );
+
+        let text = details_text(&state);
+        let expected = "Connection test: failed \u{2014} the server refused the login at 12:34\n  user: u\n  next: try this";
+        assert!(text.ends_with(expected), "{text}");
+        assert!(!text.contains("dev: failed"), "{text}");
+        assert!(!text.contains("ssh said"), "{text}");
+    }
+
+    #[test]
+    fn o_unfolds_the_ssh_output_and_the_footer_offers_it_only_when_there_is_some() {
+        let dev = summary("dev", Ownership::Managed);
+        let prod = summary("prod", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone(), prod.clone()]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        assert!(!footer_text(&state).contains("o ssh output"));
+
+        state.record_test(
+            host_finished(dev.clone(), Ok(explained("dev", "refused", &[], false))),
+            "12:34".into(),
+        );
+        assert!(
+            !footer_text(&state).contains("o ssh output"),
+            "no raw lines"
+        );
+
+        state.record_test(
+            host_finished(
+                dev,
+                Ok(explained("dev", "refused", &["Permission denied"], false)),
+            ),
+            "12:35".into(),
+        );
+        assert!(footer_text(&state).contains("o ssh output"));
+        assert!(!details_text(&state).contains("ssh said:"));
+
+        press(&mut state, KeyCode::Char('o'));
+        let text = details_text(&state);
+        assert!(
+            text.contains("  ssh said:\n    Permission denied"),
+            "{text}"
+        );
+        press(&mut state, KeyCode::Char('o'));
+        assert!(!details_text(&state).contains("ssh said:"));
+
+        press(&mut state, KeyCode::Char('o'));
+        assert!(state.show_raw);
+        press(&mut state, KeyCode::Char('j'));
+        assert!(!state.show_raw, "moving the selection hides it");
+        assert!(
+            !footer_text(&state).contains("o ssh output"),
+            "prod has none"
+        );
+
+        // `o` does nothing where there is no output to show.
+        press(&mut state, KeyCode::Char('o'));
+        assert!(!state.show_raw);
+
+        // Opening or closing a form hides it too.
+        press(&mut state, KeyCode::Char('k'));
+        press(&mut state, KeyCode::Char('o'));
+        press(&mut state, KeyCode::Char('a'));
+        assert!(!state.show_raw);
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.show_raw);
+    }
+
+    #[test]
+    fn a_new_result_or_a_form_edit_folds_the_output_again() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        let failed = || Ok(explained("dev", "refused", &["Permission denied"], false));
+
+        state.record_test(host_finished(dev.clone(), failed()), "12:34".into());
+        press(&mut state, KeyCode::Char('o'));
+        assert!(state.show_raw);
+        state.record_test(host_finished(dev, failed()), "12:35".into());
+        assert!(!state.show_raw, "a new result of the selected host");
+
+        press(&mut state, KeyCode::Char('a'));
+        let form_finished = || Finished {
+            origin: Origin::Form,
+            target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+            outcome: failed(),
+        };
+        state.record_test(form_finished(), "12:36".into());
+        state.handle_key(ctrl('o'));
+        assert!(state.show_raw);
+        state.record_test(form_finished(), "12:37".into());
+        assert!(!state.show_raw, "a new result of the form");
+
+        state.handle_key(ctrl('o'));
+        assert!(state.show_raw);
+        press(&mut state, KeyCode::Char('x'));
+        assert!(!state.show_raw, "typing in a field");
+
+        state.record_test(form_finished(), "12:38".into());
+        state.handle_key(ctrl('o'));
+        state.handle_paste("y");
+        assert!(!state.show_raw, "pasting into a field");
+    }
+
+    #[test]
+    fn output_that_is_always_shown_is_not_offered_as_a_fold() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+
+        state.record_test(
+            host_finished(
+                dev,
+                Ok(explained("dev", "unexplained", &["odd output"], true)),
+            ),
+            "12:34".into(),
+        );
+
+        assert!(details_text(&state).contains("  ssh said:\n    odd output"));
+        assert!(!footer_text(&state).contains("o ssh output"));
+    }
+
+    #[test]
+    fn a_failed_connection_adds_a_last_connection_section() {
+        let dev = summary("dev", Ownership::Managed);
+        let prod = summary("prod", Ownership::Managed);
+        let inventory = || HostInventory {
+            hosts: vec![
+                summary("dev", Ownership::Managed),
+                summary("prod", Ownership::Managed),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut state = test_state(inventory().hosts);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        let failed = || {
+            exited_255(
+                "dev",
+                Some(explanation(
+                    "the connection timed out",
+                    &["timed out"],
+                    false,
+                )),
+            )
+        };
+
+        state.finish_connect("dev", Ok(failed()));
+
+        assert_eq!(
+            state.status.as_deref(),
+            Some("dev: failed \u{2014} the connection timed out")
+        );
+        let text = details_text(&state);
+        assert!(
+            text.ends_with("Last connection: failed \u{2014} the connection timed out\n  user: u\n  next: try this"),
+            "{text}"
+        );
+        assert!(footer_text(&state).contains("o ssh output"));
+        press(&mut state, KeyCode::Char('o'));
+        assert!(details_text(&state).contains("  ssh said:\n    timed out"));
+
+        // A later clean connection replaces it.
+        state.finish_connect("dev", Ok(exited_255("dev", None)));
+        assert!(state.connections.get(&dev).is_none());
+
+        state.finish_connect("dev", Ok(failed()));
+        complete_mutation(
+            &mut state,
+            Some("dev"),
+            &["DEV"],
+            "Saved dev".into(),
+            || Ok::<_, String>(inventory()),
+        );
+        assert!(state.connections.get(&dev).is_none(), "edit or removal");
+
+        state.finish_connect("dev", Ok(failed()));
+        state.finish_connect(
+            "prod",
+            Ok(exited_255("prod", Some(explanation("x", &[], false)))),
+        );
+        assert!(state.connections.get(&prod).is_some());
+        assert!(apply_refresh(&mut state, || Ok::<_, String>(inventory())));
+        assert!(state.connections.get(&dev).is_none(), "refresh");
+        assert!(state.connections.get(&prod).is_none(), "refresh");
     }
 
     #[test]

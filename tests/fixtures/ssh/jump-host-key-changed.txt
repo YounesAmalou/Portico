@@ -1,3 +1,12 @@
+debug1: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+debug1: Reading configuration data /tmp/portico-fixture/c_jhc
+debug1: /tmp/portico-fixture/c_jhc line 10: Applying options for target
+debug1: Setting implicit ProxyCommand from ProxyJump: /usr/bin/ssh -F /tmp/portico-fixture/c_jhc -W '[%h]:%p' jump
+debug1: loaded pubkey from /tmp/portico-fixture/good: ED25519 SHA256:yI4qJASExMXp5jXZZ/Z9O1U+6XsYogCoyPz3sfR4kho
+debug1: identity file /tmp/portico-fixture/good type 2
+debug1: no identity pubkey loaded from /tmp/portico-fixture/good
+debug1: Executing proxy command: exec /usr/bin/ssh -F /tmp/portico-fixture/c_jhc -W '[127.0.0.1]:22997' jump
+debug1: Local version string SSH-2.0-OpenSSH_10.6
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -5,10 +14,10 @@ IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
 Someone could be eavesdropping on you right now (man-in-the-middle attack)!
 It is also possible that a host key has just been changed.
 The fingerprint for the ED25519 key sent by the remote host is
-SHA256:3B9Dr0+XcF/TcGg1+6uOtxT0Xy9agDlnr2LuxV5SAaU.
+SHA256:wHaGZwkfKNWQkp6hJWK2xOjSmY7ogMw+8egI0Cf9Za8.
 Please contact your system administrator.
-Add correct host key in /scratch/k to get rid of this message.
-Offending ED25519 key in /scratch/kh_jbad:1
+Add correct host key in /tmp/portico-fixture/k to get rid of this message.
+Offending ED25519 key in /tmp/portico-fixture/kh_jbad:1
 Host key for [127.0.0.1]:22999 has changed and you have requested strict checking.
 Host key verification failed.
 kex_exchange_identification: Connection closed by remote host

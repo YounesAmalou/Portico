@@ -20,7 +20,7 @@ pub struct TestEnv {
     bin: PathBuf,
 }
 
-pub struct RunResult(Output);
+pub struct RunResult(pub Output);
 
 impl TestEnv {
     pub fn new() -> Self {
@@ -67,6 +67,41 @@ impl TestEnv {
         S: AsRef<OsStr>,
     {
         RunResult(self.command(args).output().unwrap())
+    }
+
+    /// Runs Portico with `input` on its standard input.
+    pub fn run_with_stdin<I, S>(&self, args: I, input: &str) -> RunResult
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        use std::io::Write;
+        let mut child = self
+            .command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Portico may exit without reading; a closed pipe is fine.
+        let _ = stdin.write_all(input.as_bytes());
+        drop(stdin);
+        RunResult(child.wait_with_output().unwrap())
+    }
+
+    /// Starts Portico with stdin, stdout and stderr all piped.
+    pub fn spawn_piped<I, S>(&self, args: I) -> std::process::Child
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
     }
 
     /// Starts Portico without waiting for it, its output piped.
@@ -173,6 +208,28 @@ impl RunResult {
             "status: {}\nstdout:\n{stdout}\nstderr:\n{}",
             self.0.status,
             String::from_utf8_lossy(&self.0.stderr),
+        );
+    }
+
+    /// Asserts the command exited with `code` and printed `expected` on stderr.
+    pub fn assert_exit_code_and_stderr_contains(self, code: i32, expected: &str) {
+        let stderr = String::from_utf8_lossy(&self.0.stderr);
+        assert!(
+            self.0.status.code() == Some(code) && stderr.contains(expected),
+            "status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+            self.0.status,
+            String::from_utf8_lossy(&self.0.stdout),
+        );
+    }
+
+    /// Asserts the command exited with `code` and printed exactly `expected` on stderr.
+    pub fn assert_exit_code_and_stderr(self, code: i32, expected: &str) {
+        let stderr = String::from_utf8_lossy(&self.0.stderr);
+        assert!(
+            self.0.status.code() == Some(code) && stderr == expected,
+            "status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+            self.0.status,
+            String::from_utf8_lossy(&self.0.stdout),
         );
     }
 

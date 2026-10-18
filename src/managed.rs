@@ -14,6 +14,7 @@ use thiserror::Error;
 #[cfg(test)]
 use std::sync::Arc;
 
+use crate::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
 use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
 use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
 
@@ -146,7 +147,7 @@ pub enum InitError {
     #[error(
         "configuration validation failed: {0}; correct the reported option in ~/.ssh/config or its included files (check with `ssh -G -F ~/.ssh/config portico-validation`), then rerun `portico init`"
     )]
-    Validation(String),
+    Validation(ConfigRejection),
     #[error(
         "filesystem error at {path}: {source}; check permissions or whether another writer is blocking this path, correct the problem, and rerun `portico init`"
     )]
@@ -178,8 +179,11 @@ pub enum TransactionError {
         #[source]
         source: ManagedError,
     },
-    #[error("configuration validation failed: {0}")]
-    Validation(String),
+    #[error(
+        "configuration validation failed: {0}; nothing was saved{suffix}",
+        suffix = if matches!(.0, ConfigRejection::UserFile { .. }) { "; fix that line, then save again" } else { "" }
+    )]
+    Validation(ConfigRejection),
     #[error("entry config cannot be used for validation: {0}")]
     Entry(String),
     #[error("filesystem error at {path}: {source}")]
@@ -338,7 +342,10 @@ impl ManagedStore {
         let validate_installed = || {
             self.init_managed()?;
             // Existing hosts were validated when written; parsing the installed config is enough.
-            validate(&self.paths.entry, &[]).map_err(InitError::Validation)
+            validate(&self.paths.entry, &[]).map_err(|stderr| {
+                // The installed entry is the user's own file, not one Portico staged.
+                InitError::Validation(interpret_rejection(&stderr, &self.paths.managed, None))
+            })
         };
         let preview = self.plan_init()?;
         if !preview.requires_confirmation() {
@@ -628,11 +635,22 @@ impl ManagedStore {
                 active,
                 candidate,
                 validation_file,
+                portico_lines,
                 changed_aliases,
                 ..
             },
         ) = self.stage(mutate, cancelled)?;
-        validate(validation_file.path(), &changed_aliases).map_err(TransactionError::Validation)?;
+        validate(validation_file.path(), &changed_aliases).map_err(|stderr| {
+            TransactionError::Validation(interpret_rejection(
+                &stderr,
+                candidate.path(),
+                Some(StagedEntry {
+                    path: validation_file.path(),
+                    source: &self.paths.entry,
+                    portico_lines: &portico_lines,
+                }),
+            ))
+        })?;
         drop(validation_file);
 
         let backup_candidate = write_unique(
@@ -705,8 +723,9 @@ impl ManagedStore {
 
         let entry = fs::read(&self.paths.entry)
             .map_err(|source| transaction_io(&self.paths.entry, source))?;
-        let validation_entry = substitute_include(&entry, &self.paths, candidate.path())
-            .map_err(transaction_entry_error)?;
+        let (validation_entry, portico_lines) =
+            substitute_include(&entry, &self.paths, candidate.path())
+                .map_err(transaction_entry_error)?;
         let entry_mode = fs::metadata(&self.paths.entry)
             .map_err(|source| transaction_io(&self.paths.entry, source))?
             .permissions()
@@ -727,6 +746,7 @@ impl ManagedStore {
                 candidate,
                 validation_entry,
                 validation_file,
+                portico_lines,
                 entry_mode,
                 changed_aliases,
             },
@@ -748,7 +768,7 @@ impl ManagedStore {
     where
         E: From<TransactionError>,
         M: FnOnce(&mut ManagedConfig) -> Result<(), E>,
-        U: FnOnce(&Path) -> Result<R, E>,
+        U: FnOnce(ConfigFiles<'_>) -> Result<R, E>,
     {
         let (
             (),
@@ -757,6 +777,7 @@ impl ManagedStore {
                 candidate,
                 mut validation_entry,
                 validation_file,
+                mut portico_lines,
                 entry_mode,
                 ..
             },
@@ -765,6 +786,8 @@ impl ManagedStore {
             if !validation_entry.is_empty() && !validation_entry.ends_with(b"\n") {
                 validation_entry.push(b'\n');
             }
+            let lines = line_count(&validation_entry);
+            portico_lines.extend([lines + 1, lines + 2]);
             validation_entry.extend_from_slice(
                 format!(
                     "Match all\nInclude {}\n",
@@ -784,7 +807,16 @@ impl ManagedStore {
             validation_file
         };
         drop(lock);
-        let result = use_entry(preview_file.path());
+        let managed_text = read_lossy(candidate.path());
+        let result = use_entry(ConfigFiles {
+            managed: candidate.path(),
+            managed_text: &managed_text,
+            entry: Some(StagedEntry {
+                path: preview_file.path(),
+                source: &self.paths.entry,
+                portico_lines: &portico_lines,
+            }),
+        });
         drop(preview_file);
         drop(candidate);
         result
@@ -1075,14 +1107,17 @@ fn append_include(output: &mut Vec<u8>, arguments: &[String], original: &[u8]) {
     }
 }
 
+/// Copies the entry config `contents`, pointing Portico's Include at `target` instead, and
+/// returns the copy with the 1-based numbers of the lines it rewrote. Each rewritten line stays a
+/// single line, so every other line keeps its number.
 fn substitute_include(
     contents: &[u8],
     paths: &ConfigPaths,
     target: &Path,
-) -> Result<Vec<u8>, InitError> {
-    let mut replaced = false;
+) -> Result<(Vec<u8>, Vec<u32>), InitError> {
+    let mut replaced = Vec::new();
     let mut result = Vec::new();
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+    for (index, line) in contents.split_inclusive(|byte| *byte == b'\n').enumerate() {
         match parse_directive_bytes(line)
             .map_err(|error| InitError::EntryParse(error.to_string()))?
         {
@@ -1091,7 +1126,7 @@ fn substitute_include(
                     .iter()
                     .any(|argument| is_managed_include(argument, paths)) =>
             {
-                replaced = true;
+                replaced.push(u32::try_from(index + 1).unwrap_or(u32::MAX));
                 let arguments = arguments
                     .iter()
                     .map(|argument| {
@@ -1107,12 +1142,18 @@ fn substitute_include(
             _ => result.extend_from_slice(line),
         }
     }
-    if !replaced {
+    if replaced.is_empty() {
         return Err(InitError::EntryParse(
             "Portico Include is missing from candidate entry config".into(),
         ));
     }
-    Ok(result)
+    Ok((result, replaced))
+}
+
+/// The number of lines in `contents` as OpenSSH counts them.
+fn line_count(contents: &[u8]) -> u32 {
+    let count = contents.split_inclusive(|byte| *byte == b'\n').count();
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 fn is_managed_include(argument: &str, paths: &ConfigPaths) -> bool {
@@ -1216,6 +1257,33 @@ fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
     }
 }
 
+/// Reads a managed config for mapping OpenSSH's line numbers back to hosts.
+///
+/// A read failure yields empty text: the line then maps to no host, so the rejection degrades
+/// to an unmapped one, which is still reported verbatim. Nothing depends on the text otherwise.
+pub(crate) fn read_lossy(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+/// Interprets ssh's stderr against the managed config at `managed` and the entry Portico staged
+/// at `entry`, if any.
+fn interpret_rejection(
+    stderr: &str,
+    managed: &Path,
+    entry: Option<StagedEntry<'_>>,
+) -> ConfigRejection {
+    interpret(
+        stderr,
+        &ConfigFiles {
+            managed,
+            managed_text: &read_lossy(managed),
+            entry,
+        },
+    )
+}
+
 /// A staged change: the candidate managed config and an entry config including it, written but
 /// not activated, with the transaction lock still held.
 struct Staged {
@@ -1224,6 +1292,8 @@ struct Staged {
     candidate: PendingFile,
     validation_entry: Vec<u8>,
     validation_file: PendingFile,
+    /// The lines of the validation entry Portico wrote rather than copied from the user's.
+    portico_lines: Vec<u32>,
     entry_mode: u32,
     changed_aliases: Vec<String>,
 }
@@ -2121,8 +2191,10 @@ mod tests {
         let candidate = paths.portico_dir.join("candidate");
         let entry = "Include ~/.ssh/portico/config first.conf\nHost unrelated\nInclude second.conf ~/.ssh/portico/config third.conf\n";
 
-        let substituted = substitute_include(entry.as_bytes(), &paths, &candidate).unwrap();
+        let (substituted, portico_lines) =
+            substitute_include(entry.as_bytes(), &paths, &candidate).unwrap();
 
+        assert_eq!(portico_lines, [1, 3]);
         assert_eq!(
             String::from_utf8(substituted).unwrap(),
             format!(
@@ -2131,6 +2203,37 @@ mod tests {
                 candidate.display()
             )
         );
+    }
+
+    #[test]
+    fn init_reports_an_error_in_the_users_entry_as_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        std::fs::write(
+            &paths.entry,
+            "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+        )
+        .unwrap();
+        let entry = paths.entry.clone();
+        let result = ManagedStore::new(paths.clone()).apply_init(true, |_, _| {
+            Err(format!(
+                "{}: line 3: Bad configuration option: bogus",
+                entry.display()
+            ))
+        });
+
+        match result {
+            Err(InitError::Validation(rejection)) => assert_eq!(
+                rejection,
+                ConfigRejection::UserFile {
+                    path: paths.entry.clone(),
+                    line: 3,
+                    message: "Bad configuration option: bogus".into(),
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -2362,6 +2465,110 @@ mod tests {
 
         assert!(matches!(result, Err(TransactionError::Validation(_))));
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
+    }
+
+    #[test]
+    fn a_rejected_managed_line_reports_its_host_and_field() {
+        let fixture = initialized_store();
+        let host = Host::new("dev", "dev.example", None, Some(22), None, None).unwrap();
+
+        let result = fixture.store.transact(
+            |config| config.insert(host).map_err(TransactionError::Operation),
+            |entry, _| {
+                let candidate = included_candidate(&fs::read(entry).unwrap());
+                let text = fs::read_to_string(&candidate).unwrap();
+                let line = text
+                    .lines()
+                    .position(|line| line.trim() == "Port 22")
+                    .expect("the candidate has a Port line")
+                    + 1;
+                Err(format!(
+                    "{} line {line}: Bad port '22'.",
+                    candidate.display()
+                ))
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(TransactionError::Validation(ConfigRejection::Managed {
+                    field: Some(HostField::Port),
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Runs the real `ssh -G` on a staged entry and returns its stderr on failure.
+    fn real_ssh_g(entry: &Path) -> Result<(), String> {
+        let output = std::process::Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(entry)
+            .args(["--", "dev"])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+
+    #[test]
+    fn a_rejected_line_of_the_users_entry_names_their_real_file() {
+        let fixture = initialized_store();
+        fs::write(
+            &fixture.paths.entry,
+            "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+        )
+        .unwrap();
+        let host = Host::new("dev", "dev.example", None, None, None, None).unwrap();
+
+        let result = fixture.store.transact(
+            |config| config.insert(host).map_err(TransactionError::Operation),
+            |entry, _| real_ssh_g(entry),
+        );
+
+        match result {
+            Err(TransactionError::Validation(ConfigRejection::UserFile { path, line, .. })) => {
+                assert_eq!(path, fixture.paths.entry);
+                assert_eq!(line, 3);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_preview_maps_the_users_entry_lines_back_to_their_file() {
+        let fixture = preview_fixture("ssh_config");
+        fs::write(&fixture.paths.system_config, "# system\n").unwrap();
+        fs::write(
+            &fixture.paths.entry,
+            "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+        )
+        .unwrap();
+
+        let rejection = fixture
+            .store
+            .preview(
+                |_| Ok::<_, TransactionError>(()),
+                |files| {
+                    let stderr = real_ssh_g(files.entry.unwrap().path).unwrap_err();
+                    Ok::<_, TransactionError>(interpret(&stderr, &files))
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            matches!(
+                &rejection,
+                ConfigRejection::UserFile { path, line: 3, .. } if path == &fixture.paths.entry
+            ),
+            "{rejection:?}"
+        );
     }
 
     #[test]
@@ -2685,7 +2892,8 @@ mod tests {
                         .insert(Host::new("new", "new.example", None, None, None, None).unwrap())
                         .map_err(TransactionError::Operation)
                 },
-                |entry| {
+                |files| {
+                    let entry = files.entry.expect("a preview stages an entry").path;
                     let candidate = included_candidate(&fs::read(entry).unwrap());
                     let contents = fs::read_to_string(&candidate).unwrap();
                     assert!(contents.contains("Host new"), "{contents}");
@@ -2714,18 +2922,23 @@ mod tests {
                     .insert(Host::new("new", "new.example", None, None, None, None).unwrap())
                     .map_err(TransactionError::Operation)
             },
-            |entry| -> Result<(), TransactionError> {
+            |files| -> Result<(), TransactionError> {
+                let entry = files.entry.expect("a preview stages an entry").path;
                 seen = Some((
                     entry.to_owned(),
                     included_candidate(&fs::read(entry).unwrap()),
                 ));
-                Err(TransactionError::Validation("ssh failed".into()))
+                Err(TransactionError::Validation(
+                    ConfigRejection::Unrecognised {
+                        raw: "ssh failed".into(),
+                    },
+                ))
             },
             None,
         );
 
         assert!(
-            matches!(result, Err(TransactionError::Validation(message)) if message == "ssh failed")
+            matches!(result, Err(TransactionError::Validation(ConfigRejection::Unrecognised { raw })) if raw == "ssh failed")
         );
         let (entry, candidate) = seen.expect("closure ran");
         assert_eq!(preview_snapshot(&fixture.paths), before);
@@ -2775,7 +2988,7 @@ mod tests {
             .store
             .preview(
                 |_| Ok::<_, TransactionError>(()),
-                |entry| Ok(fs::read_to_string(entry).unwrap()),
+                |files| Ok(fs::read_to_string(files.entry.unwrap().path).unwrap()),
                 None,
             )
             .unwrap();
@@ -2792,7 +3005,11 @@ mod tests {
             .store
             .preview(
                 |_| Ok::<_, TransactionError>(()),
-                |entry| Ok::<_, TransactionError>(fs::read_to_string(entry).unwrap()),
+                |files| {
+                    Ok::<_, TransactionError>(
+                        fs::read_to_string(files.entry.unwrap().path).unwrap(),
+                    )
+                },
                 None,
             )
             .unwrap();

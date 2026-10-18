@@ -28,7 +28,8 @@ fn main() -> ExitCode {
         &app,
         &mut stdin.lock(),
         &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
+        // Unlocked: `portico connect` mirrors ssh's stderr from another thread.
+        &mut io::stderr(),
         interactive,
         true,
     )
