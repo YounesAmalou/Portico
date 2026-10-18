@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -99,6 +99,10 @@ pub enum AdoptError {
         "the configuration changed since the preview; run the command again to see a fresh preview"
     )]
     Stale,
+    /// The user cancelled while waiting for the lock or for OpenSSH; every file holds its
+    /// previous bytes.
+    #[error("operation cancelled; nothing was changed")]
+    Cancelled,
     #[error("effective configuration of {alias} would change{}", change_detail(.removed, .added))]
     Changed {
         alias: String,
@@ -114,7 +118,8 @@ pub enum AdoptError {
         source: io::Error,
     },
     #[error(
-        "{original}; rollback also failed, so the state is uncertain; {}rollback: {}",
+        "{}; rollback also failed, so the state is uncertain; {}rollback: {}",
+        cause(.original),
         recovery(.backups),
         .failures.join("; ")
     )]
@@ -130,6 +135,15 @@ fn io_error(path: &Path, source: io::Error) -> AdoptError {
     AdoptError::Io {
         path: path.into(),
         source,
+    }
+}
+
+/// What failed before a rollback that also failed: a cancellation is not followed by its
+/// "nothing was changed".
+fn cause(original: &AdoptError) -> String {
+    match original {
+        AdoptError::Cancelled => "operation cancelled".into(),
+        other => other.to_string(),
     }
 }
 
@@ -624,7 +638,8 @@ impl ManagedStore {
     /// nothing is written. The candidates of every file are staged and validated with `ssh -G`
     /// before anything is activated, every replaced file is backed up beside itself, and a
     /// failure while activating or verifying restores every replaced file from its backup.
-    /// `cancelled` is honoured only while waiting for the lock.
+    /// `cancelled` is honoured while waiting for the lock and, through `effective`, by every
+    /// `ssh -G` probe; a probe cancelled after activation rolls back like any other failure.
     pub fn migrate(
         &self,
         plan: &MigrationPlan,
@@ -646,7 +661,24 @@ impl ManagedStore {
         // 1. Lock.
         self.ensure_ready()?;
         let lock = open_lock(&paths.lock).map_err(|source| io_error(&paths.lock, source))?;
-        acquire_lock(&lock, cancelled).map_err(|source| io_error(&paths.lock, source))?;
+        let is_cancelled = || cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed));
+        acquire_lock(&lock, cancelled).map_err(|source| {
+            if is_cancelled() {
+                AdoptError::Cancelled
+            } else {
+                io_error(&paths.lock, source)
+            }
+        })?;
+        // A probe fails rather than answers when the user cancels it.
+        let resolve = |entry: &Path, alias: &str| {
+            resolve(effective, entry, alias).map_err(|error| {
+                if is_cancelled() {
+                    AdoptError::Cancelled
+                } else {
+                    error
+                }
+            })
+        };
 
         // 2. Re-check.
         self.recheck(plan, &moves)?;
@@ -701,8 +733,8 @@ impl ManagedStore {
         let after_file = self.stage_entry(after_entry, managed_candidate)?;
         let mut before = Vec::with_capacity(aliases.len());
         for alias in &aliases {
-            let old = resolve(effective, before_file.path(), alias)?;
-            require_same(alias, &old, &resolve(effective, after_file.path(), alias)?)?;
+            let old = resolve(before_file.path(), alias)?;
+            require_same(alias, &old, &resolve(after_file.path(), alias)?)?;
             before.push(old);
         }
         drop((before_file, after_file));
@@ -778,7 +810,7 @@ impl ManagedStore {
                 fs::read(&plan.entry).map_err(|source| io_error(&plan.entry, source))?;
             let installed = self.stage_entry(&installed, &paths.managed)?;
             for (alias, old) in aliases.iter().zip(&before) {
-                require_same(alias, old, &resolve(effective, installed.path(), alias)?)?;
+                require_same(alias, old, &resolve(installed.path(), alias)?)?;
             }
             Ok(())
         })();
@@ -1799,6 +1831,64 @@ mod tests {
             assert_eq!(backups, [bytes], "{}", path.display());
             assert_eq!(&before[path], bytes);
         }
+    }
+
+    #[test]
+    fn cancelling_an_openssh_probe_changes_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The first probe validates the staged files; the third verifies the installed ones.
+        for cancelled_call in [1, 3] {
+            let fixture = fixture("Host dev\n  HostName d\n");
+            let plan = fixture.store.adoption_plan(same()).unwrap();
+            let before = tree(&fixture.paths);
+            let cancelled = AtomicBool::new(false);
+            let calls = std::cell::Cell::new(0);
+            let effective: Effective = &|_, alias| {
+                calls.set(calls.get() + 1);
+                if calls.get() == cancelled_call {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Err("SSH operation cancelled".into());
+                }
+                Ok(format!("{alias}\n"))
+            };
+            let error = fixture
+                .store
+                .migrate(&plan, &["dev".into()], effective, Some(&cancelled))
+                .unwrap_err();
+            assert!(matches!(error, AdoptError::Cancelled), "{error}");
+            assert_eq!(
+                error.to_string(),
+                "operation cancelled; nothing was changed"
+            );
+            assert_eq!(tree(&fixture.paths), before, "probe {cancelled_call}");
+        }
+
+        // When the rollback fails too, the message no longer claims nothing changed.
+        let fixture = fixture("Host dev\n  HostName d\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0);
+        let effective: Effective = &|_, alias| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                cancelled.store(true, Ordering::Relaxed);
+                return Err("SSH operation cancelled".into());
+            }
+            Ok(format!("{alias}\n"))
+        };
+        arm(&[FailPoint::Restore]);
+        let error = fixture
+            .store
+            .migrate(&plan, &["dev".into()], effective, Some(&cancelled))
+            .unwrap_err();
+        arm(&[]);
+        assert!(
+            error
+                .to_string()
+                .starts_with("operation cancelled; rollback also failed"),
+            "{error}"
+        );
     }
 
     #[test]
