@@ -27,3 +27,5 @@ mod cli_connect;
 mod cli_test;
 #[path = "e2e/explanations.rs"]
 mod explanations;
+#[path = "e2e/tui_first_run.rs"]
+mod tui_first_run;
