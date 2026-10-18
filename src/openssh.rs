@@ -1499,6 +1499,9 @@ mod tests {
 
     /// A fake ssh that starts `sleep 30` in its group, records the sleep's pid
     /// at `<dir>/pid`, then prints `fixture` (if any) to stderr and waits.
+    ///
+    /// The sleep records its own pid just before it becomes `sleep`, so if the
+    /// pid file is missing, no sleep was ever started that could outlive ssh.
     fn fake_hanging_ssh(fixture: Option<&str>) -> (FakeProgram, PathBuf) {
         let fake = fake_ssh();
         let pid = fake.log.with_file_name("pid");
@@ -1508,11 +1511,24 @@ mod tests {
         write_executable(
             &fake.path,
             &format!(
-                "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n{print}wait\n",
+                "#!/bin/sh\nsh -c 'printf %s \"$$\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\" && exec sleep 30' sh '{0}' &\nwhile [ ! -s '{0}' ]; do sleep 0.01; done\n{print}wait\n",
                 pid.display()
             ),
         );
         (fake, pid)
+    }
+
+    /// Checks that whatever a fake ssh recorded at `pid` is gone, once the run
+    /// that a deadline ended has returned.
+    ///
+    /// A deadline counts from the spawn, so on a loaded machine it can end the
+    /// fake before the fake records anything. The fakes record a pid before
+    /// starting anything that could outlive them, so then there is nothing to
+    /// check.
+    fn assert_recorded_process_dies(pid: &Path) {
+        if let Ok(pid) = fs::read_to_string(pid) {
+            assert_dies(&pid);
+        }
     }
 
     fn wait_for_file(path: &Path) -> String {
@@ -1660,11 +1676,10 @@ mod tests {
                 Duration::from_secs(1),
             )
         });
-        let pid = wait_for_file(&pid);
         let result = probe.join().unwrap().unwrap();
 
         assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
-        assert_dies(&pid);
+        assert_recorded_process_dies(&pid);
     }
 
     #[test]
@@ -1689,7 +1704,6 @@ mod tests {
                 Duration::from_millis(300),
             ));
         });
-        let pid = wait_for_file(&pid);
 
         let result = results
             .recv_timeout(Duration::from_secs(5))
@@ -1697,7 +1711,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
-        assert_dies(&pid);
+        assert_recorded_process_dies(&pid);
     }
 
     #[test]
