@@ -359,6 +359,141 @@ pub fn classify(code: Option<i32>, stderr: &str) -> DockerProblem {
     }
 }
 
+/// A read-only POSIX script that reports, as `key=value` lines, what decides
+/// whether the user can reach the docker socket. Every key is always printed.
+pub const PROBE_SCRIPT: &str = r#"user=$(id -un 2>/dev/null)
+echo "user=$user"
+echo "process=$(id -Gn 2>/dev/null)"
+echo "database=$(id -Gn "$user" 2>/dev/null)"
+if command -v getent >/dev/null 2>&1 && getent group docker >/dev/null 2>&1; then echo group=yes; else echo group=no; fi
+host=${DOCKER_HOST:-unix:///var/run/docker.sock}
+case $host in unix://*) socket=${host#unix://} ;; *) socket= ;; esac
+echo "socket=$socket"
+socket_group=
+if [ -n "$socket" ] && command -v stat >/dev/null 2>&1; then socket_group=$(stat -c %G "$socket" 2>/dev/null); fi
+echo "socket_group=$socket_group"
+for tool in sg newgrp systemctl; do
+  if command -v $tool >/dev/null 2>&1; then echo "$tool=yes"; else echo "$tool=no"; fi
+done
+"#;
+
+/// What [`PROBE_SCRIPT`] reported about the target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Probe {
+    pub user: String,
+    /// Groups of the current process.
+    pub process_groups: Vec<String>,
+    /// Groups of the user in the group database.
+    pub database_groups: Vec<String>,
+    pub group_exists: bool,
+    pub socket: String,
+    pub socket_group: Option<String>,
+    pub has_sg: bool,
+    pub has_newgrp: bool,
+    pub has_systemctl: bool,
+}
+
+/// Reads the output of [`PROBE_SCRIPT`]; `None` when it has no user.
+pub fn parse_probe(stdout: &str) -> Option<Probe> {
+    let values: BTreeMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let value = |key: &str| values.get(key).map_or("", |value| value.trim());
+    let groups = |key: &str| value(key).split_whitespace().map(String::from).collect();
+    let user = value("user");
+    if user.is_empty() {
+        return None;
+    }
+    Some(Probe {
+        user: user.to_string(),
+        process_groups: groups("process"),
+        database_groups: groups("database"),
+        group_exists: value("group") == "yes",
+        socket: value("socket").to_string(),
+        socket_group: Some(value("socket_group"))
+            .filter(|group| !group.is_empty())
+            .map(String::from),
+        has_sg: value("sg") == "yes",
+        has_newgrp: value("newgrp") == "yes",
+        has_systemctl: value("systemctl") == "yes",
+    })
+}
+
+/// The tool that runs a command inside the docker group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum GroupTool {
+    Sg,
+    Newgrp,
+}
+
+/// What to do about a refused docker socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Access {
+    /// The user is in the group, but this process predates it: rerun inside it.
+    RerunInGroup(GroupTool),
+    /// Same, but neither tool exists: a new login is needed.
+    NeedsLogin,
+    /// Offer to add the user to the docker group.
+    OfferJoin,
+    NoOffer,
+}
+
+/// Decides the fix for a permission failure from the probe.
+pub fn decide(probe: &Probe) -> Access {
+    let has = |groups: &[String]| groups.iter().any(|group| group == "docker");
+    if has(&probe.database_groups) && !has(&probe.process_groups) {
+        return if probe.has_sg {
+            Access::RerunInGroup(GroupTool::Sg)
+        } else if probe.has_newgrp {
+            Access::RerunInGroup(GroupTool::Newgrp)
+        } else {
+            Access::NeedsLogin
+        };
+    }
+    let socket_is_unclaimed = matches!(probe.socket_group.as_deref(), Some("docker" | "root"));
+    if !has(&probe.database_groups) && (socket_is_unclaimed || !probe.group_exists) {
+        Access::OfferJoin
+    } else {
+        Access::NoOffer
+    }
+}
+
+/// Wraps a command so it runs inside the docker group.
+pub fn in_group(tool: GroupTool, words: &[String]) -> Vec<String> {
+    let tool = match tool {
+        GroupTool::Sg => "sg",
+        GroupTool::Newgrp => "newgrp",
+    };
+    vec![
+        tool.to_string(),
+        "docker".to_string(),
+        "-c".to_string(),
+        remote_command(words),
+    ]
+}
+
+/// Creates the group if needed, adds the user, and gives the socket to it
+/// (`$1` is the user, `$2` the socket) so no daemon restart is needed.
+pub const JOIN_SCRIPT: &str =
+    "groupadd -f docker && usermod -aG docker \"$1\" && chgrp docker \"$2\"";
+
+/// The command that adds `user` to the docker group and fixes the socket.
+pub fn join_group_words(user: &str, socket: &str) -> Vec<String> {
+    ["sudo", "sh", "-c", JOIN_SCRIPT, "sh", user, socket]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// The command that starts the docker daemon.
+pub fn start_daemon_words() -> Vec<String> {
+    ["sudo", "systemctl", "start", "docker"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +824,117 @@ mod tests {
         assert_eq!(
             classify(Some(1), "Error response from daemon: x"),
             DockerProblem::Other
+        );
+    }
+
+    fn probe() -> Probe {
+        Probe {
+            user: "ann".into(),
+            process_groups: vec!["ann".into()],
+            database_groups: vec!["ann".into()],
+            group_exists: true,
+            socket: "/var/run/docker.sock".into(),
+            socket_group: Some("staff".into()),
+            has_sg: true,
+            has_newgrp: true,
+            has_systemctl: true,
+        }
+    }
+
+    #[test]
+    fn parses_probe_output() {
+        let out = "motd noise\nuser=ann\nprocess=ann wheel\ndatabase=ann wheel docker\n\
+                   group=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\n\
+                   sg=yes\nnewgrp=no\nsystemctl=yes\n";
+        let parsed = parse_probe(out).unwrap();
+        assert_eq!(parsed.user, "ann");
+        assert_eq!(parsed.process_groups, ["ann", "wheel"]);
+        assert_eq!(parsed.database_groups, ["ann", "wheel", "docker"]);
+        assert!(parsed.group_exists);
+        assert_eq!(parsed.socket, "/var/run/docker.sock");
+        assert_eq!(parsed.socket_group.as_deref(), Some("docker"));
+        assert!(parsed.has_sg && !parsed.has_newgrp && parsed.has_systemctl);
+
+        let unknown = parse_probe("user=ann\nsocket=\nsocket_group=\n").unwrap();
+        assert_eq!(unknown.socket_group, None);
+        assert!(!unknown.group_exists);
+        assert_eq!(parse_probe("process=ann\n"), None);
+    }
+
+    #[test]
+    fn decides_rerun_with_sg_then_newgrp_then_login() {
+        let mut p = probe();
+        p.database_groups.push("docker".into());
+        assert_eq!(decide(&p), Access::RerunInGroup(GroupTool::Sg));
+        p.has_sg = false;
+        assert_eq!(decide(&p), Access::RerunInGroup(GroupTool::Newgrp));
+        p.has_newgrp = false;
+        assert_eq!(decide(&p), Access::NeedsLogin);
+    }
+
+    #[test]
+    fn offers_join_when_socket_is_docker_or_root_or_group_missing() {
+        for group in ["docker", "root"] {
+            let mut p = probe();
+            p.socket_group = Some(group.into());
+            assert_eq!(decide(&p), Access::OfferJoin);
+        }
+        let mut p = probe();
+        p.group_exists = false;
+        p.socket_group = None;
+        assert_eq!(decide(&p), Access::OfferJoin);
+    }
+
+    #[test]
+    fn no_offer_for_other_socket_group_or_already_member() {
+        assert_eq!(decide(&probe()), Access::NoOffer);
+        let mut p = probe();
+        p.socket_group = None;
+        assert_eq!(decide(&p), Access::NoOffer);
+        let mut p = probe();
+        p.process_groups.push("docker".into());
+        p.database_groups.push("docker".into());
+        p.socket_group = Some("docker".into());
+        assert_eq!(decide(&p), Access::NoOffer);
+    }
+
+    #[test]
+    fn probe_script_runs_under_sh() {
+        let run = |program: &str, args: &[&str]| {
+            let output = std::process::Command::new(program)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let parsed = parse_probe(&run("sh", &["-c", PROBE_SCRIPT])).unwrap();
+        assert_eq!(parsed.user, run("id", &["-un"]));
+        assert!(!parsed.process_groups.is_empty());
+    }
+
+    #[test]
+    fn in_group_and_join_words() {
+        let words = ps_words();
+        assert_eq!(
+            in_group(GroupTool::Sg, &words),
+            ["sg", "docker", "-c", &remote_command(&words)]
+        );
+        assert_eq!(in_group(GroupTool::Newgrp, &words)[0], "newgrp");
+        assert_eq!(
+            join_group_words("ann", "/var/run/docker.sock"),
+            [
+                "sudo",
+                "sh",
+                "-c",
+                JOIN_SCRIPT,
+                "sh",
+                "ann",
+                "/var/run/docker.sock"
+            ]
+        );
+        assert_eq!(
+            start_daemon_words(),
+            ["sudo", "systemctl", "start", "docker"]
         );
     }
 }
