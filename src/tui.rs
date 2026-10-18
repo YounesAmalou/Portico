@@ -33,9 +33,11 @@ use ratatui::{
 
 mod containers;
 mod lister;
+mod migrate;
 mod tester;
 
 use crate::{
+    adopt,
     app::{
         App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
     },
@@ -49,6 +51,7 @@ use crate::{
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
 use lister::Lister;
+use migrate::{MigrateAction, MigrateState};
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
 
@@ -379,6 +382,47 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     format!("Removed {alias}"),
                 );
             }
+            UiAction::OpenMigrate {
+                direction,
+                preselect,
+            } => {
+                let plan = match direction {
+                    adopt::Direction::Adopt => app.adoption_plan(),
+                    adopt::Direction::Export => app.export_plan(),
+                };
+                match plan {
+                    Ok(plan) => {
+                        let migrate = MigrateState::new(plan, Some(&preselect));
+                        state.migrate = Some(migrate.with_home(app.home()));
+                        state.mode = Mode::Migrate;
+                    }
+                    Err(error) => state.report_error(&error),
+                }
+            }
+            UiAction::Migrate(aliases) => {
+                if let Some(migrate) = state.migrate.take() {
+                    let result = app.migrate_cancellable(&migrate.plan, &aliases, terminated);
+                    let moved = result.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
+                    let changed = moved.iter().map(String::as_str).collect::<Vec<_>>();
+                    if result.is_ok() {
+                        cancel_host_test(&mut tester, &changed);
+                    }
+                    let verb = match migrate.plan.direction {
+                        adopt::Direction::Adopt => "Adopted",
+                        adopt::Direction::Export => "Exported",
+                    };
+                    inventory_changed = finish_mutation(
+                        app,
+                        &mut state,
+                        result.map(drop),
+                        None,
+                        &changed,
+                        format!("{verb}: {}", moved.join(", ")),
+                    );
+                }
+                // A failure ends the screen too, as its plan may no longer match the files.
+                state.mode = Mode::Browse;
+            }
             UiAction::Test { origin, target } => tester.start(origin, Job::Test(target)),
             UiAction::CancelTest => tester.cancel(),
             UiAction::FormEdited => tester.cancel_if(|origin, _| *origin == Origin::Form),
@@ -489,6 +533,10 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
             | TransactionError::Rollback { .. } => true,
         },
         AppError::Init(_) => true,
+        AppError::Adopt(error) => matches!(
+            error,
+            crate::adopt::AdoptError::Io { .. } | crate::adopt::AdoptError::Rollback { .. }
+        ),
         AppError::Discovery(_)
         | AppError::OpenSsh(_)
         | AppError::InvalidHost(_)
@@ -934,6 +982,7 @@ enum Mode {
     EditForm,
     ConfirmRemove,
     ConfirmTrust,
+    Migrate,
 }
 
 /// A single-line text field edited at a cursor.
@@ -1123,6 +1172,8 @@ struct UiState {
     trust: Option<PendingTrust>,
     containers: Panel,
     focus: Focus,
+    /// The migrate screen while in `Mode::Migrate`.
+    migrate: Option<MigrateState>,
 }
 
 /// The left-column panel that receives keys while browsing.
@@ -1269,6 +1320,13 @@ enum UiAction {
     /// The answer to the trust prompt; on `true` the key to trust is in `UiState::trust`.
     Trust(bool),
     Containers(PanelAction),
+    /// Opens the migrate screen of every host owned like the selected one.
+    OpenMigrate {
+        direction: adopt::Direction,
+        preselect: String,
+    },
+    /// Moves the checked hosts of the open migrate screen.
+    Migrate(Vec<String>),
 }
 
 impl UiState {
@@ -1296,6 +1354,7 @@ impl UiState {
             trust: None,
             containers: Panel::default(),
             focus: Focus::Hosts,
+            migrate: None,
         };
         state.follow_selection();
         state
@@ -1408,6 +1467,7 @@ impl UiState {
             Mode::AddForm | Mode::EditForm => self.handle_form_key(key),
             Mode::ConfirmRemove => self.handle_remove_key(key),
             Mode::ConfirmTrust => self.handle_trust_key(key),
+            Mode::Migrate => self.handle_migrate_key(key),
         };
         // Unfolded output belongs to one selection, or to one open form.
         if (selected, in_form) != (self.selected, self.in_form()) {
@@ -1431,7 +1491,7 @@ impl UiState {
                 return self.form_input_changed(&before, cursor);
             }
             Mode::Browse if self.focus == Focus::Containers => self.containers.paste(text),
-            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
+            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust | Mode::Migrate => {}
         }
         UiAction::None
     }
@@ -1451,6 +1511,17 @@ impl UiState {
                 self.mode = Mode::AddForm;
             }
             KeyCode::Char('e') => self.begin_edit(),
+            KeyCode::Char('m') => {
+                if let Some(host) = self.selected_summary() {
+                    return UiAction::OpenMigrate {
+                        direction: match host.ownership {
+                            Ownership::External => adopt::Direction::Adopt,
+                            Ownership::Managed => adopt::Direction::Export,
+                        },
+                        preselect: host.alias.clone(),
+                    };
+                }
+            }
             KeyCode::Char('x') => {
                 if self.selected_is_managed() {
                     self.mode = Mode::ConfirmRemove;
@@ -1956,6 +2027,23 @@ impl UiState {
         }
     }
 
+    fn handle_migrate_key(&mut self, key: KeyEvent) -> UiAction {
+        let Some(migrate) = &mut self.migrate else {
+            self.mode = Mode::Browse;
+            return UiAction::None;
+        };
+        match migrate.handle_key(key) {
+            MigrateAction::None => {}
+            MigrateAction::Close => {
+                self.mode = Mode::Browse;
+                self.migrate = None;
+            }
+            MigrateAction::Apply(aliases) => return UiAction::Migrate(aliases),
+            MigrateAction::Error(message) => self.status = Some(message),
+        }
+        UiAction::None
+    }
+
     fn move_selection(&mut self, offset: isize) {
         let Some(selected) = self.selected else {
             return;
@@ -2226,6 +2314,18 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             ))],
         ),
         Mode::ConfirmTrust => ("Trust host key", trust_lines(state.trust.as_ref())),
+        Mode::Migrate => state
+            .migrate
+            .as_ref()
+            .map_or(("Migrate", Vec::new()), |migrate| {
+                (
+                    migrate.title(),
+                    migrate.lines(
+                        usize::from(columns[1].width.saturating_sub(2)),
+                        usize::from(columns[1].height.saturating_sub(2)),
+                    ),
+                )
+            }),
         _ => {
             let container = state.containers.details().filter(|_| panel_focused);
             let title = if container.is_some() {
@@ -2310,16 +2410,16 @@ fn footer_text(state: &UiState) -> String {
                         .is_some_and(|details| details.declared.is_some()) =>
                 {
                     format!(
-                        "↑↓ move  / filter{clear_filter}  a add  e edit  x remove  {refresh}  {connect}"
+                        "↑↓ move  / filter{clear_filter}  a add  m export  e edit  x remove  {refresh}  {connect}"
                     )
                 }
                 Some(Ownership::Managed) => {
                     format!(
-                        "↑↓ move  / filter{clear_filter}  a add  x remove  {refresh}  {connect}"
+                        "↑↓ move  / filter{clear_filter}  a add  m export  x remove  {refresh}  {connect}"
                     )
                 }
                 Some(Ownership::External) => {
-                    format!("↑↓ move  / filter{clear_filter}  a add  {refresh}  {connect}")
+                    format!("↑↓ move  / filter{clear_filter}  a add  m adopt  {refresh}  {connect}")
                 }
                 None => format!("/ filter{clear_filter}  a add  {refresh}  Tab containers  q quit"),
             }
@@ -2343,6 +2443,11 @@ fn footer_text(state: &UiState) -> String {
         }
         Mode::ConfirmRemove => "Enter remove  Esc cancel".into(),
         Mode::ConfirmTrust => "y trust and test again  n/Esc keep it untrusted".into(),
+        Mode::Migrate => state
+            .migrate
+            .as_ref()
+            .map_or("Esc cancel", MigrateState::footer)
+            .into(),
     }
 }
 
@@ -2992,7 +3097,9 @@ mod tests {
         assert!(!text.contains("Ctrl+Enter"), "{text}");
 
         state.ctrl_enter = true;
-        let text = rendered(&state);
+        // The longer footer wraps at this width, so check its text rather than the screen.
+        let text = footer_text(&state);
+        assert!(text.contains("m export"), "{text}");
         assert!(text.contains("Enter connect"), "{text}");
         assert!(text.contains("Ctrl+Enter/n new terminal"), "{text}");
     }
@@ -5068,6 +5175,36 @@ mod tests {
         assert_eq!((hours.len(), minutes.len()), (2, 2), "{time}");
         assert!(hours.parse::<u8>().unwrap() < 24);
         assert!(minutes.parse::<u8>().unwrap() < 60);
+    }
+
+    #[test]
+    fn m_opens_migration_for_the_selected_host() {
+        let mut state = test_state(vec![
+            summary("web", Ownership::External),
+            summary("dev", Ownership::Managed),
+        ]);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('m')),
+            UiAction::OpenMigrate {
+                direction: adopt::Direction::Adopt,
+                preselect: "web".into(),
+            }
+        );
+        press(&mut state, KeyCode::Down);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('m')),
+            UiAction::OpenMigrate {
+                direction: adopt::Direction::Export,
+                preselect: "dev".into(),
+            }
+        );
+        assert!(footer_text(&state).contains("a add  m export  x remove"));
+        press(&mut state, KeyCode::Up);
+        assert!(footer_text(&state).contains("a add  m adopt  r refresh"));
+
+        let mut empty = test_state(Vec::new());
+        assert_eq!(press(&mut empty, KeyCode::Char('m')), UiAction::None);
+        assert!(!footer_text(&empty).contains("m adopt"));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

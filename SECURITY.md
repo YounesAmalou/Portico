@@ -6,7 +6,7 @@ Only the latest released 0.x version receives fixes.
 
 ## Scope
 
-Portico reads and edits SSH configuration. It inserts an `Include` line as the first line of `~/.ssh/config` (pointing at the Portico-owned file) and keeps the rest of that file unchanged, and it manages `~/.ssh/portico/`. Reports about data loss, unexpected modification of `~/.ssh/config`, unsafe file permissions, command injection through host fields, or credential exposure are in scope. Portico never reads private keys or passwords.
+Portico reads and edits SSH configuration. It inserts an `Include` line as the first line of `~/.ssh/config` (pointing at the Portico-owned file) and keeps the rest of that file unchanged, and it manages `~/.ssh/portico/`. The only other time it writes to your own SSH configuration files is `portico adopt` and `portico export` (and the TUI `m` key), which move host blocks between them after an exact preview and a confirmation (skipped with `--yes`), keep a temporary backup, and restore it on failure. Trusting a host key in the connection test (the TUI `y` key or `portico test --accept-host-key`) appends that key to your `known_hosts` file. Reports about data loss, unexpected modification of `~/.ssh/config`, unsafe file permissions, command injection through host fields, or credential exposure are in scope. Portico never reads private keys or passwords.
 
 ## Reporting a vulnerability
 

@@ -1,3 +1,4 @@
+pub mod adopt;
 pub mod app;
 pub mod cli;
 pub mod config_error;
