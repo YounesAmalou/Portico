@@ -1,6 +1,6 @@
 # Jump Host Suggestions Design
 
-**Status:** Draft
+**Status:** Approved; implemented
 
 ## Purpose
 

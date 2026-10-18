@@ -2194,7 +2194,15 @@ fn footer_text(state: &UiState) -> String {
             } else {
                 ""
             };
-            format!("↑↓ field  ←→ move  Enter save  Ctrl+T test{output}  Esc cancel")
+            if state.form.suggestions.is_some() {
+                return "↑↓ choose  Enter pick  Esc close".into();
+            }
+            let suggest = if state.form.active == PROXY_JUMP {
+                "  Ctrl+Space suggest"
+            } else {
+                ""
+            };
+            format!("↑↓ field  ←→ move  Enter save  Ctrl+T test{output}{suggest}  Esc cancel")
         }
         Mode::ConfirmRemove => "Enter remove  Esc cancel".into(),
         Mode::ConfirmTrust => "y trust and test again  n/Esc keep it untrusted".into(),
@@ -2221,6 +2229,10 @@ fn form_lines(form: &FormState, show_raw: bool) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect::<Vec<_>>();
+    if let Some(list) = &form.suggestions {
+        let rows = suggestion_lines(list, FORM_FIELDS[PROXY_JUMP].label);
+        lines.splice(PROXY_JUMP + 1..PROXY_JUMP + 1, rows);
+    }
     lines.push(Line::raw(""));
     let active = &FORM_FIELDS[form.active];
     lines.push(Line::styled(
@@ -2249,6 +2261,42 @@ fn form_lines(form: &FormState, show_raw: bool) -> Vec<Line<'static>> {
             None => lines.push(Line::raw(format!("Connection test: {}", result.line))),
         }
     }
+    lines
+}
+
+/// The jump host dropdown as boxed lines, indented to start under the value of `label`'s row.
+fn suggestion_lines(list: &Suggestions, label: &str) -> Vec<Line<'static>> {
+    let indent = " ".repeat(format!("> {label}: ").chars().count());
+    let visible = &list.items[list.offset..(list.offset + SUGGESTION_ROWS).min(list.items.len())];
+    let width = visible
+        .iter()
+        .map(|item| item.alias.chars().count())
+        .max()
+        .unwrap_or(0);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let border = "─".repeat(width + 3);
+    let mut lines = vec![Line::raw(format!("{indent}┌{border}┐"))];
+    lines.extend(visible.iter().enumerate().map(|(row, item)| {
+        let selected = list.offset + row == list.selected;
+        let cell = format!(
+            "{} {:width$} ",
+            if selected { '>' } else { ' ' },
+            item.alias
+        );
+        Line::from(vec![
+            Span::raw(format!("{indent}│")),
+            if selected {
+                Span::styled(cell, Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                Span::raw(cell)
+            },
+            Span::raw(format!(
+                "│  {}",
+                suggest::origin_label(&item.origin, home.as_deref())
+            )),
+        ])
+    }));
+    lines.push(Line::raw(format!("{indent}└{border}┘")));
     lines
 }
 
@@ -5025,5 +5073,69 @@ mod tests {
             warnings: Vec::new(),
         });
         assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn dropdown_renders_aliases_and_origins_under_proxy_jump() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        let text = rendered(&state);
+        assert!(text.contains("│> bastion    │  managed"), "{text}");
+        assert!(text.contains("│  bastion-eu │"), "{text}");
+        let lines = text.lines().collect::<Vec<_>>();
+        let row = lines
+            .iter()
+            .position(|line| line.contains("> ProxyJump:"))
+            .unwrap();
+        assert!(lines[row + 1].contains('┌'), "{text}");
+        assert!(lines[row + 4].contains('└'), "{text}");
+    }
+
+    #[test]
+    fn dropdown_scrolls_to_keep_the_selection_visible() {
+        let hosts = (1..=7)
+            .map(|n| summary(&format!("h{n}"), Ownership::Managed))
+            .collect();
+        let mut state = proxy_jump_form(hosts);
+        state.handle_key(ctrl(' '));
+        for _ in 0..6 {
+            press(&mut state, KeyCode::Down);
+        }
+        assert_eq!(
+            (suggestion(&state).selected, suggestion(&state).offset),
+            (6, 2)
+        );
+        let text = rendered(&state);
+        assert!(text.contains("│> h7 │"), "{text}");
+        assert!(!text.contains("│  h1 │"), "{text}");
+        assert!(text.contains("│  h3 │"), "{text}");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(suggestion(&state).selected, 6);
+        for _ in 0..6 {
+            press(&mut state, KeyCode::Up);
+        }
+        assert_eq!(
+            (suggestion(&state).selected, suggestion(&state).offset),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn footer_shows_suggestion_keys_while_open() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        assert_eq!(footer_text(&state), "↑↓ choose  Enter pick  Esc close");
+    }
+
+    #[test]
+    fn footer_advertises_ctrl_space_on_proxy_jump() {
+        let state = proxy_jump_form(jump_hosts());
+        assert!(
+            footer_text(&state).contains("Ctrl+Space suggest  Esc cancel"),
+            "{}",
+            footer_text(&state)
+        );
+        let state = form_with_active_field(0);
+        assert!(!footer_text(&state).contains("Ctrl+Space"));
     }
 }
