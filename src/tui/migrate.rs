@@ -435,12 +435,10 @@ mod tests {
     fn panes_render_the_checklist_and_the_preview() {
         let mut state = adoption(Some("web"));
         let checklist = pane(&state);
-        println!("{checklist}");
         assert!(checklist.contains("Adopt hosts"));
         assert!(checklist.contains("[x] web   ~/.ssh/config"));
         press(&mut state, KeyCode::Enter);
         let preview = pane(&state);
-        println!("{preview}");
         assert!(preview.contains("  -1: Host web"));
     }
 }

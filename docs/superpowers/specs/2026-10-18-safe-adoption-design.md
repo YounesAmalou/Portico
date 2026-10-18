@@ -1,6 +1,6 @@
 # Safe Adoption Design
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved; implemented
 **Date:** 2026-10-18
 
 ## Purpose
@@ -21,7 +21,7 @@ An external host is adoptable when all of these hold:
 - **An unconditional, writable source.** The file is a regular file (a symbolic link is followed to its target, as `portico init` does for the entry config), is UTF-8, is owned by the current user, and both it and its directory are writable. It was not reached through an `Include` that sits inside a `Host` or `Match` block, because such an inclusion is conditional.
 - **Lossless.** The effective configuration check below passes.
 
-Every other discovered external host is listed as ineligible with exactly one reason, the first rule it breaks, in the order above, for example `Host line declares 2 aliases`, `ForwardAgent is not supported by Portico`, `declared in 2 files` or `effective configuration would change (User: alice -> root)`.
+Every other discovered external host is listed as ineligible with exactly one reason, the first rule it breaks, in the order above, for example `Host line declares 2 aliases`, `ForwardAgent is not supported by Portico`, `declared in 2 files` or `effective configuration would change (-user root, +user alice)`.
 
 A missing `HostName` is written as `HostName <alias>`, which is OpenSSH's own default, so it does not change the effective configuration.
 

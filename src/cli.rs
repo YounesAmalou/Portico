@@ -1211,7 +1211,6 @@ mod tests {
         let (_dir, app) = adoption_app(THREE_HOSTS);
         let (exit, output, error) = run_command(&app, &["adopt"], "2\ny\n", true);
         assert_eq!(exit, std::process::ExitCode::SUCCESS, "{error}");
-        println!("{output}");
         assert!(output.starts_with(
             "Eligible hosts:\n  1. one  ~/.ssh/config\n  2. two  ~/.ssh/config\n  3. three  ~/.ssh/config\n\
              Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n\
