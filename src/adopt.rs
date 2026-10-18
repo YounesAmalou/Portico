@@ -960,6 +960,60 @@ impl MigrationPlan {
 }
 
 #[cfg(test)]
+impl MigrationPlan {
+    /// A plan over made-up files: each eligible candidate is a `Host <alias>` block with a
+    /// `HostName <alias>.example` line, appended to its source file for adoption and kept in the
+    /// managed fragment for export, below an entry config holding only the Portico Include.
+    pub(crate) fn for_tests(direction: Direction, candidates: Vec<Candidate>) -> Self {
+        let managed = PathBuf::from("/home/test/.ssh/portico/config");
+        let entry = PathBuf::from("/home/test/.ssh/config");
+        let mut config = ManagedConfig::empty();
+        let mut snapshot = BTreeMap::<PathBuf, Vec<u8>>::new();
+        let mut moves = BTreeMap::new();
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.reason.is_none())
+        {
+            let alias = &candidate.alias;
+            let host = Host::new(alias, format!("{alias}.example"), None, None, None, None)
+                .expect("a valid test host");
+            let (file, removed) = match direction {
+                Direction::Adopt => {
+                    let contents = snapshot.entry(candidate.source.clone()).or_default();
+                    let start = contents.iter().filter(|&&byte| byte == b'\n').count();
+                    contents
+                        .extend(format!("Host {alias}\n  HostName {alias}.example\n\n").bytes());
+                    (candidate.source.clone(), start..start + 3)
+                }
+                Direction::Export => {
+                    config.insert(host.clone()).expect("distinct test aliases");
+                    (entry.clone(), 0..0)
+                }
+            };
+            let item = Move {
+                file,
+                removed,
+                host,
+                comments: HostComments::default(),
+            };
+            moves.insert(alias.to_ascii_lowercase(), item);
+        }
+        snapshot.insert(managed.clone(), config.render().into_bytes());
+        snapshot
+            .entry(entry.clone())
+            .or_insert_with(|| b"Include ~/.ssh/portico/config\n".to_vec());
+        Self {
+            direction,
+            candidates,
+            managed,
+            entry,
+            snapshot,
+            moves,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::managed::{ConfigPaths, ManagedStore};
