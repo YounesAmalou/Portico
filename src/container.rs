@@ -250,7 +250,7 @@ pub enum ResolveError {
 
 /// Finds the container a user means. The first form that matches anything
 /// decides: the exact name, `project/service` or `project/service#n`, a bare
-/// service name, then an ID prefix of at least four hex digits.
+/// service name, `service#n`, then an ID prefix of at least four hex digits.
 pub fn resolve<'a>(
     reference: &str,
     containers: &'a [Container],
@@ -278,9 +278,21 @@ pub fn resolve<'a>(
     if !by_service.is_empty() {
         return pick(by_service);
     }
+    // `service#n`, as `display_name` shows a replica.
+    if let Some((service, number)) = reference.split_once('#')
+        && let Ok(number) = number.parse::<u32>()
+    {
+        let found = matching(containers, |c| {
+            c.service.as_deref() == Some(service) && c.number == Some(number)
+        });
+        if !found.is_empty() {
+            return pick(found);
+        }
+    }
     let is_id_prefix = reference.len() >= 4 && reference.chars().all(|c| c.is_ascii_hexdigit());
     if is_id_prefix {
-        return pick(matching(containers, |c| c.id.starts_with(reference)));
+        let prefix = reference.to_ascii_lowercase();
+        return pick(matching(containers, |c| c.id.starts_with(&prefix)));
     }
     Err(ResolveError::NotFound)
 }
@@ -372,7 +384,7 @@ echo "socket=$socket"
 socket_group=
 if [ -n "$socket" ] && command -v stat >/dev/null 2>&1; then socket_group=$(stat -c %G "$socket" 2>/dev/null); fi
 echo "socket_group=$socket_group"
-for tool in sg newgrp systemctl; do
+for tool in sg systemctl; do
   if command -v $tool >/dev/null 2>&1; then echo "$tool=yes"; else echo "$tool=no"; fi
 done
 "#;
@@ -389,7 +401,6 @@ pub struct Probe {
     pub socket: String,
     pub socket_group: Option<String>,
     pub has_sg: bool,
-    pub has_newgrp: bool,
     pub has_systemctl: bool,
 }
 
@@ -415,16 +426,14 @@ pub fn parse_probe(stdout: &str) -> Option<Probe> {
             .filter(|group| !group.is_empty())
             .map(String::from),
         has_sg: value("sg") == "yes",
-        has_newgrp: value("newgrp") == "yes",
         has_systemctl: value("systemctl") == "yes",
     })
 }
 
-/// The tool that runs a command inside the docker group.
+/// The tool that runs a command inside the docker group. `newgrp` cannot: it takes no command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum GroupTool {
     Sg,
-    Newgrp,
 }
 
 /// What to do about a refused docker socket.
@@ -432,7 +441,7 @@ pub enum GroupTool {
 pub enum Access {
     /// The user is in the group, but this process predates it: rerun inside it.
     RerunInGroup(GroupTool),
-    /// Same, but neither tool exists: a new login is needed.
+    /// Same, but `sg` does not exist: a new login is needed.
     NeedsLogin,
     /// Offer to add the user to the docker group.
     OfferJoin,
@@ -445,8 +454,6 @@ pub fn decide(probe: &Probe) -> Access {
     if has(&probe.database_groups) && !has(&probe.process_groups) {
         return if probe.has_sg {
             Access::RerunInGroup(GroupTool::Sg)
-        } else if probe.has_newgrp {
-            Access::RerunInGroup(GroupTool::Newgrp)
         } else {
             Access::NeedsLogin
         };
@@ -464,12 +471,9 @@ pub fn decide(probe: &Probe) -> Access {
 
 /// Wraps a command so it runs inside the docker group.
 pub fn in_group(tool: GroupTool, words: &[String]) -> Vec<String> {
-    let tool = match tool {
-        GroupTool::Sg => "sg",
-        GroupTool::Newgrp => "newgrp",
-    };
+    let GroupTool::Sg = tool;
     vec![
-        tool.to_string(),
+        "sg".to_string(),
         "docker".to_string(),
         "-c".to_string(),
         remote_command(words),
@@ -680,6 +684,8 @@ mod tests {
             container("shop-web-2", Some("shop"), Some("web"), 2),
         ];
         assert_eq!(resolved("shop/web#2", &replicas), Ok("shop-web-2"));
+        assert_eq!(resolved("web#2", &replicas), Ok("shop-web-2"));
+        assert_eq!(resolved("web#3", &replicas), Err(ResolveError::NotFound));
         assert_eq!(
             resolved("shop/web#3", &replicas),
             Err(ResolveError::NotFound)
@@ -723,6 +729,7 @@ mod tests {
             with_id(container("c", None, None, 0), "9f00998877"),
         ];
         assert_eq!(resolved("3174", &all), Ok("a"));
+        assert_eq!(resolved("3174ABCD", &all), Ok("a"));
         assert_eq!(resolved("317", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("zzzz", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("9f00", &all), ambiguous(&["b", "c"]));
@@ -839,7 +846,6 @@ mod tests {
             socket: "/var/run/docker.sock".into(),
             socket_group: Some("staff".into()),
             has_sg: true,
-            has_newgrp: true,
             has_systemctl: true,
         }
     }
@@ -848,7 +854,7 @@ mod tests {
     fn parses_probe_output() {
         let out = "motd noise\nuser=ann\nprocess=ann wheel\ndatabase=ann wheel docker\n\
                    group=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\n\
-                   sg=yes\nnewgrp=no\nsystemctl=yes\n";
+                   sg=yes\nsystemctl=yes\n";
         let parsed = parse_probe(out).unwrap();
         assert_eq!(parsed.user, "ann");
         assert_eq!(parsed.process_groups, ["ann", "wheel"]);
@@ -856,7 +862,7 @@ mod tests {
         assert!(parsed.group_exists);
         assert_eq!(parsed.socket, "/var/run/docker.sock");
         assert_eq!(parsed.socket_group.as_deref(), Some("docker"));
-        assert!(parsed.has_sg && !parsed.has_newgrp && parsed.has_systemctl);
+        assert!(parsed.has_sg && parsed.has_systemctl);
 
         let unknown = parse_probe("user=ann\nsocket=\nsocket_group=\n").unwrap();
         assert_eq!(unknown.socket_group, None);
@@ -865,13 +871,11 @@ mod tests {
     }
 
     #[test]
-    fn decides_rerun_with_sg_then_newgrp_then_login() {
+    fn decides_rerun_with_sg_then_login() {
         let mut p = probe();
         p.database_groups.push("docker".into());
         assert_eq!(decide(&p), Access::RerunInGroup(GroupTool::Sg));
         p.has_sg = false;
-        assert_eq!(decide(&p), Access::RerunInGroup(GroupTool::Newgrp));
-        p.has_newgrp = false;
         assert_eq!(decide(&p), Access::NeedsLogin);
     }
 
@@ -930,7 +934,6 @@ mod tests {
             in_group(GroupTool::Sg, &words),
             ["sg", "docker", "-c", &remote_command(&words)]
         );
-        assert_eq!(in_group(GroupTool::Newgrp, &words)[0], "newgrp");
         assert_eq!(
             join_group_words("ann", "/var/run/docker.sock"),
             [

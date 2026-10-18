@@ -118,14 +118,13 @@ impl From<DockerIssue> for ContainerError {
 
 /// The programs container commands run on this machine. On a host the bare names are used.
 ///
-/// Only the first word of a local command is mapped, so the `docker` inside an `sg` or `newgrp`
+/// Only the first word of a local command is mapped, so the `docker` inside an `sg`
 /// rerun (`sg docker -c 'docker ps …'`) is the bare name, found on PATH.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerPrograms {
     pub docker: PathBuf,
     pub sudo: PathBuf,
     pub sg: PathBuf,
-    pub newgrp: PathBuf,
     pub sh: PathBuf,
     /// The CLI's container picker.
     pub fzf: PathBuf,
@@ -137,7 +136,6 @@ impl Default for ContainerPrograms {
             docker: "docker".into(),
             sudo: "sudo".into(),
             sg: "sg".into(),
-            newgrp: "newgrp".into(),
             sh: "sh".into(),
             fzf: "fzf".into(),
         }
@@ -194,7 +192,7 @@ impl App {
             }
             Access::NeedsLogin => DockerIssue {
                 headline: format!(
-                    "{} is in the docker group on {target}, but this session started before that and neither sg nor newgrp is available.",
+                    "{} is in the docker group on {target}, but this session started before that and sg is not available.",
                     probe.user
                 ),
                 next: vec!["Log out and back in, then list again.".into()],
@@ -400,7 +398,6 @@ impl App {
             "docker" => programs.docker.as_os_str(),
             "sudo" => programs.sudo.as_os_str(),
             "sg" => programs.sg.as_os_str(),
-            "newgrp" => programs.newgrp.as_os_str(),
             "sh" => programs.sh.as_os_str(),
             other => OsStr::new(other),
         }
@@ -453,7 +450,6 @@ fn lossy(bytes: &[u8]) -> String {
 fn tool_name(tool: GroupTool) -> &'static str {
     match tool {
         GroupTool::Sg => "sg",
-        GroupTool::Newgrp => "newgrp",
     }
 }
 
@@ -605,7 +601,7 @@ mod tests {
         app: App,
     }
 
-    const PROGRAMS: [&str; 7] = ["ssh", "terminal", "docker", "sudo", "sg", "newgrp", "sh"];
+    const PROGRAMS: [&str; 6] = ["ssh", "terminal", "docker", "sudo", "sg", "sh"];
 
     fn fixture() -> Fixture {
         fixture_with_portico(None)
@@ -636,7 +632,6 @@ mod tests {
             docker: program("docker"),
             sudo: program("sudo"),
             sg: program("sg"),
-            newgrp: program("newgrp"),
             sh: program("sh"),
             fzf: program("fzf"),
         });
@@ -901,49 +896,6 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_session_older_than_the_group_reruns_through_newgrp() {
-        let fixture = fixture();
-        fixture.behave(
-            "ssh",
-            &format!(
-                "case \"$last\" in\n*'id -un'*) {probe};;\n*'newgrp docker'*) echo '{LISTING}' ;;\n*) echo '{DENIED}' >&2; exit 1 ;;\nesac\n",
-                probe = probe_output("me docker", "yes", SOCKET, "docker", "sg=no\\nnewgrp=yes\\nsystemctl=no\\n"),
-            ),
-        );
-
-        let list = fixture.app.containers(&host(), true, None).unwrap();
-
-        assert_eq!(list.via, Some(GroupTool::Newgrp));
-        assert_eq!(
-            list.note.as_deref(),
-            Some(
-                "Ran docker through `newgrp docker`: other shells need `newgrp docker` or a new login."
-            )
-        );
-        let calls = fixture.calls("ssh");
-        assert!(
-            calls.contains(&remote_command(&[
-                "sh",
-                "-c",
-                crate::container::PROBE_SCRIPT
-            ])),
-            "{calls}"
-        );
-        assert!(
-            calls.ends_with(&call(&[
-                "-o",
-                "RemoteCommand=none",
-                "-o",
-                "BatchMode=yes",
-                "--",
-                "dev",
-                &remote_command(&in_group(GroupTool::Newgrp, &ps_words())),
-            ])),
-            "{calls}"
-        );
-    }
-
-    #[test]
     fn a_user_outside_the_group_is_offered_to_join_it() {
         let fixture = fixture();
         fixture.behave(
@@ -992,19 +944,25 @@ mod tests {
     }
 
     #[test]
-    fn a_session_older_than_the_group_without_sg_or_newgrp_needs_a_login() {
+    fn a_session_older_than_the_group_without_sg_needs_a_login() {
         let fixture = fixture();
         fixture.behave("docker", &fails_with(DENIED));
         fixture.behave(
             "sh",
-            &probe_output("me docker", "yes", SOCKET, "docker", NO_TOOLS),
+            &probe_output(
+                "me docker",
+                "yes",
+                SOCKET,
+                "docker",
+                "sg=no\\nnewgrp=yes\\nsystemctl=no\\n",
+            ),
         );
 
         let issue = docker_issue(fixture.app.containers(&Target::Local, false, None));
 
         assert_eq!(
             issue.headline,
-            "me is in the docker group on this machine, but this session started before that and neither sg nor newgrp is available."
+            "me is in the docker group on this machine, but this session started before that and sg is not available."
         );
         assert_eq!(issue.next, ["Log out and back in, then list again."]);
         assert_eq!(issue.offer, None);
@@ -1262,7 +1220,7 @@ mod tests {
                 &Target::Local,
                 "abc123",
                 None,
-                Some(GroupTool::Newgrp),
+                Some(GroupTool::Sg),
                 true,
                 None,
                 false,
@@ -1275,7 +1233,7 @@ mod tests {
                 "shell",
                 "--hold",
                 "--via",
-                "newgrp",
+                "sg",
                 "--",
                 "abc123"
             ])
@@ -1368,7 +1326,6 @@ mod tests {
         assert_eq!(programs.docker, Path::new("docker"));
         assert_eq!(programs.sudo, Path::new("sudo"));
         assert_eq!(programs.sg, Path::new("sg"));
-        assert_eq!(programs.newgrp, Path::new("newgrp"));
         assert_eq!(programs.sh, Path::new("sh"));
     }
 }

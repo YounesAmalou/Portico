@@ -133,14 +133,12 @@ enum Command {
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
 enum Via {
     Sg,
-    Newgrp,
 }
 
 impl From<Via> for GroupTool {
     fn from(via: Via) -> Self {
         match via {
             Via::Sg => GroupTool::Sg,
-            Via::Newgrp => GroupTool::Newgrp,
         }
     }
 }
@@ -1512,7 +1510,7 @@ mod tests {
     /// sources `<name>.behaviour` when it exists.
     fn container_app() -> (TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["docker", "sudo", "sg", "newgrp", "sh", "fzf"] {
+        for name in ["docker", "sudo", "sg", "sh", "fzf"] {
             let base = dir.path().join(name);
             write_executable(
                 &base,
@@ -1531,7 +1529,6 @@ mod tests {
             docker: program("docker"),
             sudo: program("sudo"),
             sg: program("sg"),
-            newgrp: program("newgrp"),
             sh: program("sh"),
             fzf: program("fzf"),
         });
@@ -1823,7 +1820,6 @@ fi
                 via: Some(Via::Sg),
             }) if container == "abcd" && on == "dev" && user == "root"
         ));
-        assert_eq!(GroupTool::from(Via::Newgrp), GroupTool::Newgrp);
     }
 
     #[test]
