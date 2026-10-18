@@ -1,6 +1,10 @@
 use std::{
-    io::{BufRead, Write},
+    io::{self, BufRead, Write},
     process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
@@ -8,7 +12,7 @@ use crate::{
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
-    openssh::{ConnectionOutcome, PresentedKey},
+    openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     probe::ProbeResult,
 };
 
@@ -76,6 +80,52 @@ enum Command {
     },
 }
 
+/// The exit status of a `portico test` that a signal cancelled, as for SIGINT.
+const CANCELLED: u8 = 130;
+
+/// SIGINT, SIGTERM and SIGHUP during `portico test`.
+///
+/// `ssh` runs in its own process group, out of reach of the terminal's Ctrl+C, so while it runs
+/// these signals only set `cancelled`, and the test kills it and returns. Anywhere else, such as at
+/// the trust prompt, they end Portico as they would without these handlers.
+struct Interrupts {
+    cancelled: Arc<AtomicBool>,
+    default_action: Arc<AtomicBool>,
+}
+
+impl Interrupts {
+    fn install(handle_signals: bool) -> io::Result<Self> {
+        let interrupts = Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            default_action: Arc::new(AtomicBool::new(true)),
+        };
+        if handle_signals {
+            for signal in [
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+                signal_hook::consts::SIGHUP,
+            ] {
+                signal_hook::flag::register_conditional_default(
+                    signal,
+                    Arc::clone(&interrupts.default_action),
+                )?;
+                signal_hook::flag::register(signal, Arc::clone(&interrupts.cancelled))?;
+            }
+        }
+        Ok(interrupts)
+    }
+
+    /// Runs `test` with the cancel flag the signals set.
+    fn during<T>(&self, test: impl FnOnce(&AtomicBool) -> T) -> T {
+        self.default_action.store(false, Ordering::SeqCst);
+        let result = test(&self.cancelled);
+        self.default_action.store(true, Ordering::SeqCst);
+        result
+    }
+}
+
+/// Runs `cli`. `handle_signals` lets `portico test` catch SIGINT, SIGTERM and SIGHUP to stop
+/// its `ssh`; only the real program sets it, so tests never install process-wide handlers.
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,
@@ -83,13 +133,14 @@ pub fn run<I, O, E>(
     output: &mut O,
     error: &mut E,
     interactive: bool,
+    handle_signals: bool,
 ) -> ExitCode
 where
     I: BufRead,
     O: Write,
     E: Write,
 {
-    match execute(cli, app, input, output, interactive) {
+    match execute(cli, app, input, output, interactive, handle_signals) {
         Ok(exit) => exit,
         Err(message) => {
             let _ = writeln!(error, "error: {message}");
@@ -104,6 +155,7 @@ fn execute<I: BufRead, O: Write>(
     input: &mut I,
     output: &mut O,
     interactive: bool,
+    handle_signals: bool,
 ) -> Result<ExitCode, String> {
     match cli.command {
         None => crate::tui::run(app)
@@ -243,7 +295,15 @@ fn execute<I: BufRead, O: Write>(
             accept_host_key,
         }) => {
             let target = TestTarget::Saved(alias);
-            let outcome = app.test(&target).map_err(|error| error.to_string())?;
+            let interrupts = Interrupts::install(handle_signals)
+                .map_err(|error| format!("cannot handle signals: {error}"))?;
+            let outcome =
+                match interrupts.during(|cancelled| app.test_cancellable(&target, cancelled)) {
+                    Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                        return print_cancelled(output, target.alias());
+                    }
+                    outcome => outcome.map_err(|error| error.to_string())?,
+                };
             let (report, key) = match outcome {
                 TestOutcome::Done(report) => return print_report(output, &report),
                 TestOutcome::UnknownHostKey { report, key } => (report, key),
@@ -287,10 +347,14 @@ fn execute<I: BufRead, O: Write>(
                 writeln!(output, "Host key not trusted.").map_err(|error| error.to_string())?;
                 return Ok(ExitCode::from(1));
             }
-            match app
-                .trust_and_retest(&target, &key)
-                .map_err(|error| error.to_string())?
-            {
+            let retested = interrupts
+                .during(|cancelled| app.trust_and_retest_cancellable(&target, &key, cancelled));
+            match match retested {
+                Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                    return print_cancelled(output, target.alias());
+                }
+                retested => retested.map_err(|error| error.to_string())?,
+            } {
                 TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
                     print_report(output, &report)
                 }
@@ -311,6 +375,11 @@ fn print_untrusted_key(
     }
     text.push_str("Compare it with the fingerprint from the server's administrator or console.\n");
     write!(output, "{text}").map_err(|error| error.to_string())
+}
+
+fn print_cancelled(output: &mut impl Write, alias: &str) -> Result<ExitCode, String> {
+    writeln!(output, "{alias}: cancelled").map_err(|error| error.to_string())?;
+    Ok(ExitCode::from(CANCELLED))
 }
 
 fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
@@ -539,6 +608,7 @@ mod tests {
             &mut output,
             &mut error,
             true,
+            false,
         );
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
@@ -551,6 +621,7 @@ mod tests {
             &mut output,
             &mut error,
             true,
+            false,
         );
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         assert!(app.show("dev").is_ok());
@@ -562,6 +633,7 @@ mod tests {
             &mut output,
             &mut error,
             true,
+            false,
         );
         assert!(matches!(app.show("dev"), Err(AppError::UnknownHost(_))));
     }
@@ -586,6 +658,7 @@ mod tests {
                 &mut output,
                 &mut error,
                 true,
+                false,
             );
             assert_eq!(exit, std::process::ExitCode::FAILURE);
             assert!(output.is_empty(), "prompted for {alias}");
@@ -647,6 +720,7 @@ mod tests {
             &mut output,
             &mut Vec::new(),
             true,
+            false,
         );
         (exit, String::from_utf8(output).unwrap())
     }

@@ -433,3 +433,80 @@ fn external_hosts_can_be_tested() {
     env.run(["test", "legacy"])
         .assert_stdout_contains("legacy: authenticated as deploy@10.0.0.5:22 (publickey)");
 }
+
+fn alive(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit(')')
+                .next()
+                .map(|rest| rest.trim_start().to_owned())
+        })
+        .is_some_and(|state| !state.starts_with('Z'))
+}
+
+#[test]
+fn interrupting_a_test_stops_ssh_and_exits_130() {
+    use std::{
+        io::Read,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let env = env_with_dev();
+    let pid_file = env.home().join("ssh.pid");
+    env.install_program(
+        "ssh",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser deploy\\nport 22\\n'; exit 0; fi\nprintf '%s' \"$$\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    let mut portico = env.spawn(["test", "dev"]);
+    let started = Instant::now();
+    let ssh: libc::pid_t = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            break pid.parse().unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ssh never started"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    // SAFETY: plain kill(2) on a child this test started.
+    assert_eq!(
+        unsafe { libc::kill(portico.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+
+    let status = loop {
+        if let Some(status) = portico.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = portico.kill();
+            panic!("portico ignored SIGINT");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    portico
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let ssh_gone = Instant::now();
+    while alive(ssh) {
+        if ssh_gone.elapsed() > Duration::from_secs(5) {
+            // SAFETY: as above; never leave the fake behind.
+            unsafe { libc::kill(ssh, libc::SIGKILL) };
+            panic!("ssh {ssh} outlived the interrupted test");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(status.code(), Some(130), "{status:?}\n{stdout}");
+    assert_eq!(stdout, "dev: cancelled\n");
+}
