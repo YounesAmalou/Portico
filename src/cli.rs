@@ -4,11 +4,12 @@ use std::{
 };
 
 use crate::{
-    app::{App, AppError, HostDetails, Ownership},
+    app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
-    openssh::ConnectionOutcome,
+    openssh::{ConnectionOutcome, PresentedKey},
+    probe::ProbeResult,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -67,6 +68,11 @@ enum Command {
         alias: String,
         #[arg(short = 'n', long = "new-terminal")]
         new_terminal: bool,
+    },
+    Test {
+        alias: String,
+        #[arg(long = "accept-host-key", value_name = "FINGERPRINT")]
+        accept_host_key: Option<String>,
     },
 }
 
@@ -232,7 +238,115 @@ fn execute<I: BufRead, O: Write>(
                 }
             })
         }
+        Some(Command::Test {
+            alias,
+            accept_host_key,
+        }) => {
+            let target = TestTarget::Saved(alias);
+            let outcome = app.test(&target).map_err(|error| error.to_string())?;
+            let (report, key) = match outcome {
+                TestOutcome::Done(report) => return print_report(output, &report),
+                TestOutcome::UnknownHostKey { report, key } => (report, key),
+            };
+            print_untrusted_key(output, &report.alias, &key)?;
+            let trusted = match accept_host_key {
+                Some(expected) => {
+                    let matches = !key.fingerprints.is_empty()
+                        && key
+                            .fingerprints
+                            .iter()
+                            .all(|presented| presented.fingerprint == expected);
+                    if !matches {
+                        writeln!(
+                            output,
+                            "{}: failed \u{2014} the host key fingerprint does not match --accept-host-key",
+                            report.alias
+                        )
+                        .map_err(|error| error.to_string())?;
+                        return Ok(ExitCode::from(1));
+                    }
+                    true
+                }
+                None if interactive => confirm(input, output, "Trust this host key? [y/N] ")?,
+                None => {
+                    // --accept-host-key needs one fingerprint that every key shares.
+                    let shared = match key.fingerprints.split_first() {
+                        Some((first, rest))
+                            if rest.iter().all(|key| key.fingerprint == first.fingerprint) =>
+                        {
+                            first.fingerprint.as_str()
+                        }
+                        _ => "<fingerprint>",
+                    };
+                    writeln!(output, "hint: pass --accept-host-key {shared} to trust it")
+                        .map_err(|error| error.to_string())?;
+                    return Ok(ExitCode::from(1));
+                }
+            };
+            if !trusted {
+                writeln!(output, "Host key not trusted.").map_err(|error| error.to_string())?;
+                return Ok(ExitCode::from(1));
+            }
+            match app
+                .trust_and_retest(&target, &key)
+                .map_err(|error| error.to_string())?
+            {
+                TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
+                    print_report(output, &report)
+                }
+            }
+        }
     }
+}
+
+fn print_untrusted_key(
+    output: &mut impl Write,
+    alias: &str,
+    key: &PresentedKey,
+) -> Result<(), String> {
+    let mut text = format!("{alias}: host key not trusted\n");
+    for presented in &key.fingerprints {
+        // A hashed known-hosts name is unreadable, so name the alias instead.
+        let host = if presented.host.starts_with("|1|") {
+            alias
+        } else {
+            &presented.host
+        };
+        text.push_str(&format!(
+            "{host} presents an {} key with fingerprint {}\n",
+            presented.key_type, presented.fingerprint
+        ));
+    }
+    text.push_str("Compare it with the fingerprint from the server's administrator or console.\n");
+    write!(output, "{text}").map_err(|error| error.to_string())
+}
+
+fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
+    let alias = &report.alias;
+    let text = match &report.result {
+        ProbeResult::Authenticated(success) => {
+            let (address, port, method) = (&success.address, success.port, &success.method);
+            let line = match &report.user {
+                Some(user) => {
+                    format!("{alias}: authenticated as {user}@{address}:{port} ({method})")
+                }
+                None => format!("{alias}: authenticated to {address}:{port} ({method})"),
+            };
+            writeln!(output, "{line}").map_err(|error| error.to_string())?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        ProbeResult::Failed(failure) => {
+            let mut text = format!("{alias}: failed \u{2014} {failure}\n");
+            if let Some(fetch) = &report.key_fetch_failure {
+                text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
+            } else if let Some(hint) = failure.hint() {
+                text.push_str(&format!("hint: {hint}\n"));
+            }
+            text
+        }
+    };
+    write!(output, "{text}").map_err(|error| error.to_string())?;
+    Ok(ExitCode::from(1))
 }
 
 /// Resolves `--<flag> value` and `--unset <flag>` for one field, rejecting both together.
@@ -515,6 +629,70 @@ mod tests {
             field_change(Some(1), "port", ClearField::Port, &[ClearField::Port]),
             Err("--unset port conflicts with --port".into())
         );
+    }
+
+    /// An initialized app with a saved `dev` whose key is unknown until
+    /// `~/.ssh/known_hosts` exists.
+    fn unknown_key_app() -> (TempDir, App) {
+        let (dir, app) = test_app();
+        app.initialize(true).unwrap();
+        app.add(Host::new("dev", "h.example", None, None, None, None).unwrap())
+            .unwrap();
+        write_executable(
+            dir.path().join("ssh"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser deploy\\nport 22\\nuserknownhostsfile ~/.ssh/known_hosts\\n'; exit 0; fi\nkh=; prev=\nfor a do\n  case \"$prev$a\" in -oUserKnownHostsFile=*) kh=${{a#UserKnownHostsFile=}} ;; esac\n  prev=; [ \"$a\" = -o ] && prev=-o\ndone\nif [ -n \"$kh\" ]; then echo '|1|salt|hash ssh-ed25519 AAAAkey' >> \"$kh\"; exit 255; fi\nif [ -f '{}' ]; then\n  printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using \"publickey\".\\n' >&2\nelse\n  echo 'Host key verification failed.' >&2; exit 255\nfi\n",
+                dir.path().join(".ssh/known_hosts").display()
+            ),
+        );
+        write_executable(
+            dir.path().join("ssh-keygen"),
+            "#!/bin/sh\nprintf '256 SHA256:abc |1|salt|hash (ED25519)\\n'\n",
+        );
+        let app = App::new(
+            ManagedStore::new(ConfigPaths::from_home(dir.path())),
+            OpenSsh::new(dir.path().join("ssh"), dir.path().join("ssh"))
+                .with_keygen(dir.path().join("ssh-keygen")),
+        );
+        (dir, app)
+    }
+
+    fn run_test_command(app: &App, answer: &[u8]) -> (std::process::ExitCode, String) {
+        let mut output = Vec::new();
+        let exit = run(
+            Cli::try_parse_from(["portico", "test", "dev"]).unwrap(),
+            app,
+            &mut Cursor::new(answer),
+            &mut output,
+            &mut Vec::new(),
+            true,
+        );
+        (exit, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn answering_y_trusts_the_key_and_retests() {
+        let (dir, app) = unknown_key_app();
+        let (exit, output) = run_test_command(&app, b"y\n");
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert_eq!(
+            output,
+            "dev: host key not trusted\n\
+             dev presents an ED25519 key with fingerprint SHA256:abc\n\
+             Compare it with the fingerprint from the server's administrator or console.\n\
+             Trust this host key? [y/N] \
+             dev: authenticated as deploy@10.0.0.5:22 (publickey)\n"
+        );
+        assert!(dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    #[test]
+    fn declining_trusts_nothing_and_exits_one() {
+        let (dir, app) = unknown_key_app();
+        let (exit, output) = run_test_command(&app, b"n\n");
+        assert_eq!(exit, std::process::ExitCode::from(1));
+        assert!(output.ends_with("Trust this host key? [y/N] Host key not trusted.\n"));
+        assert!(!dir.path().join(".ssh/known_hosts").exists());
     }
 
     fn test_app() -> (TempDir, App) {
