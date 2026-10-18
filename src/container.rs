@@ -414,9 +414,13 @@ mod tests {
 
     #[test]
     fn decodes_unicode_escapes_and_skips_lone_surrogates() {
-        let escaped = r#"{"id":"a","ports":"0.0.0.0:80>80/tcp 😀"}"#;
+        let escaped =
+            r#"{"id":"a","name":"\u00e9 \ud83d\ude00","ports":"0.0.0.0:80\u002d\u003e80/tcp"}"#;
+        assert!(escaped.contains("\\ud83d"));
         let listing = parse_listing(escaped);
-        assert_eq!(listing.containers[0].ports, "0.0.0.0:80>80/tcp 😀");
+        assert_eq!(listing.skipped, 0);
+        assert_eq!(listing.containers[0].name, "é 😀");
+        assert_eq!(listing.containers[0].ports, "0.0.0.0:80->80/tcp");
         let lone = r#"{"id":"a","name":"\ud83dx"}"#;
         let listing = parse_listing(lone);
         assert!(listing.containers.is_empty());
@@ -527,6 +531,18 @@ mod tests {
         assert_eq!(resolved("317", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("zzzz", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("9f00", &all), ambiguous(&["b", "c"]));
+    }
+
+    #[test]
+    fn bare_service_with_replicas_is_ambiguous() {
+        let all = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("shop-web-2", Some("shop"), Some("web"), 2),
+        ];
+        assert_eq!(
+            resolved("web", &all),
+            ambiguous(&["shop-web-1", "shop-web-2"])
+        );
     }
 
     #[test]
