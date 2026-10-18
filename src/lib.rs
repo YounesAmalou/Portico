@@ -7,6 +7,7 @@ pub mod host;
 pub mod managed;
 pub mod openssh;
 pub mod probe;
+pub mod suggest;
 pub mod tui;
 
 #[cfg(test)]
