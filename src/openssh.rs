@@ -385,7 +385,10 @@ impl OpenSsh {
                     }
                     stderr.push_str(&line);
                     stderr.push('\n');
-                    continue;
+                    // A steady trickle of output must not hold off the deadline.
+                    if Instant::now() < deadline {
+                        continue;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1648,18 +1651,53 @@ mod tests {
         let (fake, pid) = fake_hanging_ssh(None);
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
 
-        let result = openssh
-            .probe_with_deadline(
+        let probe = thread::spawn(move || {
+            openssh.probe_with_deadline(
                 None,
                 "dev",
                 Route::Direct,
                 &AtomicBool::new(false),
-                Duration::from_millis(200),
+                Duration::from_secs(1),
             )
+        });
+        let pid = wait_for_file(&pid);
+        let result = probe.join().unwrap().unwrap();
+
+        assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
+        assert_dies(&pid);
+    }
+
+    #[test]
+    fn the_deadline_holds_while_stderr_keeps_arriving() {
+        let fake = fake_ssh();
+        let pid = fake.log.with_file_name("pid");
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwhile :; do echo still trying >&2; sleep 0.01; done\n",
+                pid.display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let (sender, results) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(openssh.probe_with_deadline(
+                None,
+                "dev",
+                Route::Direct,
+                &AtomicBool::new(false),
+                Duration::from_millis(300),
+            ));
+        });
+        let pid = wait_for_file(&pid);
+
+        let result = results
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the probe ran past its deadline")
             .unwrap();
 
         assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
-        assert_dies(&wait_for_file(&pid));
+        assert_dies(&pid);
     }
 
     #[test]
