@@ -15,7 +15,7 @@ It implements the "Jump host suggestions" slice of `ROADMAP.md` (v2). The CLI is
 - **The current hop.** ProxyJump takes several hops separated by commas. Suggestions match the hop the cursor is in: the text between the commas around the cursor. When that hop has a `user@` part, only the text after the `@` is matched, and the `user@` is kept on a pick. When a `:` follows the host part (a port is being typed), the hop gets no suggestions.
 - **Candidates.** Every alias in the TUI's host inventory, managed and external. Wildcard patterns are already skipped by discovery. An alias listed by several files appears once; the managed entry is preferred, otherwise the first one in inventory order.
 - **Exclusions.** The host being edited (in an add form, the value of the Alias field) and every alias already used by another hop of the same field.
-- **Ranking.** A candidate matches when it contains the query, ignoring case. Candidates that start with the query come first, then the rest; each group is sorted alphabetically.
+- **Ranking.** A candidate matches when it contains the query, ignoring case and the accents of Latin letters (`cafe` finds `CAFÉ`). Duplicates are collapsed ignoring ASCII case only, as OpenSSH's host matching does, so `CAFÉ` and `café` stay two hosts. Candidates that start with the query come first, then the rest; each group is sorted alphabetically.
 - **Each row** shows the alias and its origin: `managed`, or the source file of an external host with `$HOME` shown as `~`.
 
 ### When the dropdown opens and closes
@@ -39,7 +39,8 @@ When it is closed, every key behaves exactly as today.
 ### Layout
 
 - The dropdown is drawn as boxed lines directly under the ProxyJump row, aligned with the value column, with the selected row marked `>`; the origin is shown beside each alias. ProxyJump is the last field, so only the hint, error and test-result lines below it move down.
-- At most 5 rows are visible; the list scrolls to keep the selection visible and starts on the first match.
+- At most 5 rows are visible, fewer when the pane is too short to keep the fields, the dropdown and the hint under it on screen. In a narrow pane the indent shrinks first, then the origins are shortened from the left with `…`, then the aliases from the right. Widths are measured in terminal columns, so wide characters keep the box aligned.
+- The list scrolls to keep the selection visible and starts on the first match.
 - While it is open the form footer reads `↑↓ choose  Enter pick  Esc close` instead of the usual form keys. The usual footer advertises `Ctrl+Space suggest` when ProxyJump is focused.
 
 ## Code layout

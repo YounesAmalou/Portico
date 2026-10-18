@@ -48,8 +48,9 @@ pub fn current_hop(value: &str, cursor: usize) -> Option<Hop> {
     })
 }
 
-/// The candidates matching `query`, without duplicates or `exclude`d aliases: those starting with
-/// the query first, then those containing it, each group in alphabetical order.
+/// The candidates matching `query` (ignoring case and accents), without duplicates or `exclude`d
+/// aliases: those starting with the query first, then those containing it, each group in
+/// alphabetical order. Duplicates ignore ASCII case only, as OpenSSH's host matching does.
 pub fn rank(query: &str, candidates: &[Candidate], exclude: &[&str]) -> Vec<Candidate> {
     let mut unique: Vec<Candidate> = Vec::new();
     for candidate in candidates {
@@ -71,20 +72,58 @@ pub fn rank(query: &str, candidates: &[Candidate], exclude: &[&str]) -> Vec<Cand
             None => unique.push(candidate.clone()),
         }
     }
-    let query = query.to_lowercase();
+    let query = fold(query);
     let mut matches: Vec<(bool, String, Candidate)> = unique
         .into_iter()
         .filter_map(|candidate| {
-            let lower = candidate.alias.to_lowercase();
-            lower
+            let folded = fold(&candidate.alias);
+            folded
                 .contains(&query)
-                .then(|| (!lower.starts_with(&query), lower, candidate))
+                .then(|| (!folded.starts_with(&query), folded, candidate))
         })
         .collect();
-    matches.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    matches.sort_by(|a, b| (a.0, &a.1, &a.2.alias).cmp(&(b.0, &b.1, &b.2.alias)));
     matches
         .into_iter()
         .map(|(_, _, candidate)| candidate)
+        .collect()
+}
+
+/// `text` lowercased, with accented Latin letters (Latin-1 and Latin Extended-A) replaced by their
+/// base letters, so `cafe` finds `CAFÉ`. Only used to compare; aliases are shown as written.
+fn fold(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|character| {
+            match character {
+                'à'..='å' | 'ā' | 'ă' | 'ą' => "a",
+                'æ' => "ae",
+                'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
+                'ð' | 'ď' | 'đ' => "d",
+                'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+                'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+                'ĥ' | 'ħ' => "h",
+                'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+                'ĳ' => "ij",
+                'ĵ' => "j",
+                'ķ' => "k",
+                'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+                'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => "n",
+                'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+                'œ' => "oe",
+                'ŕ' | 'ŗ' | 'ř' => "r",
+                'ß' => "ss",
+                'ś' | 'ŝ' | 'ş' | 'š' => "s",
+                'ţ' | 'ť' | 'ŧ' => "t",
+                'þ' => "th",
+                'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+                'ŵ' => "w",
+                'ý' | 'ÿ' | 'ŷ' => "y",
+                'ź' | 'ż' | 'ž' => "z",
+                _ => return character.to_string(),
+            }
+            .to_owned()
+        })
         .collect()
 }
 
@@ -228,6 +267,45 @@ mod tests {
         assert_eq!(
             origin_label(&Origin::External("/etc/ssh/ssh_config".into()), Some(home)),
             "/etc/ssh/ssh_config"
+        );
+    }
+
+    #[test]
+    fn rank_ignores_accents_on_latin_letters() {
+        let all = [c("CAFÉ", true), c("Ærø-jump", true), c("cab", true)];
+        assert_eq!(aliases(&rank("cafe", &all, &[])), ["CAFÉ"]);
+        assert_eq!(aliases(&rank("café", &all, &[])), ["CAFÉ"]);
+        assert_eq!(aliases(&rank("aero", &all, &[])), ["Ærø-jump"]);
+        assert_eq!(aliases(&rank("ca", &all, &[])), ["cab", "CAFÉ"]);
+    }
+
+    #[test]
+    fn rank_keeps_aliases_openssh_tells_apart() {
+        let all = [c("CAFÉ", true), c("café", false)];
+        assert_eq!(aliases(&rank("cafe", &all, &[])), ["CAFÉ", "café"]);
+    }
+
+    #[test]
+    fn current_hop_and_apply_handle_multibyte_text_before_the_cursor() {
+        let found = current_hop("café,b", 7).unwrap();
+        assert_eq!(
+            found,
+            Hop {
+                range: 6..7,
+                query: "b".into()
+            }
+        );
+        assert_eq!(
+            apply("café,b", &found, "bastion"),
+            ("café,bastion".into(), 13)
+        );
+        let found = current_hop("ünï@bå", 9).unwrap();
+        assert_eq!(
+            found,
+            Hop {
+                range: 6..9,
+                query: "bå".into()
+            }
         );
     }
 }

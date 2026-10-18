@@ -2092,7 +2092,12 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             } else {
                 "Edit host"
             },
-            form_lines(&state.form, state.show_raw),
+            form_lines(
+                &state.form,
+                state.show_raw,
+                usize::from(columns[1].width.saturating_sub(2)),
+                usize::from(columns[1].height.saturating_sub(2)),
+            ),
         ),
         Mode::ConfirmRemove => (
             "Remove host",
@@ -2210,7 +2215,9 @@ fn footer_text(state: &UiState) -> String {
     }
 }
 
-fn form_lines(form: &FormState, show_raw: bool) -> Vec<Line<'static>> {
+/// The form's lines for a pane of `width` columns and `height` rows inside its border; only the
+/// jump host dropdown adapts to them.
+fn form_lines(form: &FormState, show_raw: bool, width: usize, height: usize) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = FORM_FIELDS
         .iter()
@@ -2231,7 +2238,11 @@ fn form_lines(form: &FormState, show_raw: bool) -> Vec<Line<'static>> {
         })
         .collect::<Vec<_>>();
     if let Some(list) = &form.suggestions {
-        let rows = suggestion_lines(list, FORM_FIELDS[PROXY_JUMP].label);
+        // Fields, the dropdown's borders, and the blank line and hint under it stay on screen.
+        let rows = height
+            .saturating_sub(FORM_FIELDS.len() + 4)
+            .clamp(1, SUGGESTION_ROWS);
+        let rows = suggestion_lines(list, FORM_FIELDS[PROXY_JUMP].label, width, rows);
         lines.splice(PROXY_JUMP + 1..PROXY_JUMP + 1, rows);
     }
     lines.push(Line::raw(""));
@@ -2265,25 +2276,45 @@ fn form_lines(form: &FormState, show_raw: bool) -> Vec<Line<'static>> {
     lines
 }
 
-/// The jump host dropdown as boxed lines, indented to start under the value of `label`'s row.
-fn suggestion_lines(list: &Suggestions, label: &str) -> Vec<Line<'static>> {
-    let indent = " ".repeat(format!("> {label}: ").chars().count());
-    let visible = &list.items[list.offset..(list.offset + SUGGESTION_ROWS).min(list.items.len())];
-    let width = visible
+/// The jump host dropdown as boxed lines under the value of `label`'s row: at most `rows` rows
+/// around the selection, fitted to `width` columns by shortening the indent, then the origins
+/// (keeping their end), then the aliases.
+fn suggestion_lines(
+    list: &Suggestions,
+    label: &str,
+    width: usize,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    let first = list
+        .offset
+        .max((list.selected + 1).saturating_sub(rows))
+        .min(list.selected);
+    let visible = &list.items[first..(first + rows).min(list.items.len())];
+    let longest = visible
         .iter()
-        .map(|item| item.alias.chars().count())
+        .map(|item| display_width(&item.alias))
         .max()
         .unwrap_or(0);
+    // A row is `│> alias │`: the alias column plus five columns of border, marker and padding.
+    let column = longest.min(width.saturating_sub(5)).max(1);
+    let boxed = column + 5;
+    let indent =
+        " ".repeat(display_width(&format!("> {label}: ")).min(width.saturating_sub(boxed)));
+    let room = width.saturating_sub(indent.len() + boxed + 2);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let border = "─".repeat(width + 3);
+    let border = "─".repeat(column + 3);
     let mut lines = vec![Line::raw(format!("{indent}┌{border}┐"))];
     lines.extend(visible.iter().enumerate().map(|(row, item)| {
-        let selected = list.offset + row == list.selected;
-        let cell = format!(
-            "{} {:width$} ",
-            if selected { '>' } else { ' ' },
-            item.alias
-        );
+        let selected = first + row == list.selected;
+        let alias = keep_start(&item.alias, column);
+        let padding = " ".repeat(column - display_width(&alias));
+        let cell = format!("{} {alias}{padding} ", if selected { '>' } else { ' ' });
+        let origin = suggest::origin_label(&item.origin, home.as_deref());
+        let origin = if room >= 4 {
+            keep_end(&origin, room)
+        } else {
+            String::new()
+        };
         Line::from(vec![
             Span::raw(format!("{indent}│")),
             if selected {
@@ -2291,14 +2322,53 @@ fn suggestion_lines(list: &Suggestions, label: &str) -> Vec<Line<'static>> {
             } else {
                 Span::raw(cell)
             },
-            Span::raw(format!(
-                "│  {}",
-                suggest::origin_label(&item.origin, home.as_deref())
-            )),
+            Span::raw(if origin.is_empty() {
+                "│".to_owned()
+            } else {
+                format!("│  {origin}")
+            }),
         ])
     }));
     lines.push(Line::raw(format!("{indent}└{border}┘")));
     lines
+}
+
+/// The terminal columns `text` takes.
+fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// `text` cut to at most `columns` columns, keeping its start and marking the cut with `…`.
+fn keep_start(text: &str, columns: usize) -> String {
+    if display_width(text) <= columns {
+        return text.to_owned();
+    }
+    let mut kept = String::new();
+    for character in text.chars() {
+        if display_width(&kept) + display_width(&character.to_string()) + 1 > columns {
+            break;
+        }
+        kept.push(character);
+    }
+    kept + "…"
+}
+
+/// `text` cut to at most `columns` columns, keeping its end and marking the cut with `…`.
+fn keep_end(text: &str, columns: usize) -> String {
+    if display_width(text) <= columns {
+        return text.to_owned();
+    }
+    let mut kept = Vec::new();
+    let mut used = 1;
+    for character in text.chars().rev() {
+        let width = display_width(&character.to_string());
+        if used + width > columns {
+            break;
+        }
+        used += width;
+        kept.push(character);
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
 }
 
 fn details_text(state: &UiState) -> String {
@@ -4550,7 +4620,7 @@ mod tests {
             outcome: Ok(outcome),
         };
         let lines = |state: &UiState| -> Vec<String> {
-            form_lines(&state.form, state.show_raw)
+            form_lines(&state.form, state.show_raw, usize::MAX, usize::MAX)
                 .iter()
                 .map(|line| {
                     line.spans
@@ -5157,5 +5227,90 @@ mod tests {
         assert_eq!(press(&mut state, KeyCode::Enter), UiAction::None);
         assert_eq!(state.form.values[PROXY_JUMP].as_str(), "bastion");
         assert_eq!(state.form.suggestions, None);
+    }
+
+    fn form_text(state: &UiState, width: usize, height: usize) -> Vec<String> {
+        form_lines(&state.form, state.show_raw, width, height)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn columns_before(line: &str, needle: char, nth: usize) -> usize {
+        let index = line.match_indices(needle).nth(nth).unwrap().0;
+        Line::raw(&line[..index]).width()
+    }
+
+    #[test]
+    fn dropdown_fits_a_narrow_pane() {
+        let mut deep = summary("bastion-eu", Ownership::External);
+        deep.source = PathBuf::from("/srv/ssh/config.d/clients/work/eu-west.conf");
+        let mut state = proxy_jump_form(vec![summary("bastion", Ownership::Managed), deep]);
+        type_text(&mut state, "bas");
+        let lines = form_text(&state, 40, 30);
+        let rows = lines
+            .iter()
+            .filter(|line| line.contains('│'))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{lines:#?}");
+        for line in &lines[PROXY_JUMP + 1..PROXY_JUMP + 5] {
+            assert!(Line::raw(line.as_str()).width() <= 40, "{line:?}");
+        }
+        assert!(rows[1].contains("bastion-eu"), "{rows:?}");
+        assert!(rows[1].ends_with("│  …west.conf"), "{rows:?}");
+    }
+
+    #[test]
+    fn dropdown_aligns_wide_aliases() {
+        let mut state = proxy_jump_form(vec![
+            summary("東京-jump", Ownership::Managed),
+            summary("tokyo-jump", Ownership::Managed),
+        ]);
+        state.handle_key(ctrl(' '));
+        let lines = form_text(&state, 100, 30);
+        let rows = &lines[PROXY_JUMP + 2..PROXY_JUMP + 4];
+        assert_eq!(
+            columns_before(&rows[0], '│', 1),
+            columns_before(&rows[1], '│', 1),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn dropdown_shrinks_to_keep_the_hint_visible() {
+        let hosts = (1..=7)
+            .map(|n| summary(&format!("h{n}"), Ownership::Managed))
+            .collect();
+        let mut state = proxy_jump_form(hosts);
+        state.handle_key(ctrl(' '));
+        for _ in 0..6 {
+            press(&mut state, KeyCode::Down);
+        }
+        let lines = form_text(&state, 100, 13);
+        assert!(lines.len() <= 13, "{lines:#?}");
+        assert!(
+            lines.iter().any(|line| line.contains("│> h7 │")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("Jump host")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn picking_after_multibyte_text_keeps_earlier_hops() {
+        let mut state = proxy_jump_form(vec![summary("bastion", Ownership::Managed)]);
+        type_text(&mut state, "café,bas");
+        assert_eq!(listed(&state), ["bastion"]);
+        press(&mut state, KeyCode::Enter);
+        let input = &state.form.values[PROXY_JUMP];
+        assert_eq!(input.as_str(), "café,bastion");
+        assert_eq!(input.cursor, input.as_str().len());
     }
 }
