@@ -511,3 +511,24 @@ fn interrupting_a_test_stops_ssh_and_exits_130() {
     assert_eq!(status.code(), Some(130), "{status:?}\n{stdout}");
     assert_eq!(stdout, "dev: cancelled\n");
 }
+
+#[test]
+fn a_save_rejected_by_the_users_own_config_names_that_file() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(env.ssh_config().parent().unwrap()).unwrap();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+    )
+    .unwrap();
+    env.run(["init", "-y"]).assert_success();
+    env.install_program(
+        "ssh",
+        "#!/bin/sh\nprintf '%s/.ssh/config: line 3: Bad configuration option: bogus\\n' \"$HOME\" >&2\nexit 255\n",
+    );
+
+    env.run(["add", "x", "-H", "h"])
+        .assert_failure_stderr_contains(
+            "line 3 of ~/.ssh/config: Bad configuration option: bogus; nothing was saved",
+        );
+}

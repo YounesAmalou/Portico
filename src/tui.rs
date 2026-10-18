@@ -37,6 +37,7 @@ use crate::{
     app::{
         App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
     },
+    config_error::ConfigRejection,
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::{InitPlan, TransactionError},
@@ -1573,6 +1574,16 @@ impl UiState {
                 if matches!(self.mode, Mode::AddForm | Mode::EditForm) =>
             {
                 self.report_form_error(host_error);
+            }
+            AppError::Transaction(TransactionError::Validation(
+                rejection @ ConfigRejection::Managed {
+                    field: Some(field), ..
+                },
+            )) if matches!(self.mode, Mode::AddForm | Mode::EditForm) => {
+                if let Some(index) = FORM_FIELDS.iter().position(|row| row.field == *field) {
+                    self.form.active = index;
+                }
+                self.form.error = Some(rejection.to_string());
             }
             AppError::AliasCollision(_) if matches!(self.mode, Mode::AddForm | Mode::EditForm) => {
                 self.form.active = 0;
@@ -3476,9 +3487,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_field_is_focused_in_the_form() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.mode = Mode::EditForm;
+
+        state.report_error(&AppError::Transaction(TransactionError::Validation(
+            ConfigRejection::Managed {
+                alias: "dev".into(),
+                field: Some(HostField::Port),
+                directive: "Port".into(),
+                message: "Bad port '99999'.".into(),
+            },
+        )));
+
+        let port = FORM_FIELDS
+            .iter()
+            .position(|row| row.field == HostField::Port)
+            .unwrap();
+        assert_eq!(state.form.active, port);
+        assert_eq!(
+            state.form.error.as_deref(),
+            Some("Port for dev: Bad port '99999'.")
+        );
+    }
+
+    #[test]
     fn rejections_before_activation_leave_the_inventory_alone() {
         let rejected = [
-            AppError::Transaction(TransactionError::Validation("bad".into())),
+            AppError::Transaction(TransactionError::Validation(
+                ConfigRejection::Unrecognised { raw: "bad".into() },
+            )),
             AppError::Transaction(TransactionError::NotInitialized),
             AppError::Transaction(TransactionError::Entry("bad".into())),
             AppError::AliasCollision("dev".into()),

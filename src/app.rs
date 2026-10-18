@@ -173,13 +173,11 @@ impl App {
                     .apply_init_cancellable(approved, cancelled, |entry, aliases| {
                         self.openssh
                             .validate_cancellable(entry, aliases, cancelled)
-                            .map_err(|error| error.to_string())
+                            .map_err(stderr_of)
                     })
             }
             None => self.store.apply_init(approved, |entry, aliases| {
-                self.openssh
-                    .validate(entry, aliases)
-                    .map_err(|error| error.to_string())
+                self.openssh.validate(entry, aliases).map_err(stderr_of)
             }),
         }?)
     }
@@ -432,7 +430,7 @@ impl App {
             }
             TestTarget::Add(host) => self.store.preview(
                 |config| self.add_mutation(config, host.clone()),
-                |entry| run(Some(entry), alias),
+                |files| run(Some(files.entry), alias),
                 Some(cancelled),
             ),
             TestTarget::Edit {
@@ -440,7 +438,7 @@ impl App {
                 changes,
             } => self.store.preview(
                 |config| self.edit_mutation(config, saved, changes.clone()),
-                |entry| run(Some(entry), alias),
+                |files| run(Some(files.entry), alias),
                 Some(cancelled),
             ),
         }
@@ -559,16 +557,22 @@ impl App {
                 |entry, aliases| {
                     self.openssh
                         .validate_cancellable(entry, aliases, cancelled)
-                        .map_err(|error| error.to_string())
+                        .map_err(stderr_of)
                 },
                 cancelled,
             ),
             None => self.store.transact(mutate, |entry, aliases| {
-                self.openssh
-                    .validate(entry, aliases)
-                    .map_err(|error| error.to_string())
+                self.openssh.validate(entry, aliases).map_err(stderr_of)
             }),
         }
+    }
+}
+
+/// The text OpenSSH printed when it refused a configuration, else the error's own message.
+fn stderr_of(error: OpenSshError) -> String {
+    match error {
+        OpenSshError::Failed { stderr, .. } => stderr,
+        other => other.to_string(),
     }
 }
 

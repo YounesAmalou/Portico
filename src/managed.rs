@@ -14,6 +14,7 @@ use thiserror::Error;
 #[cfg(test)]
 use std::sync::Arc;
 
+use crate::config_error::{ConfigFiles, ConfigRejection, interpret};
 use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
 use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
 
@@ -146,7 +147,7 @@ pub enum InitError {
     #[error(
         "configuration validation failed: {0}; correct the reported option in ~/.ssh/config or its included files (check with `ssh -G -F ~/.ssh/config portico-validation`), then rerun `portico init`"
     )]
-    Validation(String),
+    Validation(ConfigRejection),
     #[error(
         "filesystem error at {path}: {source}; check permissions or whether another writer is blocking this path, correct the problem, and rerun `portico init`"
     )]
@@ -178,8 +179,11 @@ pub enum TransactionError {
         #[source]
         source: ManagedError,
     },
-    #[error("configuration validation failed: {0}")]
-    Validation(String),
+    #[error(
+        "configuration validation failed: {0}; nothing was saved{suffix}",
+        suffix = if matches!(.0, ConfigRejection::UserFile { .. }) { "; fix that line, then save again" } else { "" }
+    )]
+    Validation(ConfigRejection),
     #[error("entry config cannot be used for validation: {0}")]
     Entry(String),
     #[error("filesystem error at {path}: {source}")]
@@ -338,7 +342,19 @@ impl ManagedStore {
         let validate_installed = || {
             self.init_managed()?;
             // Existing hosts were validated when written; parsing the installed config is enough.
-            validate(&self.paths.entry, &[]).map_err(InitError::Validation)
+            validate(&self.paths.entry, &[]).map_err(|stderr| {
+                let managed_text =
+                    String::from_utf8_lossy(&fs::read(&self.paths.managed).unwrap_or_default())
+                        .into_owned();
+                InitError::Validation(interpret(
+                    &stderr,
+                    &ConfigFiles {
+                        managed: &self.paths.managed,
+                        managed_text: &managed_text,
+                        entry: &self.paths.entry,
+                    },
+                ))
+            })
         };
         let preview = self.plan_init()?;
         if !preview.requires_confirmation() {
@@ -632,7 +648,19 @@ impl ManagedStore {
                 ..
             },
         ) = self.stage(mutate, cancelled)?;
-        validate(validation_file.path(), &changed_aliases).map_err(TransactionError::Validation)?;
+        validate(validation_file.path(), &changed_aliases).map_err(|stderr| {
+            let managed_text =
+                String::from_utf8_lossy(&fs::read(candidate.path()).unwrap_or_default())
+                    .into_owned();
+            TransactionError::Validation(interpret(
+                &stderr,
+                &ConfigFiles {
+                    managed: candidate.path(),
+                    managed_text: &managed_text,
+                    entry: validation_file.path(),
+                },
+            ))
+        })?;
         drop(validation_file);
 
         let backup_candidate = write_unique(
@@ -748,7 +776,7 @@ impl ManagedStore {
     where
         E: From<TransactionError>,
         M: FnOnce(&mut ManagedConfig) -> Result<(), E>,
-        U: FnOnce(&Path) -> Result<R, E>,
+        U: FnOnce(ConfigFiles<'_>) -> Result<R, E>,
     {
         let (
             (),
@@ -784,7 +812,13 @@ impl ManagedStore {
             validation_file
         };
         drop(lock);
-        let result = use_entry(preview_file.path());
+        let managed_text =
+            String::from_utf8_lossy(&fs::read(candidate.path()).unwrap_or_default()).into_owned();
+        let result = use_entry(ConfigFiles {
+            managed: candidate.path(),
+            managed_text: &managed_text,
+            entry: preview_file.path(),
+        });
         drop(preview_file);
         drop(candidate);
         result
@@ -2365,6 +2399,40 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_managed_line_reports_its_host_and_field() {
+        let fixture = initialized_store();
+        let host = Host::new("dev", "dev.example", None, Some(22), None, None).unwrap();
+
+        let result = fixture.store.transact(
+            |config| config.insert(host).map_err(TransactionError::Operation),
+            |entry, _| {
+                let candidate = included_candidate(&fs::read(entry).unwrap());
+                let text = fs::read_to_string(&candidate).unwrap();
+                let line = text
+                    .lines()
+                    .position(|line| line.trim() == "Port 22")
+                    .expect("the candidate has a Port line")
+                    + 1;
+                Err(format!(
+                    "{} line {line}: Bad port '22'.",
+                    candidate.display()
+                ))
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(TransactionError::Validation(ConfigRejection::Managed {
+                    field: Some(HostField::Port),
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn validation_probes_only_added_or_changed_aliases() {
         let fixture = initialized_store();
         let host = |alias: &str, hostname: &str| {
@@ -2685,7 +2753,8 @@ mod tests {
                         .insert(Host::new("new", "new.example", None, None, None, None).unwrap())
                         .map_err(TransactionError::Operation)
                 },
-                |entry| {
+                |files| {
+                    let entry = files.entry;
                     let candidate = included_candidate(&fs::read(entry).unwrap());
                     let contents = fs::read_to_string(&candidate).unwrap();
                     assert!(contents.contains("Host new"), "{contents}");
@@ -2714,18 +2783,23 @@ mod tests {
                     .insert(Host::new("new", "new.example", None, None, None, None).unwrap())
                     .map_err(TransactionError::Operation)
             },
-            |entry| -> Result<(), TransactionError> {
+            |files| -> Result<(), TransactionError> {
+                let entry = files.entry;
                 seen = Some((
                     entry.to_owned(),
                     included_candidate(&fs::read(entry).unwrap()),
                 ));
-                Err(TransactionError::Validation("ssh failed".into()))
+                Err(TransactionError::Validation(
+                    ConfigRejection::Unrecognised {
+                        raw: "ssh failed".into(),
+                    },
+                ))
             },
             None,
         );
 
         assert!(
-            matches!(result, Err(TransactionError::Validation(message)) if message == "ssh failed")
+            matches!(result, Err(TransactionError::Validation(ConfigRejection::Unrecognised { raw })) if raw == "ssh failed")
         );
         let (entry, candidate) = seen.expect("closure ran");
         assert_eq!(preview_snapshot(&fixture.paths), before);
@@ -2775,7 +2849,7 @@ mod tests {
             .store
             .preview(
                 |_| Ok::<_, TransactionError>(()),
-                |entry| Ok(fs::read_to_string(entry).unwrap()),
+                |files| Ok(fs::read_to_string(files.entry).unwrap()),
                 None,
             )
             .unwrap();
@@ -2792,7 +2866,7 @@ mod tests {
             .store
             .preview(
                 |_| Ok::<_, TransactionError>(()),
-                |entry| Ok::<_, TransactionError>(fs::read_to_string(entry).unwrap()),
+                |files| Ok::<_, TransactionError>(fs::read_to_string(files.entry).unwrap()),
                 None,
             )
             .unwrap();
