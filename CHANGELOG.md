@@ -7,6 +7,29 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
+### Added
+
+- Adopt and export hosts from the TUI
+- Add portico adopt and portico export
+- Adopt and export hosts in one rollback-safe transaction
+- Plan adoption and export with eligibility reasons
+- Render exact previews of configuration changes
+- Scan external host blocks for adoption
+- Read the raw effective configuration of a host
+- Record where external hosts are declared
+- Keep comments of managed hosts
+
+### Fixed
+
+- Scroll the migrate checklist to the cursor
+- Report a cancelled adoption as cancelled with nothing changed
+- Keep adoption backups when a panic unwinds
+- Explain a changed effective configuration that differs only in order
+- Name loop paths, key snapshots once and guard the rollback message
+- Drop comments of cleared managed host fields on replace
+
 ## [0.2.6] - 2026-10-18
 
 ### Fixed
