@@ -488,6 +488,13 @@ impl App {
                 .openssh
                 .fetch_host_key(entry, alias, route, cancelled)?
             {
+                // A key nobody can see the fingerprint of must not be offered for trust.
+                KeyFetch::Presented(key) if key.fingerprints.is_empty() => {
+                    report.key_fetch_failure = Some(Failure::Other(
+                        "ssh-keygen reported no fingerprint for the host key".into(),
+                    ));
+                    TestOutcome::Done(report)
+                }
                 KeyFetch::Presented(key) => TestOutcome::UnknownHostKey { report, key },
                 KeyFetch::Failed(failure) => {
                     report.key_fetch_failure = Some(failure);
@@ -823,6 +830,27 @@ mod tests {
         };
         assert_eq!(report.result, ProbeResult::Failed(Failure::HostKeyUnknown));
         assert_eq!(report.key_fetch_failure, Some(Failure::ConnectionRefused));
+    }
+
+    #[test]
+    fn a_key_without_fingerprints_is_never_offered() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        app.install_ssh(USER_DEPLOY, &print_fixture("host-key-unknown"), FETCH_KEY);
+        write_executable(app._dir.path().join("ssh-keygen"), "#!/bin/sh\n");
+
+        let outcome = app.test(&TestTarget::Saved("dev".into())).unwrap();
+
+        let TestOutcome::Done(report) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(report.result, ProbeResult::Failed(Failure::HostKeyUnknown));
+        assert_eq!(
+            report.key_fetch_failure,
+            Some(Failure::Other(
+                "ssh-keygen reported no fingerprint for the host key".into()
+            ))
+        );
     }
 
     #[test]
