@@ -43,8 +43,8 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
     // Every bolded slice title still pending in the spec must survive in the roadmap.
     let pending = titles(pending);
     assert!(
-        pending.len() >= 4,
-        "expected four slices, found {pending:?}"
+        pending.len() >= 3,
+        "expected three slices, found {pending:?}"
     );
     for title in pending {
         assert!(roadmap.contains(title), "roadmap dropped slice {title:?}");
@@ -60,14 +60,7 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
         );
     }
 
-    for planned in [
-        "aarch64",
-        "macOS",
-        "Windows",
-        "AUR",
-        "Homebrew",
-        "end-to-end",
-    ] {
+    for planned in ["aarch64", "macOS", "Windows", "AUR", "Homebrew"] {
         assert!(roadmap.contains(planned), "roadmap lacks {planned}");
     }
 }
@@ -211,12 +204,11 @@ fn contributing_describes_the_changelog_and_every_release_step() {
 }
 
 #[test]
-fn roadmap_records_the_release_follow_ups_and_no_longer_waits_for_the_first_release() {
+fn roadmap_records_the_release_follow_ups_and_no_longer_plans_shipped_release_work() {
     let roadmap = read("ROADMAP.md");
     for planned in [
         "Signed releases",
         "Trusted Publishing",
-        "Release automation",
         "crate-scoped token",
     ] {
         assert!(roadmap.contains(planned), "roadmap lacks {planned}");
@@ -224,6 +216,10 @@ fn roadmap_records_the_release_follow_ups_and_no_longer_waits_for_the_first_rele
     assert!(
         !roadmap.contains("First tagged release"),
         "v0.1.0 is released; the roadmap must not wait for it"
+    );
+    assert!(
+        !roadmap.contains("Release automation"),
+        "release-plz ships every release; the roadmap must not plan it"
     );
 }
 

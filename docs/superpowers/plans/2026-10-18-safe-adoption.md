@@ -50,7 +50,7 @@
 
 Parsing rules: a run of comment lines is buffered; a blank line clears the buffer; a `Host` line takes the buffer as `leading`; a directive line inside a host takes the buffer as that directive's `fields` entry. A buffer left at the end of the file or before a blank line is discarded. Rendering: leading comments above `Host` at column 0, field comments indented four spaces directly above their directive.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -92,21 +92,21 @@ fn remove_entry_returns_the_comments() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test --lib managed::tests::comments_ managed::tests::header_ managed::tests::rename_keeps managed::tests::remove_entry`
 Expected: compile errors (`HostComments` not found).
 
-- [ ] **Step 3: Implement as described in Interfaces**
+- [x] **Step 3: Implement as described in Interfaces**
 
 `render_host(host: &Host, comments: Option<&HostComments>) -> String`. Existing tests that compare whole rendered files must keep passing unchanged.
 
-- [ ] **Step 4: Run the managed tests**
+- [x] **Step 4: Run the managed tests**
 
 Run: `cargo test --lib managed::`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/managed.rs src/host.rs
@@ -125,7 +125,7 @@ git commit -m "feat: keep comments of managed hosts"
 - Produces: `ExternalHost { pub alias: String, pub source: PathBuf, pub line: usize, pub conditional: bool }`. `line` is the 1-based line of the `Host` directive in `source`. `conditional` is true when `source` was reached through an `Include` that appears after a `Host` or `Match` line other than `Host *` or `Match all` in the including file, or when the including file was itself conditional.
 - Update every `ExternalHost { .. }` constructor in tests.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -142,21 +142,21 @@ fn includes_inside_a_block_are_conditional() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test --lib discovery::tests::records_host_lines discovery::tests::includes_inside`
 Expected: compile error (no field `line`).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Track per scanned file a `conditional` flag passed into `scan_include`, and inside `scan_contents` a `in_block` flag set by each `Host`/`Match` line (cleared by `Host *` and `Match all`; `parse_directive` gains a `ConfigDirective::Match(Vec<String>)` variant so the scanner can see it).
 
-- [ ] **Step 4: Run discovery and app tests**
+- [x] **Step 4: Run discovery and app tests**
 
 Run: `cargo test --lib discovery:: app::`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/discovery.rs src/app.rs
@@ -174,11 +174,11 @@ git commit -m "feat: record where external hosts are declared"
 **Interfaces:**
 - Produces: `pub(crate) fn effective(&self, entry: &Path, alias: &str, cancelled: Option<&AtomicBool>) -> Result<String, OpenSshError>`: runs `ssh -G -F <entry> -- <alias>` through `checked_output` and returns stdout as UTF-8 (`OpenSshError::InvalidOutput` otherwise).
 
-- [ ] **Step 1: Write the failing test** `effective_returns_raw_output_of_ssh_g_with_the_entry`: with a fake ssh script that prints its arguments, assert the output equals `"-G\n-F\n<entry>\n--\ndev\n"`.
-- [ ] **Step 2: Run it** — `cargo test --lib openssh::tests::effective_returns` — expect compile error.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run it** — expect PASS.
-- [ ] **Step 5: Commit** — `git commit -m "feat: read the raw effective configuration of a host"`
+- [x] **Step 1: Write the failing test** `effective_returns_raw_output_of_ssh_g_with_the_entry`: with a fake ssh script that prints its arguments, assert the output equals `"-G\n-F\n<entry>\n--\ndev\n"`.
+- [x] **Step 2: Run it** — `cargo test --lib openssh::tests::effective_returns` — expect compile error.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run it** — expect PASS.
+- [x] **Step 5: Commit** — `git commit -m "feat: read the raw effective configuration of a host"`
 
 ---
 
@@ -197,7 +197,7 @@ git commit -m "feat: record where external hosts are declared"
 
 Refusal reasons in `parsed` (exact copy, first applicable wins): `Host line declares N aliases` (N ≥ 2), `<Directive> is not supported by Portico` (the directive as written), `<Directive> is repeated on line L`, `invalid <field>: <HostError>` (the `HostError` display), `missing value for <Directive> on line L`. A missing `HostName` becomes the alias. Directive names match case-insensitively and accept `Key=value` and `Key = value` (reuse `crate::discovery::parse_directive` tokenizing for the key; the value is everything after the key and separator, trimmed, then parsed with the managed `parse_value` rules, except `ProxyJump` which keeps the raw remainder). Comments: leading (directly above, no blank), inner lines between `Host` and the last directive attach to the next directive, a trailing `# ...` on a directive line (found with `crate::discovery::split_comment`) is appended after that directive's inner comments.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn block_with_leading_inner_and_trailing_comments() {
@@ -236,10 +236,10 @@ Refusal reasons in `parsed` (exact copy, first applicable wins): `Host line decl
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail** — `cargo test --lib adopt::scan` — compile errors.
-- [ ] **Step 3: Implement `scan_blocks`, `remove_lines`, `insert_after_first_line`.** Make `parse_value` in `managed.rs` `pub(crate)`.
-- [ ] **Step 4: Run** — `cargo test --lib adopt::scan` — all pass.
-- [ ] **Step 5: Commit** — `git commit -m "feat: scan external host blocks for adoption"`
+- [x] **Step 2: Run them to verify they fail** — `cargo test --lib adopt::scan` — compile errors.
+- [x] **Step 3: Implement `scan_blocks`, `remove_lines`, `insert_after_first_line`.** Make `parse_value` in `managed.rs` `pub(crate)`.
+- [x] **Step 4: Run** — `cargo test --lib adopt::scan` — all pass.
+- [x] **Step 5: Commit** — `git commit -m "feat: scan external host blocks for adoption"`
 
 ---
 
@@ -255,11 +255,11 @@ Refusal reasons in `parsed` (exact copy, first applicable wins): `Host line decl
   - `pub(crate) fn diff(path: &Path, old: &str, new: &str) -> FilePreview` — strips common prefix and suffix lines, then an LCS over the middle; when the middle exceeds 4 000 000 cells, it reports the whole middle as removed then added.
   - `impl fmt::Display for Preview`: for each file, a line `<path>` (home shown as `~`, via the existing helper used for jump host suggestions if one is public, otherwise `$HOME` prefix replacement), then each line as `  -<number>: <text>` or `  +<number>: <text>`, with a blank line between files.
 
-- [ ] **Step 1: Write the failing tests** — `pure_deletion_reports_old_line_numbers` (old 5 lines, lines 2–3 removed → `Removed{2}`, `Removed{3}`); `pure_insertion_reports_new_line_numbers`; `identical_text_has_no_lines`; `display_groups_by_file_with_signs` (exact string comparison of two files).
-- [ ] **Step 2: Run** — `cargo test --lib adopt::diff` — compile errors.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** — pass.
-- [ ] **Step 5: Commit** — `git commit -m "feat: render exact previews of configuration changes"`
+- [x] **Step 1: Write the failing tests** — `pure_deletion_reports_old_line_numbers` (old 5 lines, lines 2–3 removed → `Removed{2}`, `Removed{3}`); `pure_insertion_reports_new_line_numbers`; `identical_text_has_no_lines`; `display_groups_by_file_with_signs` (exact string comparison of two files).
+- [x] **Step 2: Run** — `cargo test --lib adopt::diff` — compile errors.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** — pass.
+- [x] **Step 5: Commit** — `git commit -m "feat: render exact previews of configuration changes"`
 
 ---
 
@@ -292,7 +292,7 @@ Export plan: every managed host is a candidate with `source = paths.managed`; ch
 
 `preview(selection)`: unknown or ineligible alias → `UnknownHost`/`Ineligible`; empty selection → empty `Preview`. Adoption: `diff(managed, old, new)` where new is the managed config with the selected hosts inserted (comments included) and rendered, then one `diff` per touched source file with its selected ranges removed. Export: `diff(entry)` with the blocks inserted, then `diff(managed)`. Exported blocks are rendered with the managed renderer (alphabetical, comments), joined by one blank line, followed by one blank line.
 
-- [ ] **Step 1: Write the failing tests** (a `fixture()` helper builds a temp home with `ConfigPaths::from_home`, an initialized entry `Include ~/.ssh/portico/config\n` plus content, an empty managed fragment, and `system_config` pointed at a missing path; `same: Effective` returns `Ok(String::new())`):
+- [x] **Step 1: Write the failing tests** (a `fixture()` helper builds a temp home with `ConfigPaths::from_home`, an initialized entry `Include ~/.ssh/portico/config\n` plus content, an empty managed fragment, and `system_config` pointed at a missing path; `same: Effective` returns `Ok(String::new())`):
 
 ```rust
 #[test] fn eligible_block_in_entry_is_listed_with_its_source() { /* "Host dev\n  HostName d\n" -> one candidate, reason None, source == entry */ }
@@ -311,10 +311,10 @@ Export plan: every managed host is a candidate with `source = paths.managed`; ch
 #[test] fn preview_rejects_unknown_and_ineligible_aliases() {}
 ```
 
-- [ ] **Step 2: Run** — `cargo test --lib adopt::tests` — compile errors.
-- [ ] **Step 3: Implement.** Candidate temp files for the plan-time check use stem `.config.portico-adopt-candidate` in `portico_dir` and are dropped before returning.
-- [ ] **Step 4: Run** — `cargo test --lib adopt:: managed::` — pass.
-- [ ] **Step 5: Commit** — `git commit -m "feat: plan adoption and export with eligibility reasons"`
+- [x] **Step 2: Run** — `cargo test --lib adopt::tests` — compile errors.
+- [x] **Step 3: Implement.** Candidate temp files for the plan-time check use stem `.config.portico-adopt-candidate` in `portico_dir` and are dropped before returning.
+- [x] **Step 4: Run** — `cargo test --lib adopt:: managed::` — pass.
+- [x] **Step 5: Commit** — `git commit -m "feat: plan adoption and export with eligibility reasons"`
 
 ---
 
@@ -337,7 +337,7 @@ Steps exactly as spec "The transaction" 1–8. Details the implementer cannot in
 - Rollback restores in reverse activation order by writing each backup's bytes with `write_unique` + rename (mode kept), then syncs directories; then deletes backups. If any restore fails → `Rollback` with every (file, backup) pair still present.
 - Backups are created after validation and before the first rename; on any failure before activation they are deleted.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn adopting_moves_exactly_the_shown_lines() {
@@ -362,10 +362,10 @@ Steps exactly as spec "The transaction" 1–8. Details the implementer cannot in
 #[test] fn concurrent_portico_mutation_waits_for_the_lock() { /* hold paths.lock with fs2 in a thread, start migrate, release, assert it completes */ }
 ```
 
-- [ ] **Step 2: Run** — `cargo test --lib adopt::tests` — the new tests fail (no `migrate`).
-- [ ] **Step 3: Implement `migrate`.**
-- [ ] **Step 4: Run** — `cargo test --lib` — all pass.
-- [ ] **Step 5: Commit** — `git commit -m "feat: adopt and export hosts in one rollback-safe transaction"`
+- [x] **Step 2: Run** — `cargo test --lib adopt::tests` — the new tests fail (no `migrate`).
+- [x] **Step 3: Implement `migrate`.**
+- [x] **Step 4: Run** — `cargo test --lib` — all pass.
+- [x] **Step 5: Commit** — `git commit -m "feat: adopt and export hosts in one rollback-safe transaction"`
 
 ---
 
@@ -389,7 +389,7 @@ Flow (one function `run_migration(direction, ...)` shared by both commands), cop
 - Empty selection → `Nothing to adopt.` / `Nothing to export.`, success.
 - Print the preview (`Preview` Display), then confirmation unless `--yes`; non-interactive without `--yes` → error `adopt requires --yes in non-interactive mode`; declined → `Adoption cancelled.` / `Export cancelled.`, success.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `src/cli.rs`: `parse_selection_accepts_all_none_numbers_and_ranges` (`"1,3-4"`, count 5 → `[0,2,3]`; `""` and `"none"` → `[]`; `"all"` → `[0..count]`; `"0"`, `"6"`, `"2-1"`, `"x"` → Err).
   - `tests/cli.rs` (TestEnv; init first with `portico init -y`; external includes use absolute paths):
     - `adopt_interactive_selection_moves_the_chosen_hosts` (`run_with_stdin(["adopt"], "2\ny\n")` with three eligible hosts; only the second moves; stdout contains `Adopted: `)
@@ -398,10 +398,10 @@ Flow (one function `run_migration(direction, ...)` shared by both commands), cop
     - `adopt_named_ineligible_host_fails_without_changes`
     - `export_moves_hosts_back_below_the_include`
     - `adopt_refuses_a_block_whose_effective_configuration_would_change`: install a real-ssh wrapper `install_program("ssh", "#!/bin/sh\nexec /usr/bin/ssh \"$@\"\n")`, an entry with `Host *\n  User root\n` above `Host dev\n  HostName d\n  User alice\n`; `adopt dev -y` fails with `effective configuration would change`; files unchanged. Skip (return early with a printed note) when `/usr/bin/ssh` is absent.
-- [ ] **Step 2: Run** — `cargo test --lib cli::tests::parse_selection && cargo test --test cli adopt_ export_` — fail.
-- [ ] **Step 3: Implement.** Also add the `AppError::Adopt` arm to `may_have_changed_inventory` in `src/tui.rs` (`Io` and `Rollback` → true, everything else false).
-- [ ] **Step 4: Run** — `cargo test --all-targets` — pass.
-- [ ] **Step 5: Commit** — `git commit -m "feat: add portico adopt and portico export"`
+- [x] **Step 2: Run** — `cargo test --lib cli::tests::parse_selection && cargo test --test cli adopt_ export_` — fail.
+- [x] **Step 3: Implement.** Also add the `AppError::Adopt` arm to `may_have_changed_inventory` in `src/tui.rs` (`Io` and `Rollback` → true, everything else false).
+- [x] **Step 4: Run** — `cargo test --all-targets` — pass.
+- [x] **Step 5: Commit** — `git commit -m "feat: add portico adopt and portico export"`
 
 ---
 
@@ -422,11 +422,11 @@ Flow (one function `run_migration(direction, ...)` shared by both commands), cop
   - `pub(super) fn title(&self) -> &'static str` — `Adopt hosts` / `Export hosts`; `pub(super) fn footer(&self) -> &'static str` — checklist `↑↓ move  Space toggle  a all  Enter preview  Esc cancel`, preview `↑↓ scroll  y apply  Esc back`.
 - In `tui.rs`: `Mode::Migrate`; `UiState.migrate: Option<MigrateState>`; browse `KeyCode::Char('m')` → `UiAction::OpenMigrate { direction, preselect }` (direction from the selected host's ownership; nothing selected → no-op); the event loop builds the plan with `app.adoption_plan()` / `app.export_plan()` (error → status line) and enters `Mode::Migrate`; `MigrateAction::Apply(aliases)` → `UiAction::Migrate(aliases)` → `app.migrate_cancellable(&plan, &aliases, terminated)` → `finish_mutation(.., status = "Adopted: a, b" / "Exported: a, b")`, which returns to Browse; `Close` → Browse. Browse footers gain `m adopt` (external) / `m export` (managed) after `a add`.
 
-- [ ] **Step 1: Write the failing tests** — `space_toggles_only_eligible_rows`, `a_selects_every_eligible_host`, `enter_without_selection_stays_on_the_checklist`, `y_in_preview_applies_the_selection`, `esc_steps_back_then_closes`, `preselected_host_is_checked`, and in `tui.rs` `m_opens_migration_for_the_selected_host` (asserts the returned `UiAction::OpenMigrate` for an external and a managed selection). Build plans for these tests through a `#[cfg(test)] pub(crate) fn MigrationPlan::for_tests(direction, candidates)` constructor in `adopt.rs`.
-- [ ] **Step 2: Run** — `cargo test --lib tui::` — fail.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** — `cargo test --all-targets` — pass.
-- [ ] **Step 5: Commit** — `git commit -m "feat: adopt and export hosts from the TUI"`
+- [x] **Step 1: Write the failing tests** — `space_toggles_only_eligible_rows`, `a_selects_every_eligible_host`, `enter_without_selection_stays_on_the_checklist`, `y_in_preview_applies_the_selection`, `esc_steps_back_then_closes`, `preselected_host_is_checked`, and in `tui.rs` `m_opens_migration_for_the_selected_host` (asserts the returned `UiAction::OpenMigrate` for an external and a managed selection). Build plans for these tests through a `#[cfg(test)] pub(crate) fn MigrationPlan::for_tests(direction, candidates)` constructor in `adopt.rs`.
+- [x] **Step 2: Run** — `cargo test --lib tui::` — fail.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** — `cargo test --all-targets` — pass.
+- [x] **Step 5: Commit** — `git commit -m "feat: adopt and export hosts from the TUI"`
 
 ---
 
@@ -436,12 +436,12 @@ Flow (one function `run_migration(direction, ...)` shared by both commands), cop
 - Modify: `README.md` (commands section: `portico adopt`, `portico export`, the `m` key; one paragraph on what is adoptable and that export is the way back), `tests/real_openssh.rs` (new ignored test), `tests/docs.rs` (assert README documents adoption), the spec status line → `**Status:** Approved; implemented`
 - Test: `tests/docs.rs`, `tests/real_openssh.rs`
 
-- [ ] **Step 1: Write the failing doc test** `readme_documents_adoption`: README contains `portico adopt`, `portico export` and `m`.
-- [ ] **Step 2: Run** — `cargo test --test docs readme_documents_adoption` — FAIL.
-- [ ] **Step 3: Update README and spec status; add `#[ignore]` test `adopt_and_export_keep_ssh_g_identical_with_real_openssh`** that, in a TestEnv with the real-ssh wrapper, adopts and exports a host with a comment and compares `ssh -G -F <entry> dev` before, between and after.
-- [ ] **Step 4: Run every CI check as a regular user**
+- [x] **Step 1: Write the failing doc test** `readme_documents_adoption`: README contains `portico adopt`, `portico export` and `m`.
+- [x] **Step 2: Run** — `cargo test --test docs readme_documents_adoption` — FAIL.
+- [x] **Step 3: Update README and spec status; add `#[ignore]` test `adopt_and_export_keep_ssh_g_identical_with_real_openssh`** that, in a TestEnv with the real-ssh wrapper, adopts and exports a host with a comment and compares `ssh -G -F <entry> dev` before, between and after.
+- [x] **Step 4: Run every CI check as a regular user**
 
 Run: `scripts/ci-checks.sh fmt && scripts/ci-checks.sh clippy && scripts/ci-checks.sh test && cargo test --test real_openssh -- --ignored adopt_and_export`
 Expected: all succeed.
 
-- [ ] **Step 5: Commit** — `git commit -m "docs: document host adoption and export"`
+- [x] **Step 5: Commit** — `git commit -m "docs: document host adoption and export"`

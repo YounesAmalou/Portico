@@ -47,7 +47,7 @@ Nothing edits `CHANGELOG.md` by hand any more: release-plz writes each version's
 4. Verify the GitHub Release and `cargo install portico-ssh` afterwards.
 5. The `aur` job runs `scripts/aur-publish.sh`, which pins the tag archive's SHA-256 with `scripts/aur-update.sh`, proves the package builds with `makepkg`, and pushes `PKGBUILD` and `.SRCINFO` to `ssh://aur@aur.archlinux.org/portico.git`. It is independent of `crates` and safe to re-run (a version already on the AUR changes nothing). The copy in `packaging/aur/` is the template: it is only edited when the packaging itself changes, and the version and checksum in it are rewritten at release time.
 
-If the release automation is unavailable, `scripts/tag-release.sh X.Y.Z` is the manual fallback: in a pull request set the version in `Cargo.toml`, run `cargo update -p portico-ssh` so `Cargo.lock` carries the same version (release builds use `--locked`), and add a `## [X.Y.Z] - date` changelog section; merge it, run `git checkout main && git pull`, then the script. It refuses unless `HEAD` is the tip of `origin/main`, `Cargo.toml` and `CHANGELOG.md` carry the version and the tag is new. Never tag by hand: a tag on the wrong commit burns that version.
+If the release automation fails, fix it and run it again rather than tagging by hand: a tag on the wrong commit burns that version. A version bump made outside release-plz must also run `cargo update -p portico-ssh`, so `Cargo.lock` carries the same version (release builds use `--locked`).
 
 ## Pull requests
 

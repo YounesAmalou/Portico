@@ -1,5 +1,7 @@
 # TUI Refresh Design
 
+**Status:** Approved; implemented
+
 ## Purpose
 
 The TUI reads the host inventory once at startup and afterwards only when Portico itself changes it. Host details resolved with `ssh -G` are cached until the inventory changes. Edits made elsewhere, in `~/.ssh/config`, in an included file, or in the managed file by another tool, therefore stay invisible until Portico restarts. This slice adds a refresh key that re-reads everything. It implements the "TUI refresh" follow-up slice of `2026-09-13-portico-host-management-design.md` and changes nothing else in that design.

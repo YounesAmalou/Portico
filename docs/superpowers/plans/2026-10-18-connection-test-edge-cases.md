@@ -37,7 +37,7 @@
 **Interfaces:**
 - Produces: `authenticated(line: &str, route: Route<'_>) -> Option<Authenticated>` (signature unchanged); on `Route::Proxied { hostname, .. }` it returns `None` unless the line's host equals `hostname` ignoring ASCII case.
 
-- [ ] **Step 1: Write the failing tests** in `src/probe.rs`:
+- [x] **Step 1: Write the failing tests** in `src/probe.rs`:
 
 ```rust
 #[test]
@@ -60,16 +60,16 @@ fn the_targets_host_is_matched_ignoring_case() {
 
 In `src/openssh.rs`, add `a_multi_hop_probe_waits_for_the_targets_line`: `fake_hanging_ssh(Some("authenticated-via-two-jumps"))`, route as above; the result is `ProbeResult::Authenticated` with `host == "127.0.0.3"`, and the recorded pid dies. Add `a_hops_success_before_the_targets_failure_is_a_failure`: `fake_failure` printing `Authenticated to 127.0.0.2 (via proxy) using "publickey".\n` then the `auth-refused` fixture's lines; route hostname `127.0.0.3`; the result is `ProbeResult::Failed(_)` and the raw output contains `127.0.0.2 (via proxy)`.
 
-- [ ] **Step 2: Run them and confirm they fail**
+- [x] **Step 2: Run them and confirm they fail**
 
 Run: `cargo test a_later_hops_proxied_login the_targets_host_is_matched a_multi_hop_probe a_hops_success_before`
 Expected: the hop line is accepted (`Some(..)` / wrong host `127.0.0.2`).
 
-- [ ] **Step 3: Implement.** In the `Route::Proxied` arm, after splitting off the host, return `None` unless `host.eq_ignore_ascii_case(hostname)`. Extend the doc comment with the known limit from the spec (a later verbose hop with the target's `HostName`). Update the existing tests whose `hostname` does not match their fixture's host: `a_proxied_success_is_recognised_only_through_a_proxy` and `a_proxied_probe_stops_at_the_targets_line_not_the_jump_hosts` use `hostname: "127.0.0.1"` (and the expected `address` follows).
+- [x] **Step 3: Implement.** In the `Route::Proxied` arm, after splitting off the host, return `None` unless `host.eq_ignore_ascii_case(hostname)`. Extend the doc comment with the known limit from the spec (a later verbose hop with the target's `HostName`). Update the existing tests whose `hostname` does not match their fixture's host: `a_proxied_success_is_recognised_only_through_a_proxy` and `a_proxied_probe_stops_at_the_targets_line_not_the_jump_hosts` use `hostname: "127.0.0.1"` (and the expected `address` follows).
 
-- [ ] **Step 4: Run** `cargo test` — all pass.
+- [x] **Step 4: Run** `cargo test` — all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/probe.rs src/openssh.rs tests/fixtures/ssh/authenticated-via-two-jumps.txt
@@ -88,7 +88,7 @@ git commit -m "fix: tell a later jump host's login from the target's"
 - Consumes: Task 1's host check.
 - Produces: `Route::Proxied { jump: Option<&str>, hostname: &str, port: u16, fd_passing: bool }`; `ResolvedConfig { proxy_use_fdpass: bool, .. }`. `route()` sets `fd_passing` from `proxy_use_fdpass` only (OpenSSH already reports `no` under `ProxyJump`). `classify` builds its route with `fd_passing: false`.
 
-- [ ] **Step 1: Write the failing tests.** In `src/probe.rs`, `a_fd_passing_proxy_logs_the_direct_form`:
+- [x] **Step 1: Write the failing tests.** In `src/probe.rs`, `a_fd_passing_proxy_logs_the_direct_form`:
 
 ```rust
 let route = Route::Proxied { jump: None, hostname: "127.0.0.3", port: 2222, fd_passing: true };
@@ -102,13 +102,13 @@ assert_eq!(fixture("authenticated-via-fdpass").lines().find_map(|l| authenticate
 
 In `src/openssh.rs`, extend `a_proxy_command_or_none_decides_the_route`: `"hostname h\nproxycommand nc %h %p\nproxyusefdpass yes\n"` gives `fd_passing: true`; the existing outputs (no `proxyusefdpass` line) give `fd_passing: false`. Add `a_fd_passing_probe_succeeds_instead_of_timing_out`: `fake_hanging_ssh(Some("authenticated-via-fdpass"))` with the fd-passing route returns `Authenticated` within 2 s.
 
-- [ ] **Step 2: Run them and confirm they fail** — `cargo test` does not compile (no `fd_passing`), which is the expected failure.
+- [x] **Step 2: Run them and confirm they fail** — `cargo test` does not compile (no `fd_passing`), which is the expected failure.
 
-- [ ] **Step 3: Implement.** Add the field and parse `proxyusefdpass` (`yes`, ASCII case ignored, is true). In `authenticated`, the line form is chosen by `Route::Direct | Route::Proxied { fd_passing: true, .. }` → direct form, otherwise `(via proxy)` form; the fd-passing case takes address and port from the line, keeps `via` from `jump.unwrap_or("proxy")`, and applies Task 1's host check. Add `fd_passing: false` to every other `Route::Proxied` literal and `proxy_use_fdpass: false` to the `tui.rs` fixture.
+- [x] **Step 3: Implement.** Add the field and parse `proxyusefdpass` (`yes`, ASCII case ignored, is true). In `authenticated`, the line form is chosen by `Route::Direct | Route::Proxied { fd_passing: true, .. }` → direct form, otherwise `(via proxy)` form; the fd-passing case takes address and port from the line, keeps `via` from `jump.unwrap_or("proxy")`, and applies Task 1's host check. Add `fd_passing: false` to every other `Route::Proxied` literal and `proxy_use_fdpass: false` to the `tui.rs` fixture.
 
-- [ ] **Step 4: Run** `cargo test` — all pass.
+- [x] **Step 4: Run** `cargo test` — all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/probe.rs src/openssh.rs src/tui.rs tests/fixtures/ssh/authenticated-via-fdpass.txt
@@ -127,7 +127,7 @@ git commit -m "fix: recognise a login through a fd-passing ProxyCommand"
   - `#[cfg(test)] fn Interrupts::signalled_after(step: usize) -> Interrupts`: no handlers; `during` sets the flag just after the step with that 1-based index returns, as a signal in the window would. Backed by a `#[cfg(test)]` counter field.
   - `fn test_command<I: BufRead, O: Write>(app: &App, alias: String, accept_host_key: Option<String>, raw: bool, input: &mut I, output: &mut O, interactive: bool, interrupts: &Interrupts) -> Result<ExitCode, String>`: the current `Command::Test` arm moved out of `execute`, which now installs `Interrupts` and calls it.
 
-- [ ] **Step 1: Write the failing tests** in `src/cli.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `src/cli.rs` `mod tests`:
 
 ```rust
 #[test]
@@ -146,15 +146,15 @@ fn each_step_starts_with_a_clear_flag_and_a_late_flag_is_reported() {
 
 `a_late_signal_after_an_ordinary_result_keeps_it`: probe prints the success line from the start; `signalled_after(1)` exits 0 with `authenticated`.
 
-- [ ] **Step 2: Run them and confirm they fail** — compile errors (`Step`, `test_command`, `signalled_after`).
+- [x] **Step 2: Run them and confirm they fail** — compile errors (`Step`, `test_command`, `signalled_after`).
 
-- [ ] **Step 3: Implement.** In `test_command`: a first step that is `Late(Ok(TestOutcome::UnknownHostKey { .. }))` prints the untrusted key as today, then calls `print_cancelled`; any other `Late(x)` is handled as `Done(x)`. The retest treats `Late` as `Done`. Update the `Interrupts` doc comment to say a signal after a step ends is acted on at the next step.
+- [x] **Step 3: Implement.** In `test_command`: a first step that is `Late(Ok(TestOutcome::UnknownHostKey { .. }))` prints the untrusted key as today, then calls `print_cancelled`; any other `Late(x)` is handled as `Done(x)`. The retest treats `Late` as `Done`. Update the `Interrupts` doc comment to say a signal after a step ends is acted on at the next step.
 
-- [ ] **Step 4: Run** `cargo test` — all pass, including `interrupting_a_test_stops_ssh_and_exits_130` in `tests/cli.rs`.
+- [x] **Step 4: Run** `cargo test` — all pass, including `interrupting_a_test_stops_ssh_and_exits_130` in `tests/cli.rs`.
 
-- [ ] **Step 5: Run** `scripts/ci-checks.sh` as the regular user — passes.
+- [x] **Step 5: Run** `scripts/ci-checks.sh` as the regular user — passes.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/cli.rs

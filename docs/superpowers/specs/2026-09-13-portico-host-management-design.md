@@ -1,6 +1,6 @@
 # Portico v1 Host Management Design
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved; implemented (released as v0.1.0)
 **Date:** 2026-09-13
 
 ## Purpose
@@ -226,10 +226,9 @@ A focused manual smoke test uses the installed OpenSSH tools to initialize an is
 
 Later work retains these requirements without constraining their implementation prematurely:
 
-1. **Safe adoption:** losslessly migrate a concrete external block only after showing an exact preview, creating a backup, and providing rollback.
-2. **Identity awareness:** discover file references and agent/provider identities, including 1Password, while keeping private keys with their provider. Identity knowledge must remain separate from credential possession.
-3. **Tunnels:** model local, remote, and dynamic forwards; detect local conflicts; and supervise explicitly started tunnels.
-4. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
+1. **Identity awareness:** discover file references and agent/provider identities, including 1Password, while keeping private keys with their provider. Identity knowledge must remain separate from credential possession.
+2. **Tunnels:** model local, remote, and dynamic forwards; detect local conflicts; and supervise explicitly started tunnels.
+3. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
 
 _(The former fifth slice, herdr tool integration, was dropped on 2026-10-13. The machine-readable output it called for is now part of the desktop surface slice in `ROADMAP.md`.)_
 
@@ -238,3 +237,9 @@ Each slice requires its own design review before implementation.
 ### Delivered follow-up slices
 
 - **TUI refresh:** a refresh key that discards cached host details and re-reads the inventory, so edits made outside Portico (including changes to external included configs) appear without restarting. v1 cached details until Portico itself changed the inventory. Designed in `2026-10-14-tui-refresh-design.md`.
+- **Manual connection test:** `portico test` and the TUI test key check that a host authenticates, through jump hosts and proxies, and offer to trust a new host key. Designed in `2026-10-17-connection-test-design.md`.
+- **Rich error messages:** failed saves, connections and connection tests name the host, field or file at fault and the next step, keeping OpenSSH's own output. Designed in `2026-10-18-rich-error-messages-design.md`.
+- **Jump host suggestions:** the host forms suggest known aliases while a ProxyJump value is typed. Designed in `2026-10-18-jump-host-suggestions-design.md`.
+- **Connection test edge cases:** a multi-hop ProxyJump whose intermediate hop logs at `VERBOSE`, a `ProxyCommand` with `ProxyUseFdpass yes`, and a signal arriving just after a test finishes are handled. Designed in `2026-10-18-connection-test-edge-cases-design.md`.
+- **Safe adoption:** `portico adopt` and `portico export`, and the TUI `m` key, move a concrete external block into the managed file and back losslessly, after an exact preview, with a backup, rollback and an `ssh -G` equality check. Designed in `2026-10-18-safe-adoption-design.md`.
+- **Container shells:** `portico containers` and `portico shell`, and the TUI containers panel, list the running Docker containers on this machine or a host, grouped by Compose project, and open a shell in one with `docker exec`, through `ssh -t` on a host. Designed in `2026-10-18-container-shells-design.md`.

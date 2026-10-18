@@ -1,6 +1,6 @@
 # Roadmap
 
-Scheduling an item here never cancels it. Items keep their requirements until they ship, and each needs its own design review before implementation.
+Scheduling an item here never cancels it. Items keep their requirements until they ship, and each needs its own design review before implementation. A shipped item leaves this file: the product slices delivered so far are listed under "Delivered follow-up slices" in the v1 design (`docs/superpowers/specs/2026-09-13-portico-host-management-design.md`), each design under `docs/superpowers/specs/` records its status, and `CHANGELOG.md` records every release.
 
 ## Rules that keep Portico simple
 
@@ -20,17 +20,9 @@ Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/s
 
 Everything here works in the terminal and adds no long-running state.
 
-1. **Connection test edge cases.** Three rare configurations the first version of `portico test` does not handle:
-   - A multi-hop `ProxyJump a,b` whose intermediate hop logs at `VERBOSE` prints its own `(via proxy)` login before the target's, which can be taken for the target's success.
-   - A `ProxyCommand` with `ProxyUseFdpass yes` makes OpenSSH log the direct-socket form of the login line, which the test does not accept for a proxied host, so it reports a timeout.
-   - A signal that arrives just after the first test finishes leaves the cancel flag set, so trusting a key and testing again reports "cancelled" although the key was trusted.
-2. **Container shells (Docker and Compose).** List the running containers on the local machine or on a host Portico knows, and open a shell in one. Requirements:
-   - Listing runs `docker ps` locally, or over `ssh` on the chosen host, each time it is asked for; nothing is stored. Compose projects and services (from the `com.docker.compose.*` labels) group and name the containers.
-   - Connecting runs `docker exec -it` (never `docker attach`) as the chosen user, defaulting to the image's own user, and starts `bash` when the container has it and `sh` otherwise. On a host it runs through `ssh -t <alias>`, so it reuses the current-terminal and new-terminal connect paths and their error explanations, jump hosts included.
-   - Reached from both the CLI and the TUI (a container picker for a host, plus the local machine).
-   - Scope stops at listing and a shell: container logs, restarts and Compose lifecycle (`up`, `down`) are not planned.
-   - Open design questions, settled when the slice starts: hosts where the user cannot run `docker` without a password, Podman, and whether the last user chosen per service is remembered.
-3. **Safe adoption:** losslessly migrate a concrete external block only after showing an exact preview, creating a backup, and providing rollback.
+1. **Podman.** `portico shell` supports Docker only and never run `podman`. Add Podman as a second engine behind the same picker, listing and shell. Open design questions, settled when the slice starts: rootless Podman's per-user containers, and whether `podman` and `docker` on one target are both listed.
+2. **Remembered container user.** `portico shell` stores nothing, so the user chosen for a container's shell must be picked again each time. Remember the last user per Compose service (or container) so it becomes the default. It needs its own design for a small Portico-owned preferences file, within the rule of no database.
+3. **fzf pickers across the CLI.** `portico shell` picks a container with `fzf` when it is on PATH and a numbered menu otherwise. Offer the same picker wherever the CLI needs a host and none is given (`connect`, `test`, `edit`, `remove` and the others).
 
 ### v3: long-running work and the desktop
 
@@ -60,15 +52,13 @@ Tunnels outlive the command that starts them, and the desktop surface reads ever
 
 | Item | Prerequisite |
 |---|---|
-| Release automation with release-plz: a release pull request kept open on `main` that bumps the version and changelog, and that tags, releases and publishes to crates.io when merged | A GitHub App (the default workflow token neither triggers CI on its pull requests nor starts the release on its tags) added to the tag ruleset's bypass list; a decision on the changelog format (generated from commit messages) and on how `release.yml` keeps building the release tarballs. The pull-request rule on `main` stays. Rehearsed on GitHub before a real release relies on it |
 | Project website and documentation: a static site that presents Portico (what it is, install, a short tour) and holds the user documentation now living in the README, kept in this repository and published from CI | A choice of generator (a docs-oriented static site tool) and hosting (GitHub Pages is the default candidate); the README stays the short entry point. Whatever is built is verified on GitHub, not only locally |
-| Automated end-to-end tests with a real OpenSSH and a real terminal in CI | Its own design |
 | Leaner CI and CD, remainder: merge small jobs (for example `fmt` into `clippy`) so they share the setup each job pays (about 30 s: starting the container, installing packages and the toolchain) | Measured and left out: it saves runner time but no wall-clock time, because the jobs run in parallel and the slowest one sets the pace, and it renames checks that pull requests must pass. Revisit if runner time starts to matter |
 | AUR package `portico` (source build) | Built and merged; publishing is suspended until an AUR account and key exist. Then set the `aur` environment secret and re-run the failed job |
 | AUR package `portico-bin` (prebuilt binary) | Demand for faster installs; the source package ships first |
 | Live inventory reload when the config changes | Its own design: watch `~/.ssh/config` and every included file (or poll modification times), debounce editors that save by renaming, and never reshuffle the list while a form is open; the manual refresh key already ships |
 | Linux release artifacts, ready to use without installing Rust: prebuilt tarballs (a static x86_64 musl build that runs on any distribution including Arch Linux, and an aarch64 build) and distribution packages (`.deb`, `.rpm` and an Arch Linux `.pkg.tar.zst`), each checksummed and attached to the GitHub Release | Its own design: the final target list, whether the aarch64 build needs native ARM runners in CI, how each package is built and verified in a clean container of its distribution, and how this fits the release-plz workflow; first check what the build and distribution channels already support natively |
-| macOS support, distributed through Homebrew | The end-to-end tests, and a portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher |
+| macOS support, distributed through Homebrew | A portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher, with the end-to-end tests running on macOS |
 | Windows support, distributed through winget | The same portability work, plus a Windows terminal launcher |
 | Signed releases and SBOM/provenance attestations | A decision on signing keys and attestation format |
 | Trusted Publishing on crates.io | Configure the trust relationship on crates.io, then switch the publish job to OIDC and delete the stored token |

@@ -41,7 +41,7 @@
 **Interfaces:**
 - Produces: `probe::test_args` with `LogLevel=DEBUG1`; `fn is_debug(line: &str) -> bool` (private) used by all later classification; the fixture set later tasks test against.
 
-- [ ] **Step 1: Capture fixtures.** Follow Task 1 Step 1 of `docs/superpowers/plans/2026-10-17-connection-test.md`, with two changes: the client uses `-o LogLevel=DEBUG1` instead of `VERBOSE`, and the server runs as `/usr/bin/sshd -d -f sshd_config` (one connection per start, restarted before each capture; in the Claude sandbox the daemon mode resets every connection, `-d` works). Re-capture every existing fixture under its current name, then add:
+- [x] **Step 1: Capture fixtures.** Follow Task 1 Step 1 of `docs/superpowers/plans/2026-10-17-connection-test.md`, with two changes: the client uses `-o LogLevel=DEBUG1` instead of `VERBOSE`, and the server runs as `/usr/bin/sshd -d -f sshd_config` (one connection per start, restarted before each capture; in the Claude sandbox the daemon mode resets every connection, `-d` works). Re-capture every existing fixture under its current name, then add:
   - `passphrase-key.txt` (re-captured; it now holds `Server accepts key:` for the passphrase key)
   - `wrong-user.txt`: good key, `nobodyhere@127.0.0.1`
   - `missing-identity.txt`: `-o IdentitiesOnly=yes -i <scratch>/doesnotexist`
@@ -52,7 +52,7 @@
 
   Replace the scratchpad path in every fixture with `/tmp/portico-fixture` (`sed`), so fixtures do not depend on the machine. Write the version from `ssh -V` into `VERSION`.
 
-- [ ] **Step 2: Update the argument test and run the suite.** In `test_arguments_are_exact` change `"LogLevel=VERBOSE"` to `"LogLevel=DEBUG1"`. Add:
+- [x] **Step 2: Update the argument test and run the suite.** In `test_arguments_are_exact` change `"LogLevel=VERBOSE"` to `"LogLevel=DEBUG1"`. Add:
 
 ```rust
 #[test]
@@ -66,11 +66,11 @@ fn debug_lines_never_name_the_jump_host() {
 Run: `cargo test --lib probe`
 Expected: FAIL (`LogLevel` mismatch, the new test, and any fixture test the debug lines now confuse).
 
-- [ ] **Step 3: Implement.** In `base_args` use `LogLevel=DEBUG1`. Add `is_debug(line)` (`line.starts_with("debug")`) and drop such lines before `classify_lines` and before the jump host `named`/`marked` checks in `classify` (the key facts in Task 2 read them separately). Every existing test must pass against the re-captured fixtures without changing its expected values.
+- [x] **Step 3: Implement.** In `base_args` use `LogLevel=DEBUG1`. Add `is_debug(line)` (`line.starts_with("debug")`) and drop such lines before `classify_lines` and before the jump host `named`/`marked` checks in `classify` (the key facts in Task 2 read them separately). Every existing test must pass against the re-captured fixtures without changing its expected values.
 
-- [ ] **Step 4: Run** `cargo test --lib probe` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test --lib probe` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "test: capture the ssh fixtures at debug level"` (fixtures, `probe.rs`).
+- [x] **Step 5: Commit** — `git commit -m "test: capture the ssh fixtures at debug level"` (fixtures, `probe.rs`).
 
 ---
 
@@ -112,7 +112,7 @@ pub const TEST_STDERR_LIMIT: usize = 256 * 1024;
 
   `classify(stderr, deadline_reached, jump) -> Failure` stays, now `diagnose(..).failure` for callers that only need the failure. `Diagnosis::raw` is every non-empty stderr line that is not a `debug` line. `Failure::hint()` is deleted; `Display` stays and gives the short reason used on one line (`jump host bastion failed: connection refused`, `host key changed`, `timed out`, …). `ConfigRejected` is added in Task 3; until then omit the variant.
 
-- [ ] **Step 1: Write the failing tests** in `probe::tests`:
+- [x] **Step 1: Write the failing tests** in `probe::tests`:
 
 ```rust
 #[test]
@@ -183,9 +183,9 @@ fn raw_lines_leave_out_debug_output() {
 
   Update the existing tests to the new shapes (`JumpHostFailed { cause }`, `TimedOut { deadline }`, `HostKeyChanged { .. }`, `AuthRefused { .. }` via `matches!`) and delete `reasons_and_hints_match_the_spec`'s hint assertions; keep its `Display` assertions.
 
-- [ ] **Step 2: Run** `cargo test --lib probe` — Expected: compile FAIL.
+- [x] **Step 2: Run** `cargo test --lib probe` — Expected: compile FAIL.
 
-- [ ] **Step 3: Implement** in `src/probe.rs`:
+- [x] **Step 3: Implement** in `src/probe.rs`:
   - `fn offered_key(line: &str) -> Option<OfferedKey>` parses `Offering public key: <path> <type> <fingerprint> <flags…>`; `source` is `Agent` when the flags contain `agent`, otherwise `File`.
   - `unusable`: paths from `Server accepts key: <path> …` lines when no `Authenticated to` line follows (the passphrase case).
   - On `Route::Proxied`, key facts come only from lines after the last direct-form `Authenticated to … ([addr]:port)` line; if there is none, key facts belong to the jump host's cause.
@@ -195,9 +195,9 @@ fn raw_lines_leave_out_debug_output() {
   - In `openssh.rs` `watch_ssh`, keep only the newest `TEST_STDERR_LIMIT` bytes (drop whole lines from the front).
   - Fix the call sites in `app.rs`, `cli.rs` and `tui.rs` mechanically: replace `failure.hint()` with `None` for now (Tasks 5 and 7 render explanations) and match the new variant shapes.
 
-- [ ] **Step 4: Run** `cargo test` — Expected: PASS (CLI tests asserting a `hint:` line are updated in Task 5; mark them `#[ignore = "rendered in Task 5"]` here only if they fail, and remove the ignore in Task 5).
+- [x] **Step 4: Run** `cargo test` — Expected: PASS (CLI tests asserting a `hint:` line are updated in Task 5; mark them `#[ignore = "rendered in Task 5"]` here only if they fail, and remove the ignore in Task 5).
 
-- [ ] **Step 5: Commit** — `git commit -m "refactor: read offered keys and causes from debug output"`
+- [x] **Step 5: Commit** — `git commit -m "refactor: read offered keys and causes from debug output"`
 
 ---
 
@@ -230,7 +230,7 @@ pub fn interpret(stderr: &str, files: &ConfigFiles<'_>) -> ConfigRejection;
 
   `Display` for `ConfigRejection` gives one line: `Port for dev: OpenSSH rejects '99999'` (Managed: `<Directive> for <alias>: <message>`), `line 12 of ~/.ssh/config: Bad configuration option: bogus` (UserFile, `~` applied through `$HOME`), the raw text otherwise.
 
-- [ ] **Step 1: Write the failing tests** in `config_error::tests`:
+- [x] **Step 1: Write the failing tests** in `config_error::tests`:
 
 ```rust
 const MANAGED: &str = "Host dev\n  HostName 10.0.0.5\n  Port 99999\n";
@@ -276,13 +276,13 @@ fn only_home_paths_are_shortened() {
 }
 ```
 
-- [ ] **Step 2: Run** `cargo test --lib config_error` — Expected: compile FAIL.
+- [x] **Step 2: Run** `cargo test --lib config_error` — Expected: compile FAIL.
 
-- [ ] **Step 3: Implement** `interpret`: take the first line matching `<path>: line <n>: <msg>` or `<path> line <n>: <msg>` (split on the last ` line ` / `: line ` before `<n>:`, so paths with spaces survive), skipping `terminating, N bad configuration options`. Map by path equality: `managed` → walk `managed_text` to the `Host` block containing line `n` and the directive on it; `field` from the directive name, ignoring ASCII case (`host`→`Alias`, `hostname`→`Hostname`, `user`→`User`, `port`→`Port`, `identityfile`→`IdentityFile`, `proxyjump`→`ProxyJump`, else `None`). Add `fn display_with_home(&self, home: &Path) -> String`; `Display` uses `$HOME` from the environment. Add `Failure::ConfigRejected(ConfigRejection)` to `probe`.
+- [x] **Step 3: Implement** `interpret`: take the first line matching `<path>: line <n>: <msg>` or `<path> line <n>: <msg>` (split on the last ` line ` / `: line ` before `<n>:`, so paths with spaces survive), skipping `terminating, N bad configuration options`. Map by path equality: `managed` → walk `managed_text` to the `Host` block containing line `n` and the directive on it; `field` from the directive name, ignoring ASCII case (`host`→`Alias`, `hostname`→`Hostname`, `user`→`User`, `port`→`Port`, `identityfile`→`IdentityFile`, `proxyjump`→`ProxyJump`, else `None`). Add `fn display_with_home(&self, home: &Path) -> String`; `Display` uses `$HOME` from the environment. Add `Failure::ConfigRejected(ConfigRejection)` to `probe`.
 
-- [ ] **Step 4: Run** `cargo test --lib config_error` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test --lib config_error` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat: map OpenSSH configuration errors to the host and field"`
+- [x] **Step 5: Commit** — `git commit -m "feat: map OpenSSH configuration errors to the host and field"`
 
 ---
 
@@ -297,18 +297,18 @@ fn only_home_paths_are_shortened() {
 - Produces: `TransactionError::Validation(ConfigRejection)`, `InitError::Validation(ConfigRejection)`. The `validate` closure type stays `Fn(&Path, &[String]) -> Result<(), String>`, where the `String` is now ssh's raw stderr (`OpenSshError::Failed { stderr, .. }` → `stderr`; any other error → its `to_string()`, which interprets as `Unrecognised`). `preview`'s `use_entry` closure receives `ConfigFiles<'_>` instead of `&Path` (its `entry` is the staged entry), so a form test can map config errors too.
 - Error text: `TransactionError::Validation` displays `configuration validation failed: {rejection}; nothing was saved` followed, for `UserFile`, by `; fix that line, then save again`. `InitError::Validation` keeps its current recovery text but uses `{rejection}` and ends `then rerun portico init`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `managed.rs`: `a_rejected_managed_line_reports_its_host_and_field` — a `transact` that inserts host `dev` with port 22, and whose `validate` closure reads the staged entry it is given, takes the candidate path from its `Include <path>` line, finds the line number of `Port 22` in that candidate, and returns `Err(format!("{candidate} line {n}: Bad port '22'."))`; assert `Err(TransactionError::Validation(ConfigRejection::Managed { field: Some(HostField::Port), .. }))`. Adapt the existing `Validation("ssh failed")` test to `Validation(ConfigRejection::Unrecognised { raw })` with `raw == "ssh failed"`.
   - `tui.rs`: `a_rejected_field_is_focused_in_the_form` — in `Mode::EditForm`, `report_error(&AppError::Transaction(TransactionError::Validation(ConfigRejection::Managed { alias: "dev".into(), field: Some(HostField::Port), directive: "Port".into(), message: "Bad port '99999'.".into() })))` sets `form.active` to the Port row and `form.error` to `Some("Port for dev: Bad port '99999'.")`.
   - `tests/cli.rs`: `a_save_rejected_by_the_users_own_config_names_that_file` — an env whose `~/.ssh/config` has `Bogus yes` on line 3 below the Include; `portico add x -H h` exits 1 and stderr contains `line 3 of ~/.ssh/config: Bad configuration option: bogus` and `nothing was saved`.
 
-- [ ] **Step 2: Run** `cargo test` — Expected: compile FAIL.
+- [x] **Step 2: Run** `cargo test` — Expected: compile FAIL.
 
-- [ ] **Step 3: Implement.** In `transact_inner`, map the closure's `Err(stderr)` with `interpret(&stderr, &ConfigFiles { managed: candidate.path(), managed_text: <candidate bytes as UTF-8>, entry: validation_file.path() })` before the staged files are dropped; in `apply_init`, with the real managed and entry paths. In `tui::report_error`, when in a form and the rejection is `Managed { field: Some(field), .. }`, focus that row (as `report_form_error` does) and set `form.error` to the rejection's `Display`.
+- [x] **Step 3: Implement.** In `transact_inner`, map the closure's `Err(stderr)` with `interpret(&stderr, &ConfigFiles { managed: candidate.path(), managed_text: <candidate bytes as UTF-8>, entry: validation_file.path() })` before the staged files are dropped; in `apply_init`, with the real managed and entry paths. In `tui::report_error`, when in a form and the rejection is `Managed { field: Some(field), .. }`, focus that row (as `report_form_error` does) and set `form.error` to the rejection's `Display`.
 
-- [ ] **Step 4: Run** `cargo test` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat: say which host, field or file OpenSSH rejected when saving"`
+- [x] **Step 5: Commit** — `git commit -m "feat: say which host, field or file OpenSSH rejected when saving"`
 
 ---
 
@@ -363,7 +363,7 @@ impl Explanation {
 
   `TestReport` gains `pub explanation: Option<Explanation>` (`Some` exactly when the result is `Failed`), built in `test_entry` from the `Diagnosis` and the resolved config (`identity_files` existence checked with `Path::exists` after `~/` expansion against the store's home). When `resolve_with` fails with `OpenSshError::Failed { stderr, .. }` whose `interpret` (with the preview's `ConfigFiles` for a form, or the real managed file and entry for a saved host) is not `Unrecognised`, `test_entry` returns a `Done` report with `ProbeResult::Failed(Failure::ConfigRejected(rejection))` instead of an error. `TestReport::summary()` stays the one-line form. `key_fetch_failure` stays and, when present, is added as an extra `next` line: `could not fetch the host key: {failure}`.
 
-- [ ] **Step 1: Write the failing tests.** One golden test per cause in `explain::tests`, each building a `Diagnosis` from a fixture (or by hand where noted) and asserting the full `render("dev", false)` output. The headlines and next steps are fixed copy:
+- [x] **Step 1: Write the failing tests.** One golden test per cause in `explain::tests`, each building a `Diagnosis` from a fixture (or by hand where noted) and asserting the full `render("dev", false)` output. The headlines and next steps are fixed copy:
 
 | Cause | Headline | Next |
 |---|---|---|
@@ -398,13 +398,13 @@ assert_eq!(explain(&diagnosis, &context).render("dev", false), [
 
   In `tests/cli.rs`: update the existing failure tests to the new layout; add `test_raw_prints_what_ssh_said` (`portico test x --raw` with a fake ssh printing `user@h: Permission denied (publickey).` shows `  ssh said:` and that line).
 
-- [ ] **Step 2: Run** `cargo test` — Expected: compile FAIL.
+- [x] **Step 2: Run** `cargo test` — Expected: compile FAIL.
 
-- [ ] **Step 3: Implement** `explain`, `render`, the `TestReport` field, `--raw` (`#[arg(long)] raw: bool` on `Test`), and `print_report` printing `report.summary()` for a pass and `explanation.render(alias, raw)` for a failure. Remove any `#[ignore]` added in Task 2.
+- [x] **Step 3: Implement** `explain`, `render`, the `TestReport` field, `--raw` (`#[arg(long)] raw: bool` on `Test`), and `print_report` printing `report.summary()` for a pass and `explanation.render(alias, raw)` for a failure. Remove any `#[ignore]` added in Task 2.
 
-- [ ] **Step 4: Run** `cargo test` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat: explain connection test failures with their facts and next step"`
+- [x] **Step 5: Commit** — `git commit -m "feat: explain connection test failures with their facts and next step"`
 
 ---
 
@@ -440,7 +440,7 @@ pub enum ConnectionOutcome {
 
   `App::connect` and `App::connect_cancellable` both return `ConnectionOutcome` and use `connect_mirrored` with `io::stderr()`. On `status.code() == Some(255)` they run `resolve_with(None, alias, None)`. If that fails with `OpenSshError::Failed { stderr, .. }` that `interpret` (real managed file and entry) maps to anything but `Unrecognised`, the explanation is that config rejection; any other resolve failure gives `None`. Otherwise they `diagnose` the lossy-UTF-8 tail with the resolved route and explain it with `Operation::Connect`; `Failure::Other` gives `None`. Every other status gives `None`.
 
-- [ ] **Step 1: Write the failing tests** in `openssh::tests`, with fake `ssh` scripts and a shared `Arc<Mutex<Vec<u8>>>` sink:
+- [x] **Step 1: Write the failing tests** in `openssh::tests`, with fake `ssh` scripts and a shared `Arc<Mutex<Vec<u8>>>` sink:
   - `mirrored_bytes_arrive_unchanged_and_in_order` — the script runs `printf 'Password:'; sleep 0.3; printf '\377\r\nbye\n' >&2; exit 0` (the first `printf` to stderr too); assert the sink holds `Password:` before the script exits (poll the sink while the child runs) and finally equals the exact bytes, including `\xff` and `\r\n`.
   - `the_tail_keeps_the_newest_bytes` — the script writes 100 KiB of `a` then `END\n`; `tail.len() == CONNECT_TAIL_LIMIT` and it ends with `END\n`.
   - `the_exit_status_passes_through` — `exit 3` gives code 3.
@@ -451,13 +451,13 @@ pub enum ConnectionOutcome {
   - `connect_explains_a_rejected_configuration` — exit 255, and `-G` exits 255 printing `<env home>/.ssh/config line 3: Bad configuration option: bogus`: the explanation headline is `OpenSSH rejected the configuration` with `line 3 of ~/.ssh/config`.
   - `a_lost_session_says_so` — exit 255 with `Connection to h closed by remote host.`: explanation headline `the connection was lost`.
 
-- [ ] **Step 2: Run** `cargo test` — Expected: compile FAIL.
+- [x] **Step 2: Run** `cargo test` — Expected: compile FAIL.
 
-- [ ] **Step 3: Implement.** The copier reads into an 8 KiB buffer and writes and flushes each chunk before the next read; the tail is a `VecDeque<u8>` trimmed from the front. Join the thread after the child exits. Keep the cancellation and process-tree handling of the current `connect_cancellable`. The CLI writes the explanation to its error writer: an empty line, then `render(alias, false)`, and exits with ssh's code as today. In `tui.rs`, adapt the status line to `ConnectionOutcome::Exited { status, explanation }` (`explanation.headline` when present, otherwise today's text); the details section is Task 7.
+- [x] **Step 3: Implement.** The copier reads into an 8 KiB buffer and writes and flushes each chunk before the next read; the tail is a `VecDeque<u8>` trimmed from the front. Join the thread after the child exits. Keep the cancellation and process-tree handling of the current `connect_cancellable`. The CLI writes the explanation to its error writer: an empty line, then `render(alias, false)`, and exits with ssh's code as today. In `tui.rs`, adapt the status line to `ConnectionOutcome::Exited { status, explanation }` (`explanation.headline` when present, otherwise today's text); the details section is Task 7.
 
-- [ ] **Step 4: Run** `cargo test` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat: explain why a connection failed, keeping ssh's own output"`
+- [x] **Step 5: Commit** — `git commit -m "feat: explain why a connection failed, keeping ssh's own output"`
 
 ---
 
@@ -471,20 +471,20 @@ pub enum ConnectionOutcome {
 - Consumes: `TestReport::explanation`, `ConnectionOutcome::Exited { explanation }`, `Explanation::render`.
 - Produces: `TestMark` and `FormTestResult` gain `explanation: Option<Explanation>` (the `hint` field goes); `UiState` gains `connections`: the last connection explanation per host, kept, matched and cleared exactly like `results` (edit, removal, refresh), and `show_raw: bool`, toggled by `o`, reset when the selection changes or a form opens or closes.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `a_failed_test_shows_its_explanation_in_the_details` — after a `Done` report with an explanation, the details text contains `Connection test: failed — the server refused the login at <time>` followed by the rendered fact and `next` lines (without the `dev: failed — ` prefix line).
   - `o_unfolds_the_ssh_output_and_the_footer_offers_it_only_when_there_is_some` — the footer contains `o ssh output` only when the selected host's test or connection explanation has raw lines; after `o` the details contain `ssh said:` and the raw line; a second `o` hides it; moving the selection hides it.
   - `a_failed_connection_adds_a_last_connection_section` — after the connect handling records `Exited { status: 255, explanation: Some(..) }`, the details contain `Last connection: failed — <headline>`; the status line is the headline; edit, removal and refresh clear it (one assertion each, mirroring the existing test-mark clearing tests).
   - `a_form_test_failure_shows_its_explanation` — the form area shows `Connection test: failed — <headline>` and the next lines; `o` inside a form is text, so in a form the raw output is unfolded with `Ctrl+O` instead, and the form footer advertises `Ctrl+O ssh output` only when there is raw output.
   Update the existing tests that asserted hint lines.
 
-- [ ] **Step 2: Run** `cargo test --lib tui` — Expected: FAIL.
+- [x] **Step 2: Run** `cargo test --lib tui` — Expected: FAIL.
 
-- [ ] **Step 3: Implement** as specified; the status line for a failed test keeps today's `<alias>: failed — <reason>` form, using the headline.
+- [x] **Step 3: Implement** as specified; the status line for a failed test keeps today's `<alias>: failed — <reason>` form, using the headline.
 
-- [ ] **Step 4: Run** `cargo test --lib tui` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test --lib tui` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat: show failure explanations and ssh output in the TUI"`
+- [x] **Step 5: Commit** — `git commit -m "feat: show failure explanations and ssh output in the TUI"`
 
 ---
 
@@ -497,17 +497,17 @@ pub enum ConnectionOutcome {
 **Interfaces:**
 - Produces: `OpenSsh::with_portico(self, path: Option<PathBuf>) -> Self`; `OpenSsh::system()` sets it from `std::env::current_exe().ok()`. `Connect` gains `#[arg(long, hide = true)] hold: bool`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `openssh`: `a_new_terminal_runs_portico_when_its_path_is_known` — a fake terminal script records its arguments; with `with_portico(Some("/opt/portico"))` they are exactly `/opt/portico connect --hold -- dev`; with `None` they are `<ssh> -- dev` as today.
   - `tests/cli.rs`: `hold_waits_for_enter_only_after_an_explained_failure` — `portico connect x --hold` with the refusing fake ssh and stdin `\n`: stderr ends with `Press Enter to close`, and the process exits 255 after reading the line; with an `exit 0` fake ssh and empty stdin it exits 0 without printing the prompt; with `exit 255` and output `weird thing` it does not prompt.
 
-- [ ] **Step 2: Run** `cargo test` — Expected: FAIL.
+- [x] **Step 2: Run** `cargo test` — Expected: FAIL.
 
-- [ ] **Step 3: Implement.** When `hold` is set and the outcome carries an explanation, write `Press Enter to close` to the error writer and read one line from `input` (EOF also ends the wait).
+- [x] **Step 3: Implement.** When `hold` is set and the outcome carries an explanation, write `Press Enter to close` to the error writer and read one line from `input` (EOF also ends the wait).
 
-- [ ] **Step 4: Run** `cargo test` — Expected: PASS.
+- [x] **Step 4: Run** `cargo test` — Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git commit -m "feat: keep a new terminal open to explain a failed connection"`
+- [x] **Step 5: Commit** — `git commit -m "feat: keep a new terminal open to explain a failed connection"`
 
 ---
 
@@ -516,12 +516,12 @@ pub enum ConnectionOutcome {
 **Files:**
 - Modify: `tests/real_openssh.rs`, `README.md`, `ROADMAP.md`
 
-- [ ] **Step 1: Extend the ignored end-to-end test.** Add a passphrase-protected key (`-N pw`) to `authorized_keys` and a second `Host locked` block using it; assert `portico test locked` exits 1 and prints `the key needs a passphrase` and `` `ssh-add `` with the key's path. With the authorized key removed (existing step), assert the output contains `offered:` and the key's path.
+- [x] **Step 1: Extend the ignored end-to-end test.** Add a passphrase-protected key (`-N pw`) to `authorized_keys` and a second `Host locked` block using it; assert `portico test locked` exits 1 and prints `the key needs a passphrase` and `` `ssh-add `` with the key's path. With the authorized key removed (existing step), assert the output contains `offered:` and the key's path.
 
-- [ ] **Step 2: Run** `cargo test --test real_openssh -- --ignored` — Expected: PASS (needs `/usr/bin/sshd`; outside the Claude sandbox, or with the sandbox disabled for this command).
+- [x] **Step 2: Run** `cargo test --test real_openssh -- --ignored` — Expected: PASS (needs `/usr/bin/sshd`; outside the Claude sandbox, or with the sandbox disabled for this command).
 
-- [ ] **Step 3: Documentation.** In `README.md`: replace the test section's "prints the reason" sentence with the new layout and `--raw`; add a short "When something fails" section after the test section covering: test, connect (ssh's output unchanged, then an explanation for a recognised cause; new terminals stay open on such a failure until Enter), save (names the field, or the line of your own file), `o` / `Ctrl+O` in the TUI; add `o` to the key table. In `ROADMAP.md` remove slice 1 and renumber.
+- [x] **Step 3: Documentation.** In `README.md`: replace the test section's "prints the reason" sentence with the new layout and `--raw`; add a short "When something fails" section after the test section covering: test, connect (ssh's output unchanged, then an explanation for a recognised cause; new terminals stay open on such a failure until Enter), save (names the field, or the line of your own file), `o` / `Ctrl+O` in the TUI; add `o` to the key table. In `ROADMAP.md` remove slice 1 and renumber.
 
-- [ ] **Step 4: Run** `scripts/ci-checks.sh` — Expected: every check passes (including `tests/docs.rs`).
+- [x] **Step 4: Run** `scripts/ci-checks.sh` — Expected: every check passes (including `tests/docs.rs`).
 
-- [ ] **Step 5: Commit** — `git commit -m "docs: describe how Portico explains failures"`
+- [x] **Step 5: Commit** — `git commit -m "docs: describe how Portico explains failures"`

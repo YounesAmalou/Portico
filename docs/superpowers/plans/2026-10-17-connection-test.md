@@ -66,9 +66,9 @@ Reasons and hints (exact copy):
 | `JumpHostFailed { jump, detail }` | `jump host {jump} failed: {detail}` | `test the jump host on its own first` |
 | `Other(line)` | `{line}` | `None` |
 
-- [ ] **Step 1: Capture the fixtures from a real OpenSSH.** In the session scratchpad (never the repository), run a throwaway user `sshd` on `127.0.0.1:22999`: generate a host key, a client key, a passphrase-protected client key (`-N pw`), an `authorized_keys` holding the client key, and an `sshd_config` with `Port 22999`, `ListenAddress 127.0.0.1`, absolute `HostKey`, `PidFile`, `AuthorizedKeysFile`, `StrictModes no`, `UsePAM no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; start it with `/usr/bin/sshd -f sshd_config -E log`. Run `ssh -F /dev/null` with the test options plus `-p 22999 -o IdentityAgent=none -o IdentitiesOnly=yes -i <key> -o UserKnownHostsFile=<file>` and save stderr verbatim as: `authenticated.txt` (good key, trusted), `host-key-unknown.txt` (empty known-hosts file), `host-key-changed.txt` (known-hosts entry with one base64 character altered), `auth-refused.txt` (wrong key), `passphrase-key.txt` (passphrase key), `connection-refused.txt` (port 22998), `name-unresolved.txt` (`probe.invalid`), `jump-connection-refused.txt` (`-J 127.0.0.1:22998`), `jump-target-refused.txt` (`-J` through the running sshd to `127.0.0.1:22998`), and `other.txt` (any failure not listed, for example `-o KexAlgorithms=none-such` against the sshd). Kill the sshd. Note the OpenSSH version in a header-free `tests/fixtures/ssh/VERSION` file.
+- [x] **Step 1: Capture the fixtures from a real OpenSSH.** In the session scratchpad (never the repository), run a throwaway user `sshd` on `127.0.0.1:22999`: generate a host key, a client key, a passphrase-protected client key (`-N pw`), an `authorized_keys` holding the client key, and an `sshd_config` with `Port 22999`, `ListenAddress 127.0.0.1`, absolute `HostKey`, `PidFile`, `AuthorizedKeysFile`, `StrictModes no`, `UsePAM no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`; start it with `/usr/bin/sshd -f sshd_config -E log`. Run `ssh -F /dev/null` with the test options plus `-p 22999 -o IdentityAgent=none -o IdentitiesOnly=yes -i <key> -o UserKnownHostsFile=<file>` and save stderr verbatim as: `authenticated.txt` (good key, trusted), `host-key-unknown.txt` (empty known-hosts file), `host-key-changed.txt` (known-hosts entry with one base64 character altered), `auth-refused.txt` (wrong key), `passphrase-key.txt` (passphrase key), `connection-refused.txt` (port 22998), `name-unresolved.txt` (`probe.invalid`), `jump-connection-refused.txt` (`-J 127.0.0.1:22998`), `jump-target-refused.txt` (`-J` through the running sshd to `127.0.0.1:22998`), and `other.txt` (any failure not listed, for example `-o KexAlgorithms=none-such` against the sshd). Kill the sshd. Note the OpenSSH version in a header-free `tests/fixtures/ssh/VERSION` file.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```rust
 fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARGO_MANIFEST_DIR
@@ -106,13 +106,13 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
 #[test] fn reasons_and_hints_match_the_spec() // Display and hint() for AuthRefused, HostKeyChanged and JumpHostFailed equal the table above
 ```
 
-- [ ] **Step 3: Run them** — `cargo test --lib probe::` → FAIL (module missing).
+- [x] **Step 3: Run them** — `cargo test --lib probe::` → FAIL (module missing).
 
-- [ ] **Step 4: Implement `src/probe.rs`.** Classification order: changed-key banner, then `Host key verification failed.` (unknown; also when the line mentions the jump host, see below), then jump-host rules, then `Permission denied (`…`)` (methods are the text inside the parentheses), `Could not resolve hostname <host>:`, `Connection refused`, `No route to host` / `Network is unreachable`, `Connection timed out` / `Operation timed out` / `deadline_reached`, else `Other(last non-empty line)` (`Other("ssh failed without output")` when empty). Jump-host rule: when `jump` is `Some(j)` and a failure line names the jump host's host part, or any line contains `channel 0: open failed` or `UNKNOWN port 65535`, return `JumpHostFailed { jump: j, detail }` where `detail` is the `Display` of the classification of the remaining lines (or the matched line itself when that is `Other`). Let the fixtures decide the exact substrings; the table semantics above are fixed.
+- [x] **Step 4: Implement `src/probe.rs`.** Classification order: changed-key banner, then `Host key verification failed.` (unknown; also when the line mentions the jump host, see below), then jump-host rules, then `Permission denied (`…`)` (methods are the text inside the parentheses), `Could not resolve hostname <host>:`, `Connection refused`, `No route to host` / `Network is unreachable`, `Connection timed out` / `Operation timed out` / `deadline_reached`, else `Other(last non-empty line)` (`Other("ssh failed without output")` when empty). Jump-host rule: when `jump` is `Some(j)` and a failure line names the jump host's host part, or any line contains `channel 0: open failed` or `UNKNOWN port 65535`, return `JumpHostFailed { jump: j, detail }` where `detail` is the `Display` of the classification of the remaining lines (or the matched line itself when that is `Other`). Let the fixtures decide the exact substrings; the table semantics above are fixed.
 
-- [ ] **Step 5: Run them** — `cargo test --lib probe::` → PASS.
+- [x] **Step 5: Run them** — `cargo test --lib probe::` → PASS.
 
-- [ ] **Step 6: Commit** — `git add src/probe.rs src/lib.rs tests/fixtures/ssh && git commit -m "chore: classify OpenSSH connection test output"`.
+- [x] **Step 6: Commit** — `git add src/probe.rs src/lib.rs tests/fixtures/ssh && git commit -m "chore: classify OpenSSH connection test output"`.
 
 ---
 
@@ -135,7 +135,7 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
   - `pub fn with_keygen(self, keygen: PathBuf) -> Self`; `OpenSsh::new` defaults `keygen` to `"ssh-keygen"`.
   - `pub(crate) fn append_known_hosts(path: &Path, lines: &[u8]) -> io::Result<()>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn probe_stops_at_the_success_line_and_kills_the_group()
@@ -153,13 +153,13 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
 #[test] fn resolve_with_reads_the_known_hosts_files() // -G output "hostname h\nuserknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2\n" → known_hosts_files == both; and "-F" plus the entry precede "--" in the logged args
 ```
 
-- [ ] **Step 2: Run them** — `cargo test --lib openssh::` → FAIL.
+- [x] **Step 2: Run them** — `cargo test --lib openssh::` → FAIL.
 
-- [ ] **Step 3: Implement.** `probe` spawns `ssh` with `process_group(0)`, stdin null, stdout null, stderr piped; a reader thread sends stderr lines over an `mpsc` channel; the loop checks `cancelled`, the deadline, the channel (`authenticated(line)` → kill group, reap, return success) and `try_wait`. On exit, drain the channel and `classify(all_lines, false, jump)`; on the deadline kill, `classify(all_lines, true, jump)`. Put the loop in a private `probe_with_deadline(.., deadline: Duration)` so tests can shorten it; `probe` passes `TEST_DEADLINE`. `fetch_host_key` creates an empty temp file with `managed::write_unique` in the system temp directory (`std::env::temp_dir()`), mode `0600`, made `pub(crate)` together with `PendingFile` so the file is removed on drop (`tempfile` is only a dev-dependency; do not add a crate), runs `ssh` with `fetch_key_args` through the same loop (a success line is impossible; treat any exit or the deadline the same), then reads the file: empty → `KeyFetch::Failed(classify(..))`; otherwise runs `<keygen> -l -f <file>` and parses each line. `append_known_hosts` opens with `OpenOptions::new().append(true).create(true).mode(0o600)`, reads the last byte first to decide the separating newline.
+- [x] **Step 3: Implement.** `probe` spawns `ssh` with `process_group(0)`, stdin null, stdout null, stderr piped; a reader thread sends stderr lines over an `mpsc` channel; the loop checks `cancelled`, the deadline, the channel (`authenticated(line)` → kill group, reap, return success) and `try_wait`. On exit, drain the channel and `classify(all_lines, false, jump)`; on the deadline kill, `classify(all_lines, true, jump)`. Put the loop in a private `probe_with_deadline(.., deadline: Duration)` so tests can shorten it; `probe` passes `TEST_DEADLINE`. `fetch_host_key` creates an empty temp file with `managed::write_unique` in the system temp directory (`std::env::temp_dir()`), mode `0600`, made `pub(crate)` together with `PendingFile` so the file is removed on drop (`tempfile` is only a dev-dependency; do not add a crate), runs `ssh` with `fetch_key_args` through the same loop (a success line is impossible; treat any exit or the deadline the same), then reads the file: empty → `KeyFetch::Failed(classify(..))`; otherwise runs `<keygen> -l -f <file>` and parses each line. `append_known_hosts` opens with `OpenOptions::new().append(true).create(true).mode(0o600)`, reads the last byte first to decide the separating newline.
 
-- [ ] **Step 4: Run them** — `cargo test --lib openssh::` → PASS, and the existing `openssh` tests still pass.
+- [x] **Step 4: Run them** — `cargo test --lib openssh::` → PASS, and the existing `openssh` tests still pass.
 
-- [ ] **Step 5: Commit** — `chore: run connection tests and fetch host keys with OpenSSH`.
+- [x] **Step 5: Commit** — `chore: run connection tests and fetch host keys with OpenSSH`.
 
 ---
 
@@ -174,7 +174,7 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
   - `ConfigPaths` gains `pub system_config: PathBuf`, set by `from_home` to `/etc/ssh/ssh_config`.
   - `pub(crate) fn preview<R, E, M, U>(&self, mutate: M, use_entry: U, cancelled: Option<&AtomicBool>) -> Result<R, E> where E: From<TransactionError>, M: FnOnce(&mut ManagedConfig) -> Result<(), E>, U: FnOnce(&Path) -> Result<R, E>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn preview_hands_over_the_candidate_and_changes_nothing()
@@ -191,13 +191,13 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
 // inside use_entry, a transact() on the same store (another ManagedStore value with the same paths) succeeds
 ```
 
-- [ ] **Step 2: Run them** — `cargo test --lib managed::` → FAIL.
+- [x] **Step 2: Run them** — `cargo test --lib managed::` → FAIL.
 
-- [ ] **Step 3: Implement.** Extract from `transact_inner` a private `stage(&self, mutate, cancelled) -> Result<(R, Staged), E>` covering `ensure_ready` through writing the validation entry (`Staged` owns the lock file, `active` bytes, the candidate and the validation entry `PendingFile`s, and the changed aliases). `transact_inner` becomes `stage` + validate + the existing activation; its behaviour and existing tests are unchanged. `preview` calls `stage`, appends the system include to a separate preview entry when `paths.system_config` exists (write it with `write_unique` in `ssh_dir`, quoting the path with the existing `quote_path`), drops the lock, then calls `use_entry` and lets the `PendingFile`s drop.
+- [x] **Step 3: Implement.** Extract from `transact_inner` a private `stage(&self, mutate, cancelled) -> Result<(R, Staged), E>` covering `ensure_ready` through writing the validation entry (`Staged` owns the lock file, `active` bytes, the candidate and the validation entry `PendingFile`s, and the changed aliases). `transact_inner` becomes `stage` + validate + the existing activation; its behaviour and existing tests are unchanged. `preview` calls `stage`, appends the system include to a separate preview entry when `paths.system_config` exists (write it with `write_unique` in `ssh_dir`, quoting the path with the existing `quote_path`), drops the lock, then calls `use_entry` and lets the `PendingFile`s drop.
 
-- [ ] **Step 4: Run them** — `cargo test --lib managed::` → PASS, including every existing transaction test.
+- [x] **Step 4: Run them** — `cargo test --lib managed::` → PASS, including every existing transaction test.
 
-- [ ] **Step 5: Commit** — `chore: stage managed changes separately from activating them`.
+- [x] **Step 5: Commit** — `chore: stage managed changes separately from activating them`.
 
 ---
 
@@ -217,7 +217,7 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
   - `pub fn trust_and_retest(&self, target: &TestTarget, key: &PresentedKey) -> Result<TestOutcome, AppError>` and `pub(crate) fn trust_and_retest_cancellable(..., cancelled: &AtomicBool)`
   - `AppError` gains `#[error("cannot update known hosts file {path}: {reason}")] KnownHosts { path: PathBuf, reason: String }`; `tui::may_have_changed_inventory` maps it to `false`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn a_saved_host_is_tested_with_the_users_configuration() // fake ssh: -G prints "hostname h\nuser deploy\nport 22\n"; otherwise prints the success line. test(&Saved("DEV")) on host "dev" → Done(report) with alias "dev", user Some("deploy"), Authenticated; no "-F" in the probe args
@@ -233,13 +233,13 @@ fn fixture(name: &str) -> String // reads tests/fixtures/ssh/{name}.txt via CARG
 #[test] fn tokens_in_the_known_hosts_path_are_refused() // "userknownhostsfile ~/.ssh/%u" → Err(AppError::KnownHosts{..}) and nothing written
 ```
 
-- [ ] **Step 2: Run them** — `cargo test --lib app::` → FAIL.
+- [x] **Step 2: Run them** — `cargo test --lib app::` → FAIL.
 
-- [ ] **Step 3: Implement.** Pull the add and edit mutations out of `add_inner`/`edit_inner` into private helpers so `transact` and `store.preview` share them. For each target, run inside one closure that receives `entry: Option<&Path>` (`None` for `Saved` after the case-insensitive alias lookup used by `connect`; the staged entry for forms): `resolve_with` (for `user`, `proxy_jump`, `known_hosts_files`), then `probe`; on `Failed(HostKeyUnknown)` call `fetch_host_key` and return `UnknownHostKey` or `Done` with `key_fetch_failure`. `trust_and_retest` resolves again, computes the path with `probe::known_hosts_path(.., home)` (home = `store.paths().ssh_dir.parent()`), calls `append_known_hosts`, then runs the same test.
+- [x] **Step 3: Implement.** Pull the add and edit mutations out of `add_inner`/`edit_inner` into private helpers so `transact` and `store.preview` share them. For each target, run inside one closure that receives `entry: Option<&Path>` (`None` for `Saved` after the case-insensitive alias lookup used by `connect`; the staged entry for forms): `resolve_with` (for `user`, `proxy_jump`, `known_hosts_files`), then `probe`; on `Failed(HostKeyUnknown)` call `fetch_host_key` and return `UnknownHostKey` or `Done` with `key_fetch_failure`. `trust_and_retest` resolves again, computes the path with `probe::known_hosts_path(.., home)` (home = `store.paths().ssh_dir.parent()`), calls `append_known_hosts`, then runs the same test.
 
-- [ ] **Step 4: Run them** — `cargo test --lib app::` → PASS.
+- [x] **Step 4: Run them** — `cargo test --lib app::` → PASS.
 
-- [ ] **Step 5: Commit** — `chore: test saved hosts and form values through App`.
+- [x] **Step 5: Commit** — `chore: test saved hosts and form values through App`.
 
 ---
 
@@ -264,7 +264,7 @@ Output (exact):
   ```
   (one middle line per fingerprint). Interactive: then `Trust this host key? [y/N] ` via the existing `confirm`; `y` → `trust_and_retest` and print its outcome; otherwise print `Host key not trusted.` and exit 1. Non-interactive without the flag: print `hint: pass --accept-host-key <fingerprint> to trust it` and exit 1. With the flag: trust only if every fetched fingerprint equals it, else print `{alias}: failed — the host key fingerprint does not match --accept-host-key` and exit 1. The flag is ignored when the key is already trusted.
 
-- [ ] **Step 1: Write the failing tests** in `tests/cli.rs`
+- [x] **Step 1: Write the failing tests** in `tests/cli.rs`
 
 ```rust
 #[test] fn test_reports_success_and_exits_zero() // ssh: -G → "hostname h\nuser deploy\nport 22\n", else success line for 10.0.0.5:22 → stdout contains "dev: authenticated as deploy@10.0.0.5:22 (publickey)"
@@ -276,10 +276,10 @@ Output (exact):
 #[test] fn external_hosts_can_be_tested() // host defined in ~/.ssh/config, not managed → exit 0
 ```
 
-- [ ] **Step 2: Run them** — `cargo test --test cli test_` → FAIL.
-- [ ] **Step 3: Implement the `Test` arm** of `execute`, returning `ExitCode::from(1)` for failures (not `Err`, so the output is not prefixed with `error:`).
-- [ ] **Step 4: Run them** — `cargo test --test cli` → PASS.
-- [ ] **Step 5: Commit** — `feat: add portico test`.
+- [x] **Step 2: Run them** — `cargo test --test cli test_` → FAIL.
+- [x] **Step 3: Implement the `Test` arm** of `execute`, returning `ExitCode::from(1)` for failures (not `Err`, so the output is not prefixed with `error:`).
+- [x] **Step 4: Run them** — `cargo test --test cli` → PASS.
+- [x] **Step 5: Commit** — `feat: add portico test`.
 
 ---
 
@@ -313,7 +313,7 @@ Behaviour (copy fixed by the spec):
 - Results are cleared for an alias after a successful edit or removal of it, and entirely on refresh.
 - Footers: browse adds `t test` when a host is selected; forms add `Ctrl+T test`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn t_starts_a_test_of_the_selected_host_in_browse_mode_only() // browse → Test{Saved("dev")}; filter and forms: 't' is text, UiAction::None
@@ -330,10 +330,10 @@ Behaviour (copy fixed by the spec):
 #[test] fn dropping_the_tester_kills_the_running_ssh() // pid file written by fake ssh; drop inside the scope; process gone
 ```
 
-- [ ] **Step 2: Run them** — `cargo test --lib tui::` → FAIL.
-- [ ] **Step 3: Implement.** Spawn the `Tester` next to the `Resolver` in `browse`, in the same `thread::scope`, and drop both before the scope ends (comment as for the resolver). In `browse_hosts`: poll the tester each loop iteration, set `state.testing`, keep the 25 ms poll interval while it is pending, and route `Finished` to the results, the form or (Task 7) the trust prompt. `UiAction::Test` → `tester.start(origin, Job::Test(target))`; `CancelTest` → `tester.cancel()`.
-- [ ] **Step 4: Run them** — `cargo test --lib` → PASS.
-- [ ] **Step 5: Commit** — `feat: test hosts from the TUI`.
+- [x] **Step 2: Run them** — `cargo test --lib tui::` → FAIL.
+- [x] **Step 3: Implement.** Spawn the `Tester` next to the `Resolver` in `browse`, in the same `thread::scope`, and drop both before the scope ends (comment as for the resolver). In `browse_hosts`: poll the tester each loop iteration, set `state.testing`, keep the 25 ms poll interval while it is pending, and route `Finished` to the results, the form or (Task 7) the trust prompt. `UiAction::Test` → `tester.start(origin, Job::Test(target))`; `CancelTest` → `tester.cancel()`.
+- [x] **Step 4: Run them** — `cargo test --lib` → PASS.
+- [x] **Step 5: Commit** — `feat: test hosts from the TUI`.
 
 ---
 
@@ -352,7 +352,7 @@ Behaviour:
 - A changed key needs no prompt: it is an ordinary failure whose status line also carries its hint.
 - The footer in `ConfirmTrust` reads `y trust and test again  n/Esc keep it untrusted`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn an_unknown_key_opens_the_trust_prompt_with_the_fingerprint()
@@ -361,9 +361,9 @@ Behaviour:
 #[test] fn a_changed_key_shows_its_warning_without_a_prompt()
 ```
 
-- [ ] **Step 2: Run them** — FAIL. **Step 3: Implement.** **Step 4: Run** `cargo test --lib tui::` — PASS.
-- [ ] **Step 5: PTY run.** Add `tui_connection_test_runs_on_a_real_pty` to `tests/acceptance.rs` (pattern of `tui_paste_and_terminal_lifecycle_work_on_a_real_pty`) with a fake `ssh` that, for a non-`-G` call, sleeps 1 s and prints the success line. Add a scenario to `tui_pty.py` that presses `t`, waits for `Testing dev… (Esc to cancel)` on the screen, then for `✓ dev`, then quits. Run `cargo test --test acceptance tui_connection_test` → PASS.
-- [ ] **Step 6: Commit** — `feat: trust a new host key from the TUI`.
+- [x] **Step 2: Run them** — FAIL. **Step 3: Implement.** **Step 4: Run** `cargo test --lib tui::` — PASS.
+- [x] **Step 5: PTY run.** Add `tui_connection_test_runs_on_a_real_pty` to `tests/acceptance.rs` (pattern of `tui_paste_and_terminal_lifecycle_work_on_a_real_pty`) with a fake `ssh` that, for a non-`-G` call, sleeps 1 s and prints the success line. Add a scenario to `tui_pty.py` that presses `t`, waits for `Testing dev… (Esc to cancel)` on the screen, then for `✓ dev`, then quits. Run `cargo test --test acceptance tui_connection_test` → PASS.
+- [x] **Step 6: Commit** — `feat: trust a new host key from the TUI`.
 
 ---
 
@@ -373,9 +373,9 @@ Behaviour:
 - Create: `tests/real_openssh.rs`
 - Modify: `README.md`, `ROADMAP.md`, `docs/superpowers/specs/2026-10-17-connection-test-design.md` (status line), `tests/docs.rs` if a guard needs the new command
 
-- [ ] **Step 1: Write the ignored end-to-end test** `#[ignore] fn portico_test_against_a_real_sshd()`: skip with a printed note when `/usr/bin/sshd` is missing. Start a user `sshd` on a free high port inside the test's temp dir (setup as in Task 1, Step 1). Write the env's `~/.ssh/config` with `Include ~/.ssh/portico/config` and an external `Host real` block using absolute paths (`HostName 127.0.0.1`, `Port`, `IdentityFile`, `IdentitiesOnly yes`, `IdentityAgent none`, `UserKnownHostsFile <env home>/.ssh/known_hosts`). OpenSSH resolves `~` from the password database, not `$HOME`, so install an `ssh` wrapper in the env's `bin` that runs `/usr/bin/ssh -F <env home>/.ssh/real-config "$@"`, where `real-config` is the entry with `~/.ssh/portico/config` replaced by the absolute managed path (as `ordinary_openssh_resolves_a_portico_host` does), and an `ssh-keygen` wrapper that execs `/usr/bin/ssh-keygen`. Assert: `portico test real` without the flag exits 1 and prints a `SHA256:` fingerprint; with `--accept-host-key <that fingerprint>` exits 0 with `authenticated`; the env's `known_hosts` now holds the key and the real user's `~/.ssh/known_hosts` is untouched (compare its bytes, or its absence, before and after); with the authorized key removed it exits 1 with `authentication refused`. Kill the sshd in a drop guard.
-- [ ] **Step 2: Run it** — `cargo test --test real_openssh -- --ignored` → PASS (locally, as a regular user).
-- [ ] **Step 3: Docs.** README: the `portico test` command with `--accept-host-key`, the `t` and `Ctrl+T` keys, what a pass means (login succeeds, no shell opened), and that keys with a passphrase must be in an agent. ROADMAP: remove the "Connection test (manual)" slice and renumber (a delivered slice leaves the roadmap); keep "Rich error messages". Spec: mark it implemented.
-- [ ] **Step 4: Full checks** — `scripts/ci-checks.sh` as a regular user → all green.
-- [ ] **Step 5: Commit** — `docs: document the connection test`.
-- [ ] **Step 6: Open the PR** titled `feat: add a manual connection test` (the title release-plz reads), body summarising the feature and how it was verified, with no attribution line.
+- [x] **Step 1: Write the ignored end-to-end test** `#[ignore] fn portico_test_against_a_real_sshd()`: skip with a printed note when `/usr/bin/sshd` is missing. Start a user `sshd` on a free high port inside the test's temp dir (setup as in Task 1, Step 1). Write the env's `~/.ssh/config` with `Include ~/.ssh/portico/config` and an external `Host real` block using absolute paths (`HostName 127.0.0.1`, `Port`, `IdentityFile`, `IdentitiesOnly yes`, `IdentityAgent none`, `UserKnownHostsFile <env home>/.ssh/known_hosts`). OpenSSH resolves `~` from the password database, not `$HOME`, so install an `ssh` wrapper in the env's `bin` that runs `/usr/bin/ssh -F <env home>/.ssh/real-config "$@"`, where `real-config` is the entry with `~/.ssh/portico/config` replaced by the absolute managed path (as `ordinary_openssh_resolves_a_portico_host` does), and an `ssh-keygen` wrapper that execs `/usr/bin/ssh-keygen`. Assert: `portico test real` without the flag exits 1 and prints a `SHA256:` fingerprint; with `--accept-host-key <that fingerprint>` exits 0 with `authenticated`; the env's `known_hosts` now holds the key and the real user's `~/.ssh/known_hosts` is untouched (compare its bytes, or its absence, before and after); with the authorized key removed it exits 1 with `authentication refused`. Kill the sshd in a drop guard.
+- [x] **Step 2: Run it** — `cargo test --test real_openssh -- --ignored` → PASS (locally, as a regular user).
+- [x] **Step 3: Docs.** README: the `portico test` command with `--accept-host-key`, the `t` and `Ctrl+T` keys, what a pass means (login succeeds, no shell opened), and that keys with a passphrase must be in an agent. ROADMAP: remove the "Connection test (manual)" slice and renumber (a delivered slice leaves the roadmap); keep "Rich error messages". Spec: mark it implemented.
+- [x] **Step 4: Full checks** — `scripts/ci-checks.sh` as a regular user → all green.
+- [x] **Step 5: Commit** — `docs: document the connection test`.
+- [x] **Step 6: Open the PR** titled `feat: add a manual connection test` (the title release-plz reads), body summarising the feature and how it was verified, with no attribution line.

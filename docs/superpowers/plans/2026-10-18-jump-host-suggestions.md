@@ -63,7 +63,7 @@ Rules:
 - `apply`: replace `range` with `alias`; the cursor is `range.start + alias.len()`.
 - `origin_label`: `Managed` gives `managed`; `External(path)` gives the path, with a leading `home` replaced by `~`.
 
-- [ ] **Step 1: Write the failing tests** in `src/suggest.rs` under `#[cfg(test)] mod tests`:
+- [x] **Step 1: Write the failing tests** in `src/suggest.rs` under `#[cfg(test)] mod tests`:
 
 ```rust
 fn c(alias: &str, managed: bool) -> Candidate {
@@ -142,10 +142,10 @@ fn origin_label_names_managed_or_the_file_under_home() {
 }
 ```
 
-- [ ] **Step 2: Run** `cargo test --lib suggest` — expected: FAIL to compile (module missing).
-- [ ] **Step 3: Implement** the module per the rules above, with a short module doc comment matching the style of `src/config_error.rs`.
-- [ ] **Step 4: Run** `cargo test --lib suggest` — expected: all 9 tests pass.
-- [ ] **Step 5: Run the checks and commit**
+- [x] **Step 2: Run** `cargo test --lib suggest` — expected: FAIL to compile (module missing).
+- [x] **Step 3: Implement** the module per the rules above, with a short module doc comment matching the style of `src/config_error.rs`.
+- [x] **Step 4: Run** `cargo test --lib suggest` — expected: all 9 tests pass.
+- [x] **Step 5: Run the checks and commit**
 
 ```bash
 git add src/suggest.rs src/lib.rs
@@ -185,7 +185,7 @@ Behaviour (from the spec):
 - One helper replaces the duplicated "text changed" code of `handle_form_key` and `handle_paste`; it clears `error`, `test_result` and `show_raw`, then: if the text changed, calls `suggest(false)`; if only the cursor moved and a dropdown is open, recomputes it as well. It returns `UiAction::FormEdited` only when the text changed, exactly as today.
 - `replace_hosts` recomputes an open dropdown (closing it if nothing matches, clamping the selection).
 
-- [ ] **Step 1: Write the failing tests** in the `tests` module of `src/tui.rs`. Add a helper:
+- [x] **Step 1: Write the failing tests** in the `tests` module of `src/tui.rs`. Add a helper:
 
 ```rust
 fn proxy_jump_form(hosts: Vec<HostSummary>) -> UiState {
@@ -216,10 +216,10 @@ Tests (names and assertions):
 - `leaving_proxy_jump_closes_suggestions`: type `bas`, BackTab → dropdown `None`, `active == PROXY_JUMP - 1`. In a fresh form, type `bas`, then `state.handle_key(ctrl('t'))` → dropdown `None` (the empty Alias makes the test report a form error, as today).
 - `replacing_hosts_recomputes_an_open_dropdown`: hosts `bastion`, `bastion-eu`; type `bas`, Down; `replace_hosts` with only `bastion` → `listed == ["bastion"]`, `selected == 0`; `replace_hosts` with only `web` → `None`.
 
-- [ ] **Step 2: Run** `cargo test --lib tui::tests` — expected: the new tests fail (to compile, then on assertions).
-- [ ] **Step 3: Implement** the state, `suggest`, the key handling and the shared text-changed helper as described.
-- [ ] **Step 4: Run** `cargo test --lib tui::tests` — expected: all pass, including every existing form test unchanged.
-- [ ] **Step 5: Run the checks and commit**
+- [x] **Step 2: Run** `cargo test --lib tui::tests` — expected: the new tests fail (to compile, then on assertions).
+- [x] **Step 3: Implement** the state, `suggest`, the key handling and the shared text-changed helper as described.
+- [x] **Step 4: Run** `cargo test --lib tui::tests` — expected: all pass, including every existing form test unchanged.
+- [x] **Step 5: Run the checks and commit**
 
 ```bash
 git add src/tui.rs
@@ -240,17 +240,17 @@ git commit -m "feat: open jump host suggestions while typing ProxyJump"
 
 Layout: directly after the ProxyJump row, `form_lines` adds a top border, one line per visible row (`offset..offset + SUGGESTION_ROWS`), and a bottom border. Each line starts with spaces equal to the character width of `"> ProxyJump: "`. Rows read `│> alias │  origin` for the selected row (styled `Modifier::REVERSED` on the part inside the box) and `│  alias │  origin` otherwise; the box's inner width is the longest visible alias plus 3, with aliases padded to it. Borders are `┌` `─` `┐` and `└` `─` `┘`. The home for `origin_label` is `std::env::var_os("HOME")`, as `expand_home` already uses.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
 - `dropdown_renders_aliases_and_origins_under_proxy_jump`: hosts `bastion` (managed) and `bastion-eu` (external, source `/home/test/.ssh/config`); type `bas`; `rendered(&state)` contains `"│> bastion    │  managed"` and `"bastion-eu"` and `"┌"`, and the line containing `"> ProxyJump:"` is immediately followed by the line containing `"┌"`.
 - `dropdown_scrolls_to_keep_the_selection_visible`: hosts `h1`..`h7`; Ctrl+Space; press Down 6 times → `selected == 6`, `offset == 2`; `rendered` contains `h7` and not `"│  h1"`; Down again → still 6; Up 6 times → `selected == 0`, `offset == 0`.
 - `footer_shows_suggestion_keys_while_open`: type `bas` with host `bastion-eu` → `footer_text(&state) == "↑↓ choose  Enter pick  Esc close"`.
 - `footer_advertises_ctrl_space_on_proxy_jump`: closed dropdown on ProxyJump → footer contains `"Ctrl+Space suggest  Esc cancel"`; on the Alias field it does not contain `"Ctrl+Space"`.
 
-- [ ] **Step 2: Run** `cargo test --lib tui::tests` — expected: the four new tests fail.
-- [ ] **Step 3: Implement** the drawing in `form_lines` and the two footer variants in `footer_text`.
-- [ ] **Step 4: Run** `cargo test --lib tui::tests` — expected: all pass.
-- [ ] **Step 5: Docs.** README, after the ProxyJump sentence at ~:216: "While you type a ProxyJump hop, a dropdown lists the known hosts whose alias contains what you typed: `↑` / `↓` choose, `Enter` or `Tab` fills in the hop, and `Esc` closes the list (a second `Esc` cancels the form). `Ctrl+Space` opens the list at any time." ROADMAP: delete the "Jump host suggestions" item and renumber all product slices from 1. Run `cargo test --test docs` — expected: pass.
-- [ ] **Step 6: Run the checks and commit**
+- [x] **Step 2: Run** `cargo test --lib tui::tests` — expected: the four new tests fail.
+- [x] **Step 3: Implement** the drawing in `form_lines` and the two footer variants in `footer_text`.
+- [x] **Step 4: Run** `cargo test --lib tui::tests` — expected: all pass.
+- [x] **Step 5: Docs.** README, after the ProxyJump sentence at ~:216: "While you type a ProxyJump hop, a dropdown lists the known hosts whose alias contains what you typed: `↑` / `↓` choose, `Enter` or `Tab` fills in the hop, and `Esc` closes the list (a second `Esc` cancels the form). `Ctrl+Space` opens the list at any time." ROADMAP: delete the "Jump host suggestions" item and renumber all product slices from 1. Run `cargo test --test docs` — expected: pass.
+- [x] **Step 6: Run the checks and commit**
 
 ```bash
 git add src/tui.rs README.md ROADMAP.md
