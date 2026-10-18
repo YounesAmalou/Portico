@@ -23,11 +23,13 @@ pub struct Authenticated {
 pub enum Route<'a> {
     Direct,
     /// Through `ProxyJump` (`jump` names it) or a `ProxyCommand` (`jump` is `None`), to the
-    /// resolved `hostname` and `port`.
+    /// resolved `hostname` and `port`. `fd_passing` is set when the `ProxyCommand` hands ssh its
+    /// connected socket (`ProxyUseFdpass`).
     Proxied {
         jump: Option<&'a str>,
         hostname: &'a str,
         port: u16,
+        fd_passing: bool,
     },
 }
 
@@ -186,34 +188,52 @@ pub fn fetch_key_args(entry: Option<&Path>, known_hosts: &Path, alias: &str) -> 
     args
 }
 
-/// Parses the target's success line. A direct login logs
-/// `Authenticated to <host> ([<address>]:<port>) using "<method>".`, one through a proxy
+/// Parses the target's success line. A login on a socket ssh holds itself logs
+/// `Authenticated to <host> ([<address>]:<port>) using "<method>".`, one through a proxy's pipe
 /// `Authenticated to <host> (via proxy) using "<method>".`; only the form `route` produces is
 /// accepted, so a first jump host's own success line, logged when its configuration is verbose,
-/// is never taken for the target's. A later hop is itself reached through a proxy, so a proxied
-/// line must also name the target's resolved `hostname` (OpenSSH lowercases both). A later
-/// verbose hop with the target's own `HostName` still cannot be told apart: its line carries no
-/// port.
+/// is never taken for the target's. A `ProxyCommand` that passes ssh its socket
+/// (`ProxyUseFdpass`) produces the socket form. A later hop is itself reached through a proxy,
+/// so a proxied line must also name the target's resolved `hostname` (OpenSSH lowercases both).
+/// A later verbose hop with the target's own `HostName` still cannot be told apart: its line
+/// carries no port.
 pub fn authenticated(line: &str, route: Route<'_>) -> Option<Authenticated> {
     let rest = line.trim().strip_prefix("Authenticated to ")?;
+    let on_socket = |rest: &str| -> Option<Authenticated> {
+        let (host, rest) = rest.split_once(" ([")?;
+        let (address, rest) = rest.split_once("]:")?;
+        let (port, rest) = rest.split_once(") using \"")?;
+        let method = rest.strip_suffix("\".")?;
+        Some(Authenticated {
+            host: host.to_string(),
+            address: address.to_string(),
+            port: port.parse().ok()?,
+            method: method.to_string(),
+            via: None,
+        })
+    };
     match route {
-        Route::Direct => {
-            let (host, rest) = rest.split_once(" ([")?;
-            let (address, rest) = rest.split_once("]:")?;
-            let (port, rest) = rest.split_once(") using \"")?;
-            let method = rest.strip_suffix("\".")?;
-            Some(Authenticated {
-                host: host.to_string(),
-                address: address.to_string(),
-                port: port.parse().ok()?,
-                method: method.to_string(),
-                via: None,
-            })
+        Route::Direct => on_socket(rest),
+        Route::Proxied {
+            jump,
+            hostname,
+            fd_passing: true,
+            ..
+        } => {
+            let success = on_socket(rest)?;
+            success
+                .host
+                .eq_ignore_ascii_case(hostname)
+                .then(|| Authenticated {
+                    via: Some(jump.unwrap_or("proxy").to_string()),
+                    ..success
+                })
         }
         Route::Proxied {
             jump,
             hostname,
             port,
+            fd_passing: false,
         } => {
             let (host, rest) = rest.split_once(" (via proxy) using \"")?;
             if !host.eq_ignore_ascii_case(hostname) {
@@ -424,6 +444,7 @@ pub fn classify(stderr: &str, deadline_reached: bool, jump: Option<&str>) -> Fai
             jump,
             hostname: "",
             port: 0,
+            fd_passing: false,
         },
     };
     diagnose(stderr, deadline_reached, route).failure
@@ -537,6 +558,7 @@ mod tests {
             jump: Some("bastion"),
             hostname: "127.0.0.1",
             port: 2222,
+            fd_passing: false,
         };
         assert_eq!(
             text.lines().find_map(|line| authenticated(line, jump)),
@@ -552,6 +574,7 @@ mod tests {
             jump: None,
             hostname: "127.0.0.1",
             port: 22,
+            fd_passing: false,
         };
         let success = text.lines().find_map(|line| authenticated(line, command));
         assert_eq!(success.and_then(|s| s.via), Some("proxy".into()));
@@ -574,6 +597,7 @@ mod tests {
             jump: Some("jumpv"),
             hostname: "127.0.0.1",
             port: 22999,
+            fd_passing: false,
         };
         let text = fixture("authenticated-via-verbose-jump");
         let jump_only = text
@@ -595,6 +619,7 @@ mod tests {
             jump: Some("hopa,hopb"),
             hostname: "127.0.0.3",
             port: 22999,
+            fd_passing: false,
         };
         let text = fixture("authenticated-via-two-jumps");
         let hop = text
@@ -611,11 +636,57 @@ mod tests {
     }
 
     #[test]
+    fn a_fd_passing_proxy_logs_the_direct_form() {
+        let route = Route::Proxied {
+            jump: None,
+            hostname: "127.0.0.3",
+            port: 2222,
+            fd_passing: true,
+        };
+        let text = fixture("authenticated-via-fdpass");
+        assert_eq!(
+            text.lines().find_map(|line| authenticated(line, route)),
+            Some(Authenticated {
+                host: "127.0.0.3".into(),
+                address: "127.0.0.3".into(),
+                port: 22999,
+                method: "publickey".into(),
+                via: Some("proxy".into()),
+            })
+        );
+        assert_eq!(
+            authenticated(
+                "Authenticated to 127.0.0.3 (via proxy) using \"publickey\".",
+                route
+            ),
+            None
+        );
+        assert_eq!(
+            authenticated(
+                "Authenticated to 127.0.0.9 ([127.0.0.9]:22) using \"publickey\".",
+                route
+            ),
+            None
+        );
+        let plain = Route::Proxied {
+            jump: None,
+            hostname: "127.0.0.3",
+            port: 2222,
+            fd_passing: false,
+        };
+        assert_eq!(
+            text.lines().find_map(|line| authenticated(line, plain)),
+            None
+        );
+    }
+
+    #[test]
     fn the_targets_host_is_matched_ignoring_case() {
         let route = Route::Proxied {
             jump: None,
             hostname: "Db.Example",
             port: 22,
+            fd_passing: false,
         };
         assert!(
             authenticated(
@@ -772,6 +843,7 @@ mod tests {
             jump: Some("jump"),
             hostname: "127.0.0.1",
             port: 22997,
+            fd_passing: false,
         };
         let failure = diagnose(&fixture("jump-target-key-refused"), false, jump).failure;
         // The jump host logged in; the target refused the key, so this is the target's refusal,
@@ -800,6 +872,7 @@ mod tests {
             jump: Some("jump"),
             hostname: "127.0.0.1",
             port: 22997,
+            fd_passing: false,
         };
         let text = "debug1: Offering public key: /k/jump ED25519 SHA256:j explicit\n\
                     Authenticated to jump ([127.0.0.1]:22999) using \"publickey\".\n\
