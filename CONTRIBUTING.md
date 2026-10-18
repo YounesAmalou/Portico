@@ -41,7 +41,7 @@ Nothing edits `CHANGELOG.md` by hand any more: release-plz writes each version's
 ### Cutting a release
 
 1. After a user-visible change merges to `main`, the `Release PR` workflow opens (or updates) a release pull request that sets the version in `Cargo.toml` and `Cargo.lock` and adds the version's changelog section. Before 1.0, a breaking change raises the minor version and anything else raises the patch version.
-2. Review it like any pull request. Merging it is the release decision: the same workflow then tags the merge commit `vX.Y.Z`.
+2. Review it like any pull request. Merging it is the release decision: the same workflow then tags the release pull request's commit `vX.Y.Z` (it is in `main`'s history, with the same tree as the merge commit).
 3. The tag starts the release run, which verifies that the tag matches the Cargo version and that the changelog has a section for it, re-runs CI unless that commit already passed every CI job on `main` (as the commit release-plz tags has: its merge commit carries the same tree), builds the Linux x86_64 tarball and checksum, creates the GitHub Release, and publishes in two independent jobs, each starting automatically and each failing or being re-run without affecting the other: `crates` sends `portico-ssh` to crates.io and `aur` updates the AUR package `portico`. Both run only for tags. `v*` tags are protected: they can only be created by an administrator or the release automation and can never be moved or deleted. Publishing cannot be undone. Watch the run with `gh run watch`; if only `crates` or `aur` fails, use "Re-run failed jobs" (re-running the whole workflow fails at release creation because the release already exists), and never re-tag.
 4. Verify the GitHub Release and `cargo install portico-ssh` afterwards.
 5. The `aur` job runs `scripts/aur-publish.sh`, which pins the tag archive's SHA-256 with `scripts/aur-update.sh`, proves the package builds with `makepkg`, and pushes `PKGBUILD` and `.SRCINFO` to `ssh://aur@aur.archlinux.org/portico.git`. It is independent of `crates` and safe to re-run (a version already on the AUR changes nothing). The copy in `packaging/aur/` is the template: it is only edited when the packaging itself changes, and the version and checksum in it are rewritten at release time.
@@ -52,6 +52,7 @@ If the release automation is unavailable, `scripts/tag-release.sh X.Y.Z` is the 
 
 - Keep changes focused and include tests for behaviour changes.
 - Give the pull request a conventional title (see above); the changelog is generated from it.
+- Name the branch after the same type, then a short kebab-case description of the change: `feat/jump-host-suggestions`, `fix/rich-error-followups`, `docs/release-plz-spec`, `ci/leaner-ci`. Avoid generic or tool-generated names (`patch-1`, `claude/...`, `worktree-...`); rename the branch before pushing. Only the release automation's `release-plz-*` branches use another scheme.
 - Larger features follow the project's spec, plan, implementation flow in `docs/superpowers/`.
 
 ## Licensing
