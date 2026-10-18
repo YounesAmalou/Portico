@@ -4,71 +4,165 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Advisories change without any change here: re-check the dependencies every day.
+    - cron: "23 4 * * *"
   workflow_call:
+    inputs:
+      skip:
+        description: Report success without running the checks (the commit already passed them on main)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Root restores the build cache into these and ci-container.sh hands them to the
+  # unprivileged user that builds, so both see the same registry and toolchains.
+  CARGO_HOME: /opt/cargo
+  RUSTUP_HOME: /opt/rustup
 
+# Every job reports on every pull request: a job whose work a change cannot affect is
+# skipped, which counts as passing. If `changes` fails, its outputs are empty and every
+# job runs.
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      docs: ${{ steps.filter.outputs.docs }}
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: filter
+        name: Decide which checks the change needs
+        env:
+          SKIP: ${{ inputs.skip }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # rust: anything but documentation changed; docs: documentation changed (the
+          # doc guards in tests/docs.rs read it); deps: the dependencies or their checks
+          # changed. Without a diff to inspect (a release, a new branch), run everything.
+          rust=true docs=true deps=true
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            push) base=$BEFORE ;;
+            *) base= ;;
+          esac
+          if [ "$SKIP" = true ]; then
+            rust=false docs=false deps=false
+          elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            rust=false docs=false
+          elif [ -n "$base" ] && files=$(git diff --name-only "$base" HEAD); then
+            rust=false docs=false deps=false
+            while read -r file; do
+              case "$file" in
+                "") ;;
+                *.md | docs/*) docs=true ;;
+                *) rust=true ;;
+              esac
+              case "$file" in
+                Cargo.toml | Cargo.lock | deny.toml | .github/workflows/ci.yml | scripts/ci-*.sh) deps=true ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "rust=$rust docs=$docs deps=$deps"
+          { echo "rust=$rust"; echo "docs=$docs"; echo "deps=$deps"; } >> "$GITHUB_OUTPUT"
+
   fmt:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/ci-container.sh fmt
 
   clippy:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/ci-container.sh clippy
 
   test:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.docs != 'false') }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: scripts/ci-container.sh test
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # A documentation-only change runs just the doc guards.
+      - run: scripts/ci-container.sh ${{ needs.changes.outputs.rust == 'false' && 'docs' || 'test' }}
 
   msrv:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/ci-container.sh msrv
 
   audit:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.deps != 'false' }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
-      - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: pacman -Syu --noconfirm rustup git openssh python cargo-audit
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/ci-container.sh audit
 
   deny:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.deps != 'false' }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
-      - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: pacman -Syu --noconfirm rustup git openssh python cargo-deny
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/ci-container.sh deny
 
   package:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm rustup git openssh python
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/ci-container.sh package
