@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test|msrv|audit|deny|package>" >&2
+    echo "usage: $0 <fmt|clippy|test|docs|msrv|audit|deny|package>" >&2
     exit 2
 }
 
@@ -16,7 +16,8 @@ msrv() {
     cargo "+$version" check --all-targets --locked
 }
 
-# Installs a cargo subcommand on first use so local rehearsals match CI.
+# CI installs cargo-audit and cargo-deny prebuilt from the Arch repositories; a local
+# rehearsal without them builds the missing one on first use.
 ensure_tool() {
     command -v "cargo-$1" >/dev/null || cargo install --locked "cargo-$1"
 }
@@ -26,6 +27,7 @@ case "$1" in
     fmt) cargo fmt --check ;;
     clippy) cargo clippy --all-targets --all-features -- -D warnings ;;
     test) cargo test --all-targets ;;
+    docs) cargo test --test docs ;;
     msrv) msrv ;;
     audit) ensure_tool audit && cargo audit ;;
     deny) ensure_tool deny && cargo deny check ;;
