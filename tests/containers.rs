@@ -243,3 +243,164 @@ fn listing_ssh_failure_is_explained() {
             "user@h: Permission denied (publickey).\n\ndev: failed \u{2014} the server refused the login\n",
         );
 }
+
+const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+
+/// A `docker` that lists `listing`, logs every call, and exits from `docker exec` with the
+/// code in `exec-code` when that file exists.
+fn install_shell_docker(env: &TestEnv, listing: &str) {
+    let code = env.bin().parent().unwrap().join("exec-code");
+    env.install_program(
+        "docker",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{log}'\nif [ \"$1\" = ps ]; then\ncat <<'EOF'\n{listing}\nEOF\nfi\nif [ \"$1\" = exec ] && [ -f '{code}' ]; then exit \"$(cat '{code}')\"; fi\nexit 0\n",
+            log = log(env, "docker").display(),
+            code = code.display()
+        ),
+    );
+}
+
+fn exec_call(id: &str) -> String {
+    format!("exec\n-it\n{id}\nsh\n-c\n{SHELL_SCRIPT}\n")
+}
+
+#[test]
+fn shell_local_by_service() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+
+    env.run(["shell", "web"]).assert_success();
+    assert!(
+        read_log(&env, "docker").ends_with(&exec_call("aaaa1111")),
+        "{}",
+        read_log(&env, "docker")
+    );
+}
+
+#[test]
+fn shell_with_user() {
+    let env = env_with_dev(&shop_listing());
+
+    env.run(["shell", "web", "--on", "dev", "-u", "o'brien"])
+        .assert_success();
+    let arguments = read_log(&env, "ssh");
+    assert!(
+        arguments.contains(
+            "-t\n-o\nRemoteCommand=none\n--\ndev\ndocker exec -it -u 'o'\\''brien' aaaa1111 sh -c 'command -v bash"
+        ),
+        "{arguments}"
+    );
+}
+
+#[test]
+fn shell_ambiguous_lists_candidates() {
+    let env = TestEnv::new();
+    let listing = [
+        shop_listing(),
+        ps_line(
+            "dddd4444",
+            "blog-web-1",
+            "nginx",
+            "Up",
+            Some(("blog", "web", "1")),
+        ),
+    ]
+    .join("\n");
+    install_shell_docker(&env, &listing);
+
+    env.run(["shell", "web"])
+        .assert_exit_code_and_stderr_contains(
+            1,
+            "error: web matches several containers on this machine: blog-web-1, shop-web-1\n",
+        );
+    assert!(!read_log(&env, "docker").contains("exec"));
+}
+
+#[test]
+fn shell_unknown_reference() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+
+    env.run(["shell", "nope"])
+        .assert_exit_code_and_stderr_contains(
+            1,
+            "error: no container matches nope on this machine\n",
+        );
+}
+
+#[test]
+fn shell_exit_code_passes_through() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+    let code = env.bin().parent().unwrap().join("exec-code");
+
+    for expected in [1, 130] {
+        fs::write(&code, expected.to_string()).unwrap();
+        env.run(["shell", "shop-db-1"])
+            .assert_exit_code_and_stderr(expected, "");
+    }
+}
+
+#[test]
+fn shell_ssh_255_is_explained() {
+    let env = env_with_dev("");
+    env.install_program(
+        "ssh",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser user\\nport 22\\n'; exit 0; fi\nfor a; do last=$a; done\ncase $last in 'docker ps'*)\ncat <<'EOF'\n{}\nEOF\nexit 0 ;;\nesac\nprintf 'user@h: Permission denied (publickey).\\n' >&2\nexit 255\n",
+            shop_listing()
+        ),
+    );
+
+    env.run(["shell", "web", "--on", "dev"])
+        .assert_exit_code_and_stderr_contains(
+            255,
+            "user@h: Permission denied (publickey).\n\ndev: failed \u{2014} the server refused the login\n",
+        );
+}
+
+#[test]
+fn shell_new_terminal_passes_resolved_id() {
+    let env = env_with_dev(&shop_listing());
+
+    env.run(["shell", "web", "--on", "DEV", "-n"])
+        .assert_success();
+    assert_eq!(
+        fs::read_to_string(env.connection_log()).unwrap(),
+        format!(
+            "{}\nshell\n--hold\n--on\ndev\n--\naaaa1111\n",
+            env!("CARGO_BIN_EXE_portico")
+        )
+    );
+}
+
+#[test]
+fn held_shell_runs_the_id_without_listing() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+
+    env.run(["shell", "--hold", "--", "aaaa1111"])
+        .assert_success();
+    assert_eq!(read_log(&env, "docker"), exec_call("aaaa1111"));
+}
+
+#[test]
+fn no_containers_shell_exits_one() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, "");
+
+    env.run(["shell"])
+        .assert_exit_code_and_stderr(1, "No running containers on this machine.\n");
+}
+
+#[test]
+fn shell_without_container_needs_a_terminal() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+
+    env.run(["shell"]).assert_exit_code_and_stderr(
+        1,
+        "error: choose a container: portico shell <container> (no terminal for the picker)\n",
+    );
+    assert!(!read_log(&env, "docker").contains("exec"));
+}

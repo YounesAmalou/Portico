@@ -124,6 +124,8 @@ pub struct ContainerPrograms {
     pub sg: PathBuf,
     pub newgrp: PathBuf,
     pub sh: PathBuf,
+    /// The CLI's container picker.
+    pub fzf: PathBuf,
 }
 
 impl Default for ContainerPrograms {
@@ -134,11 +136,16 @@ impl Default for ContainerPrograms {
             sg: "sg".into(),
             newgrp: "newgrp".into(),
             sh: "sh".into(),
+            fzf: "fzf".into(),
         }
     }
 }
 
 impl App {
+    pub fn container_programs(&self) -> &ContainerPrograms {
+        &self.container_programs
+    }
+
     /// Lists the running containers of `target`. On a host, `batch` keeps ssh from prompting
     /// and lets `cancelled` stop it, and an ssh failure is explained as in the TUI. When the
     /// socket is refused because this session predates the user's docker group, the listing
@@ -628,6 +635,7 @@ mod tests {
             sg: program("sg"),
             newgrp: program("newgrp"),
             sh: program("sh"),
+            fzf: program("fzf"),
         });
         app.initialize(true).unwrap();
         app.add(Host::new("dev", "h.example", None, None, None, None).unwrap())
