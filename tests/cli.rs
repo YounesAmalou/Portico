@@ -181,7 +181,7 @@ fn connection_modes_propagate_status_and_arguments() {
     env.run(["connect", "dev", "-n"]).assert_success();
     let log = std::fs::read_to_string(env.connection_log()).unwrap();
     assert!(log.contains("dev"));
-    assert!(log.contains("ssh\n--\ndev"));
+    assert!(log.contains("connect\n--hold\n--\ndev"));
 }
 
 #[test]
@@ -629,6 +629,33 @@ fn connect_explains_a_rejected_configuration() {
         255,
         "\n\nx: failed \u{2014} OpenSSH rejected the configuration\n  file: ~/.ssh/config\n  line: 3 (Bad configuration option: bogus)\n",
     );
+}
+
+#[test]
+fn hold_waits_for_enter_only_after_an_explained_failure() {
+    let env = env_with_x();
+    install_connecting_ssh(
+        &env,
+        RESOLVES,
+        "printf 'user@h: Permission denied (publickey).\\n' >&2; exit 255",
+    );
+    let refused = env.run_with_stdin(["connect", "x", "--hold"], "\n");
+    let stderr = String::from_utf8_lossy(&refused.0.stderr).into_owned();
+    assert!(
+        refused.0.status.code() == Some(255) && stderr.ends_with("Press Enter to close\n"),
+        "{stderr}"
+    );
+    // End of input also ends the wait.
+    env.run_with_stdin(["connect", "x", "--hold"], "")
+        .assert_exit_code_and_stderr_contains(255, "Press Enter to close");
+
+    install_connecting_ssh(&env, RESOLVES, "exit 0");
+    env.run_with_stdin(["connect", "x", "--hold"], "")
+        .assert_exit_code_and_stderr(0, "");
+
+    install_connecting_ssh(&env, RESOLVES, "printf 'weird thing\\n' >&2; exit 255");
+    env.run_with_stdin(["connect", "x", "--hold"], "\n")
+        .assert_exit_code_and_stderr(255, "weird thing\n");
 }
 
 #[test]

@@ -72,6 +72,9 @@ enum Command {
         alias: String,
         #[arg(short = 'n', long = "new-terminal")]
         new_terminal: bool,
+        /// Wait for Enter after an explained failure; used in a new terminal.
+        #[arg(long, hide = true)]
+        hold: bool,
     },
     Test {
         alias: String,
@@ -280,9 +283,11 @@ fn execute<I: BufRead, O: Write, E: Write>(
         Some(Command::Connect {
             alias,
             new_terminal,
+            hold,
         }) => {
+            // A held connection already runs in the terminal it was opened in.
             let status = match app
-                .connect(&alias, new_terminal)
+                .connect(&alias, new_terminal && !hold)
                 .map_err(|error| error.to_string())?
             {
                 ConnectionOutcome::LaunchRequested => return Ok(ExitCode::SUCCESS),
@@ -293,6 +298,15 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 } => {
                     if let Some(explanation) = explanation {
                         print_connection_failure(error, &alias, &explanation)?;
+                        if hold {
+                            writeln!(error, "Press Enter to close")
+                                .map_err(|error| error.to_string())?;
+                            error.flush().map_err(|error| error.to_string())?;
+                            // End of input also ends the wait.
+                            input
+                                .read_line(&mut String::new())
+                                .map_err(|error| error.to_string())?;
+                        }
                     }
                     status
                 }

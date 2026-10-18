@@ -276,7 +276,7 @@ def check_terminal(scenario):
             os.write(master, b"\x1b[13;5u")
             read_screen("requested")
             launched = Path(home, "launcher-args").read_text().split()
-            assert "ssh" in launched and launched[-1] == "alpha", launched
+            assert launched[-4:] == ["connect", "--hold", "--", "alpha"], launched
             assert not Path(home, "child-terminal-state").exists()
         elif scenario == "legacy_keyboard":
             assert b"\x1b[>1u" not in transcript

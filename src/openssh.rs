@@ -34,6 +34,8 @@ pub struct OpenSsh {
     ssh: PathBuf,
     terminal: PathBuf,
     keygen: PathBuf,
+    /// Portico's own executable, run in a new terminal so a failure can be explained there.
+    portico: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +165,7 @@ pub enum OpenSshError {
 impl OpenSsh {
     pub fn system() -> Self {
         Self::new("ssh".into(), "xdg-terminal-exec".into())
+            .with_portico(std::env::current_exe().ok())
     }
 
     pub fn new(ssh: PathBuf, terminal: PathBuf) -> Self {
@@ -170,7 +173,12 @@ impl OpenSsh {
             ssh,
             terminal,
             keygen: "ssh-keygen".into(),
+            portico: None,
         }
+    }
+
+    pub fn with_portico(self, portico: Option<PathBuf>) -> Self {
+        Self { portico, ..self }
     }
 
     pub fn with_keygen(self, keygen: PathBuf) -> Self {
@@ -462,7 +470,9 @@ impl OpenSsh {
         })
     }
 
-    /// Asks `xdg-terminal-exec` to open `ssh -- <alias>` in a new terminal.
+    /// Asks `xdg-terminal-exec` to open the connection in a new terminal: `portico connect
+    /// --hold -- <alias>` when Portico's path is known, so a failure is explained and held on
+    /// screen, otherwise `ssh -- <alias>`.
     ///
     /// The launcher's own exit status is the only signal available: it exits
     /// non-zero when it cannot find or start a terminal, but a terminal that
@@ -474,8 +484,12 @@ impl OpenSsh {
     pub fn launch_in_new_terminal(&self, alias: &str) -> Result<ConnectionOutcome, OpenSshError> {
         // The command follows the launcher's own arguments directly: older
         // launchers have no option parsing and would take `--` as the command.
-        let mut child = Command::new(&self.terminal)
-            .arg(&self.ssh)
+        let mut command = Command::new(&self.terminal);
+        match &self.portico {
+            Some(portico) => command.arg(portico).args(["connect", "--hold"]),
+            None => command.arg(&self.ssh),
+        };
+        let mut child = command
             .arg("--")
             .arg(alias)
             .stdin(Stdio::null())
@@ -1349,6 +1363,28 @@ mod tests {
         wait_for_contents(
             terminal.log(),
             &format!("{}\n--\n-external\n", ssh.path().display()),
+        );
+    }
+
+    #[test]
+    fn a_new_terminal_runs_portico_when_its_path_is_known() {
+        let ssh = fake_ssh();
+        let terminal = fake_ssh();
+        let openssh =
+            OpenSsh::new(ssh.path(), terminal.path()).with_portico(Some("/opt/portico".into()));
+
+        assert_eq!(
+            openssh.launch_in_new_terminal("dev").unwrap(),
+            ConnectionOutcome::LaunchRequested
+        );
+        wait_for_contents(terminal.log(), "/opt/portico\nconnect\n--hold\n--\ndev\n");
+
+        let terminal = fake_ssh();
+        let openssh = OpenSsh::new(ssh.path(), terminal.path()).with_portico(None);
+        openssh.launch_in_new_terminal("dev").unwrap();
+        wait_for_contents(
+            terminal.log(),
+            &format!("{}\n--\ndev\n", ssh.path().display()),
         );
     }
 

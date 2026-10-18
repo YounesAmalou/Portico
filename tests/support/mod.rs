@@ -20,7 +20,7 @@ pub struct TestEnv {
     bin: PathBuf,
 }
 
-pub struct RunResult(Output);
+pub struct RunResult(pub Output);
 
 impl TestEnv {
     pub fn new() -> Self {
@@ -67,6 +67,27 @@ impl TestEnv {
         S: AsRef<OsStr>,
     {
         RunResult(self.command(args).output().unwrap())
+    }
+
+    /// Runs Portico with `input` on its standard input.
+    pub fn run_with_stdin<I, S>(&self, args: I, input: &str) -> RunResult
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        use std::io::Write;
+        let mut child = self
+            .command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Portico may exit without reading; a closed pipe is fine.
+        let _ = stdin.write_all(input.as_bytes());
+        drop(stdin);
+        RunResult(child.wait_with_output().unwrap())
     }
 
     /// Starts Portico without waiting for it, its output piped.

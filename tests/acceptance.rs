@@ -407,7 +407,7 @@ fn approved_v1_flow_works_in_an_isolated_home() {
         assert!(
             std::fs::read_to_string(env.connection_log())
                 .unwrap()
-                .contains("ssh\n--\ndev")
+                .contains("connect\n--hold\n--\ndev")
         );
         assert_eq!(file_mode(env.home().join(".ssh")), Some(0o700));
         assert_eq!(
