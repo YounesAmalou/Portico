@@ -294,3 +294,219 @@ fn blank_or_padded_jump_and_identity_values_are_never_written() {
     env.run(["show", "dev"])
         .assert_stdout_contains("dev.example");
 }
+
+fn fixture(name: &str) -> String {
+    format!(
+        "{}/tests/fixtures/ssh/{name}.txt",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// A fake `ssh`: `-G` resolves `dev` to deploy@h; a key fetch records a key in
+/// the file it is given; a probe prints `trusted` once `~/.ssh/known_hosts`
+/// exists, else `untrusted`.
+fn install_fake_ssh(env: &TestEnv, trusted: &str, untrusted: &str) {
+    env.install_program(
+        "ssh",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser deploy\\nport 22\\nuserknownhostsfile ~/.ssh/known_hosts\\n'; exit 0; fi\nkh=; prev=\nfor a do\n  case \"$prev$a\" in -oUserKnownHostsFile=*) kh=${{a#UserKnownHostsFile=}} ;; esac\n  prev=; [ \"$a\" = -o ] && prev=-o\ndone\nif [ -n \"$kh\" ]; then echo 'h ssh-ed25519 AAAAkey' >> \"$kh\"; exit 255; fi\nif [ -f \"$HOME/.ssh/known_hosts\" ]; then\n{trusted}\nelse\n{untrusted}\nfi\n"
+        ),
+    );
+}
+
+fn install_fake_keygen(env: &TestEnv) {
+    env.install_program(
+        "ssh-keygen",
+        "#!/bin/sh\nprintf '256 SHA256:abc h (ED25519)\\n'\n",
+    );
+}
+
+fn env_with_dev() -> TestEnv {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "h.example"]).assert_success();
+    env
+}
+
+fn known_hosts(env: &TestEnv) -> std::path::PathBuf {
+    env.home().join(".ssh/known_hosts")
+}
+
+fn unknown_key_env() -> TestEnv {
+    let env = env_with_dev();
+    install_fake_keygen(&env);
+    install_fake_ssh(
+        &env,
+        "printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using \"publickey\".\\n' >&2",
+        &format!("cat '{}' >&2; exit 255", fixture("host-key-unknown")),
+    );
+    env
+}
+
+#[test]
+fn test_reports_success_and_exits_zero() {
+    let env = env_with_dev();
+    install_fake_ssh(
+        &env,
+        "printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using \"publickey\".\\n' >&2",
+        "true",
+    );
+    std::fs::write(known_hosts(&env), "").unwrap();
+    env.run(["test", "dev"])
+        .assert_stdout_contains("dev: authenticated as deploy@10.0.0.5:22 (publickey)");
+}
+
+#[test]
+fn test_reports_each_failure_with_its_hint_and_exits_one() {
+    let env = env_with_dev();
+    let refused = format!("cat '{}' >&2; exit 255", fixture("auth-refused"));
+    install_fake_ssh(&env, &refused, &refused);
+    let result = env.run(["test", "dev"]);
+    result.assert_exit_code_and_stdout_contains(
+        1,
+        "dev: failed \u{2014} authentication refused (server accepts: publickey)",
+    );
+    let result = env.run(["test", "dev"]);
+    result.assert_exit_code_and_stdout_contains(1, "hint: check the user and the key");
+}
+
+#[test]
+fn test_of_an_unknown_host_is_an_error() {
+    let env = env_with_dev();
+    env.run(["test", "nope"])
+        .assert_failure_stderr_contains("error: unknown host: nope");
+}
+
+#[test]
+fn non_interactive_unknown_key_prints_the_fingerprint_and_never_writes() {
+    let env = unknown_key_env();
+    let result = env.run(["test", "dev"]);
+    result.assert_exit_code_and_stdout_contains(1, "SHA256:abc");
+    env.run(["test", "dev"])
+        .assert_exit_code_and_stdout_contains(
+            1,
+            "hint: pass --accept-host-key SHA256:abc to trust it",
+        );
+    env.run(["test", "dev"]).assert_exit_code_and_stdout_contains(
+        1,
+        "dev: host key not trusted\nh presents an ED25519 key with fingerprint SHA256:abc\nCompare it with the fingerprint from the server's administrator or console.\n",
+    );
+    assert!(!known_hosts(&env).exists());
+}
+
+#[test]
+fn a_matching_accept_host_key_trusts_and_retests() {
+    let env = unknown_key_env();
+    env.run(["test", "dev", "--accept-host-key", "SHA256:abc"])
+        .assert_stdout_contains("dev: authenticated as deploy@10.0.0.5:22 (publickey)");
+    assert!(
+        std::fs::read_to_string(known_hosts(&env))
+            .unwrap()
+            .contains("h ssh-ed25519 AAAAkey")
+    );
+}
+
+#[test]
+fn a_mismatching_accept_host_key_writes_nothing() {
+    let env = unknown_key_env();
+    env.run(["test", "dev", "--accept-host-key", "SHA256:other"])
+        .assert_exit_code_and_stdout_contains(
+            1,
+            "dev: failed \u{2014} the host key fingerprint does not match --accept-host-key",
+        );
+    assert!(!known_hosts(&env).exists());
+}
+
+#[test]
+fn external_hosts_can_be_tested() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    let mut config = std::fs::read_to_string(env.ssh_config()).unwrap();
+    config.push_str("Host legacy\n HostName legacy.example\n");
+    std::fs::write(env.ssh_config(), config).unwrap();
+    install_fake_ssh(
+        &env,
+        "printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using \"publickey\".\\n' >&2",
+        "true",
+    );
+    std::fs::write(known_hosts(&env), "").unwrap();
+    env.run(["test", "legacy"])
+        .assert_stdout_contains("legacy: authenticated as deploy@10.0.0.5:22 (publickey)");
+}
+
+fn alive(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit(')')
+                .next()
+                .map(|rest| rest.trim_start().to_owned())
+        })
+        .is_some_and(|state| !state.starts_with('Z'))
+}
+
+#[test]
+fn interrupting_a_test_stops_ssh_and_exits_130() {
+    use std::{
+        io::Read,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let env = env_with_dev();
+    let pid_file = env.home().join("ssh.pid");
+    env.install_program(
+        "ssh",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser deploy\\nport 22\\n'; exit 0; fi\nprintf '%s' \"$$\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    let mut portico = env.spawn(["test", "dev"]);
+    let started = Instant::now();
+    let ssh: libc::pid_t = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            break pid.parse().unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ssh never started"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    // SAFETY: plain kill(2) on a child this test started.
+    assert_eq!(
+        unsafe { libc::kill(portico.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+
+    let status = loop {
+        if let Some(status) = portico.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = portico.kill();
+            panic!("portico ignored SIGINT");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    portico
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let ssh_gone = Instant::now();
+    while alive(ssh) {
+        if ssh_gone.elapsed() > Duration::from_secs(5) {
+            // SAFETY: as above; never leave the fake behind.
+            unsafe { libc::kill(ssh, libc::SIGKILL) };
+            panic!("ssh {ssh} outlived the interrupted test");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(status.code(), Some(130), "{status:?}\n{stdout}");
+    assert_eq!(stdout, "dev: cancelled\n");
+}

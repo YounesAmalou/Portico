@@ -63,6 +63,7 @@ pub struct ConfigPaths {
     pub managed: PathBuf,
     pub backup: PathBuf,
     pub lock: PathBuf,
+    pub system_config: PathBuf,
 }
 
 impl ConfigPaths {
@@ -74,6 +75,7 @@ impl ConfigPaths {
             managed: portico_dir.join("config"),
             backup: portico_dir.join("config.bak"),
             lock: portico_dir.join("config.lock"),
+            system_config: PathBuf::from("/etc/ssh/ssh_config"),
             ssh_dir,
             entry,
             portico_dir,
@@ -619,44 +621,18 @@ impl ManagedStore {
         M: FnOnce(&mut ManagedConfig) -> Result<R, E>,
         V: Fn(&Path, &[String]) -> Result<(), String>,
     {
-        self.ensure_ready()?;
-        let lock = open_lock(&self.paths.lock)
-            .map_err(|source| transaction_storage_io(&self.paths.lock, source))?;
-        #[cfg(test)]
-        if let Some(hook) = &self.before_transaction_lock {
-            hook();
-        }
-        acquire_lock(&lock, cancelled)
-            .map_err(|source| transaction_io(&self.paths.lock, source))?;
-
-        let (active, mut config) = self.read_managed()?;
-        let previous = config.clone();
-        let result = mutate(&mut config)?;
-        let candidate = write_unique(
-            &self.paths.portico_dir,
-            ".config.portico-candidate",
-            config.render().as_bytes(),
-            0o600,
-        )
-        .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
-
-        let entry = fs::read(&self.paths.entry)
-            .map_err(|source| transaction_io(&self.paths.entry, source))?;
-        let validation_entry = substitute_include(&entry, &self.paths, candidate.path())
-            .map_err(transaction_entry_error)?;
-        let entry_mode = fs::metadata(&self.paths.entry)
-            .map_err(|source| transaction_io(&self.paths.entry, source))?
-            .permissions()
-            .mode();
-        let validation_file = write_unique(
-            &self.paths.ssh_dir,
-            ".config.portico-validation",
-            &validation_entry,
-            entry_mode,
-        )
-        .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
-        validate(validation_file.path(), &config.changed_aliases(&previous))
-            .map_err(TransactionError::Validation)?;
+        let (
+            result,
+            Staged {
+                lock: _lock,
+                active,
+                candidate,
+                validation_file,
+                changed_aliases,
+                ..
+            },
+        ) = self.stage(mutate, cancelled)?;
+        validate(validation_file.path(), &changed_aliases).map_err(TransactionError::Validation)?;
         drop(validation_file);
 
         let backup_candidate = write_unique(
@@ -697,6 +673,121 @@ impl ManagedStore {
             }
         }
         Ok(result)
+    }
+
+    /// Applies `mutate` under the exclusive lock and writes the candidate managed config and an
+    /// entry config that includes it, without activating anything.
+    fn stage<R, E, M>(&self, mutate: M, cancelled: Option<&AtomicBool>) -> Result<(R, Staged), E>
+    where
+        E: From<TransactionError>,
+        M: FnOnce(&mut ManagedConfig) -> Result<R, E>,
+    {
+        self.ensure_ready()?;
+        let lock = open_lock(&self.paths.lock)
+            .map_err(|source| transaction_storage_io(&self.paths.lock, source))?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_transaction_lock {
+            hook();
+        }
+        acquire_lock(&lock, cancelled)
+            .map_err(|source| transaction_io(&self.paths.lock, source))?;
+
+        let (active, mut config) = self.read_managed()?;
+        let previous = config.clone();
+        let result = mutate(&mut config)?;
+        let candidate = write_unique(
+            &self.paths.portico_dir,
+            ".config.portico-candidate",
+            config.render().as_bytes(),
+            0o600,
+        )
+        .map_err(|source| transaction_io(&self.paths.portico_dir, source))?;
+
+        let entry = fs::read(&self.paths.entry)
+            .map_err(|source| transaction_io(&self.paths.entry, source))?;
+        let validation_entry = substitute_include(&entry, &self.paths, candidate.path())
+            .map_err(transaction_entry_error)?;
+        let entry_mode = fs::metadata(&self.paths.entry)
+            .map_err(|source| transaction_io(&self.paths.entry, source))?
+            .permissions()
+            .mode();
+        let validation_file = write_unique(
+            &self.paths.ssh_dir,
+            ".config.portico-validation",
+            &validation_entry,
+            entry_mode,
+        )
+        .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
+        let changed_aliases = config.changed_aliases(&previous);
+        Ok((
+            result,
+            Staged {
+                lock,
+                active,
+                candidate,
+                validation_entry,
+                validation_file,
+                entry_mode,
+                changed_aliases,
+            },
+        ))
+    }
+
+    /// Stages `mutate` exactly as a save would and hands the staged entry config to `use_entry`,
+    /// then discards everything; nothing is activated.
+    ///
+    /// When `paths.system_config` exists, the handed-over entry ends with `Match all` and an
+    /// Include of it, because `ssh -F` would otherwise skip the system configuration. The lock is
+    /// released before `use_entry` runs, so a slow test does not block a concurrent save.
+    pub(crate) fn preview<R, E, M, U>(
+        &self,
+        mutate: M,
+        use_entry: U,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<R, E>
+    where
+        E: From<TransactionError>,
+        M: FnOnce(&mut ManagedConfig) -> Result<(), E>,
+        U: FnOnce(&Path) -> Result<R, E>,
+    {
+        let (
+            (),
+            Staged {
+                lock,
+                candidate,
+                mut validation_entry,
+                validation_file,
+                entry_mode,
+                ..
+            },
+        ) = self.stage(mutate, cancelled)?;
+        let preview_file = if self.paths.system_config.exists() {
+            if !validation_entry.is_empty() && !validation_entry.ends_with(b"\n") {
+                validation_entry.push(b'\n');
+            }
+            validation_entry.extend_from_slice(
+                format!(
+                    "Match all\nInclude {}\n",
+                    quote_path(&self.paths.system_config.to_string_lossy())
+                )
+                .as_bytes(),
+            );
+            drop(validation_file);
+            write_unique(
+                &self.paths.ssh_dir,
+                ".config.portico-preview",
+                &validation_entry,
+                entry_mode,
+            )
+            .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?
+        } else {
+            validation_file
+        };
+        drop(lock);
+        let result = use_entry(preview_file.path());
+        drop(preview_file);
+        drop(candidate);
+        result
     }
 
     fn read_managed(&self) -> Result<(Vec<u8>, ManagedConfig), TransactionError> {
@@ -1125,12 +1216,24 @@ fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
     }
 }
 
-struct PendingFile {
+/// A staged change: the candidate managed config and an entry config including it, written but
+/// not activated, with the transaction lock still held.
+struct Staged {
+    lock: File,
+    active: Vec<u8>,
+    candidate: PendingFile,
+    validation_entry: Vec<u8>,
+    validation_file: PendingFile,
+    entry_mode: u32,
+    changed_aliases: Vec<String>,
+}
+
+pub(crate) struct PendingFile {
     path: Option<PathBuf>,
 }
 
 impl PendingFile {
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.path.as_deref().expect("pending file has a path")
     }
 
@@ -1149,7 +1252,12 @@ impl Drop for PendingFile {
     }
 }
 
-fn write_unique(dir: &Path, stem: &str, contents: &[u8], mode: u32) -> io::Result<PendingFile> {
+pub(crate) fn write_unique(
+    dir: &Path,
+    stem: &str,
+    contents: &[u8],
+    mode: u32,
+) -> io::Result<PendingFile> {
     #[cfg(test)]
     if stem == ".config.portico-rollback"
         && FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.replace(false))
@@ -2516,5 +2624,224 @@ mod tests {
                     && rollback.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
+    }
+
+    fn preview_fixture(system_config: &str) -> InitializedStore {
+        let mut fixture = initialized_store();
+        fixture
+            .store
+            .transact(
+                |config| {
+                    config
+                        .insert(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+                        .map_err(TransactionError::Operation)
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        fixture.paths.system_config = fixture._dir.path().join(system_config);
+        fixture.store = ManagedStore::new(fixture.paths.clone());
+        fixture
+    }
+
+    fn preview_snapshot(paths: &ConfigPaths) -> [Option<Vec<u8>>; 3] {
+        [&paths.managed, &paths.backup, &paths.entry].map(|path| fs::read(path).ok())
+    }
+
+    fn included_candidate(entry: &[u8]) -> PathBuf {
+        let text = std::str::from_utf8(entry).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains(".config.portico-candidate"))
+            .expect("staged entry includes the candidate");
+        let start = line.find('"').unwrap() + 1;
+        let end = start + line[start..].find('"').unwrap();
+        PathBuf::from(&line[start..end])
+    }
+
+    fn assert_no_staged_files(paths: &ConfigPaths) {
+        for dir in [&paths.ssh_dir, &paths.portico_dir] {
+            for entry in fs::read_dir(dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().starts_with(".config.portico-"),
+                    "left behind {name:?} in {}",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preview_hands_over_the_candidate_and_changes_nothing() {
+        let fixture = preview_fixture("missing_ssh_config");
+        let before = preview_snapshot(&fixture.paths);
+
+        let (entry, candidate) = fixture
+            .store
+            .preview(
+                |config| {
+                    config
+                        .insert(Host::new("new", "new.example", None, None, None, None).unwrap())
+                        .map_err(TransactionError::Operation)
+                },
+                |entry| {
+                    let candidate = included_candidate(&fs::read(entry).unwrap());
+                    let contents = fs::read_to_string(&candidate).unwrap();
+                    assert!(contents.contains("Host new"), "{contents}");
+                    assert!(contents.contains("Host dev"), "{contents}");
+                    Ok::<_, TransactionError>((entry.to_owned(), candidate))
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(preview_snapshot(&fixture.paths), before);
+        assert!(!entry.exists());
+        assert!(!candidate.exists());
+        assert_no_staged_files(&fixture.paths);
+    }
+
+    #[test]
+    fn preview_cleans_up_when_the_closure_fails() {
+        let fixture = preview_fixture("missing_ssh_config");
+        let before = preview_snapshot(&fixture.paths);
+        let mut seen = None;
+
+        let result = fixture.store.preview(
+            |config| {
+                config
+                    .insert(Host::new("new", "new.example", None, None, None, None).unwrap())
+                    .map_err(TransactionError::Operation)
+            },
+            |entry| -> Result<(), TransactionError> {
+                seen = Some((
+                    entry.to_owned(),
+                    included_candidate(&fs::read(entry).unwrap()),
+                ));
+                Err(TransactionError::Validation("ssh failed".into()))
+            },
+            None,
+        );
+
+        assert!(
+            matches!(result, Err(TransactionError::Validation(message)) if message == "ssh failed")
+        );
+        let (entry, candidate) = seen.expect("closure ran");
+        assert_eq!(preview_snapshot(&fixture.paths), before);
+        assert!(!entry.exists());
+        assert!(!candidate.exists());
+        assert_no_staged_files(&fixture.paths);
+    }
+
+    #[test]
+    fn preview_reports_mutation_errors_before_staging() {
+        let fixture = preview_fixture("missing_ssh_config");
+        let before = preview_snapshot(&fixture.paths);
+        let mut called = false;
+
+        let result = fixture.store.preview(
+            |config| {
+                config
+                    .remove("missing")
+                    .map(drop)
+                    .map_err(TransactionError::Operation)
+            },
+            |_| {
+                called = true;
+                Ok(())
+            },
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(TransactionError::Operation(ManagedError::UnknownAlias(_)))
+        ));
+        assert!(!called);
+        assert_eq!(preview_snapshot(&fixture.paths), before);
+        assert_no_staged_files(&fixture.paths);
+    }
+
+    #[test]
+    fn preview_ends_with_the_system_config_only_when_it_exists() {
+        let fixture = preview_fixture("ssh_config");
+        fs::write(
+            &fixture.paths.system_config,
+            "Host *\n  ServerAliveInterval 30\n",
+        )
+        .unwrap();
+        let entry = fixture
+            .store
+            .preview(
+                |_| Ok::<_, TransactionError>(()),
+                |entry| Ok(fs::read_to_string(entry).unwrap()),
+                None,
+            )
+            .unwrap();
+        let expected = format!(
+            "\nMatch all\nInclude {}\n",
+            quote_path(&fixture.paths.system_config.to_string_lossy())
+        );
+        assert!(entry.ends_with(&expected), "{entry:?}");
+        assert_eq!(entry.matches("Match all").count(), 1, "{entry:?}");
+        assert_no_staged_files(&fixture.paths);
+
+        let fixture = preview_fixture("missing_ssh_config");
+        let entry = fixture
+            .store
+            .preview(
+                |_| Ok::<_, TransactionError>(()),
+                |entry| Ok::<_, TransactionError>(fs::read_to_string(entry).unwrap()),
+                None,
+            )
+            .unwrap();
+        assert!(!entry.contains("Match all"), "{entry:?}");
+        assert_no_staged_files(&fixture.paths);
+    }
+
+    #[test]
+    fn preview_does_not_hold_the_lock_while_testing() {
+        let fixture = preview_fixture("missing_ssh_config");
+        let other = ManagedStore::new(fixture.paths.clone());
+        let cancelled = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+
+        let saved = thread::scope(|scope| {
+            let finished = &finished;
+            let cancelled = &cancelled;
+            scope.spawn(move || {
+                for _ in 0..250 {
+                    if finished.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            let result = fixture.store.preview(
+                |_| Ok::<_, TransactionError>(()),
+                |_| {
+                    other.transact_cancellable(
+                        |config| {
+                            config
+                                .insert(
+                                    Host::new("saved", "saved.example", None, None, None, None)
+                                        .unwrap(),
+                                )
+                                .map_err(TransactionError::Operation)
+                        },
+                        |_, _| Ok(()),
+                        cancelled,
+                    )
+                },
+                None,
+            );
+            finished.store(true, Ordering::Relaxed);
+            result
+        });
+
+        saved.expect("a save during the test is not blocked by the preview");
+        assert!(fixture.store.load().unwrap().find("saved").is_some());
     }
 }

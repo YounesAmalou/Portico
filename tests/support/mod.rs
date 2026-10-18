@@ -69,6 +69,20 @@ impl TestEnv {
         RunResult(self.command(args).output().unwrap())
     }
 
+    /// Starts Portico without waiting for it, its output piped.
+    pub fn spawn<I, S>(&self, args: I) -> std::process::Child
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
     pub fn run_with_env<I, S>(&self, args: I, key: &str, value: &OsStr) -> RunResult
     where
         I: IntoIterator<Item = S>,
@@ -148,6 +162,17 @@ impl RunResult {
             "status: {}\nstdout:\n{}\nstderr:\n{stderr}",
             self.0.status,
             String::from_utf8_lossy(&self.0.stdout),
+        );
+    }
+
+    /// Asserts the command exited with `code` and printed `expected` on stdout.
+    pub fn assert_exit_code_and_stdout_contains(self, code: i32, expected: &str) {
+        let stdout = String::from_utf8_lossy(&self.0.stdout);
+        assert!(
+            self.0.status.code() == Some(code) && stdout.contains(expected),
+            "status: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            self.0.status,
+            String::from_utf8_lossy(&self.0.stderr),
         );
     }
 

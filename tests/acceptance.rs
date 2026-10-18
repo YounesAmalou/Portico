@@ -240,9 +240,11 @@ stty -g > "$HOME/child-terminal-state"
 exit 23
 "#,
     );
+    // The PTY harness reads `connection-started` as soon as it exists, so it is renamed into
+    // place whole rather than written where the harness could read it half-written.
     std::fs::write(
         env.home().join("threaded-connection.py"),
-        "import os, pathlib, queue, signal, threading\nstarted = queue.Queue()\ndef run():\n    child_pid = os.fork()\n    if child_pid == 0:\n        os.setsid()\n        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n        os.execlp('sleep', 'sleep', '30')\n    started.put((threading.get_native_id(), child_pid))\n    os.waitpid(child_pid, 0)\nthread = threading.Thread(target=run)\nthread.start()\nworker_tid, child_pid = started.get()\npathlib.Path(os.environ['HOME'], 'connection-started').write_text(f'{os.getppid()} {os.getpid()} {worker_tid} {child_pid}\\n')\nthread.join()\n",
+        "import os, pathlib, queue, signal, threading\nstarted = queue.Queue()\ndef run():\n    child_pid = os.fork()\n    if child_pid == 0:\n        os.setsid()\n        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n        os.execlp('sleep', 'sleep', '30')\n    started.put((threading.get_native_id(), child_pid))\n    os.waitpid(child_pid, 0)\nthread = threading.Thread(target=run)\nthread.start()\nworker_tid, child_pid = started.get()\nmarker = pathlib.Path(os.environ['HOME'], 'connection-started')\npartial = marker.with_name('connection-started.tmp')\npartial.write_text(f'{os.getppid()} {os.getpid()} {worker_tid} {child_pid}\\n')\nos.replace(partial, marker)\nthread.join()\n",
     )
     .unwrap();
     env.install_program(
@@ -259,6 +261,46 @@ exit 23
         .arg(env!("CARGO_BIN_EXE_portico"))
         .arg(env.home())
         .arg(env.bin())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "PTY harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
+fn tui_connection_test_runs_on_a_real_pty() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    env.install_program(
+        "ssh",
+        r#"#!/bin/sh
+if [ "$1" = '-G' ]; then
+  printf 'hostname dev.example\nport 22\n'
+  exit 0
+fi
+sleep 1
+printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using "publickey".\n' >&2
+"#,
+    );
+
+    let output = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/tui_pty.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_portico"))
+        .arg(env.home())
+        .arg(env.bin())
+        .arg("connection_test")
         .output()
         .unwrap();
 

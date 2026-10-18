@@ -1,14 +1,19 @@
 use std::{
-    io::{BufRead, Write},
+    io::{self, BufRead, Write},
     process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
-    app::{App, AppError, HostDetails, Ownership},
+    app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
-    openssh::ConnectionOutcome,
+    openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
+    probe::ProbeResult,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -68,8 +73,59 @@ enum Command {
         #[arg(short = 'n', long = "new-terminal")]
         new_terminal: bool,
     },
+    Test {
+        alias: String,
+        #[arg(long = "accept-host-key", value_name = "FINGERPRINT")]
+        accept_host_key: Option<String>,
+    },
 }
 
+/// The exit status of a `portico test` that a signal cancelled, as for SIGINT.
+const CANCELLED: u8 = 130;
+
+/// SIGINT, SIGTERM and SIGHUP during `portico test`.
+///
+/// `ssh` runs in its own process group, out of reach of the terminal's Ctrl+C, so while it runs
+/// these signals only set `cancelled`, and the test kills it and returns. Anywhere else, such as at
+/// the trust prompt, they end Portico as they would without these handlers.
+struct Interrupts {
+    cancelled: Arc<AtomicBool>,
+    default_action: Arc<AtomicBool>,
+}
+
+impl Interrupts {
+    fn install(handle_signals: bool) -> io::Result<Self> {
+        let interrupts = Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            default_action: Arc::new(AtomicBool::new(true)),
+        };
+        if handle_signals {
+            for signal in [
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+                signal_hook::consts::SIGHUP,
+            ] {
+                signal_hook::flag::register_conditional_default(
+                    signal,
+                    Arc::clone(&interrupts.default_action),
+                )?;
+                signal_hook::flag::register(signal, Arc::clone(&interrupts.cancelled))?;
+            }
+        }
+        Ok(interrupts)
+    }
+
+    /// Runs `test` with the cancel flag the signals set.
+    fn during<T>(&self, test: impl FnOnce(&AtomicBool) -> T) -> T {
+        self.default_action.store(false, Ordering::SeqCst);
+        let result = test(&self.cancelled);
+        self.default_action.store(true, Ordering::SeqCst);
+        result
+    }
+}
+
+/// Runs `cli`. `handle_signals` lets `portico test` catch SIGINT, SIGTERM and SIGHUP to stop
+/// its `ssh`; only the real program sets it, so tests never install process-wide handlers.
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,
@@ -77,13 +133,14 @@ pub fn run<I, O, E>(
     output: &mut O,
     error: &mut E,
     interactive: bool,
+    handle_signals: bool,
 ) -> ExitCode
 where
     I: BufRead,
     O: Write,
     E: Write,
 {
-    match execute(cli, app, input, output, interactive) {
+    match execute(cli, app, input, output, interactive, handle_signals) {
         Ok(exit) => exit,
         Err(message) => {
             let _ = writeln!(error, "error: {message}");
@@ -98,6 +155,7 @@ fn execute<I: BufRead, O: Write>(
     input: &mut I,
     output: &mut O,
     interactive: bool,
+    handle_signals: bool,
 ) -> Result<ExitCode, String> {
     match cli.command {
         None => crate::tui::run(app)
@@ -232,7 +290,113 @@ fn execute<I: BufRead, O: Write>(
                 }
             })
         }
+        Some(Command::Test {
+            alias,
+            accept_host_key,
+        }) => {
+            let target = TestTarget::Saved(alias);
+            let interrupts = Interrupts::install(handle_signals)
+                .map_err(|error| format!("cannot handle signals: {error}"))?;
+            let outcome =
+                match interrupts.during(|cancelled| app.test_cancellable(&target, cancelled)) {
+                    Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                        return print_cancelled(output, target.alias());
+                    }
+                    outcome => outcome.map_err(|error| error.to_string())?,
+                };
+            let (report, key) = match outcome {
+                TestOutcome::Done(report) => return print_report(output, &report),
+                TestOutcome::UnknownHostKey { report, key } => (report, key),
+            };
+            print_untrusted_key(output, &report.alias, &key)?;
+            let trusted = match accept_host_key {
+                Some(expected) => {
+                    let matches = !key.fingerprints.is_empty()
+                        && key
+                            .fingerprints
+                            .iter()
+                            .all(|presented| presented.fingerprint == expected);
+                    if !matches {
+                        writeln!(
+                            output,
+                            "{}: failed \u{2014} the host key fingerprint does not match --accept-host-key",
+                            report.alias
+                        )
+                        .map_err(|error| error.to_string())?;
+                        return Ok(ExitCode::from(1));
+                    }
+                    true
+                }
+                None if interactive => confirm(input, output, "Trust this host key? [y/N] ")?,
+                None => {
+                    // --accept-host-key needs one fingerprint that every key shares.
+                    let shared = match key.fingerprints.split_first() {
+                        Some((first, rest))
+                            if rest.iter().all(|key| key.fingerprint == first.fingerprint) =>
+                        {
+                            first.fingerprint.as_str()
+                        }
+                        _ => "<fingerprint>",
+                    };
+                    writeln!(output, "hint: pass --accept-host-key {shared} to trust it")
+                        .map_err(|error| error.to_string())?;
+                    return Ok(ExitCode::from(1));
+                }
+            };
+            if !trusted {
+                writeln!(output, "Host key not trusted.").map_err(|error| error.to_string())?;
+                return Ok(ExitCode::from(1));
+            }
+            let retested = interrupts
+                .during(|cancelled| app.trust_and_retest_cancellable(&target, &key, cancelled));
+            match match retested {
+                Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                    return print_cancelled(output, target.alias());
+                }
+                retested => retested.map_err(|error| error.to_string())?,
+            } {
+                TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
+                    print_report(output, &report)
+                }
+            }
+        }
     }
+}
+
+fn print_untrusted_key(
+    output: &mut impl Write,
+    alias: &str,
+    key: &PresentedKey,
+) -> Result<(), String> {
+    let mut text = format!("{alias}: host key not trusted\n");
+    for presented in &key.fingerprints {
+        text.push_str(&presented.describe(alias));
+        text.push('\n');
+    }
+    text.push_str("Compare it with the fingerprint from the server's administrator or console.\n");
+    write!(output, "{text}").map_err(|error| error.to_string())
+}
+
+fn print_cancelled(output: &mut impl Write, alias: &str) -> Result<ExitCode, String> {
+    writeln!(output, "{alias}: cancelled").map_err(|error| error.to_string())?;
+    Ok(ExitCode::from(CANCELLED))
+}
+
+fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
+    let mut text = format!("{}: {}\n", report.alias, report.summary());
+    if let ProbeResult::Failed(failure) = &report.result {
+        if let Some(fetch) = &report.key_fetch_failure {
+            text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
+        } else if let Some(hint) = failure.hint() {
+            text.push_str(&format!("hint: {hint}\n"));
+        }
+    }
+    write!(output, "{text}").map_err(|error| error.to_string())?;
+    Ok(if report.passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 /// Resolves `--<flag> value` and `--unset <flag>` for one field, rejecting both together.
@@ -444,6 +608,7 @@ mod tests {
             &mut output,
             &mut error,
             true,
+            false,
         );
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
@@ -456,6 +621,7 @@ mod tests {
             &mut output,
             &mut error,
             true,
+            false,
         );
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         assert!(app.show("dev").is_ok());
@@ -467,6 +633,7 @@ mod tests {
             &mut output,
             &mut error,
             true,
+            false,
         );
         assert!(matches!(app.show("dev"), Err(AppError::UnknownHost(_))));
     }
@@ -491,6 +658,7 @@ mod tests {
                 &mut output,
                 &mut error,
                 true,
+                false,
             );
             assert_eq!(exit, std::process::ExitCode::FAILURE);
             assert!(output.is_empty(), "prompted for {alias}");
@@ -515,6 +683,71 @@ mod tests {
             field_change(Some(1), "port", ClearField::Port, &[ClearField::Port]),
             Err("--unset port conflicts with --port".into())
         );
+    }
+
+    /// An initialized app with a saved `dev` whose key is unknown until
+    /// `~/.ssh/known_hosts` exists.
+    fn unknown_key_app() -> (TempDir, App) {
+        let (dir, app) = test_app();
+        app.initialize(true).unwrap();
+        app.add(Host::new("dev", "h.example", None, None, None, None).unwrap())
+            .unwrap();
+        write_executable(
+            dir.path().join("ssh"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser deploy\\nport 22\\nuserknownhostsfile ~/.ssh/known_hosts\\n'; exit 0; fi\nkh=; prev=\nfor a do\n  case \"$prev$a\" in -oUserKnownHostsFile=*) kh=${{a#UserKnownHostsFile=}} ;; esac\n  prev=; [ \"$a\" = -o ] && prev=-o\ndone\nif [ -n \"$kh\" ]; then echo '|1|salt|hash ssh-ed25519 AAAAkey' >> \"$kh\"; exit 255; fi\nif [ -f '{}' ]; then\n  printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using \"publickey\".\\n' >&2\nelse\n  echo 'Host key verification failed.' >&2; exit 255\nfi\n",
+                dir.path().join(".ssh/known_hosts").display()
+            ),
+        );
+        write_executable(
+            dir.path().join("ssh-keygen"),
+            "#!/bin/sh\nprintf '256 SHA256:abc |1|salt|hash (ED25519)\\n'\n",
+        );
+        let app = App::new(
+            ManagedStore::new(ConfigPaths::from_home(dir.path())),
+            OpenSsh::new(dir.path().join("ssh"), dir.path().join("ssh"))
+                .with_keygen(dir.path().join("ssh-keygen")),
+        );
+        (dir, app)
+    }
+
+    fn run_test_command(app: &App, answer: &[u8]) -> (std::process::ExitCode, String) {
+        let mut output = Vec::new();
+        let exit = run(
+            Cli::try_parse_from(["portico", "test", "dev"]).unwrap(),
+            app,
+            &mut Cursor::new(answer),
+            &mut output,
+            &mut Vec::new(),
+            true,
+            false,
+        );
+        (exit, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn answering_y_trusts_the_key_and_retests() {
+        let (dir, app) = unknown_key_app();
+        let (exit, output) = run_test_command(&app, b"y\n");
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert_eq!(
+            output,
+            "dev: host key not trusted\n\
+             dev presents an ED25519 key with fingerprint SHA256:abc\n\
+             Compare it with the fingerprint from the server's administrator or console.\n\
+             Trust this host key? [y/N] \
+             dev: authenticated as deploy@10.0.0.5:22 (publickey)\n"
+        );
+        assert!(dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    #[test]
+    fn declining_trusts_nothing_and_exits_one() {
+        let (dir, app) = unknown_key_app();
+        let (exit, output) = run_test_command(&app, b"n\n");
+        assert_eq!(exit, std::process::ExitCode::from(1));
+        assert!(output.ends_with("Trust this host key? [y/N] Host key not trusted.\n"));
+        assert!(!dir.path().join(".ssh/known_hosts").exists());
     }
 
     fn test_app() -> (TempDir, App) {

@@ -30,5 +30,6 @@ fn main() -> ExitCode {
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
         interactive,
+        true,
     )
 }

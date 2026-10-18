@@ -346,3 +346,11 @@ fn release_plz_leaves_publishing_and_the_release_to_the_tag_workflow() {
         assert!(config.contains(setting), "release-plz.toml lacks {setting}");
     }
 }
+
+#[test]
+fn readme_documents_the_connection_test() {
+    let readme = read("README.md");
+    for expected in ["portico test", "--accept-host-key", "`Ctrl+T`"] {
+        assert!(readme.contains(expected), "README lacks {expected}");
+    }
+}
