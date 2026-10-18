@@ -600,6 +600,7 @@ impl OpenSsh {
         })
     }
 
+    /// The `ssh` program this instance runs.
     pub fn ssh_program(&self) -> &Path {
         &self.ssh
     }
@@ -609,7 +610,7 @@ impl OpenSsh {
     ///
     /// With `batch`, ssh never prompts (`BatchMode=yes`, stdin closed) and `cancelled` stops it
     /// and everything it started. Without, stdin is inherited and ssh stays in Portico's
-    /// process group so it can prompt on the terminal.
+    /// process group so it can prompt on the terminal; `cancelled` is ignored then.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "used by the container commands that follow")
@@ -625,6 +626,8 @@ impl OpenSsh {
         ssh.args(["-o", "RemoteCommand=none"]);
         if batch {
             ssh.args(["-o", "BatchMode=yes"]).stdin(Stdio::null());
+        } else {
+            ssh.stdin(Stdio::inherit());
         }
         ssh.arg("--").arg(alias).arg(command);
         match cancelled {
@@ -1360,7 +1363,12 @@ mod tests {
             "-o\nRemoteCommand=none\n-o\nBatchMode=yes\n--\ndev\ndocker ps\n"
         );
 
-        let cancelled = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            openssh.run_remote("dev", "docker ps", true, Some(&cancelled)),
+            Err(OpenSshError::Cancelled)
+        ));
+        cancelled.store(false, Ordering::Relaxed);
         openssh
             .run_remote("dev", "docker ps", true, Some(&cancelled))
             .unwrap();
@@ -1375,6 +1383,33 @@ mod tests {
         let output = openssh.run_remote("dev", "docker ps", true, None).unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(output.stderr, b"oops");
+    }
+
+    #[test]
+    fn run_remote_inherits_stdin_unless_batch() {
+        let fake = fake_ssh();
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nreadlink /proc/self/fd/0 > '{}'\n",
+                fake.log().display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let own = fs::read_link("/proc/self/fd/0").unwrap();
+        let seen = || {
+            PathBuf::from(
+                fs::read_to_string(fake.log())
+                    .unwrap()
+                    .trim_end_matches('\n'),
+            )
+        };
+
+        openssh.run_remote("dev", "docker ps", false, None).unwrap();
+        assert_eq!(seen(), own);
+
+        openssh.run_remote("dev", "docker ps", true, None).unwrap();
+        assert_eq!(seen(), Path::new("/dev/null"));
     }
 
     #[test]
