@@ -33,9 +33,47 @@ jobs:
           name: release-notes
           path: notes.md
 
+  # release-plz tags the merge commit of its release pull request, and pushing that commit
+  # to main already ran CI on it. Wait for that run and reuse it when every job passed;
+  # otherwise (a manual run, no run, a failed, cancelled or partly skipped run) the
+  # checks job runs CI in full.
+  ci-passed:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+      - id: check
+        name: Check whether this commit already passed CI on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed=false
+          runs="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&per_page=1"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            for _ in $(seq 60); do
+              run=$(gh api "$runs" --jq '.workflow_runs[0] | "\(.id) \(.status) \(.conclusion)"' || true)
+              read -r id status conclusion <<< "$run"
+              [ -n "$id" ] && [ "$id" != null ] || break
+              if [ "$status" = completed ]; then
+                if [ "$conclusion" = success ] && gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  --jq '[.jobs[] | select(.conclusion != "success")] | length == 0' | grep -qx true; then
+                  passed=true
+                  echo "CI run $id passed every job on this commit"
+                fi
+                break
+              fi
+              sleep 30
+            done
+          fi
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+
   checks:
-    needs: verify
+    needs: [verify, ci-passed]
     uses: ./.github/workflows/ci.yml
+    with:
+      skip: ${{ needs.ci-passed.outputs.passed == 'true' }}
 
   build:
     needs: [verify, checks]
