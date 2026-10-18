@@ -1,6 +1,6 @@
 # End-to-End Tests Design
 
-**Status:** Approved
+**Status:** Approved; implemented
 
 ## Purpose
 
