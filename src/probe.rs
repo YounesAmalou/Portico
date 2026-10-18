@@ -86,6 +86,8 @@ pub enum Failure {
     ConnectionLost {
         line: String,
     },
+    /// ssh refused the configuration before connecting.
+    ConfigRejected(crate::config_error::ConfigRejection),
     Other(String),
 }
 
@@ -121,6 +123,7 @@ impl fmt::Display for Failure {
                 write!(f, "jump host {jump} failed: {cause}")
             }
             Failure::ConnectionLost { .. } => write!(f, "connection lost"),
+            Failure::ConfigRejected(rejection) => write!(f, "{rejection}"),
             Failure::Other(line) => write!(f, "{line}"),
         }
     }
