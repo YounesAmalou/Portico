@@ -108,7 +108,7 @@ fn base_args(entry: Option<&Path>) -> Vec<OsString> {
     for option in [
         "BatchMode=yes".to_string(),
         format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
-        "LogLevel=VERBOSE".to_string(),
+        "LogLevel=DEBUG1".to_string(),
         "ClearAllForwardings=yes".to_string(),
         "ControlMaster=no".to_string(),
         "ControlPath=none".to_string(),
@@ -206,6 +206,12 @@ fn is_noise(line: &str) -> bool {
         || line.starts_with("stdio forwarding failed")
 }
 
+/// A line of OpenSSH's own debug log, which the test's `LogLevel=DEBUG1` interleaves with the
+/// messages that explain a failure; it is never one of those messages.
+fn is_debug(line: &str) -> bool {
+    line.starts_with("debug")
+}
+
 fn is_progress(line: &str) -> bool {
     line.starts_with("Authenticated to ")
         || line.starts_with("Transferred:")
@@ -280,7 +286,7 @@ fn mentions_host(line: &str, host: &str) -> bool {
 }
 
 pub fn classify(stderr: &str, deadline_reached: bool, jump: Option<&str>) -> Failure {
-    let lines: Vec<&str> = stderr.lines().collect();
+    let lines: Vec<&str> = stderr.lines().filter(|line| !is_debug(line)).collect();
     let first = classify_lines(&lines, deadline_reached);
     let Some(jump) = jump else {
         return first;
@@ -409,13 +415,16 @@ mod tests {
             port: 22999,
         };
         let text = fixture("authenticated-via-verbose-jump");
-        assert!(text.lines().next().unwrap().contains("([127.0.0.1]:22999)"));
+        let jump_only = text
+            .lines()
+            .find(|line| line.starts_with("Authenticated to "))
+            .unwrap();
+        assert!(jump_only.contains("([127.0.0.1]:22999)"));
         let success = text
             .lines()
             .find_map(|line| authenticated(line, jump))
             .unwrap();
         assert_eq!(success.via.as_deref(), Some("jumpv"));
-        let jump_only = text.lines().next().unwrap();
         assert_eq!(authenticated(jump_only, jump), None);
     }
 
@@ -505,6 +514,16 @@ mod tests {
     }
 
     #[test]
+    fn debug_lines_never_name_the_jump_host() {
+        let text = "debug1: Setting implicit ProxyCommand from ProxyJump: ssh -l u -p 22 -W '[%h]:%p' bastion\n\
+                    user@target: Permission denied (publickey).\n";
+        assert!(matches!(
+            classify(text, false, Some("bastion")),
+            Failure::AuthRefused { .. }
+        ));
+    }
+
+    #[test]
     fn unreachable_and_timeouts_are_recognised() {
         assert_eq!(
             classify(
@@ -560,7 +579,7 @@ mod tests {
                 "-o",
                 "ConnectTimeout=5",
                 "-o",
-                "LogLevel=VERBOSE",
+                "LogLevel=DEBUG1",
                 "-o",
                 "ClearAllForwardings=yes",
                 "-o",
