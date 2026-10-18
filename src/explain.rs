@@ -56,6 +56,8 @@ pub struct Explanation {
     pub facts: Facts,
     pub next: Vec<String>,
     pub raw: Vec<String>,
+    /// Whether `raw` shows even unasked, because the facts alone do not explain the failure.
+    pub always_raw: bool,
 }
 
 pub struct Context<'a> {
@@ -69,12 +71,15 @@ pub struct Context<'a> {
     /// Whether the jump host is an alias Portico knows, so `portico test <jump>` works.
     pub jump_is_known: bool,
     pub home: &'a Path,
+    /// The managed configuration file, which a rejected line of Portico's own is traced to.
+    pub managed_file: Option<&'a Path>,
 }
 
 struct Parts {
     headline: String,
     facts: Facts,
     next: Vec<String>,
+    always_raw: bool,
 }
 
 impl Parts {
@@ -83,6 +88,7 @@ impl Parts {
             headline: headline.into(),
             facts: Vec::new(),
             next: Vec::new(),
+            always_raw: false,
         }
     }
 
@@ -105,16 +111,23 @@ impl Parts {
 }
 
 pub fn explain(diagnosis: &Diagnosis, context: &Context<'_>) -> Explanation {
-    let parts = describe(&diagnosis.failure, context);
+    let parts = describe(
+        &diagnosis.failure,
+        context,
+        context.hostname.unwrap_or(context.alias),
+        context.port.unwrap_or(22),
+    );
     Explanation {
         headline: parts.headline,
         facts: parts.facts,
         next: parts.next,
         raw: diagnosis.raw.clone(),
+        always_raw: parts.always_raw,
     }
 }
 
-fn describe(failure: &Failure, context: &Context<'_>) -> Parts {
+/// `key_host` and `key_port` name the host whose key is at stake, as known_hosts records it.
+fn describe(failure: &Failure, context: &Context<'_>, key_host: &str, key_port: u16) -> Parts {
     let alias = context.alias;
     let testing = context.operation != Operation::Connect;
     match failure {
@@ -124,7 +137,10 @@ fn describe(failure: &Failure, context: &Context<'_>) -> Parts {
             unusable,
         } => refusal(methods, offered, unusable, context),
         Failure::NameUnresolved { host } => {
-            let note = if context.hostname == Some(alias) {
+            let note = if context
+                .hostname
+                .is_some_and(|name| name.eq_ignore_ascii_case(alias))
+            {
                 " (no HostName is set, so ssh looked up the alias)"
             } else {
                 ""
@@ -150,14 +166,18 @@ fn describe(failure: &Failure, context: &Context<'_>) -> Parts {
                 .next("check the address, the port and any firewall")
         }
         Failure::JumpHostFailed { jump, cause } => {
+            // Nothing known about the target belongs to the jump host.
             let inner = Context {
                 alias: jump,
                 user: None,
                 hostname: None,
                 port: None,
+                identity_files: &[],
+                jump_is_known: false,
                 ..*context
             };
-            let cause = describe(cause, &inner);
+            let (jump_host, jump_port) = jump_target(jump);
+            let cause = describe(cause, &inner, jump_host, jump_port);
             let mut flat = Vec::new();
             for (label, values) in &cause.facts {
                 for (index, value) in values.iter().enumerate() {
@@ -176,6 +196,7 @@ fn describe(failure: &Failure, context: &Context<'_>) -> Parts {
                 ));
             }
             parts.next.extend(cause.next);
+            parts.always_raw = cause.always_raw;
             parts
         }
         Failure::HostKeyUnknown => {
@@ -196,16 +217,24 @@ fn describe(failure: &Failure, context: &Context<'_>) -> Parts {
                     format!("{}:{line}", shorten(file, context.home)),
                 );
             }
-            let host = context.hostname.unwrap_or(alias);
+            let entry = if key_port == 22 {
+                key_host.to_string()
+            } else {
+                format!("[{key_host}]:{key_port}")
+            };
             parts.next(format!(
-                "once the new key is confirmed with the server's administrator, remove the old one with `ssh-keygen -R {host}`"
+                "once the new key is confirmed with the server's administrator, remove the old one with `ssh-keygen -R {entry}`"
             ))
         }
-        Failure::ConfigRejected(rejection) => rejected(rejection, context.home),
+        Failure::ConfigRejected(rejection) => rejected(rejection, context),
         Failure::ConnectionLost { line } => {
             Parts::new("the connection was lost").fact(Label::Line, line.as_str())
         }
-        Failure::Other(line) => Parts::new(line),
+        Failure::Other(line) => {
+            let mut parts = Parts::new(line);
+            parts.always_raw = true;
+            parts
+        }
     }
 }
 
@@ -286,29 +315,47 @@ fn refusal(
     parts
 }
 
-fn rejected(rejection: &ConfigRejection, home: &Path) -> Parts {
-    let parts = Parts::new("OpenSSH rejected the configuration");
-    let parts = match rejection {
+fn rejected(rejection: &ConfigRejection, context: &Context<'_>) -> Parts {
+    let home = context.home;
+    let mut parts = Parts::new("OpenSSH rejected the configuration");
+    match rejection {
         ConfigRejection::Managed {
             alias,
             directive,
             message,
             ..
-        } => parts
-            .fact(Label::File, format!("written by Portico, for {alias}"))
-            .fact(Label::Line, format!("{directive} ({message})")),
+        } => {
+            if let Some(file) = context.managed_file {
+                parts = parts.fact(Label::File, shorten(&file.display().to_string(), home));
+            }
+            parts
+                .fact(Label::Line, format!("{directive} ({message})"))
+                .next(format!("change it with `portico edit {alias}`"))
+        }
         ConfigRejection::UserFile {
             path,
             line,
             message,
         } => parts
             .fact(Label::File, shorten(&path.display().to_string(), home))
-            .fact(Label::Line, format!("{line} ({message})")),
-        ConfigRejection::Internal { raw } | ConfigRejection::Unrecognised { raw } => {
-            parts.facts(Label::Line, raw.lines().map(str::to_string).collect())
+            .fact(Label::Line, format!("{line} ({message})"))
+            .next("fix that line, then try again"),
+        ConfigRejection::Internal { .. } | ConfigRejection::Unrecognised { .. } => {
+            parts.always_raw = true;
+            parts.next("this is likely a Portico bug; see what ssh said below")
         }
-    };
-    parts.next("fix that line, then try again")
+    }
+}
+
+/// The host and port of a `ProxyJump` spec (`[user@]host[:port]`), the port defaulting to 22.
+fn jump_target(spec: &str) -> (&str, u16) {
+    let spec = spec.rsplit_once('@').map_or(spec, |(_, rest)| rest);
+    if let Some((host, port)) = spec.rsplit_once(':')
+        && let Ok(port) = port.parse()
+    {
+        return (host.trim_matches(['[', ']']), port);
+    }
+    (spec.trim_matches(['[', ']']), 22)
 }
 
 /// `user@host:port`, falling back to what is known.
@@ -367,8 +414,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 impl Explanation {
     /// `<alias>: failed — <headline>` then the aligned labelled lines (label column padded to
     /// the longest label plus one space, continuation lines indented to the value column), then
-    /// the raw lines under `  ssh said:` when `raw` is true, or whenever ssh's own last line is
-    /// all the headline there is.
+    /// the raw lines under `  ssh said:` when `raw` is true or the explanation is `always_raw`.
     pub fn render(&self, alias: &str, raw: bool) -> Vec<String> {
         let mut lines = vec![format!("{alias}: failed \u{2014} {}", self.headline)];
         let mut rows: Vec<(Label, &[String])> = self
@@ -394,8 +440,7 @@ impl Explanation {
                 }
             }
         }
-        let unrecognised = self.raw.last() == Some(&self.headline);
-        if (raw || unrecognised) && !self.raw.is_empty() {
+        if (raw || self.always_raw) && !self.raw.is_empty() {
             lines.push("  ssh said:".into());
             lines.extend(self.raw.iter().map(|line| format!("    {line}")));
         }
@@ -437,6 +482,7 @@ mod tests {
             identity_files,
             jump_is_known: false,
             home,
+            managed_file: None,
         }
     }
 
@@ -687,7 +733,7 @@ mod tests {
                 "dev: failed \u{2014} the host key changed, which can mean an attack",
                 "  file: /tmp/portico-fixture/kh_bad:1",
                 "  next: once the new key is confirmed with the server's administrator, remove",
-                "        the old one with `ssh-keygen -R 127.0.0.1`",
+                "        the old one with `ssh-keygen -R [127.0.0.1]:22999`",
             ]
         );
     }
@@ -764,6 +810,7 @@ mod tests {
             )],
             next: Vec::new(),
             raw: Vec::new(),
+            always_raw: false,
         };
         assert_eq!(
             explanation.render("x", false),
@@ -773,5 +820,146 @@ mod tests {
                 format!("        {}", "b".repeat(40)),
             ]
         );
+    }
+
+    fn explained(failure: Failure, raw: &[&str], context: &Context<'_>) -> Vec<String> {
+        let diagnosis = Diagnosis {
+            failure,
+            raw: raw.iter().map(|line| line.to_string()).collect(),
+        };
+        explain(&diagnosis, context).render("dev", false)
+    }
+
+    #[test]
+    fn a_jump_whose_cause_is_unrecognised_shows_what_ssh_said() {
+        let home = home();
+        let failure = Failure::JumpHostFailed {
+            jump: "bastion".into(),
+            cause: Box::new(Failure::Other("  odd".into())),
+        };
+        assert_eq!(
+            explained(failure, &["  odd"], &context(&home, Operation::Test, &[])),
+            [
+                "dev: failed \u{2014} jump host bastion failed:   odd",
+                "  ssh said:",
+                "      odd",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_old_key_is_removed_by_host_and_port() {
+        let home = home();
+        let changed = Failure::HostKeyChanged { known_hosts: None };
+        let mut standard = context(&home, Operation::Test, &[]);
+        standard.port = Some(22);
+        assert_eq!(
+            explained(changed.clone(), &[], &standard)[1],
+            "  next: once the new key is confirmed with the server's administrator, remove"
+        );
+        assert_eq!(
+            explained(changed.clone(), &[], &standard)[2],
+            "        the old one with `ssh-keygen -R 127.0.0.1`"
+        );
+        let jump = Failure::JumpHostFailed {
+            jump: "me@bastion:2222".into(),
+            cause: Box::new(changed.clone()),
+        };
+        assert_eq!(
+            explained(jump, &[], &standard)[2],
+            "        the old one with `ssh-keygen -R [bastion]:2222`"
+        );
+        let jump = Failure::JumpHostFailed {
+            jump: "bastion".into(),
+            cause: Box::new(changed),
+        };
+        assert_eq!(
+            explained(jump, &[], &standard)[2],
+            "        the old one with `ssh-keygen -R bastion`"
+        );
+    }
+
+    #[test]
+    fn the_targets_identity_files_are_not_the_jump_hosts() {
+        let home = home();
+        let files = [("~/.ssh/gone".to_string(), false)];
+        let failure = Failure::JumpHostFailed {
+            jump: "bastion".into(),
+            cause: Box::new(Failure::AuthRefused {
+                methods: "publickey".into(),
+                offered: Vec::new(),
+                unusable: Vec::new(),
+            }),
+        };
+        let mut context = context(&home, Operation::Test, &files);
+        context.jump_is_known = true;
+        assert_eq!(
+            explained(failure, &[], &context),
+            [
+                "dev: failed \u{2014} jump host bastion failed: no key was offered",
+                "  next: run `portico test bastion` to check the jump host on its own",
+                "        set IdentityFile for bastion, or load a key in an agent",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_managed_rejection_names_the_managed_file_and_how_to_change_it() {
+        let home = home();
+        let managed = PathBuf::from("/home/me/.config/portico/hosts.conf");
+        let mut context = context(&home, Operation::Test, &[]);
+        context.managed_file = Some(&managed);
+        let rejection = ConfigRejection::Managed {
+            alias: "web".into(),
+            field: None,
+            directive: "Port".into(),
+            message: "Bad port '99999'".into(),
+        };
+        assert_eq!(
+            explained(Failure::ConfigRejected(rejection), &[], &context),
+            [
+                "dev: failed \u{2014} OpenSSH rejected the configuration",
+                "  file: ~/.config/portico/hosts.conf",
+                "  line: Port (Bad port '99999')",
+                "  next: change it with `portico edit web`",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_internal_or_unrecognised_rejection_is_a_portico_bug_with_ssh_output() {
+        let home = home();
+        for rejection in [
+            ConfigRejection::Internal { raw: "boom".into() },
+            ConfigRejection::Unrecognised { raw: "boom".into() },
+        ] {
+            assert_eq!(
+                explained(
+                    Failure::ConfigRejected(rejection),
+                    &["boom"],
+                    &context(&home, Operation::Test, &[])
+                ),
+                [
+                    "dev: failed \u{2014} OpenSSH rejected the configuration",
+                    "  next: this is likely a Portico bug; see what ssh said below",
+                    "  ssh said:",
+                    "    boom",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn the_alias_is_recognised_as_the_host_name_whatever_its_case() {
+        let home = home();
+        let mut context = context(&home, Operation::Test, &[]);
+        context.hostname = Some("dev");
+        context.alias = "Dev";
+        let lines = explained(
+            Failure::NameUnresolved { host: "dev".into() },
+            &[],
+            &context,
+        );
+        assert!(lines[1].contains("no HostName is set"), "{lines:?}");
     }
 }

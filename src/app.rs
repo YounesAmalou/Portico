@@ -493,18 +493,17 @@ impl App {
             }
         };
         if let Some(key) = trust {
-            let paths = self.store.paths();
-            let home = paths.ssh_dir.parent().unwrap_or(&paths.ssh_dir);
-            let path = known_hosts_path(&resolved.known_hosts_files, home).map_err(|reason| {
-                AppError::KnownHosts {
-                    path: resolved
-                        .known_hosts_files
-                        .first()
-                        .map(PathBuf::from)
-                        .unwrap_or_default(),
-                    reason,
-                }
-            })?;
+            let path =
+                known_hosts_path(&resolved.known_hosts_files, self.home()).map_err(|reason| {
+                    AppError::KnownHosts {
+                        path: resolved
+                            .known_hosts_files
+                            .first()
+                            .map(PathBuf::from)
+                            .unwrap_or_default(),
+                        reason,
+                    }
+                })?;
             append_known_hosts(&path, &key.lines).map_err(|error| AppError::KnownHosts {
                 path: path.clone(),
                 reason: error.to_string(),
@@ -578,6 +577,7 @@ impl App {
             identity_files: &[],
             jump_is_known: false,
             home: self.home(),
+            managed_file: Some(&self.store.paths().managed),
         };
         TestReport {
             alias: alias.into(),
@@ -626,6 +626,7 @@ impl App {
                 identity_files: &identity_files,
                 jump_is_known,
                 home,
+                managed_file: Some(&self.store.paths().managed),
             },
         )
     }
