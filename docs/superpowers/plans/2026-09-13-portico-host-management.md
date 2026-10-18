@@ -55,7 +55,7 @@
 - Consumes: Nothing; this is the foundation.
 - Produces: `Host`, `HostChanges`, `Change<T>`, `ClearField`, and `HostError`; `Host::new`, getters, and `Host::apply`.
 
-- [ ] **Step 1: Create the package manifest and ignore file**
+- [x] **Step 1: Create the package manifest and ignore file**
 
 Use this manifest, then run `cargo generate-lockfile`:
 
@@ -89,7 +89,7 @@ Run: `cargo generate-lockfile`
 
 Expected: exit 0 and a new `Cargo.lock`.
 
-- [ ] **Step 2: Write failing host-model tests**
+- [x] **Step 2: Write failing host-model tests**
 
 Create `src/lib.rs` with `pub mod host;`. In `src/host.rs`, define the test module first:
 
@@ -139,13 +139,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the focused test to verify failure**
+- [x] **Step 3: Run the focused test to verify failure**
 
 Run: `cargo test host::tests --lib`
 
 Expected: compilation fails because the host types are not defined.
 
-- [ ] **Step 4: Implement the minimal validated model**
+- [x] **Step 4: Implement the minimal validated model**
 
 Use these exact public shapes:
 
@@ -188,7 +188,7 @@ impl HostChanges {
 
 Implement `FromStr` for `ClearField`, typed `HostError` variants, `Host::new`, getters, and `Host::apply`. Enforce the spec's alias expression, control/whitespace rules, port range, and one-argument identity/jump rules in one `validate` path used by both construction and edits. Do not touch identity files.
 
-- [ ] **Step 5: Run model tests and static checks**
+- [x] **Step 5: Run model tests and static checks**
 
 Run: `cargo test host::tests --lib`
 
@@ -202,7 +202,7 @@ Run: `cargo clippy --lib -- -D warnings`
 
 Expected: exit 0.
 
-- [ ] **Step 6: Commit the foundation**
+- [x] **Step 6: Commit the foundation**
 
 ```bash
 git add Cargo.toml Cargo.lock .gitignore src/lib.rs src/host.rs
@@ -221,7 +221,7 @@ git commit -m "feat: add validated host model"
 - Consumes: `crate::host::{Host, HostError}`.
 - Produces: `ManagedConfig::{empty, parse, render, hosts, find, insert, replace, remove}` and `ManagedError`.
 
-- [ ] **Step 1: Write failing codec tests**
+- [x] **Step 1: Write failing codec tests**
 
 Add `pub mod managed;` to `src/lib.rs`, then add these tests to `src/managed.rs`:
 
@@ -263,13 +263,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests to verify failure**
+- [x] **Step 2: Run the focused tests to verify failure**
 
 Run: `cargo test managed::tests --lib`
 
 Expected: compilation fails because `ManagedConfig` and `ManagedError` are missing.
 
-- [ ] **Step 3: Implement the strict codec and collection operations**
+- [x] **Step 3: Implement the strict codec and collection operations**
 
 Define:
 
@@ -291,7 +291,7 @@ impl ManagedConfig {
 
 The parser accepts blank lines, comments, one concrete alias per `Host`, and only `HostName`, `User`, `Port`, `IdentityFile`, and `ProxyJump`. Match directive names case-insensitively, require exactly one `HostName`, reject duplicate aliases case-insensitively, and report line numbers in every parse error. Use one shared quote/unquote helper for supported values: emit an unquoted value only when it contains no whitespace, quote it otherwise, and backslash-escape `\` and `"` inside quotes. The renderer emits the fixed header, four-space indentation, one blank line between blocks, and case-insensitive alias ordering.
 
-- [ ] **Step 4: Add mutation behavior tests**
+- [x] **Step 4: Add mutation behavior tests**
 
 ```rust
 #[test]
@@ -310,7 +310,7 @@ Run: `cargo test managed::tests --lib`
 
 Expected: all managed codec tests pass.
 
-- [ ] **Step 5: Run static checks and commit**
+- [x] **Step 5: Run static checks and commit**
 
 Run: `cargo fmt --check`
 
@@ -337,7 +337,7 @@ git commit -m "feat: add managed ssh config codec"
 - Consumes: Canonical entry-config and managed-fragment paths.
 - Produces: `discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryError>`, `parse_directive`, `ConfigDirective`, `ExternalHost`, and `DiscoveryWarning`.
 
-- [ ] **Step 1: Write failing recursive-discovery tests**
+- [x] **Step 1: Write failing recursive-discovery tests**
 
 Add `pub mod discovery;` to `src/lib.rs`. Use `tempfile::tempdir` and this test shape:
 
@@ -396,13 +396,13 @@ fn case_only_duplicate_is_reported_as_ambiguous() {
 }
 ```
 
-- [ ] **Step 2: Run discovery tests to verify failure**
+- [x] **Step 2: Run discovery tests to verify failure**
 
 Run: `cargo test discovery::tests --lib`
 
 Expected: compilation fails because discovery types and functions are undefined.
 
-- [ ] **Step 3: Implement the narrow read-only scanner**
+- [x] **Step 3: Implement the narrow read-only scanner**
 
 Use these shapes:
 
@@ -430,7 +430,7 @@ pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryErro
 
 Resolve relative Includes against `~/.ssh` (the entry config's parent), expand `~` and globs, sort matches for deterministic output, and track canonical visited paths to stop cycles. `parse_directive` tokenizes only enough OpenSSH syntax to recognize comments, quoted arguments, `Include`, and `Host`, and discovery reuses it rather than splitting lines independently. Skip the canonical managed path. Treat unreadable/unmatched includes and duplicate case-folded aliases as warnings and set `aliases_complete = false`; later app operations must refuse add/rename while it is false.
 
-- [ ] **Step 4: Run tests and static checks**
+- [x] **Step 4: Run tests and static checks**
 
 Run: `cargo test discovery::tests --lib`
 
@@ -444,7 +444,7 @@ Run: `cargo clippy --lib -- -D warnings`
 
 Expected: exit 0.
 
-- [ ] **Step 5: Commit discovery**
+- [x] **Step 5: Commit discovery**
 
 ```bash
 git add src/lib.rs src/discovery.rs
@@ -462,7 +462,7 @@ git commit -m "feat: discover external ssh hosts"
 - Consumes: `ManagedConfig`, `discovery::parse_directive`, and a validation closure with signature `Fn(&Path, &[String]) -> Result<(), String>` where the path is a temporary entry config.
 - Produces: `ConfigPaths`, `ManagedStore`, `InitPlan`, `InitOutcome`, `TransactionError`; `plan_init`, `apply_init`, `load`, and `transact`.
 
-- [ ] **Step 1: Write failing initialization tests**
+- [x] **Step 1: Write failing initialization tests**
 
 Add tests that construct paths from a temporary home rather than changing process-global `HOME`:
 
@@ -526,13 +526,13 @@ fn created_paths_have_restrictive_modes() {
 }
 ```
 
-- [ ] **Step 2: Run initialization tests to verify failure**
+- [x] **Step 2: Run initialization tests to verify failure**
 
 Run: `cargo test managed::tests::initialization --lib`
 
 Expected: compilation fails because path/store/init types are missing.
 
-- [ ] **Step 3: Implement path derivation and initialization**
+- [x] **Step 3: Implement path derivation and initialization**
 
 Define:
 
@@ -566,7 +566,7 @@ impl ConfigPaths {
 
 `apply_init` acquires the lock, recomputes the plan after confirmation, creates a non-overwriting `config.portico-backup-<unix-seconds>-<pid>` backup with `create_new(true)`, prefixes or repositions exactly one active Portico Include, writes same-directory temporary files, validates before activation, preserves existing entry permissions, and syncs files/directories. Use `fs2::FileExt::lock_exclusive`; no stale PID lock protocol.
 
-- [ ] **Step 4: Write failing transaction tests**
+- [x] **Step 4: Write failing transaction tests**
 
 ```rust
 #[test]
@@ -603,7 +603,7 @@ fn successful_mutation_keeps_exact_previous_version() {
 
 Define a local `InitializedStore { _dir: TempDir, store: ManagedStore, paths: ConfigPaths }` test fixture and `initialized_store() -> InitializedStore` helper in `src/managed.rs`. The helper calls `apply_init(true, |_, _| Ok(()))`; `_dir` keeps the temporary home alive through every assertion.
 
-- [ ] **Step 5: Implement the atomic transaction**
+- [x] **Step 5: Implement the atomic transaction**
 
 Add:
 
@@ -616,7 +616,7 @@ where
 
 Under one exclusive lock: reload, mutate, render, create a unique same-directory candidate with `create_new(true)`, write/sync it, build a temporary entry config that substitutes the Portico Include with the candidate path, validate every managed alias, rotate the one-step backup, atomically rename, sync the directory, and remove temporary validation files. A drop guard must remove unused candidates after errors.
 
-- [ ] **Step 6: Run managed tests and static checks**
+- [x] **Step 6: Run managed tests and static checks**
 
 Run: `cargo test managed::tests --lib`
 
@@ -630,7 +630,7 @@ Run: `cargo clippy --lib -- -D warnings`
 
 Expected: exit 0.
 
-- [ ] **Step 7: Commit safe storage**
+- [x] **Step 7: Commit safe storage**
 
 ```bash
 git add src/managed.rs
@@ -650,7 +650,7 @@ git commit -m "feat: add atomic ssh config storage"
 - Consumes: `Host`, `HostChanges`, `ManagedStore`, `discover`, and configured executable paths.
 - Produces: `OpenSsh`, `ResolvedConfig`, `App`, `HostSummary`, `HostDetails`, `Ownership`, and all shared operations.
 
-- [ ] **Step 1: Write failing process-boundary tests**
+- [x] **Step 1: Write failing process-boundary tests**
 
 Add `pub mod openssh;` and `pub mod app;` to `src/lib.rs`. Create an executable fake `ssh` in a temporary directory that records one argument per output line. Test these exact calls:
 
@@ -679,13 +679,13 @@ fn parses_effective_configuration() {
 
 In the `openssh` test module, define `FakeProgram { _dir: TempDir, path: PathBuf, log: PathBuf }` with `path(&self) -> PathBuf` and `log(&self) -> &Path`. `fake_ssh()` writes a mode-`0700` script that records `"$@"` one argument per line and exits 0. `fake_resolver(output: &str)` writes a mode-`0700` script that prints the supplied fixed output when its first argument is `-G`. Build script contents only from test-controlled strings.
 
-- [ ] **Step 2: Run OpenSSH tests to verify failure**
+- [x] **Step 2: Run OpenSSH tests to verify failure**
 
 Run: `cargo test openssh::tests --lib`
 
 Expected: compilation fails because the process adapter is missing.
 
-- [ ] **Step 3: Implement the concrete process adapter**
+- [x] **Step 3: Implement the concrete process adapter**
 
 Define:
 
@@ -713,7 +713,7 @@ impl OpenSsh {
 
 Use `Command` directly. Validation runs `ssh -G -F <temporary-entry> <alias>` for each alias, using a harmless validation alias when the list is empty. Resolution runs `ssh -G <alias>` and parses only the five displayed keys. New-terminal connection runs `xdg-terminal-exec -- ssh <alias>` as distinct arguments.
 
-- [ ] **Step 4: Write failing application-operation tests**
+- [x] **Step 4: Write failing application-operation tests**
 
 Build an `App` with temporary paths and fake executables, then test:
 
@@ -759,7 +759,7 @@ fn incomplete_discovery_blocks_add_but_not_existing_connect() {
 }
 ```
 
-- [ ] **Step 5: Implement the application core**
+- [x] **Step 5: Implement the application core**
 
 Use these public methods:
 
@@ -801,7 +801,7 @@ In the `app` test module, define `TestApp { _dir: TempDir, app: App }`. `initial
 
 `HostSummary` contains alias, ownership, and source path. `HostDetails` adds optional declared `Host`, resolved config, and discovery warnings. Resolve effective configuration only for `show` or the currently selected TUI host, not every row. Before add/rename, discover again and reject incomplete discovery or any case-insensitive collision. Before edit/remove, prove the alias exists in the managed store; otherwise return the external/unknown typed error.
 
-- [ ] **Step 6: Run core tests and static checks**
+- [x] **Step 6: Run core tests and static checks**
 
 Run: `cargo test --lib`
 
@@ -815,7 +815,7 @@ Run: `cargo clippy --lib -- -D warnings`
 
 Expected: exit 0.
 
-- [ ] **Step 7: Commit the shared core**
+- [x] **Step 7: Commit the shared core**
 
 ```bash
 git add src/lib.rs src/openssh.rs src/app.rs
@@ -834,7 +834,7 @@ git commit -m "feat: add shared host operations"
 - Consumes: `App`, `HostSummary`, `HostDetails`, `Host`, `HostChanges`, and `ClearField`.
 - Produces: `tui::run(&App) -> Result<(), TuiError>` and testable `UiState` update/render behavior.
 
-- [ ] **Step 1: Write failing state-transition and render tests**
+- [x] **Step 1: Write failing state-transition and render tests**
 
 Add `pub mod tui;` to `src/lib.rs`. Use `ratatui::backend::TestBackend`:
 
@@ -867,13 +867,13 @@ fn filtering_preserves_a_valid_selection() {
 
 In the TUI test module, define `summary(alias: &str, ownership: Ownership) -> HostSummary`, `details(alias: &str, ownership: Ownership) -> HostDetails`, `render_to_buffer(state: &UiState, details: HostDetails) -> Buffer`, and `buffer_text(buffer: &Buffer) -> String`. They create fixed test-only values, render through `ratatui::backend::TestBackend`, and flatten each cell's symbol row by row; no production mock interface is needed.
 
-- [ ] **Step 2: Run TUI tests to verify failure**
+- [x] **Step 2: Run TUI tests to verify failure**
 
 Run: `cargo test tui::tests --lib`
 
 Expected: compilation fails because TUI state and rendering are missing.
 
-- [ ] **Step 3: Implement state and pure rendering**
+- [x] **Step 3: Implement state and pure rendering**
 
 Use these tested state interfaces:
 
@@ -901,7 +901,7 @@ impl UiState {
 
 Render one horizontal split: host list/filter on the left and details or the active form on the right. The footer derives its keys from current mode and selected ownership. Implement movement, `/`, `a`, `e`, `x`, Enter, `n`, Esc, and `q`; forms must expose exactly the six v1 fields and reuse `Host::new`/`HostChanges` for validation.
 
-- [ ] **Step 4: Write failing terminal-suspension test**
+- [x] **Step 4: Write failing terminal-suspension test**
 
 ```rust
 #[test]
@@ -918,7 +918,7 @@ fn restores_terminal_around_child_even_when_child_fails() {
 }
 ```
 
-- [ ] **Step 5: Implement terminal lifecycle and the event loop**
+- [x] **Step 5: Implement terminal lifecycle and the event loop**
 
 Implement the tested orchestration helper with this signature:
 
@@ -932,7 +932,7 @@ where
 
 Create an RAII terminal guard whose `Drop` disables raw mode, leaves the alternate screen, and restores the cursor. Register `SIGINT`, `SIGTERM`, and `SIGHUP` with `signal_hook::flag` against an `AtomicBool`; poll terminal events with a short timeout so the event loop observes the flag, exits normally, and lets the guard restore the terminal. `suspend_for_child` must always attempt re-entry after the child closure. `run` detects an uninitialized store, presents `InitPlan`, and requires explicit confirmation before calling `App::initialize`. It then loads hosts, resolves only the selected details, calls `App` operations for forms/actions, refreshes after mutations, retains selection by alias, and shows errors in a footer/status line. Before in-place SSH it suspends the TUI; new-terminal SSH leaves the TUI active.
 
-- [ ] **Step 6: Run TUI tests and static checks**
+- [x] **Step 6: Run TUI tests and static checks**
 
 Run: `cargo test tui::tests --lib`
 
@@ -946,7 +946,7 @@ Run: `cargo clippy --lib -- -D warnings`
 
 Expected: exit 0.
 
-- [ ] **Step 7: Commit the TUI**
+- [x] **Step 7: Commit the TUI**
 
 ```bash
 git add src/lib.rs src/tui.rs
@@ -968,7 +968,7 @@ git commit -m "feat: add host management tui"
 - Consumes: Every `App` operation and `tui::run`.
 - Produces: Exact command/flag contract; `cli::run(args, app, input, output, error) -> ExitCode`; environment-backed executable.
 
-- [ ] **Step 1: Write failing command-shape tests**
+- [x] **Step 1: Write failing command-shape tests**
 
 Add `pub mod cli;` to `src/lib.rs`. In `src/cli.rs`, test parsing before implementing execution:
 
@@ -994,13 +994,13 @@ fn parses_repeatable_unset_and_force() {
 }
 ```
 
-- [ ] **Step 2: Run CLI parser tests to verify failure**
+- [x] **Step 2: Run CLI parser tests to verify failure**
 
 Run: `cargo test cli::tests --lib`
 
 Expected: compilation fails because `Cli` and `Command` are undefined.
 
-- [ ] **Step 3: Implement the exact `clap` surface**
+- [x] **Step 3: Implement the exact `clap` surface**
 
 Define the parser exactly at this boundary; no subcommand opens the TUI:
 
@@ -1040,7 +1040,7 @@ enum Command {
 }
 ```
 
-- [ ] **Step 4: Write failing binary-level CRUD and confirmation tests**
+- [x] **Step 4: Write failing binary-level CRUD and confirmation tests**
 
 In `tests/support/mod.rs`, define `TestEnv { _dir: TempDir, home: PathBuf, bin: PathBuf }` and `RunResult(std::process::Output)`. `TestEnv::new()` creates fake `ssh` and `xdg-terminal-exec` executables in `bin`; fake `ssh` handles `-G` by printing deterministic valid configuration and records connection arguments, while the fake terminal records its arguments. Use this runner so arrays and dynamically generated concurrency arguments share one path:
 
@@ -1108,7 +1108,7 @@ fn connection_modes_propagate_status_and_arguments() {
 }
 ```
 
-- [ ] **Step 5: Implement command execution and `main`**
+- [x] **Step 5: Implement command execution and `main`**
 
 Use this boundary:
 
@@ -1129,7 +1129,7 @@ where
 
 `main` reads `HOME`, creates `ConfigPaths`, uses `OpenSsh::system()` so normal `PATH` lookup selects `ssh` and `xdg-terminal-exec`, parses `Cli`, computes `interactive` with `std::io::IsTerminal`, and exits with `run`. Before `init`, print `InitPlan`; require an interactive confirmation or `-y`. Before removal, prompt only when `interactive` is true; non-TTY removal requires `-f`. Do not add test-only production settings, colored output, or JSON output.
 
-- [ ] **Step 6: Run CLI tests and inspect help**
+- [x] **Step 6: Run CLI tests and inspect help**
 
 Run: `cargo test cli::tests --lib`
 
@@ -1151,7 +1151,7 @@ Run: `cargo clippy --all-targets -- -D warnings`
 
 Expected: exit 0.
 
-- [ ] **Step 7: Commit the executable**
+- [x] **Step 7: Commit the executable**
 
 ```bash
 git add src/lib.rs src/cli.rs src/main.rs tests/support/mod.rs tests/cli.rs
@@ -1170,7 +1170,7 @@ git commit -m "feat: expose portico cli"
 - Consumes: The complete binary, `tests/support/mod.rs`, and all public v1 behavior.
 - Produces: Executable evidence for initialization safety, concurrency, OpenSSH compatibility, and terminal/process invariants.
 
-- [ ] **Step 1: Add the real-OpenSSH compatibility test**
+- [x] **Step 1: Add the real-OpenSSH compatibility test**
 
 Declare `mod support; use support::TestEnv;`. Use a temporary home, initialize with the fake validator, add a managed host, then create a test-only copy of the entry config that replaces the literal Portico Include with the absolute temporary managed path. Invoke installed OpenSSH against that validation copy:
 
@@ -1206,7 +1206,7 @@ Run: `cargo test --test acceptance ordinary_openssh_resolves_a_portico_host`
 
 Expected: PASS using the installed OpenSSH parser without touching the real home or opening a network connection.
 
-- [ ] **Step 2: Add concurrency and rollback acceptance tests**
+- [x] **Step 2: Add concurrency and rollback acceptance tests**
 
 Add these acceptance tests, extending `TestEnv` with `reject_alias(&self, alias: &str)` so its fake `ssh -G` exits nonzero for that exact alias:
 
@@ -1257,7 +1257,7 @@ Run: `cargo test --test acceptance`
 
 Expected: PASS if the earlier invariants are correct. If it fails, stop this task, add a focused regression test in the responsible earlier task, make the smallest correction there, and rerun this acceptance test before continuing.
 
-- [ ] **Step 3: Run the complete verification suite**
+- [x] **Step 3: Run the complete verification suite**
 
 Run: `cargo test --all-targets`
 
@@ -1275,13 +1275,13 @@ Run: `cargo run -- --help`
 
 Expected: approved commands and short flags are present, with no deferred commands.
 
-- [ ] **Step 4: Perform the isolated manual smoke test**
+- [x] **Step 4: Perform the isolated manual smoke test**
 
 Run `cargo test --test acceptance -- --nocapture` as the isolated smoke harness, then use `cargo run -- --help` for the real binary surface. The harness creates its own temporary home, exercises `init -y`, `add`, `hosts`, `show`, `edit`, new-terminal connection through a fake terminal executable, and `remove -f`, and prints the temporary config, permissions, backup, and `ssh -G -F` results on failure. Do not run a network connection and do not point Portico at the user's real home.
 
 Expected: every approved v1 flow works; external files differ only by the one initialization Include; managed removal leaves ordinary config valid.
 
-- [ ] **Step 5: Commit acceptance proof**
+- [x] **Step 5: Commit acceptance proof**
 
 ```bash
 git add tests/acceptance.rs tests/support/mod.rs src/managed.rs src/discovery.rs src/openssh.rs src/app.rs src/tui.rs src/cli.rs
