@@ -240,9 +240,11 @@ stty -g > "$HOME/child-terminal-state"
 exit 23
 "#,
     );
+    // The PTY harness reads `connection-started` as soon as it exists, so it is renamed into
+    // place whole rather than written where the harness could read it half-written.
     std::fs::write(
         env.home().join("threaded-connection.py"),
-        "import os, pathlib, queue, signal, threading\nstarted = queue.Queue()\ndef run():\n    child_pid = os.fork()\n    if child_pid == 0:\n        os.setsid()\n        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n        os.execlp('sleep', 'sleep', '30')\n    started.put((threading.get_native_id(), child_pid))\n    os.waitpid(child_pid, 0)\nthread = threading.Thread(target=run)\nthread.start()\nworker_tid, child_pid = started.get()\npathlib.Path(os.environ['HOME'], 'connection-started').write_text(f'{os.getppid()} {os.getpid()} {worker_tid} {child_pid}\\n')\nthread.join()\n",
+        "import os, pathlib, queue, signal, threading\nstarted = queue.Queue()\ndef run():\n    child_pid = os.fork()\n    if child_pid == 0:\n        os.setsid()\n        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n        os.execlp('sleep', 'sleep', '30')\n    started.put((threading.get_native_id(), child_pid))\n    os.waitpid(child_pid, 0)\nthread = threading.Thread(target=run)\nthread.start()\nworker_tid, child_pid = started.get()\nmarker = pathlib.Path(os.environ['HOME'], 'connection-started')\npartial = marker.with_name('connection-started.tmp')\npartial.write_text(f'{os.getppid()} {os.getpid()} {worker_tid} {child_pid}\\n')\nos.replace(partial, marker)\nthread.join()\n",
     )
     .unwrap();
     env.install_program(
