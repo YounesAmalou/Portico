@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
 use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
-use crate::host::{Change, Host, HostChanges, HostError, HostField, parse_port};
+use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
 const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
@@ -989,10 +989,7 @@ impl ManagedConfig {
         if self.find(host.alias()).is_some() {
             return Err(ManagedError::DuplicateAlias(host.alias().into()));
         }
-        if !comments.is_empty() {
-            self.comments
-                .insert(host.alias().to_ascii_lowercase(), comments);
-        }
+        self.set_comments(&host, comments);
         self.hosts.push(host);
         self.sort_hosts();
         Ok(())
@@ -1010,30 +1007,13 @@ impl ManagedConfig {
             return Err(ManagedError::DuplicateAlias(host.alias().into()));
         }
         if let Some(comments) = self.comments.remove(&old_alias.to_ascii_lowercase()) {
-            self.comments
-                .insert(host.alias().to_ascii_lowercase(), comments);
+            self.set_comments(&host, comments);
         }
         self.hosts[index] = host;
         Ok(())
     }
 
     pub fn apply(&mut self, alias: &str, changes: HostChanges) -> Result<(), ManagedError> {
-        let cleared = [
-            (
-                HostField::Hostname,
-                matches!(changes.hostname, Change::Clear),
-            ),
-            (HostField::User, matches!(changes.user, Change::Clear)),
-            (HostField::Port, matches!(changes.port, Change::Clear)),
-            (
-                HostField::IdentityFile,
-                matches!(changes.identity_file, Change::Clear),
-            ),
-            (
-                HostField::ProxyJump,
-                matches!(changes.proxy_jump, Change::Clear),
-            ),
-        ];
         let host = self
             .find(alias)
             .ok_or_else(|| ManagedError::UnknownAlias(alias.into()))?
@@ -1042,17 +1022,7 @@ impl ManagedConfig {
                 alias: alias.into(),
                 source,
             })?;
-        let new_alias = host.alias().to_owned();
-        self.replace(alias, host)?;
-        if let Some(comments) = self.comments.get_mut(&new_alias.to_ascii_lowercase()) {
-            for (field, _) in cleared.iter().filter(|(_, clear)| *clear) {
-                comments.fields.remove(field);
-            }
-            if comments.is_empty() {
-                self.comments.remove(&new_alias.to_ascii_lowercase());
-            }
-        }
-        Ok(())
+        self.replace(alias, host)
     }
 
     pub fn remove(&mut self, alias: &str) -> Result<Host, ManagedError> {
@@ -1123,13 +1093,31 @@ impl ManagedConfig {
             leading: leading_comments,
             fields: field_comments,
         };
-        if !comments.is_empty() {
-            self.comments
-                .insert(host.alias().to_ascii_lowercase(), comments);
-        }
+        self.set_comments(&host, comments);
         self.hosts.push(host);
         self.sort_hosts();
         Ok(())
+    }
+
+    /// Stores the comments of `host`, dropping those of fields it does not set.
+    fn set_comments(&mut self, host: &Host, mut comments: HostComments) {
+        comments.fields.retain(|field, lines| {
+            !lines.is_empty()
+                && match field {
+                    HostField::User => host.user().is_some(),
+                    HostField::Port => host.port().is_some(),
+                    HostField::IdentityFile => host.identity_file().is_some(),
+                    HostField::ProxyJump => host.proxy_jump().is_some(),
+                    HostField::Hostname => true,
+                    HostField::Alias => false,
+                }
+        });
+        let key = host.alias().to_ascii_lowercase();
+        if comments.is_empty() {
+            self.comments.remove(&key);
+        } else {
+            self.comments.insert(key, comments);
+        }
     }
 
     fn sort_hosts(&mut self) {
@@ -1716,6 +1704,7 @@ fn quote_path(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::Change;
     use tempfile::TempDir;
 
     struct InitializedStore {
@@ -1787,6 +1776,32 @@ mod tests {
         assert!(!kept.fields.contains_key(&HostField::User));
         assert_eq!(kept.fields[&HostField::Port], vec!["# p"]);
         assert!(config.comments("dev").is_none());
+    }
+
+    #[test]
+    fn replace_drops_comments_of_fields_the_new_host_lacks() {
+        let mut config = ManagedConfig::empty();
+        let comments = HostComments {
+            leading: vec!["# lead".into()],
+            fields: BTreeMap::from([
+                (HostField::User, vec!["# who".into()]),
+                (HostField::Port, vec!["# p".into()]),
+            ]),
+        };
+        let host = Host::new("dev", "h", Some("bob".into()), Some(2222), None, None).unwrap();
+        config.insert_with_comments(host.clone(), comments).unwrap();
+        let edited = host
+            .apply(HostChanges {
+                user: Change::Clear,
+                ..HostChanges::default()
+            })
+            .unwrap();
+        config.replace("dev", edited).unwrap();
+        let kept = config.comments("dev").unwrap();
+        assert_eq!(kept.leading, vec!["# lead"]);
+        assert!(!kept.fields.contains_key(&HostField::User));
+        assert_eq!(kept.fields[&HostField::Port], vec!["# p"]);
+        assert_eq!(ManagedConfig::parse(&config.render()).unwrap(), config);
     }
 
     #[test]
