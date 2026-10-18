@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -8,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -17,6 +19,7 @@ use std::{
 
 use thiserror::Error;
 
+use crate::explain::Explanation;
 use crate::managed::write_unique;
 use crate::probe::{
     Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, TEST_STDERR_LIMIT, authenticated,
@@ -110,11 +113,29 @@ enum Watched {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionOutcome {
-    Exited(ExitStatus),
+    /// ssh ran in this terminal and exited; a failure Portico recognised is explained.
+    Exited {
+        status: ExitStatus,
+        explanation: Option<Explanation>,
+    },
     LaunchRequested,
     LaunchFailed(ExitStatus),
+}
+
+/// The most of a connection's stderr kept for diagnosis, counted from the end.
+pub const CONNECT_TAIL_LIMIT: usize = 64 * 1024;
+
+/// How long the stderr copier may keep running after ssh exits: anything ssh wrote is already in
+/// the pipe, so only a descendant still holding the pipe open makes it wait this long.
+const MIRROR_DRAIN: Duration = Duration::from_secs(1);
+
+/// A connection whose stderr was mirrored: ssh's exit status and the newest bytes it wrote there.
+#[derive(Debug)]
+pub struct Mirrored {
+    pub status: ExitStatus,
+    pub tail: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -439,27 +460,6 @@ impl OpenSsh {
         })
     }
 
-    pub fn connect(
-        &self,
-        alias: &str,
-        new_terminal: bool,
-    ) -> Result<ConnectionOutcome, OpenSshError> {
-        if new_terminal {
-            return self.launch_in_new_terminal(alias);
-        }
-
-        Ok(ConnectionOutcome::Exited(
-            Command::new(&self.ssh)
-                .arg("--")
-                .arg(alias)
-                .status()
-                .map_err(|source| OpenSshError::Io {
-                    program: self.ssh.clone(),
-                    source,
-                })?,
-        ))
-    }
-
     /// Asks `xdg-terminal-exec` to open `ssh -- <alias>` in a new terminal.
     ///
     /// The launcher's own exit status is the only signal available: it exits
@@ -469,7 +469,7 @@ impl OpenSsh {
     /// fails within `LAUNCH_GRACE` is reported as `LaunchFailed`; anything
     /// else is `LaunchRequested`, which promises only that the request was
     /// accepted, never that the SSH session itself succeeded.
-    fn launch_in_new_terminal(&self, alias: &str) -> Result<ConnectionOutcome, OpenSshError> {
+    pub fn launch_in_new_terminal(&self, alias: &str) -> Result<ConnectionOutcome, OpenSshError> {
         // The command follows the launcher's own arguments directly: older
         // launchers have no option parsing and would take `--` as the command.
         let mut child = Command::new(&self.terminal)
@@ -512,42 +512,50 @@ impl OpenSsh {
         }
     }
 
-    pub(crate) fn connect_cancellable(
+    /// Runs `ssh -- <alias>` with stdin and stdout inherited and stderr piped through a copier
+    /// thread that writes every chunk to `sink` as soon as it is read and keeps the newest
+    /// `CONNECT_TAIL_LIMIT` bytes.
+    ///
+    /// Setting `cancelled` stops ssh and every process it started.
+    pub(crate) fn connect_mirrored(
         &self,
         alias: &str,
-        cancelled: &AtomicBool,
-    ) -> Result<ExitStatus, OpenSshError> {
+        sink: Box<dyn Write + Send>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Mirrored, OpenSshError> {
+        let io_error = |source| OpenSshError::Io {
+            program: self.ssh.clone(),
+            source,
+        };
         let mut child = Command::new(&self.ssh)
             .arg("--")
             .arg(alias)
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|source| OpenSshError::Io {
-                program: self.ssh.clone(),
-                source,
-            })?;
-        loop {
-            if cancelled.load(Ordering::Relaxed) {
-                terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
-                    program: self.ssh.clone(),
-                    source,
-                })?;
+            .map_err(io_error)?;
+        let copier = Copier::start(child.stderr.take().expect("stderr is piped"), sink);
+        let status = loop {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+                let stopped = terminate_process_tree(&mut child);
+                copier.finish();
+                stopped.map_err(io_error)?;
                 return Err(OpenSshError::Cancelled);
             }
             match child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
+                Ok(Some(status)) => break status,
                 Ok(None) => thread::sleep(Duration::from_millis(20)),
                 Err(source) => {
-                    terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
-                        program: self.ssh.clone(),
-                        source,
-                    })?;
-                    return Err(OpenSshError::Io {
-                        program: self.ssh.clone(),
-                        source,
-                    });
+                    let stopped = terminate_process_tree(&mut child);
+                    copier.finish();
+                    stopped.map_err(io_error)?;
+                    return Err(io_error(source));
                 }
             }
-        }
+        };
+        Ok(Mirrored {
+            status,
+            tail: copier.finish(),
+        })
     }
 
     fn validate_alias(
@@ -647,6 +655,72 @@ fn has_exited(child: &std::process::Child) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { info.si_pid() } != 0)
+}
+
+/// Copies a child's stderr to a sink chunk by chunk, keeping the newest bytes.
+struct Copier {
+    thread: thread::JoinHandle<()>,
+    done: mpsc::Receiver<()>,
+    detached: Arc<AtomicBool>,
+    tail: Arc<Mutex<VecDeque<u8>>>,
+}
+
+impl Copier {
+    fn start(mut source: impl Read + Send + 'static, mut sink: Box<dyn Write + Send>) -> Self {
+        let (finished, done) = mpsc::channel();
+        let detached = Arc::new(AtomicBool::new(false));
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let thread = thread::spawn({
+            let detached = Arc::clone(&detached);
+            let tail = Arc::clone(&tail);
+            move || {
+                let mut buffer = [0; 8 * 1024];
+                loop {
+                    let read = match source.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    // Once Portico has moved on, a leftover descendant's output is not ssh's.
+                    if detached.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let chunk = &buffer[..read];
+                    // A sink that fails must not stop the reading, or ssh would block on a full
+                    // pipe; the tail still gets every byte.
+                    let _ = sink.write_all(chunk).and_then(|()| sink.flush());
+                    let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    tail.extend(chunk);
+                    let excess = tail.len().saturating_sub(CONNECT_TAIL_LIMIT);
+                    tail.drain(..excess);
+                }
+                let _ = finished.send(());
+            }
+        });
+        Self {
+            thread,
+            done,
+            detached,
+            tail,
+        }
+    }
+
+    /// Waits for the copy to reach the end of the pipe, which comes when ssh and everything it
+    /// started have exited; a descendant that still holds the pipe after `MIRROR_DRAIN` is left
+    /// behind, and the copier stops at its next write. Returns the tail.
+    fn finish(self) -> Vec<u8> {
+        if self.done.recv_timeout(MIRROR_DRAIN).is_ok() {
+            let _ = self.thread.join();
+        } else {
+            self.detached.store(true, Ordering::Relaxed);
+        }
+        let tail = self
+            .tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tail.iter().copied().collect()
+    }
 }
 
 fn parse_fingerprint(line: &str) -> Result<KeyFingerprint, OpenSshError> {
@@ -1188,12 +1262,11 @@ mod tests {
     fn passes_alias_as_one_argument_without_a_shell() {
         let fake = fake_ssh();
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
-        let outcome = openssh.connect("-external", false).unwrap();
+        let mirrored = openssh
+            .connect_mirrored("-external", Box::new(io::sink()), None)
+            .unwrap();
 
-        assert!(matches!(
-            outcome,
-            ConnectionOutcome::Exited(status) if status.success()
-        ));
+        assert!(mirrored.status.success());
         assert_eq!(fs::read_to_string(fake.log()).unwrap(), "--\n-external\n");
     }
 
@@ -1268,7 +1341,7 @@ mod tests {
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
 
         assert_eq!(
-            openssh.connect("-external", true).unwrap(),
+            openssh.launch_in_new_terminal("-external").unwrap(),
             ConnectionOutcome::LaunchRequested
         );
         wait_for_contents(
@@ -1285,7 +1358,7 @@ mod tests {
         let openssh = OpenSsh::new(ssh.path(), terminal.path());
 
         assert!(matches!(
-            openssh.connect("dev", true).unwrap(),
+            openssh.launch_in_new_terminal("dev").unwrap(),
             ConnectionOutcome::LaunchFailed(status) if status.code() == Some(7)
         ));
     }
@@ -1295,7 +1368,7 @@ mod tests {
         let openssh = OpenSsh::new("ssh".into(), "/nonexistent/xdg-terminal-exec".into());
 
         assert!(matches!(
-            openssh.connect("dev", true),
+            openssh.launch_in_new_terminal("dev"),
             Err(OpenSshError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound
         ));
     }
@@ -1319,7 +1392,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         assert_eq!(
-            openssh.connect("dev", true).unwrap(),
+            openssh.launch_in_new_terminal("dev").unwrap(),
             ConnectionOutcome::LaunchRequested
         );
 
@@ -1396,7 +1469,7 @@ mod tests {
         fail_pidfd_open_after(0);
         let started = Instant::now();
 
-        let result = openssh.connect_cancellable("dev", &cancelled);
+        let result = openssh.connect_mirrored("dev", Box::new(io::sink()), Some(&cancelled));
 
         cancel.join().unwrap();
         let pid = fs::read_to_string(marker).unwrap();
@@ -1437,7 +1510,7 @@ mod tests {
         // The root's descriptor opens; the first descendant's does not.
         fail_pidfd_open_after(1);
 
-        let result = openssh.connect_cancellable("dev", &cancelled);
+        let result = openssh.connect_mirrored("dev", Box::new(io::sink()), Some(&cancelled));
 
         cancel.join().unwrap();
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
@@ -1928,5 +2001,123 @@ mod tests {
                 .to_string()
                 .contains("bad option")
         );
+    }
+
+    /// A sink the tests can read while a connection still writes to it.
+    #[derive(Clone, Default)]
+    struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedSink {
+        fn contents(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mirrored_ssh(script: &str) -> FakeProgram {
+        let fake = fake_ssh();
+        write_executable(&fake.path, &format!("#!/bin/sh\n{script}\n"));
+        fake
+    }
+
+    #[test]
+    fn mirrored_bytes_arrive_unchanged_and_in_order() {
+        let fake = fake_ssh();
+        let release = fake.log.with_file_name("release");
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nprintf 'Password:' >&2\ni=0\nwhile [ ! -f '{}' ] && [ \"$i\" -lt 1000 ]; do i=$((i + 1)); sleep 0.01; done\nprintf '\\377\\r\\nbye\\n' >&2\nexit 0\n",
+                release.display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let sink = SharedSink::default();
+        let connection = thread::spawn({
+            let sink = sink.clone();
+            move || openssh.connect_mirrored("dev", Box::new(sink), None)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.contents() != b"Password:" {
+            assert!(Instant::now() < deadline, "the prompt was not mirrored");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!connection.is_finished(), "ssh exited before its release");
+        fs::write(&release, "").unwrap();
+        let mirrored = connection.join().unwrap().unwrap();
+
+        assert!(mirrored.status.success());
+        assert_eq!(sink.contents(), b"Password:\xff\r\nbye\n");
+        assert_eq!(mirrored.tail, b"Password:\xff\r\nbye\n");
+    }
+
+    #[test]
+    fn the_tail_keeps_the_newest_bytes() {
+        let fake = mirrored_ssh("head -c 102400 /dev/zero | tr '\\000' a >&2\nprintf 'END\\n' >&2");
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let sink = SharedSink::default();
+
+        let mirrored = openssh
+            .connect_mirrored("dev", Box::new(sink.clone()), None)
+            .unwrap();
+
+        assert_eq!(sink.contents().len(), 102400 + 4);
+        assert_eq!(mirrored.tail.len(), CONNECT_TAIL_LIMIT);
+        assert!(mirrored.tail.ends_with(b"aaaEND\n"));
+    }
+
+    #[test]
+    fn the_exit_status_passes_through() {
+        let fake = mirrored_ssh("exit 3");
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+
+        let mirrored = openssh
+            .connect_mirrored("dev", Box::new(SharedSink::default()), None)
+            .unwrap();
+
+        assert_eq!(mirrored.status.code(), Some(3));
+        assert!(mirrored.tail.is_empty());
+    }
+
+    #[test]
+    fn a_descendant_holding_stderr_open_does_not_block_the_return() {
+        let fake = fake_ssh();
+        let pid = fake.log.with_file_name("pid");
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nprintf 'gone\\n' >&2\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nexit 255\n",
+                pid.display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let sink = SharedSink::default();
+        let started = Instant::now();
+
+        let mirrored = openssh
+            .connect_mirrored("dev", Box::new(sink.clone()), None)
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?} for a descendant",
+            started.elapsed()
+        );
+        assert_eq!(mirrored.status.code(), Some(255));
+        assert_eq!(mirrored.tail, b"gone\n");
+        assert_eq!(sink.contents(), b"gone\n");
+        let pid: libc::pid_t = fs::read_to_string(pid).unwrap().parse().unwrap();
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 }

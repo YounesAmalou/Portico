@@ -1243,7 +1243,7 @@ fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
 ///
 /// A read failure yields empty text: the line then maps to no host, so the rejection degrades
 /// to an unmapped one, which is still reported verbatim. Nothing depends on the text otherwise.
-fn read_lossy(path: &Path) -> String {
+pub(crate) fn read_lossy(path: &Path) -> String {
     fs::read(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()

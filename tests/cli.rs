@@ -543,3 +543,99 @@ fn a_save_rejected_by_the_users_own_config_names_that_file() {
             "line 3 of ~/.ssh/config: Bad configuration option: bogus; nothing was saved; fix that line, then save again",
         );
 }
+
+/// Replaces `ssh`: `-G` runs `resolve`, anything else runs `connect`.
+fn install_connecting_ssh(env: &TestEnv, resolve: &str, connect: &str) {
+    env.install_program(
+        "ssh",
+        &format!("#!/bin/sh\nif [ \"$1\" = '-G' ]; then\n{resolve}\nfi\n{connect}\n"),
+    );
+}
+
+const RESOLVES: &str = "printf 'hostname h\\nuser user\\nport 22\\n'; exit 0";
+
+fn env_with_x() -> TestEnv {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "x", "-H", "h"]).assert_success();
+    env
+}
+
+#[test]
+fn connect_explains_a_refused_login() {
+    let env = env_with_x();
+    install_connecting_ssh(
+        &env,
+        RESOLVES,
+        "printf 'user@h: Permission denied (publickey).\\n' >&2; exit 255",
+    );
+
+    env.run(["connect", "x"]).assert_exit_code_and_stderr_contains(
+        255,
+        "user@h: Permission denied (publickey).\n\nx: failed \u{2014} the server refused the login\n",
+    );
+}
+
+#[test]
+fn connect_adds_nothing_for_other_exit_codes_or_unknown_output() {
+    let env = env_with_x();
+    install_connecting_ssh(
+        &env,
+        RESOLVES,
+        "printf 'user@h: Permission denied (publickey).\\n' >&2; exit 1",
+    );
+    env.run(["connect", "x"])
+        .assert_exit_code_and_stderr(1, "user@h: Permission denied (publickey).\n");
+
+    install_connecting_ssh(&env, RESOLVES, "printf 'weird thing\\n' >&2; exit 255");
+    env.run(["connect", "x"])
+        .assert_exit_code_and_stderr(255, "weird thing\n");
+}
+
+#[test]
+fn connect_keeps_the_exit_code_when_resolving_fails() {
+    let env = env_with_x();
+    install_connecting_ssh(
+        &env,
+        "printf 'oops\\n' >&2; exit 1",
+        "printf 'Permission denied (publickey).\\n' >&2; exit 255",
+    );
+
+    env.run(["connect", "x"])
+        .assert_exit_code_and_stderr(255, "Permission denied (publickey).\n");
+}
+
+#[test]
+fn connect_explains_a_rejected_configuration() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(env.ssh_config().parent().unwrap()).unwrap();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+    )
+    .unwrap();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "x", "-H", "h"]).assert_success();
+    let rejected = "printf '%s/.ssh/config: line 3: Bad configuration option: bogus\\n' \"$HOME\" >&2; exit 255";
+    install_connecting_ssh(&env, rejected, rejected);
+
+    env.run(["connect", "x"]).assert_exit_code_and_stderr_contains(
+        255,
+        "\n\nx: failed \u{2014} OpenSSH rejected the configuration\n  file: ~/.ssh/config\n  line: 3 (Bad configuration option: bogus)\n",
+    );
+}
+
+#[test]
+fn a_lost_session_says_so() {
+    let env = env_with_x();
+    install_connecting_ssh(
+        &env,
+        RESOLVES,
+        "printf 'Connection to h closed by remote host.\\n' >&2; exit 255",
+    );
+
+    env.run(["connect", "x"]).assert_exit_code_and_stderr_contains(
+        255,
+        "Connection to h closed by remote host.\n\nx: failed \u{2014} the connection was lost\n",
+    );
+}

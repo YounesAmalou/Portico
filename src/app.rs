@@ -1,7 +1,6 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
-    process::ExitStatus,
     sync::atomic::AtomicBool,
 };
 
@@ -12,12 +11,14 @@ use crate::{
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
     explain::{Context, Explanation, Operation, explain},
     host::{Change, Host, HostChanges, HostError},
-    managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
+    managed::{
+        InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError, read_lossy,
+    },
     openssh::{
         ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
         append_known_hosts,
     },
-    probe::{Diagnosis, Failure, ProbeResult, known_hosts_path},
+    probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
 };
 
 pub struct App {
@@ -344,28 +345,86 @@ impl App {
         )
     }
 
+    /// Connects to `alias`, in this terminal or a new one. In this terminal ssh's stderr is
+    /// mirrored to Portico's, and a failure Portico recognises is explained.
     pub fn connect(&self, alias: &str, new_terminal: bool) -> Result<ConnectionOutcome, AppError> {
-        let host = self
-            .hosts()?
-            .hosts
-            .into_iter()
-            .find(|host| host.alias.eq_ignore_ascii_case(alias))
-            .ok_or_else(|| AppError::UnknownHost(alias.into()))?;
-        Ok(self.openssh.connect(&host.alias, new_terminal)?)
+        let alias = self.connectable_alias(alias)?;
+        if new_terminal {
+            return Ok(self.openssh.launch_in_new_terminal(&alias)?);
+        }
+        self.connect_here(&alias, None)
     }
 
     pub(crate) fn connect_cancellable(
         &self,
         alias: &str,
         cancelled: &AtomicBool,
-    ) -> Result<ExitStatus, AppError> {
-        let host = self
+    ) -> Result<ConnectionOutcome, AppError> {
+        let alias = self.connectable_alias(alias)?;
+        self.connect_here(&alias, Some(cancelled))
+    }
+
+    /// The alias as the inventory spells it.
+    fn connectable_alias(&self, alias: &str) -> Result<String, AppError> {
+        Ok(self
             .hosts()?
             .hosts
             .into_iter()
             .find(|host| host.alias.eq_ignore_ascii_case(alias))
-            .ok_or_else(|| AppError::UnknownHost(alias.into()))?;
-        Ok(self.openssh.connect_cancellable(&host.alias, cancelled)?)
+            .ok_or_else(|| AppError::UnknownHost(alias.into()))?
+            .alias)
+    }
+
+    fn connect_here(
+        &self,
+        alias: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<ConnectionOutcome, AppError> {
+        let mirrored = self
+            .openssh
+            .connect_mirrored(alias, Box::new(io::stderr()), cancelled)?;
+        // Only 255 is ssh's own failure; any other code is the remote command's or a logout.
+        let explanation = if mirrored.status.code() == Some(255) {
+            self.explain_connection(alias, &mirrored.tail)
+        } else {
+            None
+        };
+        Ok(ConnectionOutcome::Exited {
+            status: mirrored.status,
+            explanation,
+        })
+    }
+
+    /// Explains a failed connection from the end of what ssh wrote to stderr, or `None` when
+    /// the cause is not recognised: ssh's own output is then already on screen.
+    fn explain_connection(&self, alias: &str, tail: &[u8]) -> Option<Explanation> {
+        match self.openssh.resolve_with(None, alias, None) {
+            Ok(resolved) => {
+                let diagnosis = diagnose(&String::from_utf8_lossy(tail), false, resolved.route());
+                if matches!(diagnosis.failure, Failure::Other(_)) {
+                    return None;
+                }
+                Some(self.explain_failure(diagnosis, alias, &resolved, Operation::Connect))
+            }
+            Err(OpenSshError::Failed { stderr, .. }) => {
+                let managed = &self.store.paths().managed;
+                // Portico wrote no entry for this run: every other file is the user's own.
+                let files = ConfigFiles {
+                    managed,
+                    managed_text: &read_lossy(managed),
+                    entry: Path::new(""),
+                };
+                match interpret(&stderr, &files) {
+                    ConfigRejection::Unrecognised { .. } => None,
+                    rejection => Some(self.explain_rejection(
+                        alias,
+                        Operation::Connect,
+                        &rejection_diagnosis(&stderr, rejection),
+                    )),
+                }
+            }
+            Err(_) => None,
+        }
     }
 
     fn add_mutation(&self, config: &mut ManagedConfig, host: Host) -> Result<(), AppError> {
@@ -519,6 +578,7 @@ impl App {
                 },
                 alias,
                 &resolved,
+                Operation::Test,
             )),
             ProbeResult::Authenticated(_) => None,
         };
@@ -560,17 +620,26 @@ impl App {
 
     /// The test result for a configuration OpenSSH refused before it could connect.
     fn rejected_report(&self, alias: &str, stderr: &str, rejection: ConfigRejection) -> TestReport {
-        let diagnosis = Diagnosis {
-            failure: Failure::ConfigRejected(rejection),
-            raw: stderr
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| line.trim_end().to_string())
-                .collect(),
-        };
+        let diagnosis = rejection_diagnosis(stderr, rejection);
+        TestReport {
+            alias: alias.into(),
+            user: None,
+            explanation: Some(self.explain_rejection(alias, Operation::Test, &diagnosis)),
+            result: ProbeResult::Failed(diagnosis.failure),
+            key_fetch_failure: None,
+        }
+    }
+
+    /// Explains a configuration OpenSSH refused; nothing about the host was resolved.
+    fn explain_rejection(
+        &self,
+        alias: &str,
+        operation: Operation,
+        diagnosis: &Diagnosis,
+    ) -> Explanation {
         let context = Context {
             alias,
-            operation: Operation::Test,
+            operation,
             user: None,
             hostname: None,
             port: None,
@@ -579,13 +648,7 @@ impl App {
             home: self.home(),
             managed_file: Some(&self.store.paths().managed),
         };
-        TestReport {
-            alias: alias.into(),
-            user: None,
-            explanation: Some(explain(&diagnosis, &context)),
-            result: ProbeResult::Failed(diagnosis.failure),
-            key_fetch_failure: None,
-        }
+        explain(diagnosis, &context)
     }
 
     fn explain_failure(
@@ -593,6 +656,7 @@ impl App {
         diagnosis: Diagnosis,
         alias: &str,
         resolved: &ResolvedConfig,
+        operation: Operation,
     ) -> Explanation {
         let home = self.home();
         let identity_files: Vec<(String, bool)> = resolved
@@ -619,7 +683,7 @@ impl App {
             &diagnosis,
             &Context {
                 alias,
-                operation: Operation::Test,
+                operation,
                 user: resolved.user.as_deref(),
                 hostname: Some(&resolved.hostname),
                 port: resolved.port,
@@ -694,6 +758,18 @@ impl App {
                 self.openssh.validate(entry, aliases).map_err(stderr_of)
             }),
         }
+    }
+}
+
+/// A configuration OpenSSH refused, as a diagnosis that keeps every line it printed.
+fn rejection_diagnosis(stderr: &str, rejection: ConfigRejection) -> Diagnosis {
+    Diagnosis {
+        failure: Failure::ConfigRejected(rejection),
+        raw: stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.trim_end().to_string())
+            .collect(),
     }
 }
 
@@ -1185,7 +1261,7 @@ mod tests {
         assert!(app.show("legacy").is_ok());
         assert!(matches!(
             app.connect("legacy", false).unwrap(),
-            ConnectionOutcome::Exited(status) if status.success()
+            ConnectionOutcome::Exited { status, explanation: None } if status.success()
         ));
     }
 
@@ -1393,7 +1469,7 @@ mod tests {
 
         assert!(matches!(
             app.connect("-external", false).unwrap(),
-            ConnectionOutcome::Exited(status) if status.success()
+            ConnectionOutcome::Exited { status, explanation: None } if status.success()
         ));
         assert_eq!(
             fs::read_to_string(&app.fake_log).unwrap(),

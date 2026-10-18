@@ -187,6 +187,17 @@ impl RunResult {
         );
     }
 
+    /// Asserts the command exited with `code` and printed exactly `expected` on stderr.
+    pub fn assert_exit_code_and_stderr(self, code: i32, expected: &str) {
+        let stderr = String::from_utf8_lossy(&self.0.stderr);
+        assert!(
+            self.0.status.code() == Some(code) && stderr == expected,
+            "status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+            self.0.status,
+            String::from_utf8_lossy(&self.0.stdout),
+        );
+    }
+
     pub fn assert_exit_code(self, expected: i32) {
         assert_eq!(self.0.status.code(), Some(expected));
     }

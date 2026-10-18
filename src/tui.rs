@@ -283,7 +283,6 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                             // The terminal's Ctrl+C is for ssh now; Portico waits for it.
                             let _foreground = signals.foreground_child();
                             app.connect_cancellable(&alias, terminated)
-                                .map(ConnectionOutcome::Exited)
                                 .map_err(TuiError::from)
                         },
                         || session.enter(),
@@ -303,10 +302,16 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Ok(ConnectionOutcome::LaunchFailed(status)) => {
                         format!("terminal launcher exited with {status}")
                     }
-                    Ok(ConnectionOutcome::Exited(status)) if status.success() => {
+                    Ok(ConnectionOutcome::Exited {
+                        explanation: Some(explanation),
+                        ..
+                    }) => format!("{alias}: failed \u{2014} {}", explanation.headline),
+                    Ok(ConnectionOutcome::Exited { status, .. }) if status.success() => {
                         format!("Disconnected from {alias}")
                     }
-                    Ok(ConnectionOutcome::Exited(status)) => format!("ssh exited with {status}"),
+                    Ok(ConnectionOutcome::Exited { status, .. }) => {
+                        format!("ssh exited with {status}")
+                    }
                     Err(error) => error.to_string(),
                 });
             }

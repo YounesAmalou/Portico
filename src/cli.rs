@@ -10,6 +10,7 @@ use std::{
 use crate::{
     app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
     discovery::DiscoveryWarning,
+    explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
@@ -142,7 +143,7 @@ where
     O: Write,
     E: Write,
 {
-    match execute(cli, app, input, output, interactive, handle_signals) {
+    match execute(cli, app, input, output, error, interactive, handle_signals) {
         Ok(exit) => exit,
         Err(message) => {
             let _ = writeln!(error, "error: {message}");
@@ -151,11 +152,12 @@ where
     }
 }
 
-fn execute<I: BufRead, O: Write>(
+fn execute<I: BufRead, O: Write, E: Write>(
     cli: Cli,
     app: &App,
     input: &mut I,
     output: &mut O,
+    error: &mut E,
     interactive: bool,
     handle_signals: bool,
 ) -> Result<ExitCode, String> {
@@ -279,18 +281,26 @@ fn execute<I: BufRead, O: Write>(
             alias,
             new_terminal,
         }) => {
-            let status = app
+            let status = match app
                 .connect(&alias, new_terminal)
-                .map_err(|error| error.to_string())?;
-            Ok(match status {
-                ConnectionOutcome::LaunchRequested => ExitCode::SUCCESS,
-                ConnectionOutcome::Exited(status) | ConnectionOutcome::LaunchFailed(status) => {
+                .map_err(|error| error.to_string())?
+            {
+                ConnectionOutcome::LaunchRequested => return Ok(ExitCode::SUCCESS),
+                ConnectionOutcome::Exited {
+                    status,
+                    explanation,
+                } => {
+                    if let Some(explanation) = explanation {
+                        print_connection_failure(error, &alias, &explanation)?;
+                    }
                     status
-                        .code()
-                        .and_then(|code| u8::try_from(code).ok())
-                        .map_or(ExitCode::FAILURE, ExitCode::from)
                 }
-            })
+                ConnectionOutcome::LaunchFailed(status) => status,
+            };
+            Ok(status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .map_or(ExitCode::FAILURE, ExitCode::from))
         }
         Some(Command::Test {
             alias,
@@ -383,6 +393,19 @@ fn print_untrusted_key(
 fn print_cancelled(output: &mut impl Write, alias: &str) -> Result<ExitCode, String> {
     writeln!(output, "{alias}: cancelled").map_err(|error| error.to_string())?;
     Ok(ExitCode::from(CANCELLED))
+}
+
+/// Explains a failed connection below what ssh already wrote to the same stream.
+fn print_connection_failure(
+    error: &mut impl Write,
+    alias: &str,
+    explanation: &Explanation,
+) -> Result<(), String> {
+    writeln!(error).map_err(|error| error.to_string())?;
+    for line in explanation.render(alias, false) {
+        writeln!(error, "{line}").map_err(|error| error.to_string())?;
+    }
+    error.flush().map_err(|error| error.to_string())
 }
 
 fn print_report(
