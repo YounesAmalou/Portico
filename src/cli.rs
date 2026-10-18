@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     io::{self, BufRead, Write},
     path::Path,
-    process::ExitCode,
+    process::{ExitCode, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,7 +11,11 @@ use std::{
 
 use crate::{
     adopt::{Candidate, Direction},
-    app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
+    app::{
+        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, Offer, Ownership,
+        Target, TestOutcome, TestReport, TestTarget,
+    },
+    container::{GroupTool, ResolveError, display_name, group, remote_command, resolve},
     discovery::DiscoveryWarning,
     explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},
@@ -103,6 +107,42 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    Containers {
+        #[arg(long = "on", value_name = "ALIAS")]
+        on: Option<String>,
+    },
+    Shell {
+        container: Option<String>,
+        #[arg(long = "on", value_name = "ALIAS")]
+        on: Option<String>,
+        #[arg(short = 'u', long)]
+        user: Option<String>,
+        #[arg(short = 'n', long = "new-terminal")]
+        new_terminal: bool,
+        /// Open the given container ID without listing, and wait for Enter after an explained
+        /// failure; used in a new terminal.
+        #[arg(long, hide = true)]
+        hold: bool,
+        /// Run docker inside the docker group, as the listing before the new terminal did.
+        #[arg(long, hide = true, value_enum)]
+        via: Option<Via>,
+    },
+}
+
+/// `--via`: the tool that runs docker inside the docker group.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+enum Via {
+    Sg,
+    Newgrp,
+}
+
+impl From<Via> for GroupTool {
+    fn from(via: Via) -> Self {
+        match via {
+            Via::Sg => GroupTool::Sg,
+            Via::Newgrp => GroupTool::Newgrp,
+        }
+    }
 }
 
 /// ssh's exit status as Portico's: its code, or 128 plus the signal that killed it, as a shell
@@ -197,8 +237,9 @@ impl Interrupts {
     }
 }
 
-/// Runs `cli`. `handle_signals` lets `portico test` catch SIGINT, SIGTERM and SIGHUP to stop
-/// its `ssh`; only the real program sets it, so tests never install process-wide handlers.
+/// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets
+/// `portico test` catch SIGINT, SIGTERM and SIGHUP to stop its `ssh`; only the real program sets
+/// it, so tests never install process-wide handlers.
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,
@@ -215,6 +256,7 @@ where
 {
     match execute(cli, app, input, output, error, interactive, handle_signals) {
         Ok(exit) => exit,
+        Err(message) if message.is_empty() => ExitCode::FAILURE,
         Err(message) => {
             let _ = writeln!(error, "error: {message}");
             ExitCode::FAILURE
@@ -353,32 +395,81 @@ fn execute<I: BufRead, O: Write, E: Write>(
             hold,
         }) => {
             // A held connection already runs in the terminal it was opened in.
-            let status = match app
+            let outcome = app
                 .connect(&alias, new_terminal && !hold)
-                .map_err(|error| error.to_string())?
-            {
-                ConnectionOutcome::LaunchRequested => return Ok(ExitCode::SUCCESS),
-                ConnectionOutcome::Exited {
-                    alias,
-                    status,
-                    explanation,
-                } => {
-                    if let Some(explanation) = explanation {
-                        print_connection_failure(error, &alias, &explanation)?;
-                        if hold {
-                            writeln!(error, "Press Enter to close")
-                                .map_err(|error| error.to_string())?;
-                            error.flush().map_err(|error| error.to_string())?;
-                            // Best effort: end of input or a read error ends the wait, and
-                            // the exit code stays ssh's either way.
-                            let _ = input.read_line(&mut String::new());
-                        }
+                .map_err(|error| error.to_string())?;
+            finish_connection(outcome, hold, input, error)
+        }
+        Some(Command::Containers { on }) => {
+            let list = list_with_offers(app, &target(on), input, output, error, interactive)?;
+            print_listing(output, &list)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Shell {
+            container,
+            on,
+            user,
+            new_terminal,
+            hold,
+            via,
+        }) => {
+            let target = target(on);
+            // A held shell was resolved before its terminal was opened.
+            let (id, via) = match container {
+                Some(id) if hold => (id, via.map(GroupTool::from)),
+                container => {
+                    let list = list_with_offers(app, &target, input, output, error, interactive)?;
+                    let containers = &list.listing.containers;
+                    if containers.is_empty() {
+                        writeln!(error, "No running containers on {}.", list.target)
+                            .map_err(|error| error.to_string())?;
+                        return Ok(ExitCode::FAILURE);
                     }
-                    status
+                    let id = match container {
+                        Some(reference) => match resolve(&reference, containers) {
+                            Ok(container) => container.id.clone(),
+                            Err(ResolveError::NotFound) => {
+                                return Err(ContainerError::NoMatch {
+                                    target: list.target,
+                                    reference,
+                                }
+                                .to_string());
+                            }
+                            Err(ResolveError::Ambiguous(candidates)) => {
+                                return Err(ContainerError::Ambiguous {
+                                    target: list.target,
+                                    reference,
+                                    candidates,
+                                }
+                                .to_string());
+                            }
+                        },
+                        None if interactive => {
+                            match pick(&app.container_programs().fzf, &list, input, output)? {
+                                Some(id) => id,
+                                None => return Ok(ExitCode::from(CANCELLED)),
+                            }
+                        }
+                        None => {
+                            return Err("choose a container: portico shell <container> (no terminal for the picker)".into());
+                        }
+                    };
+                    (id, list.via)
                 }
-                ConnectionOutcome::LaunchFailed(status) => status,
             };
-            Ok(exit_code(status))
+            let outcome = match app.container_shell(
+                &target,
+                &id,
+                user.as_deref(),
+                via,
+                new_terminal && !hold,
+                None,
+                false,
+            ) {
+                Ok(outcome) => outcome,
+                Err(failure) => return Err(report_container_failure(error, failure)?),
+            };
+            finish_connection(outcome, hold, input, error)
         }
         Some(Command::Adopt { aliases, all, yes }) => {
             let interrupts = Interrupts::install(handle_signals)
@@ -506,6 +597,290 @@ fn test_command<I: BufRead, O: Write>(
             print_report(output, &report, raw)
         }
     }
+}
+
+/// Exits as a connection did: with ssh's (or docker's) status, after explaining a failed
+/// connection, and with `hold` waiting for Enter before the terminal closes.
+fn finish_connection<I: BufRead, E: Write>(
+    outcome: ConnectionOutcome,
+    hold: bool,
+    input: &mut I,
+    error: &mut E,
+) -> Result<ExitCode, String> {
+    let status = match outcome {
+        ConnectionOutcome::LaunchRequested => return Ok(ExitCode::SUCCESS),
+        ConnectionOutcome::Exited {
+            alias,
+            status,
+            explanation,
+        } => {
+            if let Some(explanation) = explanation {
+                print_connection_failure(error, &alias, &explanation)?;
+                if hold {
+                    writeln!(error, "Press Enter to close").map_err(|error| error.to_string())?;
+                    error.flush().map_err(|error| error.to_string())?;
+                    // Best effort: end of input or a read error ends the wait, and the exit
+                    // code stays ssh's either way.
+                    let _ = input.read_line(&mut String::new());
+                }
+            }
+            status
+        }
+        ConnectionOutcome::LaunchFailed(status) => status,
+    };
+    Ok(exit_code(status))
+}
+
+/// Asks which container to open: through `fzf` when it runs, otherwise from a numbered menu
+/// read from `input`. `None` when the choice is cancelled.
+fn pick<I: BufRead, O: Write>(
+    fzf: &Path,
+    list: &ContainerList,
+    input: &mut I,
+    output: &mut O,
+) -> Result<Option<String>, String> {
+    let containers = &list.listing.containers;
+    let rows: Vec<[String; 6]> = group(containers)
+        .into_iter()
+        .flat_map(|group| {
+            let project = group.project.unwrap_or("Other");
+            group.containers.into_iter().map(move |container| {
+                [
+                    container.id.clone(),
+                    project.to_string(),
+                    display_name(container, containers),
+                    container.name.clone(),
+                    container.image.clone(),
+                    container.status.clone(),
+                ]
+            })
+        })
+        .collect();
+    let spawned = std::process::Command::new(fzf)
+        .args([
+            "--delimiter",
+            "\t",
+            "--with-nth",
+            "2..",
+            "--prompt",
+            "container> ",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // fzf draws on the terminal through /dev/tty and its stderr.
+        .stderr(Stdio::inherit())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            let lines: String = rows.iter().map(|row| row.join("\t") + "\n").collect();
+            if let Some(mut stdin) = child.stdin.take() {
+                // fzf may exit before reading everything, as when it is cancelled.
+                let _ = stdin.write_all(lines.as_bytes());
+            }
+            let result = child
+                .wait_with_output()
+                .map_err(|error| format!("cannot run {}: {error}", fzf.display()))?;
+            match result.status.code() {
+                Some(0) => Ok(String::from_utf8_lossy(&result.stdout)
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split('\t').next())
+                    .filter(|id| !id.is_empty())
+                    .map(String::from)),
+                Some(1 | 130) => Ok(None),
+                _ => Err(format!("{} exited with {}", fzf.display(), result.status)),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut menu = String::new();
+            for (number, [_, rest @ ..]) in rows.iter().enumerate() {
+                menu.push_str(&format!("{}) {}\n", number + 1, rest.join("  ")));
+            }
+            menu.push_str("Container number: ");
+            write!(output, "{menu}").map_err(|error| error.to_string())?;
+            output.flush().map_err(|error| error.to_string())?;
+            let mut answer = String::new();
+            input
+                .read_line(&mut answer)
+                .map_err(|error| error.to_string())?;
+            let answer = answer.trim();
+            if answer.is_empty() {
+                return Ok(None);
+            }
+            answer
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| rows.get(number.checked_sub(1)?))
+                .map(|row| Some(row[0].clone()))
+                .ok_or_else(|| format!("no container numbered {answer}"))
+        }
+        Err(error) => Err(format!("cannot run {}: {error}", fzf.display())),
+    }
+}
+
+/// This machine without `--on`, otherwise the host it names.
+fn target(on: Option<String>) -> Target {
+    on.map_or(Target::Local, Target::Host)
+}
+
+/// Lists the containers of `target`. When docker refuses with a fix Portico can run, an
+/// interactive session is asked whether to run it, and on yes the listing runs once more.
+fn list_with_offers<I: BufRead, O: Write, E: Write>(
+    app: &App,
+    target: &Target,
+    input: &mut I,
+    output: &mut O,
+    error: &mut E,
+    interactive: bool,
+) -> Result<ContainerList, String> {
+    let mut offered = false;
+    loop {
+        let issue = match app.containers(target, false, None) {
+            Ok(list) => return Ok(list),
+            Err(ContainerError::Docker(issue)) => issue,
+            Err(failure) => return Err(report_container_failure(error, failure)?),
+        };
+        let offer = match &issue.offer {
+            Some(offer) if interactive && !offered => offer,
+            _ => {
+                print_docker_issue(error, &issue, true)?;
+                return Err(String::new());
+            }
+        };
+        print_docker_issue(error, &issue, false)?;
+        let prompt = format!("{} [y/N] ", offer_prompt(&issue.target, offer));
+        if !confirm(input, output, &prompt)? {
+            print_docker_issue_next(error, &issue)?;
+            return Err(String::new());
+        }
+        let status = match app.docker_fix(target, offer) {
+            Ok(status) => status,
+            Err(failure) => return Err(report_container_failure(error, failure)?),
+        };
+        if !status.success() {
+            return Err(format!(
+                "{} exited with {status}",
+                remote_command(&offer.words())
+            ));
+        }
+        offered = true;
+    }
+}
+
+/// The question asked before running `offer` on `target`.
+fn offer_prompt(target: &Target, offer: &Offer) -> String {
+    match offer {
+        Offer::JoinGroup { user, .. } => format!(
+            "Add {user} to the docker group on {target}? Members of the docker group have root-equivalent access. This runs: {}",
+            remote_command(&offer.words())
+        ),
+        Offer::StartDaemon => format!(
+            "Start the Docker service on {target}? This runs: {}",
+            remote_command(&offer.words())
+        ),
+    }
+}
+
+/// Prints the issue's headline, and with `next` what to do about it.
+fn print_docker_issue(
+    error: &mut impl Write,
+    issue: &DockerIssue,
+    next: bool,
+) -> Result<(), String> {
+    writeln!(error, "error: {}", issue.headline).map_err(|error| error.to_string())?;
+    if next {
+        print_docker_issue_next(error, issue)?;
+    }
+    Ok(())
+}
+
+fn print_docker_issue_next(error: &mut impl Write, issue: &DockerIssue) -> Result<(), String> {
+    for line in &issue.next {
+        writeln!(error, "  {line}").map_err(|error| error.to_string())?;
+    }
+    error.flush().map_err(|error| error.to_string())
+}
+
+/// Reports a container failure on `error` and returns what is left for `run` to print: the
+/// message, or nothing when the failure was explained here.
+fn report_container_failure(
+    error: &mut impl Write,
+    failure: ContainerError,
+) -> Result<String, String> {
+    match failure {
+        ContainerError::Docker(issue) => {
+            print_docker_issue(error, &issue, true)?;
+            Ok(String::new())
+        }
+        ContainerError::Ssh {
+            alias,
+            explanation,
+            stderr,
+        } => {
+            // ssh's stderr was captured, so show it above the explanation.
+            write!(error, "{stderr}").map_err(|error| error.to_string())?;
+            match explanation {
+                Some(explanation) => {
+                    print_connection_failure(error, &alias, &explanation)?;
+                    Ok(String::new())
+                }
+                None => Ok(format!("ssh to {alias} failed")),
+            }
+        }
+        failure => Ok(failure.to_string()),
+    }
+}
+
+/// Prints the containers grouped by project, each group's columns aligned, then the note
+/// and the count of skipped lines.
+fn print_listing(output: &mut impl Write, list: &ContainerList) -> Result<(), String> {
+    let containers = &list.listing.containers;
+    let mut text = String::new();
+    if containers.is_empty() {
+        text.push_str(&format!("No running containers on {}.\n", list.target));
+    }
+    for group in group(containers) {
+        text.push_str(group.project.unwrap_or("Other"));
+        text.push('\n');
+        let rows: Vec<[String; 4]> = group
+            .containers
+            .iter()
+            .map(|container| {
+                [
+                    display_name(container, containers),
+                    container.name.clone(),
+                    container.image.clone(),
+                    container.status.clone(),
+                ]
+            })
+            .collect();
+        let width = |column: usize| {
+            rows.iter()
+                .map(|row| row[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let widths = [width(0), width(1), width(2)];
+        for [display, name, image, status] in &rows {
+            text.push_str(&format!(
+                "  {display:<w0$}  {name:<w1$}  {image:<w2$}  {status}\n",
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2]
+            ));
+        }
+    }
+    if let Some(note) = &list.note {
+        text.push_str(note);
+        text.push('\n');
+    }
+    if list.listing.skipped > 0 {
+        text.push_str(&format!(
+            "Skipped {} lines docker printed that Portico could not read.\n",
+            list.listing.skipped
+        ));
+    }
+    write!(output, "{text}").map_err(|error| error.to_string())
 }
 
 /// What `portico adopt` or `portico export` was asked to do.
@@ -923,7 +1298,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::App,
+        app::{App, ContainerPrograms},
+        container::{SHELL_SCRIPT, join_group_words, remote_command},
         host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
@@ -1126,6 +1502,328 @@ mod tests {
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(output.ends_with("Trust this host key? [y/N] Host key not trusted.\n"));
         assert!(!dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    const LISTING: &str = r#"{"id":"aaaa1111","name":"web","image":"nginx","status":"Up"}"#;
+    const DENIED: &str = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock";
+
+    /// An app whose local container programs are fakes in a temporary directory. Each fake
+    /// appends its arguments to `<name>.calls`, one call per line as `[arg][arg]…`, then
+    /// sources `<name>.behaviour` when it exists.
+    fn container_app() -> (TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["docker", "sudo", "sg", "newgrp", "sh", "fzf"] {
+            let base = dir.path().join(name);
+            write_executable(
+                &base,
+                &format!(
+                    "#!/bin/sh\nprintf '[%s]' \"$@\" >> '{base}.calls'\necho >> '{base}.calls'\nif [ -f '{base}.behaviour' ]; then . '{base}.behaviour'; fi\nexit 0\n",
+                    base = base.display()
+                ),
+            );
+        }
+        let program = |name: &str| dir.path().join(name);
+        let app = App::new(
+            ManagedStore::new(ConfigPaths::from_home(dir.path())),
+            OpenSsh::new(program("ssh"), program("terminal")),
+        )
+        .with_container_programs(ContainerPrograms {
+            docker: program("docker"),
+            sudo: program("sudo"),
+            sg: program("sg"),
+            newgrp: program("newgrp"),
+            sh: program("sh"),
+            fzf: program("fzf"),
+        });
+        (dir, app)
+    }
+
+    fn behave(dir: &TempDir, name: &str, script: &str) {
+        fs::write(dir.path().join(format!("{name}.behaviour")), script).unwrap();
+    }
+
+    fn calls(dir: &TempDir, name: &str) -> String {
+        fs::read_to_string(dir.path().join(format!("{name}.calls"))).unwrap_or_default()
+    }
+
+    /// Docker refuses the socket; the probe reports `me` outside the docker group until
+    /// `sudo` has run, and `sg` lists once it has.
+    fn refused_until_joined(dir: &TempDir) {
+        let joined = dir.path().join("joined");
+        behave(dir, "docker", &format!("echo '{DENIED}' >&2\nexit 1\n"));
+        behave(
+            dir,
+            "sh",
+            &format!(
+                "database=me\n[ -f '{joined}' ] && database='me docker'\nprintf 'user=me\\nprocess=me\\ndatabase=%s\\ngroup=yes\\nsocket=/var/run/docker.sock\\nsocket_group=docker\\nsg=yes\\nnewgrp=yes\\nsystemctl=yes\\n' \"$database\"\n",
+                joined = joined.display()
+            ),
+        );
+        behave(dir, "sudo", &format!("touch '{}'\n", joined.display()));
+        behave(dir, "sg", &format!("echo '{LISTING}'\n"));
+    }
+
+    fn run_containers(app: &App, answer: &[u8]) -> (ExitCode, String, String) {
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+        let exit = run(
+            Cli::try_parse_from(["portico", "containers"]).unwrap(),
+            app,
+            &mut Cursor::new(answer),
+            &mut output,
+            &mut error,
+            true,
+            false,
+        );
+        (
+            exit,
+            String::from_utf8(output).unwrap(),
+            String::from_utf8(error).unwrap(),
+        )
+    }
+
+    #[test]
+    fn join_offer_accepted_runs_sudo_then_lists() {
+        let (dir, app) = container_app();
+        refused_until_joined(&dir);
+
+        let (exit, output, error) = run_containers(&app, b"y\n");
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        let join = join_group_words("me", "/var/run/docker.sock");
+        let expected_sudo: String = join[1..].iter().map(|word| format!("[{word}]")).collect();
+        assert_eq!(calls(&dir, "sudo"), format!("{expected_sudo}\n"));
+        assert_eq!(
+            output,
+            format!(
+                "Add me to the docker group on this machine? Members of the docker group have root-equivalent access. This runs: {} [y/N] \
+                 Other\n  web  web  nginx  Up\n\
+                 Ran docker through `sg docker`: other shells need `newgrp docker` or a new login.\n",
+                remote_command(&join)
+            )
+        );
+        assert_eq!(
+            error,
+            "error: me cannot use Docker on this machine: permission denied on /var/run/docker.sock.\n"
+        );
+    }
+
+    #[test]
+    fn join_offer_declined_lists_options() {
+        let (dir, app) = container_app();
+        refused_until_joined(&dir);
+
+        let (exit, output, error) = run_containers(&app, b"n\n");
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(calls(&dir, "sudo").is_empty());
+        assert!(output.ends_with("[y/N] "), "{output}");
+        assert!(
+            error.starts_with(
+                "error: me cannot use Docker on this machine: permission denied on /var/run/docker.sock.\n  Add me to the docker group (root-equivalent access): sudo sh -c "
+            ),
+            "{error}"
+        );
+        assert!(error.contains("\n  Or use rootless Docker: "), "{error}");
+    }
+
+    #[test]
+    fn a_failed_fix_stops_without_listing_again() {
+        let (dir, app) = container_app();
+        refused_until_joined(&dir);
+        behave(&dir, "sudo", "exit 1\n");
+
+        let (exit, _, error) = run_containers(&app, b"y\n");
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(calls(&dir, "docker").lines().count(), 1, "listed again");
+        assert!(
+            error.ends_with(&format!(
+                "error: {} exited with exit status: 1\n",
+                remote_command(&join_group_words("me", "/var/run/docker.sock"))
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn start_daemon_offer_runs_systemctl_through_sudo() {
+        let (dir, app) = container_app();
+        behave(
+            &dir,
+            "docker",
+            "echo 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.' >&2\nexit 1\n",
+        );
+        behave(
+            &dir,
+            "sh",
+            "printf 'user=me\\nprocess=me\\ndatabase=me\\ngroup=yes\\nsocket=/var/run/docker.sock\\nsocket_group=docker\\nsg=yes\\nnewgrp=yes\\nsystemctl=yes\\n'\n",
+        );
+
+        let (exit, output, _) = run_containers(&app, b"y\n");
+
+        // The fake daemon stays down, so the second listing fails without a second offer.
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(calls(&dir, "sudo"), "[systemctl][start][docker]\n");
+        assert_eq!(
+            output,
+            "Start the Docker service on this machine? This runs: sudo systemctl start docker [y/N] "
+        );
+    }
+
+    /// Two containers outside any project: `alpha` (`aaaa1111`) then `beta` (`bbbb2222`).
+    fn two_containers(dir: &TempDir) {
+        behave(
+            dir,
+            "docker",
+            r#"if [ "$1" = ps ]; then
+echo '{"id":"bbbb2222","name":"beta","image":"redis","status":"Up 1 hour"}'
+echo '{"id":"aaaa1111","name":"alpha","image":"nginx","status":"Up 2 hours"}'
+fi
+"#,
+        );
+    }
+
+    fn run_shell(app: &App, answer: &[u8]) -> (ExitCode, String) {
+        let mut output = Vec::new();
+        let exit = run(
+            Cli::try_parse_from(["portico", "shell"]).unwrap(),
+            app,
+            &mut Cursor::new(answer),
+            &mut output,
+            &mut Vec::new(),
+            true,
+            false,
+        );
+        (exit, String::from_utf8(output).unwrap())
+    }
+
+    fn exec_call(id: &str) -> String {
+        format!("[exec][-it][{id}][sh][-c][{SHELL_SCRIPT}]\n")
+    }
+
+    #[test]
+    fn numbered_picker_selects_second() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+        fs::remove_file(dir.path().join("fzf")).unwrap();
+
+        let (exit, output) = run_shell(&app, b"2\n");
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(
+            output,
+            "1) Other  alpha  alpha  nginx  Up 2 hours\n2) Other  beta  beta  redis  Up 1 hour\nContainer number: "
+        );
+        assert!(calls(&dir, "docker").ends_with(&exec_call("bbbb2222")));
+    }
+
+    #[test]
+    fn numbered_picker_cancelled_runs_nothing() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+        fs::remove_file(dir.path().join("fzf")).unwrap();
+
+        for answer in [&b""[..], b"\n"] {
+            let (exit, _) = run_shell(&app, answer);
+            assert_eq!(exit, ExitCode::from(130));
+        }
+        assert!(!calls(&dir, "docker").contains("[exec]"));
+    }
+
+    #[test]
+    fn numbered_picker_rejects_a_bad_number() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+        fs::remove_file(dir.path().join("fzf")).unwrap();
+        let mut error = Vec::new();
+
+        let exit = run(
+            Cli::try_parse_from(["portico", "shell"]).unwrap(),
+            &app,
+            &mut Cursor::new(b"3\n"),
+            &mut Vec::new(),
+            &mut error,
+            true,
+            false,
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8(error).unwrap(),
+            "error: no container numbered 3\n"
+        );
+        assert!(!calls(&dir, "docker").contains("[exec]"));
+    }
+
+    #[test]
+    fn fzf_picker_used_when_present() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+        behave(&dir, "fzf", "sed -n 2p\n");
+
+        let (exit, output) = run_shell(&app, b"");
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert!(output.is_empty(), "{output}");
+        assert_eq!(
+            calls(&dir, "fzf"),
+            "[--delimiter][\t][--with-nth][2..][--prompt][container> ]\n"
+        );
+        assert!(calls(&dir, "docker").ends_with(&exec_call("bbbb2222")));
+    }
+
+    #[test]
+    fn fzf_lines_carry_the_id_and_project() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+        let lines = dir.path().join("lines");
+        behave(
+            &dir,
+            "fzf",
+            &format!("cat > '{}'\nexit 130\n", lines.display()),
+        );
+
+        let (exit, _) = run_shell(&app, b"");
+
+        assert_eq!(exit, ExitCode::from(130));
+        assert_eq!(
+            fs::read_to_string(lines).unwrap(),
+            "aaaa1111\tOther\talpha\talpha\tnginx\tUp 2 hours\nbbbb2222\tOther\tbeta\tbeta\tredis\tUp 1 hour\n"
+        );
+        assert!(!calls(&dir, "docker").contains("[exec]"));
+    }
+
+    #[test]
+    fn fzf_with_no_match_cancels() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+        behave(&dir, "fzf", "exit 1\n");
+
+        let (exit, _) = run_shell(&app, b"");
+
+        assert_eq!(exit, ExitCode::from(130));
+        assert!(!calls(&dir, "docker").contains("[exec]"));
+    }
+
+    #[test]
+    fn parses_shell_arguments() {
+        let cli = Cli::try_parse_from([
+            "portico", "shell", "--hold", "--on", "dev", "-u", "root", "--via", "sg", "--", "abcd",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Shell {
+                container: Some(container),
+                on: Some(on),
+                user: Some(user),
+                new_terminal: false,
+                hold: true,
+                via: Some(Via::Sg),
+            }) if container == "abcd" && on == "dev" && user == "root"
+        ));
+        assert_eq!(GroupTool::from(Via::Newgrp), GroupTool::Newgrp);
     }
 
     #[test]

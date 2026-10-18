@@ -506,16 +506,27 @@ impl OpenSsh {
     /// else is `LaunchRequested`, which promises only that the request was
     /// accepted, never that the SSH session itself succeeded.
     pub fn launch_in_new_terminal(&self, alias: &str) -> Result<ConnectionOutcome, OpenSshError> {
+        self.launch_new_terminal_with(
+            &["connect".into(), "--hold".into(), "--".into(), alias.into()],
+            &[self.ssh.clone().into(), "--".into(), alias.into()],
+        )
+    }
+
+    /// Asks the terminal launcher to run `<portico> <portico_args…>` when Portico's path is
+    /// known, otherwise `fallback`, with the same launch semantics as `launch_in_new_terminal`.
+    pub fn launch_new_terminal_with(
+        &self,
+        portico_args: &[OsString],
+        fallback: &[OsString],
+    ) -> Result<ConnectionOutcome, OpenSshError> {
         // The command follows the launcher's own arguments directly: older
         // launchers have no option parsing and would take `--` as the command.
         let mut command = Command::new(&self.terminal);
         match &self.portico {
-            Some(portico) => command.arg(portico).args(["connect", "--hold"]),
-            None => command.arg(&self.ssh),
+            Some(portico) => command.arg(portico).args(portico_args),
+            None => command.args(fallback),
         };
         let mut child = command
-            .arg("--")
-            .arg(alias)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -563,16 +574,29 @@ impl OpenSsh {
         sink: Box<dyn Write + Send>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Mirrored, OpenSshError> {
+        self.connect_mirrored_command(alias, None, sink, cancelled)
+    }
+
+    /// Like `connect_mirrored`, but with `Some(command)` runs `ssh -t -o RemoteCommand=none --
+    /// <alias> <command>`, forcing a terminal for the remote command.
+    pub(crate) fn connect_mirrored_command(
+        &self,
+        alias: &str,
+        command: Option<&str>,
+        sink: Box<dyn Write + Send>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Mirrored, OpenSshError> {
         let io_error = |source| OpenSshError::Io {
             program: self.ssh.clone(),
             source,
         };
-        let mut child = Command::new(&self.ssh)
-            .arg("--")
-            .arg(alias)
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(io_error)?;
+        let mut ssh = Command::new(&self.ssh);
+        if command.is_some() {
+            ssh.args(["-t", "-o", "RemoteCommand=none"]);
+        }
+        ssh.arg("--").arg(alias);
+        ssh.args(command);
+        let mut child = ssh.stderr(Stdio::piped()).spawn().map_err(io_error)?;
         let copier = Copier::start(child.stderr.take().expect("stderr is piped"), sink);
         let status = loop {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
@@ -596,6 +620,41 @@ impl OpenSsh {
             status,
             tail: copier.finish(),
         })
+    }
+
+    /// The `ssh` program this instance runs.
+    pub fn ssh_program(&self) -> &Path {
+        &self.ssh
+    }
+
+    /// Runs `ssh -o RemoteCommand=none -- <alias> <command>` and returns its output whatever
+    /// the exit status.
+    ///
+    /// With `batch`, ssh never prompts (`BatchMode=yes`, stdin closed) and `cancelled` stops it
+    /// and everything it started. Without, stdin is inherited and ssh stays in Portico's
+    /// process group so it can prompt on the terminal; `cancelled` is ignored then.
+    pub(crate) fn run_remote(
+        &self,
+        alias: &str,
+        command: &str,
+        batch: bool,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Output, OpenSshError> {
+        let mut ssh = Command::new(&self.ssh);
+        ssh.args(["-o", "RemoteCommand=none"]);
+        if batch {
+            ssh.args(["-o", "BatchMode=yes"]).stdin(Stdio::null());
+        } else {
+            ssh.stdin(Stdio::inherit());
+        }
+        ssh.arg("--").arg(alias).arg(command);
+        match cancelled {
+            Some(cancelled) if batch => self.cancellable_output(&mut ssh, cancelled),
+            _ => ssh.output().map_err(|source| OpenSshError::Io {
+                program: self.ssh.clone(),
+                source,
+            }),
+        }
     }
 
     fn validate_alias(
@@ -641,7 +700,9 @@ impl OpenSsh {
         }
     }
 
-    fn cancellable_output(
+    /// Runs `command` in its own process group with stdout and stderr captured; setting
+    /// `cancelled` stops it and everything it started.
+    pub(crate) fn cancellable_output(
         &self,
         command: &mut Command,
         cancelled: &AtomicBool,
@@ -1308,6 +1369,109 @@ mod tests {
 
         assert!(mirrored.status.success());
         assert_eq!(fs::read_to_string(fake.log()).unwrap(), "--\n-external\n");
+    }
+
+    #[test]
+    fn run_remote_passes_remote_command_none_and_batch() {
+        let fake = fake_ssh();
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let output = openssh.run_remote("dev", "docker ps", true, None).unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            fs::read_to_string(fake.log()).unwrap(),
+            "-o\nRemoteCommand=none\n-o\nBatchMode=yes\n--\ndev\ndocker ps\n"
+        );
+
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            openssh.run_remote("dev", "docker ps", true, Some(&cancelled)),
+            Err(OpenSshError::Cancelled)
+        ));
+        cancelled.store(false, Ordering::Relaxed);
+        openssh
+            .run_remote("dev", "docker ps", true, Some(&cancelled))
+            .unwrap();
+
+        openssh.run_remote("dev", "docker ps", false, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(fake.log()).unwrap(),
+            "-o\nRemoteCommand=none\n--\ndev\ndocker ps\n"
+        );
+
+        write_executable(&fake.path, "#!/bin/sh\nprintf oops >&2\nexit 3\n");
+        let output = openssh.run_remote("dev", "docker ps", true, None).unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stderr, b"oops");
+    }
+
+    #[test]
+    fn run_remote_inherits_stdin_unless_batch() {
+        let fake = fake_ssh();
+        write_executable(
+            &fake.path,
+            &format!(
+                "#!/bin/sh\nreadlink /proc/self/fd/0 > '{}'\n",
+                fake.log().display()
+            ),
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let own = fs::read_link("/proc/self/fd/0").unwrap();
+        let seen = || {
+            PathBuf::from(
+                fs::read_to_string(fake.log())
+                    .unwrap()
+                    .trim_end_matches('\n'),
+            )
+        };
+
+        openssh.run_remote("dev", "docker ps", false, None).unwrap();
+        assert_eq!(seen(), own);
+
+        openssh.run_remote("dev", "docker ps", true, None).unwrap();
+        assert_eq!(seen(), Path::new("/dev/null"));
+    }
+
+    #[test]
+    fn connect_mirrored_command_requests_a_tty() {
+        let fake = fake_ssh();
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let mirrored = openssh
+            .connect_mirrored_command(
+                "dev",
+                Some("docker exec -it web sh"),
+                Box::new(io::sink()),
+                None,
+            )
+            .unwrap();
+
+        assert!(mirrored.status.success());
+        assert_eq!(
+            fs::read_to_string(fake.log()).unwrap(),
+            "-t\n-o\nRemoteCommand=none\n--\ndev\ndocker exec -it web sh\n"
+        );
+    }
+
+    #[test]
+    fn new_terminal_with_custom_portico_args() {
+        let ssh = fake_ssh();
+        let terminal = fake_ssh();
+        let openssh =
+            OpenSsh::new(ssh.path(), terminal.path()).with_portico(Some("/opt/portico".into()));
+        let args = ["shell".into(), "--hold".into(), "x".into()];
+        let fallback = ["fallback".into(), "y".into()];
+
+        assert_eq!(
+            openssh.launch_new_terminal_with(&args, &fallback).unwrap(),
+            ConnectionOutcome::LaunchRequested
+        );
+        wait_for_contents(terminal.log(), "/opt/portico\nshell\n--hold\nx\n");
+
+        let terminal = fake_ssh();
+        let openssh = OpenSsh::new(ssh.path(), terminal.path()).with_portico(None);
+        openssh.launch_new_terminal_with(&args, &fallback).unwrap();
+        wait_for_contents(terminal.log(), "fallback\ny\n");
+        assert_eq!(openssh.ssh_program(), ssh.path());
     }
 
     #[test]

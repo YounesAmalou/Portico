@@ -12,6 +12,7 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Connects in the current terminal or through `xdg-terminal-exec`.
 - Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
+- Lists the running Docker containers on this machine or a host, grouped by Compose project, and opens a shell in one.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
@@ -25,6 +26,8 @@ Private keys remain where they already live. Portico stores identity-file refere
 - Linux on x86_64 (verified on Arch Linux; other platforms are on the [roadmap](ROADMAP.md))
 - OpenSSH client tools (`ssh`)
 - `xdg-terminal-exec` for the new-terminal option only
+- `docker`, only for container shells, on this machine or on the host (Docker only; Podman is not supported)
+- `fzf`, optional, for the `portico shell` picker (a numbered menu is used without it)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
 
@@ -119,6 +122,10 @@ portico edit <alias> [options]  Change only the supplied fields
 portico remove <alias> [-f]     Remove a managed host
 portico connect <alias> [-n]    Connect using OpenSSH
 portico test <alias> [--raw]    Check that logging in works, without a shell
+portico containers [--on <alias>]
+                                List running containers, here or on a host
+portico shell [<container>] [--on <alias>] [-u <user>] [-n]
+                                Open a shell in a container
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
 ```
@@ -182,6 +189,29 @@ A test passes only when OpenSSH completes authentication. It never opens a shell
 
 The first time a host is tested its key is usually unknown. In a terminal, Portico shows the key's fingerprint and asks before trusting it. Without a terminal it trusts nothing, prints the fingerprint and fails; `--accept-host-key` trusts the key only if its fingerprint matches the one given exactly, then tests again. A changed host key is never offered for trust.
 
+### Container shells
+
+```sh
+portico containers
+portico containers --on dev-vps
+portico shell --on dev-vps
+portico shell web --on dev-vps
+portico shell myapp/api#2 -u root
+portico shell 3f9a1c -n
+```
+
+`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in a terminal: `fzf` when it is installed, a numbered menu otherwise. Cancelling exits with 130.
+
+A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name, or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
+
+Only Docker is supported, and Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
+
+When Docker fails, Portico explains why and, where it can, offers the fix. The full command is shown first and `sudo` prompts in your terminal; Portico never sees a password. Declining prints the options to do it yourself.
+
+- **Not in the `docker` group:** it offers `sudo` to create the group, add you to it and give the group the socket. Members of the group have root-equivalent access.
+- **Daemon not running:** it offers `sudo systemctl start docker`, only when `systemctl` exists on the target.
+- **Group added but this session is older:** it runs docker through `sg docker` (or `newgrp docker`), so no logout is needed. Other shells need `newgrp docker` or a new login.
+
 ### When something fails
 
 - **`portico test`** explains the failure as described above: the cause, the facts that matter (user, keys offered, jump host) and a next step. Add `--raw` to see ssh's output too.
@@ -227,6 +257,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
 | `m` | Adopt the selected external host, or export the selected managed host, after a preview |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
+| `Tab` / `Shift+Tab` | Move the focus between the hosts and the containers panel |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |
 
@@ -240,6 +271,21 @@ Form fields only accept characters they can hold, whether typed or pasted: alias
 Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it. Portico re-reads the inventory and re-resolves details when it changes the configuration itself; edits made elsewhere, such as in `~/.ssh/config` or an included file, appear after `r` or `F5`. The selection and filter are kept, and if the files cannot be read the list stays as it was and the footer reports why.
 
 A test shows `✓` or `✗` beside the host and its result in the details until the host is edited or removed or the inventory is refreshed. `Esc` cancels a running test. An unknown host key opens a prompt showing its fingerprint: `y` trusts it and tests again, `n` or `Esc` declines. If you have moved on by the time the result arrives (into the filter or a form, say), no prompt interrupts you: the host is marked untrusted, and `t` tests it again to review the key. Editing a form cancels its running test.
+
+The containers panel sits under the hosts and follows the selected host. It lists only when it gains focus for a host not yet listed, or on `r`, and keeps the result for the session. Its details show the selected container. Keys in the panel:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` / `j` / `k` | Move through containers |
+| `Enter` | Open a shell in this terminal |
+| `n` | Open a shell in a new terminal |
+| `u` | Set the user for the next shell (empty means the image's user; not saved) |
+| `r` | List again |
+| `L` | List this machine instead of the selected host |
+| `g` / `s` | Add yourself to the docker group / start docker, shown only when the error offers it |
+| `Esc` | Cancel a listing, otherwise back to the hosts |
+| `Tab` / `Shift+Tab` | Back to the hosts |
+| `q` | Quit |
 
 External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
@@ -260,4 +306,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 
 ## Current scope
 
-V1 deliberately does not include tunnels, port-conflict management, SSH-agent or password-manager discovery, key generation, Quickshell, a daemon, or a machine-readable API. Those features remain deferred until their workflows and integration contracts are clear.
+V1 deliberately does not include Podman, container logs or lifecycle, tunnels, port-conflict management, SSH-agent or password-manager discovery, key generation, Quickshell, a daemon, or a machine-readable API. Those features remain deferred until their workflows and integration contracts are clear.
