@@ -1276,8 +1276,8 @@ fn is_managed_include(argument: &str, paths: &ConfigPaths) -> bool {
 
 /// Follows the symbolic link chain at `path` to the file a write must replace, which may not
 /// exist yet. An error names the path it occurred at.
-pub(crate) fn symlink_target(path: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
-    let mut path = path.to_path_buf();
+pub(crate) fn symlink_target(start: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
+    let mut path = start.to_path_buf();
     for _ in 0..40 {
         match fs::read_link(&path) {
             Ok(target) => path = path.parent().unwrap_or(Path::new("")).join(target),
@@ -1294,11 +1294,14 @@ pub(crate) fn symlink_target(path: &Path) -> Result<PathBuf, (PathBuf, io::Error
     }
     Err((
         path,
-        io::Error::other("too many symbolic links; correct the entry target"),
+        io::Error::other(format!(
+            "too many levels of symbolic links from {}",
+            start.display()
+        )),
     ))
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -3298,5 +3301,18 @@ mod tests {
 
         saved.expect("a save during the test is not blocked by the preview");
         assert!(fixture.store.load().unwrap().find("saved").is_some());
+    }
+    #[test]
+    fn a_symbolic_link_loop_names_the_path_it_started_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let (_, error) = symlink_target(&first).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("too many levels of symbolic links from {}", first.display())
+        );
     }
 }

@@ -18,8 +18,8 @@ use thiserror::Error;
 use crate::discovery::{DiscoveryError, DiscoveryWarning, discover};
 use crate::host::Host;
 use crate::managed::{
-    HostComments, ManagedConfig, ManagedStore, TransactionError, render_host, symlink_target,
-    write_unique,
+    HostComments, ManagedConfig, ManagedStore, TransactionError, normalize_path, render_host,
+    symlink_target, write_unique,
 };
 
 /// Whether hosts move into the managed fragment or out of it.
@@ -55,10 +55,10 @@ pub struct MigrationPlan {
     pub candidates: Vec<Candidate>,
     /// The managed fragment.
     managed: PathBuf,
-    /// The entry config, symlinks resolved.
+    /// The entry config, symlinks resolved, as `file_key` names it.
     entry: PathBuf,
-    /// The exact bytes of every file read, keyed by symlink-resolved path: the managed fragment,
-    /// the entry config and every source of a candidate.
+    /// The exact bytes of every file read: the managed fragment, the entry config and every
+    /// source of a candidate. User files are keyed by `file_key` of their symlink target.
     snapshot: BTreeMap<PathBuf, Vec<u8>>,
     /// The move of every eligible host, keyed by lowercase alias.
     moves: BTreeMap<String, Move>,
@@ -113,9 +113,9 @@ pub enum AdoptError {
         source: io::Error,
     },
     #[error(
-        "{original}; rollback also failed, so the state is uncertain; {recovery}; rollback: {failures}",
-        recovery = .backups.iter().map(|(file, backup)| format!("restore {} from {}", file.display(), backup.display())).collect::<Vec<_>>().join("; "),
-        failures = .failures.join("; ")
+        "{original}; rollback also failed, so the state is uncertain; {}rollback: {}",
+        recovery(.backups),
+        .failures.join("; ")
     )]
     Rollback {
         original: Box<AdoptError>,
@@ -129,6 +129,34 @@ fn io_error(path: &Path, source: io::Error) -> AdoptError {
     AdoptError::Io {
         path: path.into(),
         source,
+    }
+}
+
+/// `restore F from B; ` for each file still to restore, or nothing when there is none.
+fn recovery(backups: &[(PathBuf, PathBuf)]) -> String {
+    backups
+        .iter()
+        .map(|(file, backup)| format!("restore {} from {}; ", file.display(), backup.display()))
+        .collect()
+}
+
+/// The path a plan keys `file` by, symlinks already followed: its directory canonicalized, so
+/// that two spellings of one file (`a/../x` and `x`, or a path through a symlinked directory)
+/// are one key. The directory is resolved by the filesystem rather than lexically because `..`
+/// after a symlinked directory leads elsewhere; without a resolvable directory the path is only
+/// normalized lexically.
+fn file_key(file: PathBuf) -> PathBuf {
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
+        return normalize_path(&file);
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    match fs::canonicalize(dir) {
+        Ok(dir) => dir.join(name),
+        Err(_) => normalize_path(&file),
     }
 }
 
@@ -253,7 +281,7 @@ struct Source {
 impl Source {
     fn read(path: &Path, euid: u32, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) -> Self {
         let target = match symlink_target(path) {
-            Ok(target) => target,
+            Ok(target) => file_key(target),
             Err((at, error)) => {
                 return Self {
                     target: path.into(),
@@ -293,7 +321,7 @@ impl ManagedStore {
     pub fn adoption_plan(&self, effective: Effective<'_>) -> Result<MigrationPlan, AdoptError> {
         let paths = self.paths();
         let (managed_bytes, config) = self.read_managed()?;
-        let entry = self.entry_file()?;
+        let entry = file_key(self.entry_file()?);
         let entry_bytes = fs::read(&entry).map_err(|source| io_error(&entry, source))?;
         let discovery = discover(&paths.entry, &paths.managed)?;
         let mut snapshot = BTreeMap::from([
@@ -391,7 +419,7 @@ impl ManagedStore {
     pub fn export_plan(&self, effective: Effective<'_>) -> Result<MigrationPlan, AdoptError> {
         let paths = self.paths();
         let (managed_bytes, config) = self.read_managed()?;
-        let entry = self.entry_file()?;
+        let entry = file_key(self.entry_file()?);
         let entry_bytes = fs::read(&entry).map_err(|source| io_error(&entry, source))?;
         let problem = source_problem(&entry, &entry_bytes, effective_uid());
 
@@ -944,5 +972,58 @@ mod tests {
             fixture.store.export_plan(same()),
             Err(AdoptError::Transaction(TransactionError::NotInitialized))
         ));
+    }
+    #[test]
+    fn snapshot_keys_name_each_file_once() {
+        let fixture = fixture("Include linked.conf\n");
+        fs::create_dir_all(fixture.paths.ssh_dir.join("sub")).unwrap();
+        let target = fixture.write("hosts.conf", b"Host dev\n  HostName d\n");
+        symlink(
+            "sub/../hosts.conf",
+            fixture.paths.ssh_dir.join("linked.conf"),
+        )
+        .unwrap();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let preview = plan.preview(&["dev".into()]).unwrap();
+        assert_eq!(preview.files[1].path, target);
+        assert!(plan.snapshot.contains_key(&target));
+        assert_eq!(plan.snapshot.len(), 3, "{:?}", plan.snapshot.keys());
+
+        let fixture = fixture_with("", "\nHost dev\n    HostName d\n");
+        let real = fixture.paths.ssh_dir.join("config.real");
+        fs::rename(&fixture.paths.entry, &real).unwrap();
+        symlink("sub/../config.real", &fixture.paths.entry).unwrap();
+        fs::create_dir_all(fixture.paths.ssh_dir.join("sub")).unwrap();
+        let plan = fixture.store.export_plan(same()).unwrap();
+        assert_eq!(plan.entry, real);
+        assert_eq!(plan.preview(&["dev".into()]).unwrap().files[0].path, real);
+    }
+
+    #[test]
+    fn rollback_message_reads_well_with_any_number_of_backups() {
+        let error = |backups: Vec<(PathBuf, PathBuf)>| {
+            AdoptError::Rollback {
+                original: Box::new(AdoptError::Stale),
+                failures: vec!["disk full".into()],
+                backups,
+            }
+            .to_string()
+        };
+        let original = AdoptError::Stale.to_string();
+        assert_eq!(
+            error(Vec::new()),
+            format!(
+                "{original}; rollback also failed, so the state is uncertain; rollback: disk full"
+            )
+        );
+        assert_eq!(
+            error(vec![
+                ("/a".into(), "/.a.bak".into()),
+                ("/b".into(), "/.b.bak".into()),
+            ]),
+            format!(
+                "{original}; rollback also failed, so the state is uncertain; restore /a from /.a.bak; restore /b from /.b.bak; rollback: disk full"
+            )
+        );
     }
 }
