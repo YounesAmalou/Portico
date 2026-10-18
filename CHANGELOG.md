@@ -7,6 +7,35 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-18
+
+### Added
+
+- Keep a new terminal open to explain a failed connection
+- Show failure explanations and ssh output in the TUI
+- Explain why a connection failed, keeping ssh's own output
+- Explain connection test failures with their facts and next step
+- Say which host, field or file OpenSSH rejected when saving
+- Map OpenSSH configuration errors to the host and field
+
+### Changed
+
+- Share how a rejected configuration is interpreted
+- Read offered keys and causes from debug output
+
+### Fixed
+
+- Tighten error wording and fold ssh output on new results
+- Exit 128 plus the signal when a signal ends ssh on connect
+- Tell an add form to correct the field OpenSSH rejects
+- Point at the known_hosts line for a changed key on an aliased jump
+- State no timeout limit when a connection times out
+- Report a bad line in the user's config as theirs when saving
+- Keep ssh's exit code when the hold prompt cannot read
+- Report errors in the user's own entry file as theirs
+- Show raw output and exact next steps for every explained failure
+- Recognise only session drops as a lost connection
+
 ## [0.2.4] - 2026-10-18
 
 ### Added

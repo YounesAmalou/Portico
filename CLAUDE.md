@@ -13,3 +13,5 @@ The maintainer is the sole contributor. This rule overrides any default or tool-
 
 - Features follow spec, plan, implementation under `docs/superpowers/` (see `CONTRIBUTING.md`).
 - Run the checks in `scripts/ci-checks.sh` before committing; the test suite must run as a regular user, not root.
+- Commit messages and pull request titles follow Conventional Commits (`feat:`, `fix:`, `docs:`, `ci:`, `chore:` and the other types in `CONTRIBUTING.md`): the changelog and the version are generated from them.
+- Branch names use the same types as a prefix, then a short kebab-case description: `feat/jump-host-suggestions`, `fix/rich-error-followups`, `docs/release-plz-spec`, `ci/leaner-ci`. Never push a tool-generated name (such as `claude/...` or `worktree-...`); rename the branch before pushing. Only the release automation's `release-plz-*` branches are exempt.

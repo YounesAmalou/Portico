@@ -8,7 +8,12 @@ set -euo pipefail
 
 if [ "$(id -u)" -eq 0 ]; then
     id ci >/dev/null 2>&1 || useradd --create-home ci
-    chown -R ci: "$PWD"
+    # The checkout and any shared cargo and rustup homes (CI restores its build cache
+    # into them as root) must belong to the user who builds.
+    for dir in "$PWD" ${CARGO_HOME:+"$CARGO_HOME"} ${RUSTUP_HOME:+"$RUSTUP_HOME"}; do
+        mkdir -p "$dir"
+        chown -R ci: "$dir"
+    done
     exec runuser -u ci -- "$(readlink -f "$0")" "$@"
 fi
 
