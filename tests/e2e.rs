@@ -10,14 +10,10 @@
 #[path = "support/executable.rs"]
 mod executable;
 
-// Fixtures grow with the suite; Task 6 removes this once every helper is used.
-#[allow(dead_code)]
 #[path = "e2e/client.rs"]
 mod client;
-#[allow(dead_code)]
 #[path = "e2e/sshd.rs"]
 mod sshd;
-#[allow(dead_code)]
 #[path = "e2e/terminal.rs"]
 mod terminal;
 

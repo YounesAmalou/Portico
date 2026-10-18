@@ -31,11 +31,7 @@ const DEVICE_ATTRIBUTES: &[u8] = b"\x1b[?62;c";
 pub enum Key {
     Enter,
     Tab,
-    Esc,
     Backspace,
-    Up,
-    Down,
-    CtrlC,
 }
 
 impl Key {
@@ -43,11 +39,7 @@ impl Key {
         match self {
             Key::Enter => b"\r",
             Key::Tab => b"\t",
-            Key::Esc => b"\x1b",
             Key::Backspace => b"\x7f",
-            Key::Up => b"\x1b[A",
-            Key::Down => b"\x1b[B",
-            Key::CtrlC => b"\x03",
         }
     }
 }
