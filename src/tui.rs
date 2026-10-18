@@ -43,6 +43,7 @@ use crate::{
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
+    suggest::{self, Candidate},
 };
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
@@ -1129,6 +1130,36 @@ struct FormState {
     error: Option<String>,
     /// The last connection test of the typed values, shown until the form is edited.
     test_result: Option<FormTestResult>,
+    /// The jump host dropdown under ProxyJump, while it is open.
+    suggestions: Option<Suggestions>,
+}
+
+/// The index of ProxyJump in `FORM_FIELDS`.
+const PROXY_JUMP: usize = 5;
+/// How many suggestions the dropdown shows at once.
+const SUGGESTION_ROWS: usize = 5;
+
+/// The open jump host dropdown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Suggestions {
+    /// The matching aliases, never empty while the dropdown is open.
+    items: Vec<Candidate>,
+    selected: usize,
+    /// The first visible row; the selection always stays within the visible rows.
+    offset: usize,
+    /// Whether Ctrl+Space opened it, which keeps it open for an empty hop.
+    forced: bool,
+}
+
+impl Suggestions {
+    fn select(&mut self, selected: usize) {
+        self.selected = selected.min(self.items.len() - 1);
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + SUGGESTION_ROWS {
+            self.offset = self.selected + 1 - SUGGESTION_ROWS;
+        }
+    }
 }
 
 /// A form's connection test result, with the explanation shown under it.
@@ -1268,6 +1299,9 @@ impl UiState {
         {
             self.selected = Some(index);
         }
+        if self.form.suggestions.is_some() {
+            self.suggest(false);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
@@ -1301,15 +1335,9 @@ impl UiState {
             }
             Mode::AddForm | Mode::EditForm => {
                 let input = &mut self.form.values[self.form.active];
-                let before = input.as_str().to_owned();
+                let (before, cursor) = (input.as_str().to_owned(), input.cursor);
                 input.paste(text);
-                let edited = input.as_str() != before;
-                self.form.error = None;
-                self.form.test_result = None;
-                self.show_raw = false;
-                if edited {
-                    return UiAction::FormEdited;
-                }
+                return self.form_input_changed(&before, cursor);
             }
             Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
@@ -1400,6 +1428,31 @@ impl UiState {
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) -> UiAction {
+        if key.code == KeyCode::Char(' ') && key.modifiers == KeyModifiers::CONTROL {
+            if self.form.active == PROXY_JUMP {
+                self.suggest(true);
+            }
+            return UiAction::None;
+        }
+        if let Some(list) = &mut self.form.suggestions {
+            match key.code {
+                KeyCode::Up => {
+                    list.select(list.selected.saturating_sub(1));
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    list.select(list.selected + 1);
+                    return UiAction::None;
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => return self.pick_suggestion(),
+                KeyCode::Tab => return self.pick_suggestion(),
+                KeyCode::Esc => {
+                    self.form.suggestions = None;
+                    return UiAction::None;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => self.mode = Mode::Browse,
             KeyCode::Up | KeyCode::BackTab => self.form.active = self.form.active.saturating_sub(1),
@@ -1408,6 +1461,7 @@ impl UiState {
             }
             KeyCode::Enter if key.modifiers.is_empty() => return self.submit_form(),
             KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+                self.form.suggestions = None;
                 return self.test_form();
             }
             KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
@@ -1417,19 +1471,116 @@ impl UiState {
             }
             _ => {
                 let input = &mut self.form.values[self.form.active];
-                let before = input.as_str().to_owned();
+                let (before, cursor) = (input.as_str().to_owned(), input.cursor);
                 if input.handle_key(key) {
-                    let edited = input.as_str() != before;
-                    self.form.error = None;
-                    self.form.test_result = None;
-                    self.show_raw = false;
-                    if edited {
-                        return UiAction::FormEdited;
-                    }
+                    return self.form_input_changed(&before, cursor);
                 }
             }
         }
+        if self.form.active != PROXY_JUMP {
+            self.form.suggestions = None;
+        }
         UiAction::None
+    }
+
+    /// Follows up a key or paste that went to the focused input: a change clears the form's last
+    /// error and test result and recomputes the jump host dropdown, which also follows the
+    /// cursor while it is open.
+    fn form_input_changed(&mut self, before: &str, cursor: usize) -> UiAction {
+        self.form.error = None;
+        self.form.test_result = None;
+        self.show_raw = false;
+        let input = &self.form.values[self.form.active];
+        let edited = input.as_str() != before;
+        if edited || (input.cursor != cursor && self.form.suggestions.is_some()) {
+            self.suggest(false);
+        }
+        if edited {
+            UiAction::FormEdited
+        } else {
+            UiAction::None
+        }
+    }
+
+    /// Opens, recomputes or closes the jump host dropdown for the hop under the ProxyJump cursor.
+    /// `forced` (Ctrl+Space) keeps it open for an empty hop or an exact match, for as long as it
+    /// stays open.
+    fn suggest(&mut self, forced: bool) {
+        let form = &mut self.form;
+        let previous = form.suggestions.take();
+        let forced = forced || previous.as_ref().is_some_and(|list| list.forced);
+        if form.active != PROXY_JUMP {
+            return;
+        }
+        let input = &form.values[PROXY_JUMP];
+        let value = input.as_str();
+        let Some(hop) = suggest::current_hop(value, input.cursor) else {
+            return;
+        };
+        let hop_start = value[..hop.range.start]
+            .rfind(',')
+            .map_or(0, |comma| comma + 1);
+        let mut exclude = vec![form.values[0].as_str()];
+        if let Some(original) = &form.original {
+            exclude.push(original.alias());
+        }
+        let mut start = 0;
+        for segment in value.split(',') {
+            if start != hop_start {
+                let alias = segment.rsplit('@').next().unwrap_or(segment);
+                exclude.push(alias.split(':').next().unwrap_or(alias));
+            }
+            start += segment.len() + 1;
+        }
+        let candidates = self
+            .hosts
+            .iter()
+            .map(|host| Candidate {
+                alias: host.alias.clone(),
+                origin: match host.ownership {
+                    Ownership::Managed => suggest::Origin::Managed,
+                    Ownership::External => suggest::Origin::External(host.source.clone()),
+                },
+            })
+            .collect::<Vec<_>>();
+        let items = suggest::rank(&hop.query, &candidates, &exclude);
+        let exact = items
+            .iter()
+            .any(|item| item.alias.eq_ignore_ascii_case(&hop.query));
+        if items.is_empty() || (!forced && (hop.query.is_empty() || exact)) {
+            return;
+        }
+        let selected = previous
+            .and_then(|list| {
+                let alias = &list.items[list.selected].alias;
+                items.iter().position(|item| &item.alias == alias)
+            })
+            .unwrap_or(0);
+        let mut list = Suggestions {
+            items,
+            selected: 0,
+            offset: 0,
+            forced,
+        };
+        list.select(selected);
+        form.suggestions = Some(list);
+    }
+
+    /// Replaces the hop under the ProxyJump cursor with the selected suggestion.
+    fn pick_suggestion(&mut self) -> UiAction {
+        let Some(list) = self.form.suggestions.take() else {
+            return UiAction::None;
+        };
+        let input = &mut self.form.values[PROXY_JUMP];
+        let Some(hop) = suggest::current_hop(input.as_str(), input.cursor) else {
+            return UiAction::None;
+        };
+        (input.text, input.cursor) =
+            suggest::apply(input.as_str(), &hop, &list.items[list.selected].alias);
+        self.form.error = None;
+        self.form.test_result = None;
+        self.show_raw = false;
+        UiAction::FormEdited
     }
 
     fn submit_form(&mut self) -> UiAction {
@@ -1747,6 +1898,7 @@ impl Default for FormState {
             original: None,
             error: None,
             test_result: None,
+            suggestions: None,
         }
     }
 }
@@ -1772,6 +1924,7 @@ impl FormState {
             original: Some(host.clone()),
             error: None,
             test_result: None,
+            suggestions: None,
         }
     }
 
@@ -4667,5 +4820,210 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn proxy_jump_form(hosts: Vec<HostSummary>) -> UiState {
+        let mut state = test_state(hosts);
+        press(&mut state, KeyCode::Char('a'));
+        for _ in 0..PROXY_JUMP {
+            press(&mut state, KeyCode::Tab);
+        }
+        state
+    }
+
+    fn listed(state: &UiState) -> Vec<&str> {
+        state.form.suggestions.as_ref().map_or(Vec::new(), |list| {
+            list.items.iter().map(|item| item.alias.as_str()).collect()
+        })
+    }
+
+    fn jump_hosts() -> Vec<HostSummary> {
+        let mut eu = summary("bastion-eu", Ownership::External);
+        eu.source = PathBuf::from("/home/test/.ssh/config");
+        vec![
+            summary("bastion", Ownership::Managed),
+            eu,
+            summary("web", Ownership::Managed),
+        ]
+    }
+
+    fn suggestion(state: &UiState) -> &Suggestions {
+        state.form.suggestions.as_ref().expect("suggestions open")
+    }
+
+    #[test]
+    fn jump_suggestions_do_not_open_on_focus() {
+        let state = proxy_jump_form(jump_hosts());
+        assert_eq!(state.form.active, PROXY_JUMP);
+        assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn typing_a_jump_host_opens_matching_suggestions() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        assert_eq!(listed(&state), ["bastion", "bastion-eu"]);
+        assert_eq!(suggestion(&state).selected, 0);
+    }
+
+    #[test]
+    fn up_and_down_move_through_suggestions_without_wrapping() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(suggestion(&state).selected, 1);
+        press(&mut state, KeyCode::Down);
+        assert_eq!(suggestion(&state).selected, 1);
+        press(&mut state, KeyCode::Up);
+        press(&mut state, KeyCode::Up);
+        assert_eq!(suggestion(&state).selected, 0);
+        assert_eq!(state.form.active, PROXY_JUMP);
+    }
+
+    #[test]
+    fn enter_and_tab_pick_a_suggestion_without_saving() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        press(&mut state, KeyCode::Down);
+        assert_eq!(press(&mut state, KeyCode::Enter), UiAction::FormEdited);
+        let input = &state.form.values[PROXY_JUMP];
+        assert_eq!(input.as_str(), "bastion-eu");
+        assert_eq!(input.cursor, "bastion-eu".len());
+        assert_eq!(state.form.suggestions, None);
+        assert_eq!(state.mode, Mode::AddForm);
+        assert_eq!(state.form.active, PROXY_JUMP);
+
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.form.values[PROXY_JUMP].as_str(), "bastion");
+        assert_eq!(state.form.active, PROXY_JUMP);
+        assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn esc_closes_suggestions_then_cancels_the_form() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.form.suggestions, None);
+        assert_eq!(state.mode, Mode::AddForm);
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn enter_saves_when_suggestions_are_closed() {
+        let mut state = proxy_jump_form(jump_hosts());
+        fill_form(&mut state, ["app", "app.example", "", "", "", ""]);
+        state.form.values[PROXY_JUMP] = TextInput::for_field(HostField::ProxyJump, "");
+        type_text(&mut state, "bastion");
+        assert_eq!(state.form.suggestions, None);
+        let UiAction::Add(host) = press(&mut state, KeyCode::Enter) else {
+            panic!("expected add action")
+        };
+        assert_eq!(host.proxy_jump(), Some("bastion"));
+    }
+
+    #[test]
+    fn ctrl_space_lists_every_candidate_for_an_empty_hop() {
+        let mut state = proxy_jump_form(vec![
+            summary("b", Ownership::Managed),
+            summary("a", Ownership::Managed),
+        ]);
+        state.handle_key(ctrl(' '));
+        assert_eq!(listed(&state), ["a", "b"]);
+        assert!(suggestion(&state).forced);
+        press(&mut state, KeyCode::Backspace);
+        assert_eq!(listed(&state), ["a", "b"]);
+    }
+
+    #[test]
+    fn exact_alias_closes_suggestions() {
+        let mut state = proxy_jump_form(vec![summary("bastion", Ownership::Managed)]);
+        type_text(&mut state, "bastio");
+        assert_eq!(listed(&state), ["bastion"]);
+        type_text(&mut state, "n");
+        assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn no_other_hosts_means_no_suggestions() {
+        let mut state = proxy_jump_form(Vec::new());
+        type_text(&mut state, "b");
+        assert_eq!(state.form.suggestions, None);
+        state.handle_key(ctrl(' '));
+        assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn edit_form_does_not_suggest_its_own_host() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("devbox", Ownership::Managed),
+        ]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        press(&mut state, KeyCode::Char('e'));
+        assert_eq!(state.mode, Mode::EditForm);
+        state.form.active = PROXY_JUMP;
+        state.form.values[PROXY_JUMP] = TextInput::for_field(HostField::ProxyJump, "");
+        type_text(&mut state, "dev");
+        assert_eq!(listed(&state), ["devbox"]);
+    }
+
+    #[test]
+    fn picking_in_a_chain_replaces_only_the_current_hop() {
+        let mut state = proxy_jump_form(vec![
+            summary("bastion", Ownership::Managed),
+            summary("prod-jump", Ownership::Managed),
+            summary("web", Ownership::Managed),
+        ]);
+        type_text(&mut state, "bastion,pro");
+        assert_eq!(listed(&state), ["prod-jump"]);
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(state.form.values[PROXY_JUMP].as_str(), "bastion,prod-jump");
+        type_text(&mut state, ",");
+        assert_eq!(state.form.suggestions, None);
+        state.handle_key(ctrl(' '));
+        assert_eq!(listed(&state), ["web"]);
+    }
+
+    #[test]
+    fn paste_into_proxy_jump_opens_suggestions() {
+        let mut state = proxy_jump_form(vec![summary("bastion", Ownership::Managed)]);
+        assert_eq!(state.handle_paste("bas"), UiAction::FormEdited);
+        assert_eq!(listed(&state), ["bastion"]);
+    }
+
+    #[test]
+    fn leaving_proxy_jump_closes_suggestions() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.form.suggestions, None);
+        assert_eq!(state.form.active, PROXY_JUMP - 1);
+
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        state.handle_key(ctrl('t'));
+        assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn replacing_hosts_recomputes_an_open_dropdown() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bas");
+        press(&mut state, KeyCode::Down);
+        state.replace_hosts(HostInventory {
+            hosts: vec![summary("bastion", Ownership::Managed)],
+            warnings: Vec::new(),
+        });
+        assert_eq!(listed(&state), ["bastion"]);
+        assert_eq!(suggestion(&state).selected, 0);
+        state.replace_hosts(HostInventory {
+            hosts: vec![summary("web", Ownership::Managed)],
+            warnings: Vec::new(),
+        });
+        assert_eq!(state.form.suggestions, None);
     }
 }
