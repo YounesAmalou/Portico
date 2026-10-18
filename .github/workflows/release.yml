@@ -33,34 +33,38 @@ jobs:
           name: release-notes
           path: notes.md
 
-  # release-plz tags the merge commit of its release pull request, and pushing that commit
-  # to main already ran CI on it. Wait for that run and reuse it when every job passed;
-  # otherwise (a manual run, no run, a failed, cancelled or partly skipped run) the
-  # checks job runs CI in full.
+  # release-plz tags the last commit of its release pull request. Branch protection makes
+  # that pull request up to date with main before it merges, so the merge commit pushed to
+  # main has the same tree, and CI already checked it there. Wait for that run and reuse
+  # it when every job passed; otherwise (a manual run, no such run, a failed, cancelled or
+  # partly skipped run) the checks job runs CI in full.
   ci-passed:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      contents: read
     outputs:
       passed: ${{ steps.check.outputs.passed }}
     steps:
       - id: check
-        name: Check whether this commit already passed CI on main
+        name: Check whether this tree already passed CI on main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           passed=false
-          runs="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&per_page=1"
+          repo="repos/$GITHUB_REPOSITORY"
           if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tree=$(gh api "$repo/git/commits/$GITHUB_SHA" --jq .tree.sha)
             for _ in $(seq 60); do
-              run=$(gh api "$runs" --jq '.workflow_runs[0] | "\(.id) \(.status) \(.conclusion)"' || true)
+              run=$(gh api "$repo/actions/workflows/ci.yml/runs?event=push&branch=main&per_page=20" --jq \
+                "[.workflow_runs[] | select(.head_commit.tree_id == \"$tree\")][0] | \"\(.id) \(.status) \(.conclusion)\"" || true)
               read -r id status conclusion <<< "$run"
               [ -n "$id" ] && [ "$id" != null ] || break
               if [ "$status" = completed ]; then
-                if [ "$conclusion" = success ] && gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                if [ "$conclusion" = success ] && gh api "$repo/actions/runs/$id/jobs" \
                   --jq '[.jobs[] | select(.conclusion != "success")] | length == 0' | grep -qx true; then
                   passed=true
-                  echo "CI run $id passed every job on this commit"
+                  echo "CI run $id passed every job on this tree"
                 fi
                 break
               fi
