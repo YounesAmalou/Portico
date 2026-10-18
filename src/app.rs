@@ -513,7 +513,7 @@ impl App {
             }
             TestTarget::Add(host) => self.store.preview(
                 |config| self.add_mutation(config, host.clone()),
-                |files| run(files.entry, &files, alias),
+                |files| run(files.entry.map(|entry| entry.path), &files, alias),
                 Some(cancelled),
             ),
             TestTarget::Edit {
@@ -521,7 +521,7 @@ impl App {
                 changes,
             } => self.store.preview(
                 |config| self.edit_mutation(config, saved, changes.clone()),
-                |files| run(files.entry, &files, alias),
+                |files| run(files.entry.map(|entry| entry.path), &files, alias),
                 Some(cancelled),
             ),
         }

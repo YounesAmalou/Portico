@@ -21,7 +21,7 @@ pub enum ConfigRejection {
         line: u32,
         message: String,
     },
-    /// The validation entry Portico wrote; never expected.
+    /// A line Portico itself wrote into the staged validation entry.
     Internal { raw: String },
     /// Output in no recognised shape.
     Unrecognised { raw: String },
@@ -32,7 +32,19 @@ pub struct ConfigFiles<'a> {
     pub managed_text: &'a str,
     /// The staged entry Portico wrote to validate a change, when there is one. Without it every
     /// file but the managed one is the user's own, `~/.ssh/config` included.
-    pub entry: Option<&'a Path>,
+    pub entry: Option<StagedEntry<'a>>,
+}
+
+/// An entry config Portico staged to validate a change: a copy of the user's entry config with
+/// Portico's Include line swapped one line for one line, plus any lines Portico appended.
+#[derive(Clone, Copy, Debug)]
+pub struct StagedEntry<'a> {
+    pub path: &'a Path,
+    /// The user's entry config the staged one copies.
+    pub source: &'a Path,
+    /// The 1-based lines Portico wrote; every other line is the user's, at the same number in
+    /// `source`.
+    pub portico_lines: &'a [u32],
 }
 
 impl ConfigRejection {
@@ -89,9 +101,17 @@ pub fn interpret(stderr: &str, files: &ConfigFiles<'_>) -> ConfigRejection {
             directive,
             message,
         }
-    } else if files.entry.is_some_and(|entry| path == entry) {
-        ConfigRejection::Internal {
-            raw: stderr.trim().to_string(),
+    } else if let Some(entry) = files.entry.filter(|entry| path == entry.path) {
+        if entry.portico_lines.contains(&line) {
+            ConfigRejection::Internal {
+                raw: stderr.trim().to_string(),
+            }
+        } else {
+            ConfigRejection::UserFile {
+                path: entry.source.to_path_buf(),
+                line,
+                message,
+            }
         }
     } else {
         ConfigRejection::UserFile {
@@ -166,11 +186,17 @@ mod tests {
 
     const MANAGED: &str = "Host dev\n  HostName 10.0.0.5\n  Port 99999\n";
 
+    const SOURCE: &str = "/home/me/.ssh/config";
+
     fn files<'a>(managed: &'a Path, entry: &'a Path) -> ConfigFiles<'a> {
         ConfigFiles {
             managed,
             managed_text: MANAGED,
-            entry: Some(entry),
+            entry: Some(StagedEntry {
+                path: entry,
+                source: Path::new(SOURCE),
+                portico_lines: &[2, 9, 10],
+            }),
         }
     }
 
@@ -239,12 +265,43 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_wrapper_is_internal_and_anything_else_unrecognised() {
+    fn portico_lines_of_the_staged_entry_are_internal() {
         let (m, e) = (Path::new("/tmp/m"), Path::new("/tmp/e"));
-        assert!(matches!(
-            interpret("/tmp/e line 2: Bad thing\n", &files(m, e)),
-            ConfigRejection::Internal { .. }
-        ));
+        for line in [2, 9, 10] {
+            assert!(matches!(
+                interpret(&format!("/tmp/e line {line}: Bad thing\n"), &files(m, e)),
+                ConfigRejection::Internal { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn the_users_lines_of_the_staged_entry_name_their_real_file() {
+        let (m, e) = (
+            Path::new("/tmp/m"),
+            Path::new("/home/me/.ssh/.config.portico-validation"),
+        );
+        let rejection = interpret(
+            "/home/me/.ssh/.config.portico-validation: line 3: Bad configuration option: bogus\n",
+            &files(m, e),
+        );
+        assert_eq!(
+            rejection,
+            ConfigRejection::UserFile {
+                path: SOURCE.into(),
+                line: 3,
+                message: "Bad configuration option: bogus".into(),
+            }
+        );
+        assert_eq!(
+            rejection.display_with_home(Path::new("/home/me")),
+            "line 3 of ~/.ssh/config: Bad configuration option: bogus"
+        );
+    }
+
+    #[test]
+    fn unrecognised_output_stays_unrecognised() {
+        let (m, e) = (Path::new("/tmp/m"), Path::new("/tmp/e"));
         assert!(matches!(
             interpret("something odd\n", &files(m, e)),
             ConfigRejection::Unrecognised { .. }
@@ -280,7 +337,11 @@ mod tests {
         let files = ConfigFiles {
             managed: m,
             managed_text: text,
-            entry: Some(e),
+            entry: Some(StagedEntry {
+                path: e,
+                source: Path::new(SOURCE),
+                portico_lines: &[1],
+            }),
         };
         assert_eq!(
             interpret("/tmp/m line 2: Bad x\n", &files),

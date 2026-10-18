@@ -96,7 +96,7 @@ Applies to add, edit and `portico init`, and to a test or connect that fails bec
 - `TransactionError::Validation` and `InitError::Validation` carry ssh's stderr plus the paths of the staged managed file and validation entry, instead of a string.
 - A new pure module, `src/config_error.rs`, parses each `<file> line <n>: <message>` line:
   - **The staged managed file:** Portico reads the staged content, finds the `Host` block and directive at that line, and names the host and field, for example `Port for dev: OpenSSH rejects '99999'`. In the TUI the error appears on that field of the form.
-  - **The staged validation entry:** reported as an internal Portico error with the raw text. It is not expected to happen.
+  - **The staged validation entry:** the entry is a copy of the user's `~/.ssh/config` with Portico's Include line swapped one line for one line (and, for a test, `Match all` and an Include of the system configuration appended). A rejected line Portico wrote there (the swapped Include or an appended line) is reported as an internal Portico error with the raw text. Any other line is the user's own: it is reported against the real `~/.ssh/config` at the same line number.
   - **Any other file:** the user's own configuration, for example `line 12 of ~/.ssh/config (not written by Portico): Bad configuration option: bogus`, with the next step `nothing was saved; fix that line, then save again` (for `init`: `then rerun portico init`).
   - `ConfigFiles.entry` is Portico's staged validation wrapper only. `portico init`, saved-host tests and `connect` treat the user's entry file (`~/.ssh/config`) as the user's own file.
 - Output that does not parse falls back to today's message with the raw lines.
@@ -123,7 +123,7 @@ Applies to add, edit and `portico init`, and to a test or connect that fails bec
 ## Testing
 
 - **Classifier and explanations (unit):** every fixture under `tests/fixtures/ssh/` is re-captured at `DEBUG1` from a real OpenSSH talking to a throwaway `sshd`, run as a normal user on a high port. New fixtures: a passphrase key, a wrong user, a missing IdentityFile, a password-only server, a refused key through a jump host, a changed key with its `Offending` line, and a lost connection. One golden test per cause checks the exact rendered text. The `sshd` setup is recorded in the plan so fixtures can be regenerated.
-- **Config errors (unit):** a line in the staged managed file maps to its host and field; another file is reported as the user's; the entry wrapper is internal; unparseable output falls back.
+- **Config errors (unit):** a line in the staged managed file maps to its host and field; another file is reported as the user's; a user line of the entry wrapper maps to the real `~/.ssh/config` and Portico's own lines there are internal; unparseable output falls back.
 - **Connect mirroring (unit, fake `ssh` scripts):** bytes arrive in order and unchanged, partial lines included; exit 255 with a recognised cause prints the explanation; other exit codes and "Other" print nothing extra; the exit code passes through; the tail is capped.
 - **`--hold` (unit):** waits for Enter only after a recognised failure; the launch uses the current executable and falls back to `ssh` when it is unavailable.
 - **CLI (integration, `tests/cli.rs`):** the test failure layout and `--raw`; connect explanations; save errors naming the field or the user's file.

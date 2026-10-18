@@ -534,7 +534,8 @@ fn a_save_rejected_by_the_users_own_config_names_that_file() {
     env.run(["init", "-y"]).assert_success();
     env.install_program(
         "ssh",
-        "#!/bin/sh\nprintf '%s/.ssh/config: line 3: Bad configuration option: bogus\\n' \"$HOME\" >&2\nexit 255\n",
+        // Like ssh, name the file given with -F: Portico's staged copy of the entry config.
+        "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-F' ]; then config=\"$2\"; fi\n  shift\ndone\nprintf '%s: line 3: Bad configuration option: bogus\\n' \"$config\" >&2\nexit 255\n",
     );
 
     env.run(["add", "x", "-H", "h"])
