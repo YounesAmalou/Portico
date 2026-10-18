@@ -251,6 +251,15 @@ fn last_line(lines: &[&str]) -> String {
         .to_string()
 }
 
+/// The messages OpenSSH prints when a running session is dropped; a server closing the
+/// connection before login (`kex_exchange_identification: ...`) is not one of them.
+fn is_session_drop(line: &str) -> bool {
+    let line = line.trim();
+    (line.starts_with("Connection to ") && line.ends_with("closed by remote host."))
+        || (line.starts_with("client_loop:") && line.contains("Broken pipe"))
+        || (line.starts_with("Timeout, server ") && line.ends_with("not responding."))
+}
+
 /// What ssh's debug log says about keys and `known_hosts`.
 #[derive(Default)]
 struct KeyFacts {
@@ -366,11 +375,7 @@ fn classify_lines(lines: &[&str], deadline_reached: bool, facts: &KeyFacts) -> F
     if text.contains("No route to host") || text.contains("Network is unreachable") {
         return Failure::Unreachable;
     }
-    if let Some(line) = lines.iter().find(|line| {
-        ["Broken pipe", "closed by remote host", "not responding"]
-            .iter()
-            .any(|marker| line.contains(marker))
-    }) {
+    if let Some(line) = lines.iter().find(|line| is_session_drop(line)) {
         return Failure::ConnectionLost {
             line: line.trim().to_string(),
         };
@@ -728,6 +733,7 @@ mod tests {
         let Failure::AuthRefused { offered, .. } = failure else {
             panic!("{failure:?}")
         };
+        assert!(!offered.is_empty());
         assert!(offered.iter().all(|key| key.path.ends_with("wrong")));
         assert_eq!(
             classify(
@@ -769,12 +775,22 @@ mod tests {
         for line in [
             "client_loop: send disconnect: Broken pipe",
             "Timeout, server 10.0.0.1 not responding.",
+            "Connection to 10.0.0.1 closed by remote host.",
         ] {
             assert!(
                 matches!(classify(line, false, None), Failure::ConnectionLost { .. }),
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn a_connection_closed_before_login_is_not_a_lost_session() {
+        let line = "kex_exchange_identification: Connection closed by remote host";
+        assert_eq!(
+            classify(line, false, None),
+            Failure::Other(line.to_string())
+        );
     }
 
     #[test]

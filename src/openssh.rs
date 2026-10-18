@@ -383,7 +383,7 @@ impl OpenSsh {
                         terminate_process_group(&mut child);
                         return Ok(Watched::Authenticated(success));
                     }
-                    push_capped(&mut stderr, &line);
+                    push_capped(&mut stderr, &line, TEST_STDERR_LIMIT);
                     // A steady trickle of output must not hold off the deadline.
                     if Instant::now() < deadline {
                         continue;
@@ -422,7 +422,7 @@ impl OpenSsh {
                     if let Some(success) = authenticated(&line, route) {
                         return Ok(Watched::Authenticated(success));
                     }
-                    push_capped(&mut stderr, &line);
+                    push_capped(&mut stderr, &line, TEST_STDERR_LIMIT);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < drain_deadline => {}
                 Err(_) => break,
@@ -997,21 +997,28 @@ fn kill_process_group(child: &mut std::process::Child) {
     }
 }
 
-/// Sends each line of `pipe` as it arrives; the channel closes at end of file.
-/// Appends `line`, then drops whole lines from the front until at most `TEST_STDERR_LIMIT`
-/// bytes remain, so a chatty ssh keeps its newest output.
-fn push_capped(stderr: &mut String, line: &str) {
+/// Appends `line`, then drops whole lines from the front until at most `limit` bytes remain,
+/// so a chatty ssh keeps its newest output. A single line over the limit keeps its newest
+/// `limit` bytes instead.
+fn push_capped(stderr: &mut String, line: &str, limit: usize) {
     stderr.push_str(line);
     stderr.push('\n');
-    if let Some(excess) = stderr.len().checked_sub(TEST_STDERR_LIMIT) {
-        let cut = stderr.as_bytes()[excess..]
+    if let Some(excess) = stderr.len().checked_sub(limit) {
+        let whole_lines = stderr.as_bytes()[excess..]
             .iter()
             .position(|&byte| byte == b'\n')
-            .map_or(stderr.len(), |at| excess + at + 1);
+            .map(|at| excess + at + 1)
+            .filter(|&cut| cut < stderr.len());
+        let cut = whole_lines.unwrap_or_else(|| {
+            (excess..=stderr.len())
+                .find(|&at| stderr.is_char_boundary(at))
+                .unwrap_or(stderr.len())
+        });
         stderr.drain(..cut);
     }
 }
 
+/// Sends each line of `pipe` as it arrives; the channel closes at end of file.
 fn read_lines(pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -1685,12 +1692,21 @@ mod tests {
         let mut stderr = String::new();
         let line = "x".repeat(1023);
         for n in 0..400 {
-            push_capped(&mut stderr, &format!("{n}{line}"));
+            push_capped(&mut stderr, &format!("{n}{line}"), TEST_STDERR_LIMIT);
         }
         assert!(stderr.len() <= TEST_STDERR_LIMIT);
         assert!(stderr.ends_with(&format!("399{line}\n")));
         assert!(stderr.lines().all(|l| l.ends_with(&line)));
         assert!(!stderr.starts_with("0x"));
+    }
+
+    #[test]
+    fn a_line_over_the_limit_keeps_its_newest_bytes() {
+        let mut stderr = String::from("old\n");
+        push_capped(&mut stderr, &format!("{}tail", "\u{e9}".repeat(20)), 11);
+        assert!(stderr.len() <= 11);
+        assert!(stderr.ends_with("tail\n"));
+        assert!(!stderr.contains("old"));
     }
 
     #[test]
