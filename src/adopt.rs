@@ -99,7 +99,7 @@ pub enum AdoptError {
         "the configuration changed since the preview; run the command again to see a fresh preview"
     )]
     Stale,
-    #[error("effective configuration of {alias} would change: {}", signed_lines(.removed, .added))]
+    #[error("effective configuration of {alias} would change{}", change_detail(.removed, .added))]
     Changed {
         alias: String,
         removed: Vec<String>,
@@ -169,6 +169,15 @@ fn signed_lines(removed: &[String], added: &[String]) -> String {
         .chain(added.iter().map(|line| format!("+{line}")))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `: ` and the signed lines, or nothing when the outputs differ only in line order, as the
+/// losslessness reason falls back to the bare sentence then.
+fn change_detail(removed: &[String], added: &[String]) -> String {
+    if removed.is_empty() && added.is_empty() {
+        return String::new();
+    }
+    format!(": {}", signed_lines(removed, added))
 }
 
 /// The lines only `before` has and the lines only `after` has, each in its own order.
@@ -1727,6 +1736,20 @@ mod tests {
             "effective configuration of a would change: -a, +a changed"
         );
         assert_eq!(tree(&fixture.paths), before);
+    }
+
+    #[test]
+    fn a_reordered_effective_configuration_still_explains_the_change() {
+        let error = require_same(
+            "dev",
+            "identityfile ~/.ssh/a\nidentityfile ~/.ssh/b\n",
+            "identityfile ~/.ssh/b\nidentityfile ~/.ssh/a\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "effective configuration of dev would change"
+        );
     }
 
     #[test]
