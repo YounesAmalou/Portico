@@ -302,6 +302,63 @@ fn pick(mut found: Vec<&Container>) -> Result<&Container, ResolveError> {
     }
 }
 
+/// Quotes one word for a POSIX shell: words made only of safe characters
+/// stay as they are, anything else is single-quoted.
+pub fn quote(word: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The words quoted and joined into the one string ssh runs remotely.
+pub fn remote_command<S: AsRef<str>>(words: &[S]) -> String {
+    words
+        .iter()
+        .map(|word| quote(word.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Runs bash when the container has it, and sh otherwise.
+pub const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+
+/// The words of the command that opens a shell in a container.
+pub fn exec_words(id: &str, user: Option<&str>) -> Vec<String> {
+    let mut words = vec!["docker", "exec", "-it"];
+    if let Some(user) = user {
+        words.extend(["-u", user]);
+    }
+    words.extend([id, "sh", "-c", SHELL_SCRIPT]);
+    words.into_iter().map(String::from).collect()
+}
+
+/// What went wrong when a docker command failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DockerProblem {
+    NotInstalled,
+    DaemonDown,
+    PermissionDenied,
+    Other,
+}
+
+/// Recognises a docker failure from its exit status and stderr; over ssh the
+/// same text arrives from the remote shell.
+pub fn classify(code: Option<i32>, stderr: &str) -> DockerProblem {
+    let stderr = stderr.to_lowercase();
+    if code == Some(127) && stderr.contains("not found") {
+        DockerProblem::NotInstalled
+    } else if stderr.contains("cannot connect to the docker daemon") {
+        DockerProblem::DaemonDown
+    } else if stderr.contains("permission denied while trying to connect to the docker") {
+        DockerProblem::PermissionDenied
+    } else {
+        DockerProblem::Other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +608,87 @@ mod tests {
         assert_eq!(resolved("nope", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("nope/web", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("web", &[]), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn quotes_only_when_needed() {
+        assert_eq!(quote("web"), "web");
+        assert_eq!(quote("a b"), "'a b'");
+        assert_eq!(quote("o'brien"), "'o'\\''brien'");
+        assert_eq!(quote(""), "''");
+    }
+
+    #[test]
+    fn remote_command_round_trips_through_sh() {
+        let words = ["printf", "%s|", "a b", "o'brien", "", "$HOME"];
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command(&words))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "a b|o'brien||$HOME|"
+        );
+    }
+
+    #[test]
+    fn exec_words_with_and_without_user() {
+        assert_eq!(
+            exec_words("abc", None),
+            ["docker", "exec", "-it", "abc", "sh", "-c", SHELL_SCRIPT]
+        );
+        assert_eq!(
+            exec_words("abc", Some("root")),
+            [
+                "docker",
+                "exec",
+                "-it",
+                "-u",
+                "root",
+                "abc",
+                "sh",
+                "-c",
+                SHELL_SCRIPT
+            ]
+        );
+    }
+
+    #[test]
+    fn classifies_docker_messages() {
+        let not_installed = DockerProblem::NotInstalled;
+        assert_eq!(
+            classify(Some(127), "bash: docker: command not found"),
+            not_installed
+        );
+        assert_eq!(
+            classify(Some(127), "sh: 1: docker: not found"),
+            not_installed
+        );
+        assert_eq!(
+            classify(
+                Some(1),
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+            ),
+            DockerProblem::DaemonDown
+        );
+        assert_eq!(
+            classify(
+                Some(1),
+                "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get \"x\""
+            ),
+            DockerProblem::PermissionDenied
+        );
+        assert_eq!(
+            classify(
+                Some(1),
+                "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
+            ),
+            DockerProblem::PermissionDenied
+        );
+        assert_eq!(
+            classify(Some(1), "Error response from daemon: x"),
+            DockerProblem::Other
+        );
     }
 }
