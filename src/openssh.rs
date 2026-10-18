@@ -117,6 +117,8 @@ enum Watched {
 pub enum ConnectionOutcome {
     /// ssh ran in this terminal and exited; a failure Portico recognised is explained.
     Exited {
+        /// The alias as the inventory spells it, which the explanation uses too.
+        alias: String,
         status: ExitStatus,
         explanation: Option<Explanation>,
     },

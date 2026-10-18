@@ -574,6 +574,12 @@ fn connect_explains_a_refused_login() {
         255,
         "user@h: Permission denied (publickey).\n\nx: failed \u{2014} the server refused the login\n",
     );
+    // The explanation names the host as the inventory spells it.
+    env.run(["connect", "X"])
+        .assert_exit_code_and_stderr_contains(
+            255,
+            "\n\nx: failed \u{2014} the server refused the login\n",
+        );
 }
 
 #[test]
@@ -637,5 +643,27 @@ fn a_lost_session_says_so() {
     env.run(["connect", "x"]).assert_exit_code_and_stderr_contains(
         255,
         "Connection to h closed by remote host.\n\nx: failed \u{2014} the connection was lost\n",
+    );
+}
+
+#[test]
+fn a_test_rejected_by_the_users_own_config_names_that_file() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(env.ssh_config().parent().unwrap()).unwrap();
+    std::fs::write(
+        env.ssh_config(),
+        "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+    )
+    .unwrap();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "x", "-H", "h"]).assert_success();
+    env.install_program(
+        "ssh",
+        "#!/bin/sh\nprintf '%s/.ssh/config: line 3: Bad configuration option: bogus\\n' \"$HOME\" >&2\nexit 255\n",
+    );
+
+    env.run(["test", "x"]).assert_exit_code_and_stdout_contains(
+        1,
+        "x: failed \u{2014} OpenSSH rejected the configuration\n  file: ~/.ssh/config\n  line: 3 (Bad configuration option: bogus)\n  next: fix that line, then try again\n",
     );
 }

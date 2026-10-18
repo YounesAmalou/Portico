@@ -30,7 +30,9 @@ pub enum ConfigRejection {
 pub struct ConfigFiles<'a> {
     pub managed: &'a Path,
     pub managed_text: &'a str,
-    pub entry: &'a Path,
+    /// The staged entry Portico wrote to validate a change, when there is one. Without it every
+    /// file but the managed one is the user's own, `~/.ssh/config` included.
+    pub entry: Option<&'a Path>,
 }
 
 impl ConfigRejection {
@@ -87,7 +89,7 @@ pub fn interpret(stderr: &str, files: &ConfigFiles<'_>) -> ConfigRejection {
             directive,
             message,
         }
-    } else if path == files.entry {
+    } else if files.entry.is_some_and(|entry| path == entry) {
         ConfigRejection::Internal {
             raw: stderr.trim().to_string(),
         }
@@ -168,8 +170,28 @@ mod tests {
         ConfigFiles {
             managed,
             managed_text: MANAGED,
-            entry,
+            entry: Some(entry),
         }
+    }
+
+    #[test]
+    fn without_a_staged_entry_the_entry_file_is_the_users_own() {
+        let files = ConfigFiles {
+            managed: Path::new("/home/me/.ssh/portico/config"),
+            managed_text: MANAGED,
+            entry: None,
+        };
+        assert_eq!(
+            interpret(
+                "/home/me/.ssh/config: line 3: Bad configuration option: bogus\n",
+                &files
+            ),
+            ConfigRejection::UserFile {
+                path: "/home/me/.ssh/config".into(),
+                line: 3,
+                message: "Bad configuration option: bogus".into(),
+            }
+        );
     }
 
     #[test]
@@ -258,7 +280,7 @@ mod tests {
         let files = ConfigFiles {
             managed: m,
             managed_text: text,
-            entry: e,
+            entry: Some(e),
         };
         assert_eq!(
             interpret("/tmp/m line 2: Bad x\n", &files),

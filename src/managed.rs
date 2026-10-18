@@ -343,11 +343,8 @@ impl ManagedStore {
             self.init_managed()?;
             // Existing hosts were validated when written; parsing the installed config is enough.
             validate(&self.paths.entry, &[]).map_err(|stderr| {
-                InitError::Validation(interpret_rejection(
-                    &stderr,
-                    &self.paths.managed,
-                    &self.paths.entry,
-                ))
+                // The installed entry is the user's own file, not one Portico staged.
+                InitError::Validation(interpret_rejection(&stderr, &self.paths.managed, None))
             })
         };
         let preview = self.plan_init()?;
@@ -646,7 +643,7 @@ impl ManagedStore {
             TransactionError::Validation(interpret_rejection(
                 &stderr,
                 candidate.path(),
-                validation_file.path(),
+                Some(validation_file.path()),
             ))
         })?;
         drop(validation_file);
@@ -804,7 +801,7 @@ impl ManagedStore {
         let result = use_entry(ConfigFiles {
             managed: candidate.path(),
             managed_text: &managed_text,
-            entry: preview_file.path(),
+            entry: Some(preview_file.path()),
         });
         drop(preview_file);
         drop(candidate);
@@ -1249,8 +1246,9 @@ pub(crate) fn read_lossy(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Interprets ssh's stderr against the managed config at `managed` and the entry at `entry`.
-fn interpret_rejection(stderr: &str, managed: &Path, entry: &Path) -> ConfigRejection {
+/// Interprets ssh's stderr against the managed config at `managed` and the entry Portico staged
+/// at `entry`, if any.
+fn interpret_rejection(stderr: &str, managed: &Path, entry: Option<&Path>) -> ConfigRejection {
     interpret(
         stderr,
         &ConfigFiles {
@@ -2177,6 +2175,37 @@ mod tests {
     }
 
     #[test]
+    fn init_reports_an_error_in_the_users_entry_as_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_home(dir.path());
+        std::fs::create_dir_all(&paths.ssh_dir).unwrap();
+        std::fs::write(
+            &paths.entry,
+            "Include ~/.ssh/portico/config\n# mine\nBogus yes\n",
+        )
+        .unwrap();
+        let entry = paths.entry.clone();
+        let result = ManagedStore::new(paths.clone()).apply_init(true, |_, _| {
+            Err(format!(
+                "{}: line 3: Bad configuration option: bogus",
+                entry.display()
+            ))
+        });
+
+        match result {
+            Err(InitError::Validation(rejection)) => assert_eq!(
+                rejection,
+                ConfigRejection::UserFile {
+                    path: paths.entry.clone(),
+                    line: 3,
+                    message: "Bad configuration option: bogus".into(),
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn managed_only_init_rollback_preserves_entry_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -2763,7 +2792,7 @@ mod tests {
                         .map_err(TransactionError::Operation)
                 },
                 |files| {
-                    let entry = files.entry;
+                    let entry = files.entry.expect("a preview stages an entry");
                     let candidate = included_candidate(&fs::read(entry).unwrap());
                     let contents = fs::read_to_string(&candidate).unwrap();
                     assert!(contents.contains("Host new"), "{contents}");
@@ -2793,7 +2822,7 @@ mod tests {
                     .map_err(TransactionError::Operation)
             },
             |files| -> Result<(), TransactionError> {
-                let entry = files.entry;
+                let entry = files.entry.expect("a preview stages an entry");
                 seen = Some((
                     entry.to_owned(),
                     included_candidate(&fs::read(entry).unwrap()),
@@ -2858,7 +2887,7 @@ mod tests {
             .store
             .preview(
                 |_| Ok::<_, TransactionError>(()),
-                |files| Ok(fs::read_to_string(files.entry).unwrap()),
+                |files| Ok(fs::read_to_string(files.entry.unwrap()).unwrap()),
                 None,
             )
             .unwrap();
@@ -2875,7 +2904,9 @@ mod tests {
             .store
             .preview(
                 |_| Ok::<_, TransactionError>(()),
-                |files| Ok::<_, TransactionError>(fs::read_to_string(files.entry).unwrap()),
+                |files| {
+                    Ok::<_, TransactionError>(fs::read_to_string(files.entry.unwrap()).unwrap())
+                },
                 None,
             )
             .unwrap();

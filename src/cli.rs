@@ -287,6 +287,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
             {
                 ConnectionOutcome::LaunchRequested => return Ok(ExitCode::SUCCESS),
                 ConnectionOutcome::Exited {
+                    alias,
                     status,
                     explanation,
                 } => {

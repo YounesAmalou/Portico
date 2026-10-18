@@ -1,5 +1,5 @@
 use std::{
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -390,6 +390,7 @@ impl App {
             None
         };
         Ok(ConnectionOutcome::Exited {
+            alias: alias.into(),
             status: mirrored.status,
             explanation,
         })
@@ -408,11 +409,11 @@ impl App {
             }
             Err(OpenSshError::Failed { stderr, .. }) => {
                 let managed = &self.store.paths().managed;
-                // Portico wrote no entry for this run: every other file is the user's own.
+                // ssh read the user's own configuration; nothing was staged.
                 let files = ConfigFiles {
                     managed,
                     managed_text: &read_lossy(managed),
-                    entry: Path::new(""),
+                    entry: None,
                 };
                 match interpret(&stderr, &files) {
                     ConfigRejection::Unrecognised { .. } => None,
@@ -501,19 +502,18 @@ impl App {
                     .find(|host| host.alias.eq_ignore_ascii_case(alias))
                     .ok_or_else(|| AppError::UnknownHost(alias.clone()))?
                     .alias;
-                let paths = self.store.paths();
-                let managed_text = fs::read_to_string(&paths.managed).unwrap_or_default();
+                let managed = &self.store.paths().managed;
                 let files = ConfigFiles {
-                    managed: &paths.managed,
-                    managed_text: &managed_text,
-                    entry: &paths.entry,
+                    managed,
+                    managed_text: &read_lossy(managed),
+                    entry: None,
                 };
                 // ssh reads the user's own configuration, not a staged one.
                 run(None, &files, &alias)
             }
             TestTarget::Add(host) => self.store.preview(
                 |config| self.add_mutation(config, host.clone()),
-                |files| run(Some(files.entry), &files, alias),
+                |files| run(files.entry, &files, alias),
                 Some(cancelled),
             ),
             TestTarget::Edit {
@@ -521,7 +521,7 @@ impl App {
                 changes,
             } => self.store.preview(
                 |config| self.edit_mutation(config, saved, changes.clone()),
-                |files| run(Some(files.entry), &files, alias),
+                |files| run(files.entry, &files, alias),
                 Some(cancelled),
             ),
         }
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(app.show("legacy").is_ok());
         assert!(matches!(
             app.connect("legacy", false).unwrap(),
-            ConnectionOutcome::Exited { status, explanation: None } if status.success()
+            ConnectionOutcome::Exited { status, explanation: None, .. } if status.success()
         ));
     }
 
@@ -1469,7 +1469,7 @@ mod tests {
 
         assert!(matches!(
             app.connect("-external", false).unwrap(),
-            ConnectionOutcome::Exited { status, explanation: None } if status.success()
+            ConnectionOutcome::Exited { status, explanation: None, .. } if status.success()
         ));
         assert_eq!(
             fs::read_to_string(&app.fake_log).unwrap(),
