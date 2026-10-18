@@ -114,8 +114,10 @@ pub fn explain(diagnosis: &Diagnosis, context: &Context<'_>) -> Explanation {
     let parts = describe(
         &diagnosis.failure,
         context,
-        context.hostname.unwrap_or(context.alias),
-        context.port.unwrap_or(22),
+        Some(known_hosts_entry(
+            context.hostname.unwrap_or(context.alias),
+            context.port.unwrap_or(22),
+        )),
     );
     Explanation {
         headline: parts.headline,
@@ -126,8 +128,9 @@ pub fn explain(diagnosis: &Diagnosis, context: &Context<'_>) -> Explanation {
     }
 }
 
-/// `key_host` and `key_port` name the host whose key is at stake, as known_hosts records it.
-fn describe(failure: &Failure, context: &Context<'_>, key_host: &str, key_port: u16) -> Parts {
+/// `key_entry` names the host whose key is at stake as known_hosts records it, when that is
+/// known for certain.
+fn describe(failure: &Failure, context: &Context<'_>, key_entry: Option<String>) -> Parts {
     let alias = context.alias;
     let testing = context.operation != Operation::Connect;
     match failure {
@@ -184,8 +187,15 @@ fn describe(failure: &Failure, context: &Context<'_>, key_host: &str, key_port: 
                 jump_is_known: false,
                 ..*context
             };
-            let (jump_host, jump_port) = jump_target(jump);
-            let cause = describe(cause, &inner, jump_host, jump_port);
+            // A known alias may name another HostName or Port, and a chain hides which hop
+            // failed, so only a single literal spec says which known_hosts entry is the jump's.
+            let key_entry = if context.jump_is_known || jump.contains(',') {
+                None
+            } else {
+                let (jump_host, jump_port) = jump_target(jump);
+                Some(known_hosts_entry(jump_host, jump_port))
+            };
+            let cause = describe(cause, &inner, key_entry);
             let mut flat = Vec::new();
             for (label, values) in &cause.facts {
                 for (index, value) in values.iter().enumerate() {
@@ -219,20 +229,24 @@ fn describe(failure: &Failure, context: &Context<'_>, key_host: &str, key_port: 
         }
         Failure::HostKeyChanged { known_hosts } => {
             let mut parts = Parts::new("the host key changed, which can mean an attack");
-            if let Some((file, line)) = known_hosts {
-                parts = parts.fact(
-                    Label::File,
-                    format!("{}:{line}", shorten(file, context.home)),
-                );
+            let offending = known_hosts
+                .as_ref()
+                .map(|(file, line)| format!("{}:{line}", shorten(file, context.home)));
+            if let Some(offending) = &offending {
+                parts = parts.fact(Label::File, offending.as_str());
             }
-            let entry = if key_port == 22 {
-                key_host.to_string()
-            } else {
-                format!("[{key_host}]:{key_port}")
-            };
-            parts.next(format!(
-                "once the new key is confirmed with the server's administrator, remove the old one with `ssh-keygen -R {entry}`"
-            ))
+            let confirmed = "once the new key is confirmed with the server's administrator";
+            parts.next(match (key_entry, offending) {
+                (Some(entry), _) => {
+                    format!("{confirmed}, remove the old one with `ssh-keygen -R {entry}`")
+                }
+                (None, Some(offending)) => {
+                    format!("{confirmed}, remove the old entry at {offending}")
+                }
+                (None, None) => {
+                    format!("{confirmed}, remove the old entry from your known_hosts file")
+                }
+            })
         }
         Failure::ConfigRejected(rejection) => rejected(rejection, context),
         Failure::ConnectionLost { line } => {
@@ -352,6 +366,15 @@ fn rejected(rejection: &ConfigRejection, context: &Context<'_>) -> Parts {
             parts.always_raw = true;
             parts.next("this is likely a Portico bug; see what ssh said below")
         }
+    }
+}
+
+/// How known_hosts records `host` at `port`: bracketed with the port unless it is 22.
+fn known_hosts_entry(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
     }
 }
 
@@ -896,6 +919,49 @@ mod tests {
         assert_eq!(
             explained(jump, &[], &standard)[2],
             "        the old one with `ssh-keygen -R bastion`"
+        );
+    }
+
+    #[test]
+    fn a_changed_key_on_an_aliased_or_chained_jump_points_at_the_offending_line() {
+        let home = home();
+        let changed = Failure::HostKeyChanged {
+            known_hosts: Some(("/home/me/.ssh/known_hosts".into(), 7)),
+        };
+        let mut aliased = context(&home, Operation::Test, &[]);
+        aliased.jump_is_known = true;
+        let lines = explained(
+            Failure::JumpHostFailed {
+                jump: "bastion".into(),
+                cause: Box::new(changed.clone()),
+            },
+            &[],
+            &aliased,
+        );
+        assert_eq!(
+            lines[1..],
+            [
+                "  jump: file: ~/.ssh/known_hosts:7",
+                "  next: run `portico test bastion` to check the jump host on its own",
+                "        once the new key is confirmed with the server's administrator, remove",
+                "        the old entry at ~/.ssh/known_hosts:7",
+            ]
+        );
+        let lines = explained(
+            Failure::JumpHostFailed {
+                jump: "edge,inner:2222".into(),
+                cause: Box::new(changed),
+            },
+            &[],
+            &context(&home, Operation::Test, &[]),
+        );
+        assert_eq!(
+            lines[1..],
+            [
+                "  jump: file: ~/.ssh/known_hosts:7",
+                "  next: once the new key is confirmed with the server's administrator, remove",
+                "        the old entry at ~/.ssh/known_hosts:7",
+            ]
         );
     }
 
