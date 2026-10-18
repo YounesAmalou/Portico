@@ -20,6 +20,16 @@ may contain breaking changes.
 - Read the raw effective configuration of a host
 - Record where external hosts are declared
 - Keep comments of managed hosts
+- List containers and open shells from the TUI
+- Add the TUI containers panel
+- Open a container shell from the CLI with a picker
+- Add portico containers
+- List containers and open shells on this machine or a host
+- Run remote commands through the ssh connect paths
+- Detect docker group access and build the fixes
+- Build container shell commands and classify docker failures
+- Resolve container references by name, service or id
+- Parse and group running docker containers
 
 ### Fixed
 
@@ -29,6 +39,14 @@ may contain breaking changes.
 - Explain a changed effective configuration that differs only in order
 - Name loop paths, key snapshots once and guard the rollback message
 - Drop comments of cleared managed host fields on replace
+- Show container fixes in full and wrap panel errors
+- Tidy TUI containers panel focus and scrolling
+- Let remote container commands read the terminal
+- Tighten container parsing and ordering
+- Leave a later jump host's offered keys out of the target's
+- Keep a late signal from cancelling the retest after trusting a key
+- Recognise a login through a fd-passing ProxyCommand
+- Tell a later jump host's login from the target's
 
 ## [0.2.6] - 2026-10-18
 
