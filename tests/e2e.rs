@@ -29,3 +29,5 @@ mod cli_test;
 mod explanations;
 #[path = "e2e/tui_first_run.rs"]
 mod tui_first_run;
+#[path = "e2e/tui_maintenance.rs"]
+mod tui_maintenance;
