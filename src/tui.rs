@@ -32,6 +32,7 @@ use ratatui::{
 };
 
 mod containers;
+mod lister;
 mod tester;
 
 use crate::{
@@ -46,6 +47,8 @@ use crate::{
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     suggest::{self, Candidate},
 };
+use containers::{Panel, PanelAction, fix_status, shell_status};
+use lister::Lister;
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
 
@@ -197,7 +200,8 @@ fn browse<B: Backend<Error = io::Error>>(
     thread::scope(|scope| {
         let resolver = Resolver::spawn(scope, app);
         let tester = Tester::spawn(scope, app);
-        browse_hosts(app, terminal, signals, session, resolver, tester)
+        let lister = Lister::spawn(scope, app);
+        browse_hosts(app, terminal, signals, session, resolver, tester, lister)
     })
 }
 
@@ -208,6 +212,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     session: &TerminalSession,
     mut resolver: Resolver,
     mut tester: Tester,
+    mut lister: Lister,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
@@ -227,6 +232,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             state.record_test(finished, local_time());
             redraw = true;
         }
+        if let Some((target, result)) = lister.try_finished() {
+            state.containers.finish(target, result);
+            redraw = true;
+        }
         let testing = tester.running().map(str::to_owned);
         if state.testing != testing {
             state.testing = testing;
@@ -237,7 +246,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             redraw = false;
         }
         // Poll quickly while a resolution or a test is running so its result appears promptly.
-        let wait = if resolver.is_pending() || tester.running().is_some() {
+        let wait = if resolver.is_pending() || tester.running().is_some() || lister.is_running() {
             Duration::from_millis(25)
         } else {
             Duration::from_millis(100)
@@ -299,6 +308,60 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 };
                 state.finish_connect(&alias, result);
             }
+            UiAction::Containers(PanelAction::List(target)) => {
+                lister.list(&mut state.containers, target);
+            }
+            UiAction::Containers(PanelAction::CancelList) => {
+                lister.cancel();
+            }
+            UiAction::Containers(PanelAction::Shell {
+                target,
+                id,
+                user,
+                via,
+                new_terminal,
+            }) => {
+                let shell = |cancelled| {
+                    let user = user.as_deref();
+                    app.container_shell(&target, &id, user, via, new_terminal, cancelled, true)
+                };
+                let result = if new_terminal {
+                    Ok(shell(None))
+                } else {
+                    let result = suspend_for_child(
+                        || session.leave(),
+                        || {
+                            let _foreground = signals.foreground_child();
+                            Ok(shell(Some(terminated)))
+                        },
+                        || session.enter(),
+                    );
+                    if let Err(TuiError::Io(error)) = result {
+                        return Err(TuiError::Io(error));
+                    }
+                    redraw_from_scratch(terminal)?;
+                    result
+                };
+                state.status = Some(shell_status(&target, result));
+            }
+            UiAction::Containers(PanelAction::Fix { target, offer }) => {
+                let result = suspend_for_child(
+                    || session.leave(),
+                    || {
+                        // sudo may prompt, and the terminal's Ctrl+C is for it now.
+                        let _foreground = signals.foreground_child();
+                        Ok(app.docker_fix(&target, &offer))
+                    },
+                    || session.enter(),
+                );
+                if let Err(TuiError::Io(error)) = result {
+                    return Err(TuiError::Io(error));
+                }
+                redraw_from_scratch(terminal)?;
+                state.status = fix_status(&offer, result);
+                lister.list(&mut state.containers, target);
+            }
+            UiAction::Containers(_) => {}
             UiAction::Refresh => {
                 inventory_changed = apply_refresh(&mut state, || app.hosts());
                 if inventory_changed {
@@ -370,6 +433,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             tester.cancel_if(|origin, _| *origin == Origin::Form);
         }
 
+        state.follow_selection();
         sync_details(&mut state, &mut resolver, inventory_changed);
         redraw = true;
     }
@@ -1067,6 +1131,16 @@ struct UiState {
     show_raw: bool,
     /// The host key awaiting the user's decision while in `Mode::ConfirmTrust`.
     trust: Option<PendingTrust>,
+    containers: Panel,
+    focus: Focus,
+}
+
+/// The left-column panel that receives keys while browsing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Focus {
+    #[default]
+    Hosts,
+    Containers,
 }
 
 /// The outcome of a host's last connection test.
@@ -1204,6 +1278,7 @@ enum UiAction {
     FormEdited,
     /// The answer to the trust prompt; on `true` the key to trust is in `UiState::trust`.
     Trust(bool),
+    Containers(PanelAction),
 }
 
 impl UiState {
@@ -1211,7 +1286,7 @@ impl UiState {
         let HostInventory { hosts, warnings } = inventory;
         let visible = (0..hosts.len()).collect::<Vec<_>>();
         let selected = visible.first().copied();
-        Self {
+        let mut state = Self {
             hosts,
             warnings,
             visible,
@@ -1229,7 +1304,17 @@ impl UiState {
             connections: PerHost::default(),
             show_raw: false,
             trust: None,
-        }
+            containers: Panel::default(),
+            focus: Focus::Hosts,
+        };
+        state.follow_selection();
+        state
+    }
+
+    /// Points the containers panel at the selected host when the selection moved.
+    fn follow_selection(&mut self) {
+        let alias = self.selected.map(|index| self.hosts[index].alias.clone());
+        self.containers.follow_selection(alias.as_deref());
     }
 
     fn set_filter(&mut self, filter: &str) {
@@ -1308,6 +1393,20 @@ impl UiState {
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         self.status = None;
         self.edit_pending = false;
+        if self.mode == Mode::Browse && self.focus == Focus::Containers {
+            let action = self.containers.handle_key(key);
+            if matches!(action, PanelAction::Leave | PanelAction::CancelList) {
+                self.focus = Focus::Hosts;
+            }
+            return match action {
+                PanelAction::Quit => UiAction::Quit,
+                action => UiAction::Containers(action),
+            };
+        }
+        if self.mode == Mode::Browse && key.code == KeyCode::Tab {
+            self.focus = Focus::Containers;
+            return UiAction::Containers(self.containers.on_focus());
+        }
         if key.code == KeyCode::Esc && self.testing.is_some() {
             self.status = Some("Test cancelled".into());
             return UiAction::CancelTest;
@@ -1324,6 +1423,7 @@ impl UiState {
         if (selected, in_form) != (self.selected, self.in_form()) {
             self.show_raw = false;
         }
+        self.follow_selection();
         action
     }
 
@@ -2049,6 +2149,13 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(areas[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length((columns[0].height * 2 / 5).max(6)),
+        ])
+        .split(columns[0]);
 
     let hosts = state
         .visible
@@ -2082,8 +2189,28 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                     .title(Line::from(title)),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-        columns[0],
+        left[0],
         &mut list_state,
+    );
+    let panel_focused = state.mode == Mode::Browse && state.focus == Focus::Containers;
+    let panel_border = if panel_focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Paragraph::new(
+            state
+                .containers
+                .lines(panel_focused, usize::from(left[1].height.saturating_sub(2))),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(panel_border)
+                .title(state.containers.title()),
+        ),
+        left[1],
     );
 
     let (right_title, detail_lines) = match state.mode {
@@ -2108,13 +2235,21 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             ))],
         ),
         Mode::ConfirmTrust => ("Trust host key", trust_lines(state.trust.as_ref())),
-        _ => (
-            "Details",
-            details_text(state)
-                .lines()
-                .map(|line| Line::raw(line.to_owned()))
-                .collect(),
-        ),
+        _ => {
+            let container = state.containers.details().filter(|_| panel_focused);
+            let title = if container.is_some() {
+                "Container"
+            } else {
+                "Details"
+            };
+            let text = container.unwrap_or_else(|| details_text(state));
+            (
+                title,
+                text.lines()
+                    .map(|line| Line::raw(line.to_owned()))
+                    .collect(),
+            )
+        }
     };
     frame.render_widget(
         Paragraph::new(detail_lines)
@@ -2154,6 +2289,9 @@ fn trust_lines(pending: Option<&PendingTrust>) -> Vec<Line<'static>> {
 }
 
 fn footer_text(state: &UiState) -> String {
+    if state.mode == Mode::Browse && state.focus == Focus::Containers {
+        return state.containers.footer().into();
+    }
     match state.mode {
         Mode::Browse => {
             let new_terminal = if state.ctrl_enter {
@@ -2167,7 +2305,8 @@ fn footer_text(state: &UiState) -> String {
             } else {
                 ""
             };
-            let connect = format!("{output}t test  Enter connect  {new_terminal}  q quit");
+            let connect =
+                format!("{output}t test  Enter connect  {new_terminal}  Tab containers  q quit");
             let clear_filter = if state.filter.is_empty() {
                 ""
             } else {
@@ -2191,7 +2330,7 @@ fn footer_text(state: &UiState) -> String {
                 Some(Ownership::External) => {
                     format!("↑↓ move  / filter{clear_filter}  a add  {refresh}  {connect}")
                 }
-                None => format!("/ filter{clear_filter}  a add  {refresh}  q quit"),
+                None => format!("/ filter{clear_filter}  a add  {refresh}  Tab containers  q quit"),
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -2642,6 +2781,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::app::{ContainerList, Target};
 
     fn test_state(hosts: Vec<HostSummary>) -> UiState {
         UiState::new(
@@ -5313,5 +5453,119 @@ mod tests {
         let input = &state.form.values[PROXY_JUMP];
         assert_eq!(input.as_str(), "café,bastion");
         assert_eq!(input.cursor, input.as_str().len());
+    }
+
+    fn shop_list(target: Target) -> ContainerList {
+        ContainerList {
+            target,
+            listing: crate::container::Listing {
+                containers: ["web", "db"]
+                    .into_iter()
+                    .map(|service| crate::container::Container {
+                        id: format!("{service}-id"),
+                        name: format!("shop-{service}-1"),
+                        image: format!("{service}:latest"),
+                        command: "run".into(),
+                        running_for: "3 hours ago".into(),
+                        status: "Up 3 hours".into(),
+                        ports: String::new(),
+                        networks: "shop_default".into(),
+                        mounts: String::new(),
+                        project: Some("shop".into()),
+                        service: Some(service.into()),
+                        number: Some(1),
+                        working_dir: None,
+                    })
+                    .collect(),
+                skipped: 0,
+            },
+            via: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn tab_focuses_containers_and_lists() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert_eq!(
+            press(&mut state, KeyCode::Tab),
+            UiAction::Containers(PanelAction::List(Target::Host("dev".into())))
+        );
+        assert_eq!(state.focus, Focus::Containers);
+        assert_eq!(
+            press(&mut state, KeyCode::Tab),
+            UiAction::Containers(PanelAction::Leave)
+        );
+        assert_eq!(state.focus, Focus::Hosts);
+    }
+
+    #[test]
+    fn panel_keys_route_when_focused() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("web", Ownership::Managed),
+        ]);
+        press(&mut state, KeyCode::Tab);
+        let dev = Target::Host("dev".into());
+        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+        assert!(state.containers.details().unwrap().contains("db-id"));
+        assert_eq!(
+            press(&mut state, KeyCode::Char('j')),
+            UiAction::Containers(PanelAction::None)
+        );
+        assert_eq!(state.selected_alias(), Some("dev"));
+        assert!(state.containers.details().unwrap().contains("web-id"));
+        assert_eq!(press(&mut state, KeyCode::Char('q')), UiAction::Quit);
+    }
+
+    #[test]
+    fn moving_host_selection_follows() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("web", Ownership::Managed),
+        ]);
+        assert_eq!(state.containers.target(), Some(Target::Host("dev".into())));
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('L')),
+            UiAction::Containers(PanelAction::List(Target::Local))
+        );
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(
+            state.containers.target(),
+            Some(Target::Local),
+            "kept on leaving"
+        );
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.containers.target(), Some(Target::Host("web".into())));
+    }
+
+    #[test]
+    fn details_pane_shows_container_when_focused() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let dev = Target::Host("dev".into());
+        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+        let text = rendered(&state);
+        assert!(text.contains("Containers: dev"), "{text}");
+        assert!(
+            text.contains("Tab to list") || text.contains("shop"),
+            "{text}"
+        );
+        assert!(!text.contains("image: db:latest"), "{text}");
+
+        press(&mut state, KeyCode::Tab);
+        let text = rendered(&state);
+        assert!(text.contains("image: db:latest"), "{text}");
+        assert!(text.contains("> db"), "{text}");
+        assert!(text.contains("u user"), "{text}");
+        assert!(text.contains("user: image default"), "{text}");
+    }
+
+    #[test]
+    fn browse_footer_mentions_tab_containers() {
+        let state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert!(footer_text(&state).contains("Tab containers"));
+        let state = test_state(Vec::new());
+        assert!(footer_text(&state).contains("Tab containers"));
     }
 }

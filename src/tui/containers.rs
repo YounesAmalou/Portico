@@ -1,10 +1,6 @@
 //! The containers panel under the hosts: what it lists, its keys, and how it reads.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the TUI in the next commit")
-)]
 
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -12,10 +8,11 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::{TextInput, explanation_lines};
+use super::{TextInput, TuiError, explanation_lines};
 use crate::{
     app::{ContainerError, ContainerList, Offer, Target},
-    container::{Container, GroupTool, display_name, group},
+    container::{Container, GroupTool, display_name, group, remote_command},
+    openssh::ConnectionOutcome,
 };
 
 /// Why a target could not be listed, as the panel shows it.
@@ -53,7 +50,7 @@ pub(super) enum PanelAction {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct Panel {
     pinned_local: bool,
     host: Option<String>,
@@ -62,6 +59,11 @@ pub(super) struct Panel {
     user: TextInput,
     editing_user: bool,
     previous_user: String,
+    /// The listing a running refresh replaces, which cancelling it restores.
+    refreshing: HashMap<Target, PanelState>,
+    /// The first line shown when the lines outgrow the panel, moved only as far as the
+    /// selection needs.
+    scroll: Cell<usize>,
 }
 
 impl Panel {
@@ -81,6 +83,14 @@ impl Panel {
         self.pinned_local = false;
         if self.target() != before {
             self.selected = 0;
+            self.scroll.set(0);
+        }
+    }
+
+    /// Follows the selected host only when it moved, so an `L` survives other keys.
+    pub(super) fn follow_selection(&mut self, alias: Option<&str>) {
+        if self.host.as_deref() != alias {
+            self.follow(alias);
         }
     }
 
@@ -112,8 +122,8 @@ impl Panel {
         let state = target.as_ref().map(|target| self.state(target));
         match key.code {
             KeyCode::Esc if matches!(state, Some(PanelState::Listing)) => {
-                if let Some(target) = &target {
-                    self.lists.remove(target);
+                if let Some(target) = target {
+                    self.abandon(target);
                 }
                 PanelAction::CancelList
             }
@@ -164,7 +174,20 @@ impl Panel {
     }
 
     pub(super) fn set_listing(&mut self, target: Target) {
-        self.lists.insert(target, PanelState::Listing);
+        if let Some(previous @ PanelState::Listed(_)) =
+            self.lists.insert(target.clone(), PanelState::Listing)
+        {
+            self.refreshing.insert(target, previous);
+        }
+    }
+
+    /// Forgets a listing that will not finish: a refreshed listing comes back, anything else
+    /// is listed again on the next focus.
+    pub(super) fn abandon(&mut self, target: Target) {
+        match self.refreshing.remove(&target) {
+            Some(previous) => self.lists.insert(target, previous),
+            None => self.lists.remove(&target),
+        };
     }
 
     /// Keeps a listing's result for the session.
@@ -173,6 +196,7 @@ impl Panel {
             Ok(list) => PanelState::Listed(list),
             Err(error) => PanelState::Failed(failure(&error)),
         };
+        self.refreshing.remove(&target);
         self.lists.insert(target, state);
         let count = self.rows().len();
         self.selected = self.selected.min(count.saturating_sub(1));
@@ -185,13 +209,47 @@ impl Panel {
         }
     }
 
-    pub(super) fn lines(&self, focused: bool) -> Vec<Line<'static>> {
+    /// The panel's lines for `height` rows, scrolled so the selected row shows, with the user
+    /// line kept last while focused.
+    pub(super) fn lines(&self, focused: bool, height: usize) -> Vec<Line<'static>> {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let (mut lines, selected) = self.body();
+        let room = height.saturating_sub(usize::from(focused));
+        if lines.len() > room {
+            let mut first = self.scroll.get();
+            match selected {
+                Some(line) if line < first => first = line,
+                Some(line) if line >= first + room => first = line + 1 - room,
+                Some(_) => {}
+                None => first = 0,
+            }
+            first = first.min(lines.len() - room);
+            self.scroll.set(first);
+            lines = lines.into_iter().skip(first).take(room).collect();
+        }
+        if focused {
+            let mut user = vec![Span::raw("user: ")];
+            if self.editing_user {
+                user.extend(self.user.spans(true));
+            } else if let Some(chosen) = self.chosen_user() {
+                user.push(Span::raw(chosen));
+            } else {
+                user.push(Span::styled("image default", dim));
+            }
+            lines.push(Line::from(user));
+        }
+        lines
+    }
+
+    /// Every line above the user line, and the index of the selected row's line.
+    fn body(&self) -> (Vec<Line<'static>>, Option<usize>) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let Some(target) = self.target() else {
-            return vec![Line::raw("No host selected")];
+            return (vec![Line::raw("No host selected")], None);
         };
-        let mut lines = match self.state(&target) {
+        let mut selected = None;
+        let lines = match self.state(&target) {
             PanelState::Unlisted => vec![Line::raw("Tab to list containers")],
             PanelState::Listing => vec![Line::raw("Listing…")],
             PanelState::Failed(failure) => {
@@ -228,7 +286,12 @@ impl Panel {
                         bold,
                     ));
                     for container in group.containers {
-                        let mark = if row == self.selected { ">" } else { " " };
+                        let mark = if row == self.selected {
+                            selected = Some(lines.len());
+                            ">"
+                        } else {
+                            " "
+                        };
                         lines.push(Line::from(vec![
                             Span::raw(format!("{mark} {}  ", display_name(container, all))),
                             Span::styled(container.status.clone(), dim),
@@ -239,28 +302,14 @@ impl Panel {
                 lines
             }
         };
-        if focused {
-            let mut user = vec![Span::raw("user: ")];
-            if self.editing_user {
-                user.extend(self.user.spans(true));
-            } else if self.user.is_empty() {
-                user.push(Span::styled("image default", dim));
-            } else {
-                user.push(Span::raw(self.user.as_str().to_owned()));
-            }
-            lines.push(Line::from(user));
-        }
-        lines
+        (lines, selected)
     }
 
     /// The selected container, one `label: value` line per non-empty field.
     pub(super) fn details(&self) -> Option<String> {
         let container = *self.rows().get(self.selected)?;
-        let user = if self.user.is_empty() {
-            "image default"
-        } else {
-            self.user.as_str()
-        };
+        let chosen = self.chosen_user();
+        let user = chosen.as_deref().unwrap_or("image default");
         let rows = [
             ("name", container.name.as_str()),
             ("id", &container.id),
@@ -317,6 +366,12 @@ impl Panel {
         })
     }
 
+    /// The user for the next shell, trimmed; blank means the image's own.
+    fn chosen_user(&self) -> Option<String> {
+        let user = self.user.as_str().trim();
+        (!user.is_empty()).then(|| user.to_owned())
+    }
+
     fn shell(&self, new_terminal: bool) -> PanelAction {
         let (Some(list), Some(container)) =
             (self.listed(), self.rows().get(self.selected).copied())
@@ -326,10 +381,53 @@ impl Panel {
         PanelAction::Shell {
             target: list.target.clone(),
             id: container.id.clone(),
-            user: (!self.user.is_empty()).then(|| self.user.as_str().to_owned()),
+            user: self.chosen_user(),
             via: list.via,
             new_terminal,
         }
+    }
+}
+
+/// The status line after a shell on `target`.
+pub(super) fn shell_status(
+    target: &Target,
+    result: Result<Result<ConnectionOutcome, ContainerError>, TuiError>,
+) -> String {
+    match result {
+        Ok(Ok(ConnectionOutcome::Exited {
+            explanation: Some(explanation),
+            ..
+        })) => explanation.headline,
+        Ok(Ok(ConnectionOutcome::Exited { status, .. })) if status.success() => {
+            format!("Shell on {target} closed")
+        }
+        Ok(Ok(ConnectionOutcome::Exited { status, .. })) => {
+            format!("Shell on {target} exited with {status}")
+        }
+        Ok(Ok(ConnectionOutcome::LaunchRequested)) => {
+            format!("Opened a shell on {target} in a new terminal")
+        }
+        Ok(Ok(ConnectionOutcome::LaunchFailed(status))) => {
+            format!("Could not open a terminal: {status}")
+        }
+        Ok(Err(error)) => error.to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// The status line after running `offer`'s fix: nothing when it succeeded.
+pub(super) fn fix_status(
+    offer: &Offer,
+    result: Result<Result<std::process::ExitStatus, ContainerError>, TuiError>,
+) -> Option<String> {
+    match result {
+        Ok(Ok(status)) if status.success() => None,
+        Ok(Ok(status)) => Some(format!(
+            "{} exited with {status}",
+            remote_command(&offer.words())
+        )),
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(error) => Some(error.to_string()),
     }
 }
 
@@ -498,7 +596,7 @@ mod tests {
     fn selection_skips_headers() {
         let mut panel = listed_panel();
         let selected = |panel: &Panel| {
-            texts(&panel.lines(true))
+            texts(&panel.lines(true, 100))
                 .into_iter()
                 .filter(|line| line.starts_with('>'))
                 .collect::<Vec<_>>()
@@ -565,7 +663,7 @@ mod tests {
             PanelAction::None,
             "applies"
         );
-        assert_eq!(texts(&panel.lines(true)).last().unwrap(), "user: root");
+        assert_eq!(texts(&panel.lines(true, 100)).last().unwrap(), "user: root");
 
         press(&mut panel, KeyCode::Down);
         assert_eq!(
@@ -584,7 +682,7 @@ mod tests {
     fn esc_while_editing_user_restores() {
         let mut panel = listed_panel();
         assert_eq!(
-            texts(&panel.lines(true)).last().unwrap(),
+            texts(&panel.lines(true, 100)).last().unwrap(),
             "user: image default"
         );
         press(&mut panel, KeyCode::Char('u'));
@@ -596,7 +694,7 @@ mod tests {
         );
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None, "stays");
         assert_eq!(
-            texts(&panel.lines(true)).last().unwrap(),
+            texts(&panel.lines(true, 100)).last().unwrap(),
             "user: image default"
         );
         assert_eq!(
@@ -622,7 +720,7 @@ mod tests {
         let mut panel = Panel::default();
         panel.follow(Some("dev"));
         panel.set_listing(host("dev"));
-        assert_eq!(texts(&panel.lines(true))[0], "Listing…");
+        assert_eq!(texts(&panel.lines(true, 100))[0], "Listing…");
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::CancelList);
         assert_eq!(
             panel.on_focus(),
@@ -668,9 +766,9 @@ mod tests {
     #[test]
     fn renders_groups_and_hint() {
         let mut panel = Panel::default();
-        assert_eq!(texts(&panel.lines(false)), ["No host selected"]);
+        assert_eq!(texts(&panel.lines(false, 100)), ["No host selected"]);
         panel.follow(Some("dev"));
-        assert_eq!(texts(&panel.lines(false)), ["Tab to list containers"]);
+        assert_eq!(texts(&panel.lines(false, 100)), ["Tab to list containers"]);
 
         let mut listed = list(host("dev"), containers());
         listed.via = Some(GroupTool::Sg);
@@ -678,7 +776,7 @@ mod tests {
         listed.listing.skipped = 2;
         panel.finish(host("dev"), Ok(listed));
         assert_eq!(
-            texts(&panel.lines(false)),
+            texts(&panel.lines(false, 100)),
             [
                 "Listed through sg: other shells still lack the docker group.",
                 "Skipped 2 lines docker printed that Portico could not read.",
@@ -692,13 +790,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            texts(&panel.lines(true)).last().unwrap(),
+            texts(&panel.lines(true, 100)).last().unwrap(),
             "user: image default"
         );
 
         panel.finish(host("dev"), Ok(list(host("dev"), Vec::new())));
         assert_eq!(
-            texts(&panel.lines(false)),
+            texts(&panel.lines(false, 100)),
             ["No running containers on dev."]
         );
         assert_eq!(press(&mut panel, KeyCode::Enter), PanelAction::None);
@@ -763,7 +861,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            texts(&panel.lines(false)),
+            texts(&panel.lines(false, 100)),
             [
                 "ssh to dev failed \u{2014} the connection was refused",
                 "  user: deploy",
@@ -780,13 +878,13 @@ mod tests {
             }),
         );
         assert_eq!(
-            texts(&panel.lines(false)),
+            texts(&panel.lines(false, 100)),
             ["ssh to dev failed", "ssh: Could not resolve hostname dev"]
         );
 
         panel.finish(host("dev"), Err(issue(Some(Offer::StartDaemon))));
         assert_eq!(
-            texts(&panel.lines(false)),
+            texts(&panel.lines(false, 100)),
             [
                 "The docker daemon is not running on dev.",
                 "Start it with: sudo systemctl start docker",
@@ -800,7 +898,7 @@ mod tests {
         };
         panel.finish(host("dev"), Err(issue(Some(join))));
         assert_eq!(
-            texts(&panel.lines(false)).last().unwrap(),
+            texts(&panel.lines(false, 100)).last().unwrap(),
             "g add to docker group"
         );
 
@@ -812,8 +910,172 @@ mod tests {
             }),
         );
         assert_eq!(
-            texts(&panel.lines(false)),
+            texts(&panel.lines(false, 100)),
             ["no container matches web on dev"]
         );
+    }
+
+    #[test]
+    fn esc_during_refresh_restores_listing() {
+        let mut panel = listed_panel();
+        let before = texts(&panel.lines(false, 100));
+        assert_eq!(
+            press(&mut panel, KeyCode::Char('r')),
+            PanelAction::List(host("dev"))
+        );
+        panel.set_listing(host("dev"));
+        assert_eq!(texts(&panel.lines(false, 100)), ["Listing…"]);
+        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::CancelList);
+        assert_eq!(texts(&panel.lines(false, 100)), before);
+        assert_eq!(panel.on_focus(), PanelAction::None);
+
+        panel.set_listing(host("dev"));
+        panel.finish(host("dev"), Ok(list(host("dev"), Vec::new())));
+        panel.set_listing(host("dev"));
+        panel.finish(host("dev"), Err(issue(None)));
+        panel.set_listing(host("dev"));
+        press(&mut panel, KeyCode::Esc);
+        assert_eq!(
+            panel.on_focus(),
+            PanelAction::List(host("dev")),
+            "a failure is not restored"
+        );
+    }
+
+    #[test]
+    fn blank_user_means_image_default() {
+        let mut panel = listed_panel();
+        press(&mut panel, KeyCode::Char('u'));
+        press(&mut panel, KeyCode::Char(' '));
+        press(&mut panel, KeyCode::Char(' '));
+        press(&mut panel, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell { user: None, .. }
+        ));
+        assert!(panel.details().unwrap().ends_with("user: image default"));
+        assert_eq!(
+            texts(&panel.lines(true, 100)).last().unwrap(),
+            "user: image default"
+        );
+
+        press(&mut panel, KeyCode::Char('u'));
+        for character in "root ".chars() {
+            press(&mut panel, KeyCode::Char(character));
+        }
+        press(&mut panel, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell { user: Some(user), .. } if user == "root"
+        ));
+        assert!(panel.details().unwrap().ends_with("user: root"));
+    }
+
+    #[test]
+    fn long_listing_scrolls_to_selection() {
+        let mut panel = listed_panel();
+        let shown = |panel: &Panel| texts(&panel.lines(true, 4));
+        assert_eq!(
+            shown(&panel),
+            [
+                "shop",
+                "> api  Up 2 hours",
+                "  web  Up 2 hours",
+                "user: image default"
+            ]
+        );
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Down);
+        assert_eq!(
+            shown(&panel),
+            [
+                "  db  Up 2 hours",
+                "Other",
+                "> redis  Up 2 hours",
+                "user: image default"
+            ]
+        );
+        press(&mut panel, KeyCode::Up);
+        assert_eq!(
+            shown(&panel)[..3],
+            ["> db  Up 2 hours", "Other", "  redis  Up 2 hours"],
+            "no jump"
+        );
+        press(&mut panel, KeyCode::Up);
+        assert_eq!(
+            shown(&panel)[..3],
+            ["> web  Up 2 hours", "wiki", "  db  Up 2 hours"]
+        );
+        assert_eq!(texts(&panel.lines(false, 2)), ["> web  Up 2 hours", "wiki"]);
+        assert_eq!(texts(&panel.lines(true, 0)), ["user: image default"]);
+    }
+
+    #[test]
+    fn shell_and_fix_status_lines() {
+        use std::os::unix::process::ExitStatusExt;
+        let ok = std::process::ExitStatus::from_raw(0);
+        let failed = std::process::ExitStatus::from_raw(256);
+        let exited = |status, explanation| {
+            Ok(Ok(ConnectionOutcome::Exited {
+                alias: "dev".into(),
+                status,
+                explanation,
+            }))
+        };
+        let dev = host("dev");
+        assert_eq!(shell_status(&dev, exited(ok, None)), "Shell on dev closed");
+        assert_eq!(
+            shell_status(&dev, exited(failed, None)),
+            "Shell on dev exited with exit status: 1"
+        );
+        let explanation = Explanation {
+            headline: "the connection was refused".into(),
+            facts: Vec::new(),
+            next: Vec::new(),
+            raw: Vec::new(),
+            always_raw: false,
+        };
+        assert_eq!(
+            shell_status(&dev, exited(failed, Some(explanation))),
+            "the connection was refused"
+        );
+        assert_eq!(
+            shell_status(&Target::Local, Ok(Ok(ConnectionOutcome::LaunchRequested))),
+            "Opened a shell on this machine in a new terminal"
+        );
+        assert_eq!(
+            shell_status(&dev, Ok(Ok(ConnectionOutcome::LaunchFailed(failed)))),
+            "Could not open a terminal: exit status: 1"
+        );
+        assert_eq!(
+            shell_status(&dev, Ok(Err(issue(None)))),
+            "The docker daemon is not running on dev."
+        );
+
+        assert_eq!(fix_status(&Offer::StartDaemon, Ok(Ok(ok))), None);
+        let line = fix_status(&Offer::StartDaemon, Ok(Ok(failed))).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "{} exited with exit status: 1",
+                remote_command(&Offer::StartDaemon.words())
+            )
+        );
+        assert!(line.contains("sudo"), "{line}");
+    }
+
+    #[test]
+    fn abandoning_a_superseded_listing() {
+        let mut panel = listed_panel();
+        panel.set_listing(host("dev"));
+        panel.follow(Some("web"));
+        panel.set_listing(host("web"));
+        panel.abandon(host("dev"));
+        panel.abandon(host("web"));
+        assert_eq!(panel.on_focus(), PanelAction::List(host("web")));
+        panel.follow(Some("dev"));
+        assert_eq!(panel.on_focus(), PanelAction::None);
+        assert_eq!(texts(&panel.lines(false, 100))[1], "> api  Up 2 hours");
     }
 }
