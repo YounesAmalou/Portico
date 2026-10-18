@@ -8,7 +8,11 @@ use std::{
 };
 
 use crate::{
-    app::{App, AppError, HostDetails, Ownership, TestOutcome, TestReport, TestTarget},
+    app::{
+        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, Offer, Ownership,
+        Target, TestOutcome, TestReport, TestTarget,
+    },
+    container::{display_name, group, remote_command},
     discovery::DiscoveryWarning,
     explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},
@@ -84,6 +88,10 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    Containers {
+        #[arg(long = "on", value_name = "ALIAS")]
+        on: Option<String>,
+    },
 }
 
 /// ssh's exit status as Portico's: its code, or 128 plus the signal that killed it, as a shell
@@ -141,7 +149,7 @@ impl Interrupts {
     }
 }
 
-/// Runs `cli`. `handle_signals` lets `portico test` catch SIGINT, SIGTERM and SIGHUP to stop
+/// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets `portico test` catch SIGINT, SIGTERM and SIGHUP to stop
 /// its `ssh`; only the real program sets it, so tests never install process-wide handlers.
 pub fn run<I, O, E>(
     cli: Cli,
@@ -159,6 +167,7 @@ where
 {
     match execute(cli, app, input, output, error, interactive, handle_signals) {
         Ok(exit) => exit,
+        Err(message) if message.is_empty() => ExitCode::FAILURE,
         Err(message) => {
             let _ = writeln!(error, "error: {message}");
             ExitCode::FAILURE
@@ -324,6 +333,11 @@ fn execute<I: BufRead, O: Write, E: Write>(
             };
             Ok(exit_code(status))
         }
+        Some(Command::Containers { on }) => {
+            let list = list_with_offers(app, &target(on), input, output, error, interactive)?;
+            print_listing(output, &list)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Test {
             alias,
             accept_host_key,
@@ -396,6 +410,171 @@ fn execute<I: BufRead, O: Write, E: Write>(
             }
         }
     }
+}
+
+/// This machine without `--on`, otherwise the host it names.
+fn target(on: Option<String>) -> Target {
+    on.map_or(Target::Local, Target::Host)
+}
+
+/// Lists the containers of `target`. When docker refuses with a fix Portico can run, an
+/// interactive session is asked whether to run it, and on yes the listing runs once more.
+fn list_with_offers<I: BufRead, O: Write, E: Write>(
+    app: &App,
+    target: &Target,
+    input: &mut I,
+    output: &mut O,
+    error: &mut E,
+    interactive: bool,
+) -> Result<ContainerList, String> {
+    let mut offered = false;
+    loop {
+        let issue = match app.containers(target, false, None) {
+            Ok(list) => return Ok(list),
+            Err(ContainerError::Docker(issue)) => issue,
+            Err(failure) => return Err(report_container_failure(error, failure)?),
+        };
+        let offer = match &issue.offer {
+            Some(offer) if interactive && !offered => offer,
+            _ => {
+                print_docker_issue(error, &issue, true)?;
+                return Err(String::new());
+            }
+        };
+        print_docker_issue(error, &issue, false)?;
+        let prompt = format!("{} [y/N] ", offer_prompt(&issue.target, offer));
+        if !confirm(input, output, &prompt)? {
+            print_docker_issue_next(error, &issue)?;
+            return Err(String::new());
+        }
+        let status = match app.docker_fix(target, offer) {
+            Ok(status) => status,
+            Err(failure) => return Err(report_container_failure(error, failure)?),
+        };
+        if !status.success() {
+            return Err(format!(
+                "{} exited with {status}",
+                remote_command(&offer.words())
+            ));
+        }
+        offered = true;
+    }
+}
+
+/// The question asked before running `offer` on `target`.
+fn offer_prompt(target: &Target, offer: &Offer) -> String {
+    match offer {
+        Offer::JoinGroup { user, .. } => format!(
+            "Add {user} to the docker group on {target}? Members of the docker group have root-equivalent access. This runs: {}",
+            remote_command(&offer.words())
+        ),
+        Offer::StartDaemon => format!(
+            "Start the Docker service on {target}? This runs: {}",
+            remote_command(&offer.words())
+        ),
+    }
+}
+
+/// Prints the issue's headline, and with `next` what to do about it.
+fn print_docker_issue(
+    error: &mut impl Write,
+    issue: &DockerIssue,
+    next: bool,
+) -> Result<(), String> {
+    writeln!(error, "error: {}", issue.headline).map_err(|error| error.to_string())?;
+    if next {
+        print_docker_issue_next(error, issue)?;
+    }
+    Ok(())
+}
+
+fn print_docker_issue_next(error: &mut impl Write, issue: &DockerIssue) -> Result<(), String> {
+    for line in &issue.next {
+        writeln!(error, "  {line}").map_err(|error| error.to_string())?;
+    }
+    error.flush().map_err(|error| error.to_string())
+}
+
+/// Reports a container failure on `error` and returns what is left for `run` to print: the
+/// message, or nothing when the failure was explained here.
+fn report_container_failure(
+    error: &mut impl Write,
+    failure: ContainerError,
+) -> Result<String, String> {
+    match failure {
+        ContainerError::Docker(issue) => {
+            print_docker_issue(error, &issue, true)?;
+            Ok(String::new())
+        }
+        ContainerError::Ssh {
+            alias,
+            explanation,
+            stderr,
+        } => {
+            // ssh's stderr was captured, so show it above the explanation.
+            write!(error, "{stderr}").map_err(|error| error.to_string())?;
+            match explanation {
+                Some(explanation) => {
+                    print_connection_failure(error, &alias, &explanation)?;
+                    Ok(String::new())
+                }
+                None => Ok(format!("ssh to {alias} failed")),
+            }
+        }
+        failure => Ok(failure.to_string()),
+    }
+}
+
+/// Prints the containers grouped by project, each group's columns aligned, then the note
+/// and the count of skipped lines.
+fn print_listing(output: &mut impl Write, list: &ContainerList) -> Result<(), String> {
+    let containers = &list.listing.containers;
+    let mut text = String::new();
+    if containers.is_empty() {
+        text.push_str(&format!("No running containers on {}.\n", list.target));
+    }
+    for group in group(containers) {
+        text.push_str(group.project.unwrap_or("Other"));
+        text.push('\n');
+        let rows: Vec<[String; 4]> = group
+            .containers
+            .iter()
+            .map(|container| {
+                [
+                    display_name(container, containers),
+                    container.name.clone(),
+                    container.image.clone(),
+                    container.status.clone(),
+                ]
+            })
+            .collect();
+        let width = |column: usize| {
+            rows.iter()
+                .map(|row| row[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let widths = [width(0), width(1), width(2)];
+        for [display, name, image, status] in &rows {
+            text.push_str(&format!(
+                "  {display:<w0$}  {name:<w1$}  {image:<w2$}  {status}\n",
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2]
+            ));
+        }
+    }
+    if let Some(note) = &list.note {
+        text.push_str(note);
+        text.push('\n');
+    }
+    if list.listing.skipped > 0 {
+        text.push_str(&format!(
+            "Skipped {} lines docker printed that Portico could not read.\n",
+            list.listing.skipped
+        ));
+    }
+    write!(output, "{text}").map_err(|error| error.to_string())
 }
 
 fn print_untrusted_key(
@@ -595,7 +774,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::App,
+        app::{App, ContainerPrograms},
+        container::{join_group_words, remote_command},
         host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
@@ -798,6 +978,172 @@ mod tests {
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(output.ends_with("Trust this host key? [y/N] Host key not trusted.\n"));
         assert!(!dir.path().join(".ssh/known_hosts").exists());
+    }
+
+    const LISTING: &str = r#"{"id":"aaaa1111","name":"web","image":"nginx","status":"Up"}"#;
+    const DENIED: &str = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock";
+
+    /// An app whose local container programs are fakes in a temporary directory. Each fake
+    /// appends its arguments to `<name>.calls`, one call per line as `[arg][arg]…`, then
+    /// sources `<name>.behaviour` when it exists.
+    fn container_app() -> (TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["docker", "sudo", "sg", "newgrp", "sh"] {
+            let base = dir.path().join(name);
+            write_executable(
+                &base,
+                &format!(
+                    "#!/bin/sh\nprintf '[%s]' \"$@\" >> '{base}.calls'\necho >> '{base}.calls'\nif [ -f '{base}.behaviour' ]; then . '{base}.behaviour'; fi\nexit 0\n",
+                    base = base.display()
+                ),
+            );
+        }
+        let program = |name: &str| dir.path().join(name);
+        let app = App::new(
+            ManagedStore::new(ConfigPaths::from_home(dir.path())),
+            OpenSsh::new(program("ssh"), program("terminal")),
+        )
+        .with_container_programs(ContainerPrograms {
+            docker: program("docker"),
+            sudo: program("sudo"),
+            sg: program("sg"),
+            newgrp: program("newgrp"),
+            sh: program("sh"),
+        });
+        (dir, app)
+    }
+
+    fn behave(dir: &TempDir, name: &str, script: &str) {
+        fs::write(dir.path().join(format!("{name}.behaviour")), script).unwrap();
+    }
+
+    fn calls(dir: &TempDir, name: &str) -> String {
+        fs::read_to_string(dir.path().join(format!("{name}.calls"))).unwrap_or_default()
+    }
+
+    /// Docker refuses the socket; the probe reports `me` outside the docker group until
+    /// `sudo` has run, and `sg` lists once it has.
+    fn refused_until_joined(dir: &TempDir) {
+        let joined = dir.path().join("joined");
+        behave(dir, "docker", &format!("echo '{DENIED}' >&2\nexit 1\n"));
+        behave(
+            dir,
+            "sh",
+            &format!(
+                "database=me\n[ -f '{joined}' ] && database='me docker'\nprintf 'user=me\\nprocess=me\\ndatabase=%s\\ngroup=yes\\nsocket=/var/run/docker.sock\\nsocket_group=docker\\nsg=yes\\nnewgrp=yes\\nsystemctl=yes\\n' \"$database\"\n",
+                joined = joined.display()
+            ),
+        );
+        behave(dir, "sudo", &format!("touch '{}'\n", joined.display()));
+        behave(dir, "sg", &format!("echo '{LISTING}'\n"));
+    }
+
+    fn run_containers(app: &App, answer: &[u8]) -> (ExitCode, String, String) {
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+        let exit = run(
+            Cli::try_parse_from(["portico", "containers"]).unwrap(),
+            app,
+            &mut Cursor::new(answer),
+            &mut output,
+            &mut error,
+            true,
+            false,
+        );
+        (
+            exit,
+            String::from_utf8(output).unwrap(),
+            String::from_utf8(error).unwrap(),
+        )
+    }
+
+    #[test]
+    fn join_offer_accepted_runs_sudo_then_lists() {
+        let (dir, app) = container_app();
+        refused_until_joined(&dir);
+
+        let (exit, output, error) = run_containers(&app, b"y\n");
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        let join = join_group_words("me", "/var/run/docker.sock");
+        let expected_sudo: String = join[1..].iter().map(|word| format!("[{word}]")).collect();
+        assert_eq!(calls(&dir, "sudo"), format!("{expected_sudo}\n"));
+        assert_eq!(
+            output,
+            format!(
+                "Add me to the docker group on this machine? Members of the docker group have root-equivalent access. This runs: {} [y/N] \
+                 Other\n  web  web  nginx  Up\n\
+                 Ran docker through `sg docker`: other shells need `newgrp docker` or a new login.\n",
+                remote_command(&join)
+            )
+        );
+        assert_eq!(
+            error,
+            "error: me cannot use Docker on this machine: permission denied on /var/run/docker.sock.\n"
+        );
+    }
+
+    #[test]
+    fn join_offer_declined_lists_options() {
+        let (dir, app) = container_app();
+        refused_until_joined(&dir);
+
+        let (exit, output, error) = run_containers(&app, b"n\n");
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(calls(&dir, "sudo").is_empty());
+        assert!(output.ends_with("[y/N] "), "{output}");
+        assert!(
+            error.starts_with(
+                "error: me cannot use Docker on this machine: permission denied on /var/run/docker.sock.\n  Add me to the docker group (root-equivalent access): sudo sh -c "
+            ),
+            "{error}"
+        );
+        assert!(error.contains("\n  Or use rootless Docker: "), "{error}");
+    }
+
+    #[test]
+    fn a_failed_fix_stops_without_listing_again() {
+        let (dir, app) = container_app();
+        refused_until_joined(&dir);
+        behave(&dir, "sudo", "exit 1\n");
+
+        let (exit, _, error) = run_containers(&app, b"y\n");
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(calls(&dir, "docker").lines().count(), 1, "listed again");
+        assert!(
+            error.ends_with(&format!(
+                "error: {} exited with exit status: 1\n",
+                remote_command(&join_group_words("me", "/var/run/docker.sock"))
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn start_daemon_offer_runs_systemctl_through_sudo() {
+        let (dir, app) = container_app();
+        behave(
+            &dir,
+            "docker",
+            "echo 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.' >&2\nexit 1\n",
+        );
+        behave(
+            &dir,
+            "sh",
+            "printf 'user=me\\nprocess=me\\ndatabase=me\\ngroup=yes\\nsocket=/var/run/docker.sock\\nsocket_group=docker\\nsg=yes\\nnewgrp=yes\\nsystemctl=yes\\n'\n",
+        );
+
+        let (exit, output, _) = run_containers(&app, b"y\n");
+
+        // The fake daemon stays down, so the second listing fails without a second offer.
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(calls(&dir, "sudo"), "[systemctl][start][docker]\n");
+        assert_eq!(
+            output,
+            "Start the Docker service on this machine? This runs: sudo systemctl start docker [y/N] "
+        );
     }
 
     fn test_app() -> (TempDir, App) {
