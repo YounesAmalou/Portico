@@ -32,7 +32,8 @@ fn test_trust_edit_and_remove() {
     assert!(!known.trim().is_empty(), "the host key was not recorded");
 
     // Pointing the host at a closed port makes the next test explain why.
-    let closed = closed_port().to_string();
+    let closed_port = closed_port();
+    let closed = closed_port.port().to_string();
     terminal.type_text("e");
     terminal.wait_for("Enter save");
     for _ in 0..3 {

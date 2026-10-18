@@ -39,7 +39,8 @@ fn closed_port_is_a_refused_connection() {
     let sshd = Sshd::start();
     let client = Client::new();
     client.init();
-    let port = closed_port().to_string();
+    let closed = closed_port();
+    let port = closed.port().to_string();
     let user = current_user().0;
     let key = sshd.client_key();
     client.run_ok(&[
@@ -92,7 +93,8 @@ fn failing_jump_host_names_the_jump() {
     let sshd = Sshd::start();
     let client = Client::new();
     client.init();
-    let closed = closed_port().to_string();
+    let gate_port = closed_port();
+    let closed = gate_port.port().to_string();
     let live = sshd.port().to_string();
     let user = current_user().0;
     let key = sshd.client_key();
