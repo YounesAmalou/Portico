@@ -46,6 +46,8 @@ pub struct ResolvedConfig {
     pub identity_files: Vec<String>,
     pub proxy_jump: Option<String>,
     pub proxy_command: Option<String>,
+    /// `ProxyUseFdpass`: the `ProxyCommand` hands ssh its connected socket.
+    pub proxy_use_fdpass: bool,
     pub known_hosts_files: Vec<String>,
 }
 
@@ -65,6 +67,7 @@ impl ResolvedConfig {
             jump,
             hostname: &self.hostname,
             port: self.port.unwrap_or(22),
+            fd_passing: self.proxy_use_fdpass,
         }
     }
 }
@@ -258,6 +261,7 @@ impl OpenSsh {
         let mut identity_files = Vec::new();
         let mut proxy_jump = None;
         let mut proxy_command = None;
+        let mut proxy_use_fdpass = false;
         let mut known_hosts_files = Vec::new();
         for line in text.lines() {
             let Some((key, value)) = line.split_once(char::is_whitespace) else {
@@ -279,6 +283,8 @@ impl OpenSsh {
                 proxy_jump = Some(value.into());
             } else if key.eq_ignore_ascii_case("proxycommand") {
                 proxy_command = Some(value.into());
+            } else if key.eq_ignore_ascii_case("proxyusefdpass") {
+                proxy_use_fdpass = value.eq_ignore_ascii_case("yes");
             } else if key.eq_ignore_ascii_case("userknownhostsfile") {
                 known_hosts_files = value.split_whitespace().map(String::from).collect();
             }
@@ -291,6 +297,7 @@ impl OpenSsh {
             identity_files,
             proxy_jump,
             proxy_command,
+            proxy_use_fdpass,
             known_hosts_files,
         })
     }
@@ -1475,6 +1482,7 @@ mod tests {
                 jump: Some("bastion"),
                 hostname: "dev.example",
                 port: 2222,
+                fd_passing: false,
             }
         );
     }
@@ -1495,6 +1503,17 @@ mod tests {
                 jump: None,
                 hostname: "h",
                 port: 22,
+                fd_passing: false,
+            }
+        );
+        let fd_passing = resolve("hostname h\nproxycommand nc %h %p\nproxyusefdpass yes\n");
+        assert_eq!(
+            fd_passing.route(),
+            Route::Proxied {
+                jump: None,
+                hostname: "h",
+                port: 22,
+                fd_passing: true,
             }
         );
         let none = resolve("hostname h\nport 2200\nproxyjump none\nproxycommand none\n");
@@ -1880,8 +1899,9 @@ mod tests {
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
         let route = Route::Proxied {
             jump: Some("jumpv"),
-            hostname: "db.internal",
+            hostname: "127.0.0.1",
             port: 2222,
+            fd_passing: false,
         };
 
         let result = openssh
@@ -1893,13 +1913,86 @@ mod tests {
             result,
             ProbeResult::Authenticated(Authenticated {
                 host: "127.0.0.1".into(),
-                address: "db.internal".into(),
+                address: "127.0.0.1".into(),
                 port: 2222,
                 method: "publickey".into(),
                 via: Some("jumpv".into()),
             })
         );
         assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn a_multi_hop_probe_waits_for_the_targets_line() {
+        let (fake, pid) = fake_hanging_ssh(Some("authenticated-via-two-jumps"));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: Some("hopa,hopb"),
+            hostname: "127.0.0.3",
+            port: 22999,
+            fd_passing: false,
+        };
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap()
+            .0;
+
+        assert!(
+            matches!(&result, ProbeResult::Authenticated(success) if success.host == "127.0.0.3"),
+            "{result:?}"
+        );
+        assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn a_fd_passing_probe_succeeds_instead_of_timing_out() {
+        let (fake, pid) = fake_hanging_ssh(Some("authenticated-via-fdpass"));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: None,
+            hostname: "127.0.0.3",
+            port: 22999,
+            fd_passing: true,
+        };
+        let started = Instant::now();
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap()
+            .0;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(&result, ProbeResult::Authenticated(success) if success.address == "127.0.0.3"),
+            "{result:?}"
+        );
+        assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn a_hops_success_before_the_targets_failure_is_a_failure() {
+        let refused = fs::read_to_string(fixture_path("auth-refused")).unwrap();
+        let fake = fake_failure(&format!(
+            "Authenticated to 127.0.0.2 (via proxy) using \"publickey\".\n{refused}"
+        ));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: Some("hopa,hopb"),
+            hostname: "127.0.0.3",
+            port: 22999,
+            fd_passing: false,
+        };
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap()
+            .0;
+
+        assert!(
+            matches!(result, ProbeResult::Failed(Failure::AuthRefused { .. })),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1911,6 +2004,7 @@ mod tests {
             jump: Some("jumpv"),
             hostname: "127.0.0.1",
             port: 22999,
+            fd_passing: false,
         };
 
         let result = openssh

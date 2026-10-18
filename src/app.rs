@@ -969,12 +969,12 @@ mod tests {
         app.add(host("dev")).unwrap();
         for (resolved, summary) in [
             (
-                "hostname db.internal\\nuser deploy\\nport 2222\\nproxyjump bastion\\n",
-                "authenticated as deploy@db.internal:2222 via bastion (publickey)",
+                "hostname 127.0.0.1\\nuser deploy\\nport 2222\\nproxyjump bastion\\n",
+                "authenticated as deploy@127.0.0.1:2222 via bastion (publickey)",
             ),
             (
-                "hostname db.internal\\nport 22\\nproxycommand nc %%h %%p\\n",
-                "authenticated to db.internal:22 via proxy (publickey)",
+                "hostname 127.0.0.1\\nport 22\\nproxycommand nc %%h %%p\\n",
+                "authenticated to 127.0.0.1:22 via proxy (publickey)",
             ),
         ] {
             app.install_ssh(resolved, &print_fixture("authenticated-via-proxy"), ":");
