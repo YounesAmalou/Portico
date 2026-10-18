@@ -30,7 +30,7 @@ The remote command is one string that Portico builds by quoting every word for a
   - id, name, image, command, running for, status, ports, networks, mounts
   - the labels `com.docker.compose.project`, `com.docker.compose.service`, `com.docker.compose.container-number` and `com.docker.compose.project.working_dir`
 
-  Each field is written with Go's `json` template function, so any character in a value survives. Portico parses these lines with a small parser for flat string objects, so no new dependency is needed. A line that does not parse is skipped and counted, and the listing says how many lines were skipped.
+  Each field is written with Go's `json` template function, so any character in a value survives. Portico parses these lines with a small parser for flat string objects, so no new dependency is needed. Lines that do not start with `{` (shell start-up noise over ssh) are ignored. A line that starts with `{` but does not parse is skipped and counted, and the listing says how many lines were skipped.
 - **Over ssh** the CLI runs `ssh -o RemoteCommand=none -- <alias> <command>` with stdin inherited, so ssh can prompt on the terminal, and stdout and stderr captured. The TUI adds `-o BatchMode=yes`, uses a null stdin, and runs the listing on a worker thread that Esc or quitting cancels.
 - **Grouping.** Containers that have a Compose project label are grouped by project, with projects sorted by name. Inside a project they are sorted by service, then container number. Containers without the label come last, under "Other", sorted by name.
 - **Display name.** A Compose container shows its service, with `#<number>` added when the service has more than one container. Any other container shows its name.
