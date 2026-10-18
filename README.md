@@ -16,7 +16,7 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
-Portico owns only `~/.ssh/portico/config`. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH files, and each shows a preview and asks for confirmation first. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
+Portico owns only `~/.ssh/portico/config`. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents.
 
@@ -206,7 +206,7 @@ portico adopt dev-vps --yes
 portico adopt --all
 ```
 
-Portico shows an exact preview of both files first and asks before changing anything. Without `--yes` it asks in a terminal; scripts must pass `--yes` and name hosts or `--all`. Each file is backed up beside the original for the duration of the move and the backup is deleted once it succeeds; if anything fails, the files are restored. If the configuration changed since the preview, nothing is written and you run the command again.
+Portico shows an exact preview of both files first and, unless you pass `--yes`, asks before changing anything. Without `--yes` it asks in a terminal; scripts must pass `--yes` and name hosts or `--all`. Each file is backed up beside the original for the duration of the move and the backup is deleted once it succeeds; if anything fails, the files are restored. If the configuration changed since the preview, nothing is written and you run the command again.
 
 `portico export` is the way back: it moves managed hosts, comments included, into `~/.ssh/config` below the Portico include, with the same preview and options.
 
