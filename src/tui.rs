@@ -3399,8 +3399,20 @@ mod tests {
         panic::set_hook(original);
     }
 
+    /// Serialises the tests that install `Signals` and raise signals.
+    ///
+    /// Signal handlers are process-wide and are never unregistered, so a signal one test raises
+    /// runs the handlers every other test installed too: SIGTERM raised while another test holds
+    /// a foreground child would set that test's flag. These tests must not overlap.
+    fn signal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn sigint_ends_the_tui_unless_a_child_owns_the_terminal() {
+        let _lock = signal_test_lock();
         let signals = Signals::install().unwrap();
         {
             let _child = signals.foreground_child();
@@ -3413,6 +3425,7 @@ mod tests {
 
     #[test]
     fn sigterm_and_sighup_end_the_tui_even_while_a_child_runs() {
+        let _lock = signal_test_lock();
         for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
             let signals = Signals::install().unwrap();
             let _child = signals.foreground_child();
