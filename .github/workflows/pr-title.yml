@@ -13,7 +13,7 @@ jobs:
   title:
     runs-on: ubuntu-latest
     steps:
-      - name: Check the title follows type(scope)!: description
+      - name: "Check the title follows type(scope)!: description"
         env:
           TITLE: ${{ github.event.pull_request.title }}
         run: |
