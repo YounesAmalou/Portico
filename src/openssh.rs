@@ -1716,7 +1716,7 @@ mod tests {
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
         let route = Route::Proxied {
             jump: Some("jumpv"),
-            hostname: "db.internal",
+            hostname: "127.0.0.1",
             port: 2222,
         };
 
@@ -1729,13 +1729,59 @@ mod tests {
             result,
             ProbeResult::Authenticated(Authenticated {
                 host: "127.0.0.1".into(),
-                address: "db.internal".into(),
+                address: "127.0.0.1".into(),
                 port: 2222,
                 method: "publickey".into(),
                 via: Some("jumpv".into()),
             })
         );
         assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn a_multi_hop_probe_waits_for_the_targets_line() {
+        let (fake, pid) = fake_hanging_ssh(Some("authenticated-via-two-jumps"));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: Some("hopa,hopb"),
+            hostname: "127.0.0.3",
+            port: 22999,
+        };
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap()
+            .0;
+
+        assert!(
+            matches!(&result, ProbeResult::Authenticated(success) if success.host == "127.0.0.3"),
+            "{result:?}"
+        );
+        assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn a_hops_success_before_the_targets_failure_is_a_failure() {
+        let refused = fs::read_to_string(fixture_path("auth-refused")).unwrap();
+        let fake = fake_failure(&format!(
+            "Authenticated to 127.0.0.2 (via proxy) using \"publickey\".\n{refused}"
+        ));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: Some("hopa,hopb"),
+            hostname: "127.0.0.3",
+            port: 22999,
+        };
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap()
+            .0;
+
+        assert!(
+            matches!(result, ProbeResult::Failed(Failure::AuthRefused { .. })),
+            "{result:?}"
+        );
     }
 
     #[test]

@@ -189,8 +189,11 @@ pub fn fetch_key_args(entry: Option<&Path>, known_hosts: &Path, alias: &str) -> 
 /// Parses the target's success line. A direct login logs
 /// `Authenticated to <host> ([<address>]:<port>) using "<method>".`, one through a proxy
 /// `Authenticated to <host> (via proxy) using "<method>".`; only the form `route` produces is
-/// accepted, so a jump host's own success line, logged when its configuration is verbose, is
-/// never taken for the target's.
+/// accepted, so a first jump host's own success line, logged when its configuration is verbose,
+/// is never taken for the target's. A later hop is itself reached through a proxy, so a proxied
+/// line must also name the target's resolved `hostname` (OpenSSH lowercases both). A later
+/// verbose hop with the target's own `HostName` still cannot be told apart: its line carries no
+/// port.
 pub fn authenticated(line: &str, route: Route<'_>) -> Option<Authenticated> {
     let rest = line.trim().strip_prefix("Authenticated to ")?;
     match route {
@@ -213,6 +216,9 @@ pub fn authenticated(line: &str, route: Route<'_>) -> Option<Authenticated> {
             port,
         } => {
             let (host, rest) = rest.split_once(" (via proxy) using \"")?;
+            if !host.eq_ignore_ascii_case(hostname) {
+                return None;
+            }
             let method = rest.strip_suffix("\".")?;
             Some(Authenticated {
                 host: host.to_string(),
@@ -529,14 +535,14 @@ mod tests {
         let text = fixture("authenticated-via-proxy");
         let jump = Route::Proxied {
             jump: Some("bastion"),
-            hostname: "db.internal",
+            hostname: "127.0.0.1",
             port: 2222,
         };
         assert_eq!(
             text.lines().find_map(|line| authenticated(line, jump)),
             Some(Authenticated {
                 host: "127.0.0.1".into(),
-                address: "db.internal".into(),
+                address: "127.0.0.1".into(),
                 port: 2222,
                 method: "publickey".into(),
                 via: Some("bastion".into()),
@@ -544,7 +550,7 @@ mod tests {
         );
         let command = Route::Proxied {
             jump: None,
-            hostname: "db.internal",
+            hostname: "127.0.0.1",
             port: 22,
         };
         let success = text.lines().find_map(|line| authenticated(line, command));
@@ -581,6 +587,43 @@ mod tests {
             .unwrap();
         assert_eq!(success.via.as_deref(), Some("jumpv"));
         assert_eq!(authenticated(jump_only, jump), None);
+    }
+
+    #[test]
+    fn a_later_hops_proxied_login_is_not_the_targets() {
+        let route = Route::Proxied {
+            jump: Some("hopa,hopb"),
+            hostname: "127.0.0.3",
+            port: 22999,
+        };
+        let text = fixture("authenticated-via-two-jumps");
+        let hop = text
+            .lines()
+            .find(|line| line.contains("127.0.0.2 (via proxy)"))
+            .unwrap();
+        assert_eq!(authenticated(hop, route), None);
+        let success = text
+            .lines()
+            .find_map(|line| authenticated(line, route))
+            .unwrap();
+        assert_eq!(success.host, "127.0.0.3");
+        assert_eq!(success.via.as_deref(), Some("hopa,hopb"));
+    }
+
+    #[test]
+    fn the_targets_host_is_matched_ignoring_case() {
+        let route = Route::Proxied {
+            jump: None,
+            hostname: "Db.Example",
+            port: 22,
+        };
+        assert!(
+            authenticated(
+                "Authenticated to db.example (via proxy) using \"publickey\".",
+                route
+            )
+            .is_some()
+        );
     }
 
     fn refused() -> Failure {
