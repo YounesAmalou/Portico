@@ -115,21 +115,23 @@ fn portico_test_against_a_real_sshd() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(SSHD)
-        .args(["-D", "-e", "-f"])
-        .arg(&sshd_config)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut sshd = Sshd(
+        Command::new(SSHD)
+            .args(["-D", "-e", "-f"])
+            .arg(&sshd_config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let ready = Instant::now();
     loop {
         if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
             break;
         }
         assert!(
-            child.try_wait().unwrap().is_none(),
+            sshd.0.try_wait().unwrap().is_none(),
             "sshd exited before it listened"
         );
         assert!(
@@ -138,7 +140,6 @@ fn portico_test_against_a_real_sshd() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let _sshd = Sshd(child);
 
     let env = TestEnv::new();
     assert_ne!(

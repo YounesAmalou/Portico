@@ -4,7 +4,7 @@
 
 ## Purpose
 
-Saving a host proves only that OpenSSH can parse it. Whether the host can actually be logged into (right address, port, user, key, jump host and a trusted host key) is found out later, on the first real connection. This slice adds a manual connection test that answers that question on demand, from the CLI and the TUI, including for the values typed into an add or edit form before they are saved. It implemented the connection-test slice of `ROADMAP.md`, which left the roadmap when it shipped, and changes nothing else in the v1 design (`2026-09-13-portico-host-management-design.md`).
+Saving a host proves only that OpenSSH can parse it. Whether the host can actually be logged into (right address, port, user, key, jump host and a trusted host key) is found out later, on the first real connection. This slice adds a manual connection test that answers that question on demand, from the CLI and the TUI, including for the values typed into an add or edit form before they are saved. It implements the connection-test slice of `ROADMAP.md` (since removed from it) and changes nothing else in the v1 design (`2026-09-13-portico-host-management-design.md`).
 
 A test passes only when OpenSSH completes authentication. A host that answers but refuses the login, or whose host key is not trusted, fails. A test never opens a shell or runs a remote command, so it works the same for hosts that only allow port forwarding (a key restricted to forwarding, a `ForceCommand`, or no shell).
 
