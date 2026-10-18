@@ -248,7 +248,9 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             continue;
         }
         if let Event::Paste(text) = event {
-            state.handle_paste(&text);
+            if state.handle_paste(&text) == UiAction::FormEdited {
+                tester.cancel_if(|origin, _| *origin == Origin::Form);
+            }
             sync_details(&mut state, &mut resolver, false);
             redraw = true;
             continue;
@@ -360,6 +362,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }
             UiAction::Test { origin, target } => tester.start(origin, Job::Test(target)),
             UiAction::CancelTest => tester.cancel(),
+            UiAction::FormEdited => tester.cancel_if(|origin, _| *origin == Origin::Form),
             UiAction::Trust(trusted) => {
                 if let Some(pending) = state.trust.take()
                     && trusted
@@ -1119,7 +1122,14 @@ struct FormState {
     /// The reason the last save was rejected, shown until the form is edited.
     error: Option<String>,
     /// The last connection test of the typed values, shown until the form is edited.
-    test_result: Option<String>,
+    test_result: Option<FormTestResult>,
+}
+
+/// A form's connection test result, with the hint shown under it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FormTestResult {
+    line: String,
+    hint: Option<String>,
 }
 
 /// A host key the server presented that the user is deciding whether to trust.
@@ -1152,6 +1162,8 @@ enum UiAction {
         target: TestTarget,
     },
     CancelTest,
+    /// The open form's values changed, so a test of the old values no longer applies.
+    FormEdited,
     /// The answer to the trust prompt; on `true` the key to trust is in `UiState::trust`.
     Trust(bool),
 }
@@ -1265,7 +1277,7 @@ impl UiState {
         }
     }
 
-    fn handle_paste(&mut self, text: &str) {
+    fn handle_paste(&mut self, text: &str) -> UiAction {
         self.status = None;
         match self.mode {
             Mode::Filter => {
@@ -1273,12 +1285,19 @@ impl UiState {
                 self.refilter();
             }
             Mode::AddForm | Mode::EditForm => {
-                self.form.values[self.form.active].paste(text);
+                let input = &mut self.form.values[self.form.active];
+                let before = input.as_str().to_owned();
+                input.paste(text);
+                let edited = input.as_str() != before;
                 self.form.error = None;
                 self.form.test_result = None;
+                if edited {
+                    return UiAction::FormEdited;
+                }
             }
             Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
+        UiAction::None
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> UiAction {
@@ -1373,9 +1392,15 @@ impl UiState {
                 return self.test_form();
             }
             _ => {
-                if self.form.values[self.form.active].handle_key(key) {
+                let input = &mut self.form.values[self.form.active];
+                let before = input.as_str().to_owned();
+                if input.handle_key(key) {
+                    let edited = input.as_str() != before;
                     self.form.error = None;
                     self.form.test_result = None;
+                    if edited {
+                        return UiAction::FormEdited;
+                    }
                 }
             }
         }
@@ -1430,7 +1455,7 @@ impl UiState {
             outcome,
         } = finished;
         let (passed, line, hint) = match &outcome {
-            Ok(TestOutcome::UnknownHostKey { key, .. }) if self.can_show(&origin) => {
+            Ok(TestOutcome::UnknownHostKey { key, .. }) if self.can_prompt(&origin) => {
                 self.trust = Some(PendingTrust {
                     origin,
                     target,
@@ -1440,7 +1465,13 @@ impl UiState {
                 self.mode = Mode::ConfirmTrust;
                 return;
             }
-            Ok(TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. }) => {
+            // The user has moved on; a prompt now would take the keys they are typing.
+            Ok(TestOutcome::UnknownHostKey { report, .. }) => (
+                false,
+                report.summary(),
+                Some("press t to review the host key".to_owned()),
+            ),
+            Ok(TestOutcome::Done(report)) => {
                 let hint = match &report.result {
                     ProbeResult::Failed(failure) => report
                         .key_fetch_failure
@@ -1453,28 +1484,37 @@ impl UiState {
             }
             Err(error) => (false, format!("failed \u{2014} {error}"), None),
         };
-        let status = match (&origin, hint) {
+        let status = match (&origin, &hint) {
             (Origin::Host(_), Some(hint)) => format!("{}: {line} ({hint})", target.alias()),
             (Origin::Host(_), None) => format!("{}: {line}", target.alias()),
             (Origin::Form, _) => String::new(),
         };
-        self.show_result(origin, passed, line, finished_at);
+        self.show_result(origin, passed, line, hint, finished_at);
         if !status.is_empty() {
             self.status = Some(status);
         }
     }
 
-    /// Whether a result from `origin` still has somewhere to be shown.
-    fn can_show(&self, origin: &Origin) -> bool {
+    /// Whether the user is still where a test from `origin` started, so its trust prompt may
+    /// open: the host list for a saved host, the same open form for a form. Leaving a form
+    /// cancels its test, so a form result that arrives finds its own form.
+    fn can_prompt(&self, origin: &Origin) -> bool {
         match origin {
-            Origin::Host(_) => true,
+            Origin::Host(_) => self.mode == Mode::Browse,
             Origin::Form => self.in_form(),
         }
     }
 
     /// Records a result: a saved host's marks it in the list and the details pane; a form's goes
-    /// to the form, if it is still open.
-    fn show_result(&mut self, origin: Origin, passed: bool, line: String, finished_at: String) {
+    /// to the form with its `hint`, if the form is still open.
+    fn show_result(
+        &mut self,
+        origin: Origin,
+        passed: bool,
+        line: String,
+        hint: Option<String>,
+        finished_at: String,
+    ) {
         match origin {
             Origin::Host(host) => {
                 self.results.insert(
@@ -1488,7 +1528,7 @@ impl UiState {
             }
             Origin::Form => {
                 if self.in_form() {
-                    self.form.test_result = Some(line);
+                    self.form.test_result = Some(FormTestResult { line, hint });
                 }
             }
         }
@@ -1510,6 +1550,7 @@ impl UiState {
                 pending.origin,
                 false,
                 "failed \u{2014} host key not trusted".into(),
+                None,
                 local_time(),
             );
             self.status = Some("Host key not trusted".into());
@@ -1927,7 +1968,10 @@ fn form_lines(form: &FormState) -> Vec<Line<'static>> {
         ));
     }
     if let Some(result) = &form.test_result {
-        lines.push(Line::raw(format!("Connection test: {result}")));
+        lines.push(Line::raw(format!("Connection test: {}", result.line)));
+        if let Some(hint) = &result.hint {
+            lines.push(Line::styled(hint.clone(), dim));
+        }
     }
     lines
 }
@@ -2433,7 +2477,7 @@ mod tests {
 
         press(&mut state, KeyCode::Esc);
         press(&mut state, KeyCode::Char('a'));
-        assert_eq!(press(&mut state, KeyCode::Char('r')), UiAction::None);
+        assert_eq!(press(&mut state, KeyCode::Char('r')), UiAction::FormEdited);
         assert_eq!(state.form.values[0].as_str(), "r");
         assert_eq!(press(&mut state, KeyCode::F(5)), UiAction::None);
     }
@@ -3655,7 +3699,7 @@ mod tests {
         press(&mut state, KeyCode::Esc);
 
         press(&mut state, KeyCode::Char('a'));
-        assert_eq!(press(&mut state, KeyCode::Char('t')), UiAction::None);
+        assert_eq!(press(&mut state, KeyCode::Char('t')), UiAction::FormEdited);
         assert_eq!(state.form.values[0].as_str(), "t");
 
         let mut empty = test_state(Vec::new());
@@ -3804,7 +3848,11 @@ mod tests {
         press(&mut state, KeyCode::Char('a'));
         state.record_test(form_finished(), "12:34".into());
         assert_eq!(
-            state.form.test_result.as_deref(),
+            state
+                .form
+                .test_result
+                .as_ref()
+                .map(|result| result.line.as_str()),
             Some("authenticated as u@10.0.0.5:22 (publickey)")
         );
         let text = rendered(&state);
@@ -4007,6 +4055,115 @@ mod tests {
         state.record_test(finished, "12:34".into());
         assert_eq!(state.mode, Mode::Browse);
         assert!(state.trust.is_none());
+    }
+
+    #[test]
+    fn a_host_test_opens_the_prompt_only_from_browse_mode() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        press(&mut state, KeyCode::Char('/'));
+
+        state.record_test(
+            host_finished(dev.clone(), Ok(unknown_key("dev", "dev.example"))),
+            "12:34".into(),
+        );
+
+        assert_eq!(state.mode, Mode::Filter);
+        assert!(state.trust.is_none());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("dev: failed \u{2014} host key not trusted (press t to review the host key)")
+        );
+        type_text(&mut state, "yd");
+        assert_eq!(
+            state.filter.as_str(),
+            "yd",
+            "typed-ahead keys were swallowed"
+        );
+        let mark = state.results.get(&dev).expect("a recorded result");
+        assert!(!mark.passed);
+        assert_eq!(mark.line, "failed \u{2014} host key not trusted");
+
+        // From an open form, too, the host's result is recorded without a prompt.
+        let mut state = test_state(vec![dev.clone()]);
+        press(&mut state, KeyCode::Char('a'));
+        state.record_test(
+            host_finished(dev.clone(), Ok(unknown_key("dev", "dev.example"))),
+            "12:34".into(),
+        );
+        assert_eq!(state.mode, Mode::AddForm);
+        assert!(state.trust.is_none());
+        press(&mut state, KeyCode::Char('y'));
+        assert_eq!(state.form.values[0].as_str(), "y");
+        assert!(state.results.get(&dev).is_some());
+    }
+
+    #[test]
+    fn a_form_test_opens_the_prompt_only_in_its_open_form() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let finished = || Finished {
+            origin: Origin::Form,
+            target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+            outcome: Ok(unknown_key("new", "h")),
+        };
+        press(&mut state, KeyCode::Char('/'));
+        state.record_test(finished(), "12:34".into());
+        assert_eq!(state.mode, Mode::Filter);
+        assert!(state.trust.is_none());
+
+        press(&mut state, KeyCode::Esc);
+        press(&mut state, KeyCode::Char('a'));
+        state.record_test(finished(), "12:34".into());
+        assert_eq!(state.mode, Mode::ConfirmTrust);
+    }
+
+    #[test]
+    fn a_form_result_shows_its_hint_under_it() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('a'));
+        let changed = TestOutcome::Done(report(
+            "new",
+            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged),
+        ));
+
+        state.record_test(
+            Finished {
+                origin: Origin::Form,
+                target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+                outcome: Ok(changed),
+            },
+            "12:34".into(),
+        );
+
+        let lines: Vec<String> = form_lines(&state.form)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let at = lines
+            .iter()
+            .position(|line| line == "Connection test: failed \u{2014} host key changed")
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(lines[at + 1].contains("can mean an attack"), "{lines:#?}");
+        assert!(rendered(&state).contains("can mean an attack"));
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn editing_or_pasting_into_a_form_cancels_its_test() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('a'));
+        state.testing = Some("new".into());
+
+        assert_eq!(press(&mut state, KeyCode::Char('x')), UiAction::FormEdited);
+        assert_eq!(state.handle_paste("y"), UiAction::FormEdited);
+        assert_eq!(press(&mut state, KeyCode::Left), UiAction::None, "no edit");
+        assert_eq!(press(&mut state, KeyCode::Tab), UiAction::None);
+        assert_eq!(state.form.values[0].as_str(), "xy");
     }
 
     #[test]
