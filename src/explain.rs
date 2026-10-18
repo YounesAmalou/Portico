@@ -156,14 +156,22 @@ fn describe(failure: &Failure, context: &Context<'_>, key_host: &str, key_port: 
         Failure::Unreachable => with_address(Parts::new("the host is unreachable"), context)
             .next("check the address and your network"),
         Failure::TimedOut { deadline } => {
+            // Only a test sets ConnectTimeout; a connection runs with the user's own settings.
             let line = if *deadline {
-                format!("the test gave up after {} s", TEST_DEADLINE.as_secs())
+                Some(format!(
+                    "the test gave up after {} s",
+                    TEST_DEADLINE.as_secs()
+                ))
+            } else if testing {
+                Some(format!("no answer within {CONNECT_TIMEOUT_SECS} s"))
             } else {
-                format!("no answer within {CONNECT_TIMEOUT_SECS} s")
+                None
             };
-            with_address(Parts::new("the host did not answer in time"), context)
-                .fact(Label::Line, line)
-                .next("check the address, the port and any firewall")
+            let mut parts = with_address(Parts::new("the host did not answer in time"), context);
+            if let Some(line) = line {
+                parts = parts.fact(Label::Line, line);
+            }
+            parts.next("check the address, the port and any firewall")
         }
         Failure::JumpHostFailed { jump, cause } => {
             // Nothing known about the target belongs to the jump host.
@@ -664,6 +672,18 @@ mod tests {
         );
         let lines = by_hand(Failure::TimedOut { deadline: true }, Operation::Test);
         assert_eq!(lines[2], "  line:    the test gave up after 15 s");
+    }
+
+    #[test]
+    fn a_connection_timeout_states_no_limit_portico_never_set() {
+        assert_eq!(
+            by_hand(Failure::TimedOut { deadline: false }, Operation::Connect),
+            [
+                "dev: failed \u{2014} the host did not answer in time",
+                "  address: 127.0.0.1:22999",
+                "  next:    check the address, the port and any firewall",
+            ]
+        );
     }
 
     #[test]
