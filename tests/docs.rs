@@ -338,9 +338,14 @@ fn release_plz_leaves_publishing_and_the_release_to_the_tag_workflow() {
         "git_release_enable = false",
         "git_tag_name = \"v{{ version }}\"",
         "release_always = false",
+        "features_always_increment_minor = true",
     ] {
         assert!(config.contains(setting), "release-plz.toml lacks {setting}");
     }
+    assert!(
+        config.contains("pr_body") && !config.contains("generated with"),
+        "release pull requests carry no release-plz credit footer"
+    );
 }
 
 #[test]
