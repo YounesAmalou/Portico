@@ -47,7 +47,7 @@ use crate::{
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     suggest::{self, Candidate},
 };
-use containers::{Panel, PanelAction, fix_status, shell_status};
+use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
 use lister::Lister;
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
@@ -321,6 +321,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }
             UiAction::Containers(PanelAction::Fix { target, offer }) => {
                 let result = suspended(terminal, session, signals, || {
+                    show_fix(&mut io::stdout(), &target, &offer)?;
                     Ok(app.docker_fix(&target, &offer))
                 })?;
                 state.status = fix_status(&offer, result);
@@ -2189,11 +2190,11 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         Style::default()
     };
     frame.render_widget(
-        Paragraph::new(
-            state
-                .containers
-                .lines(panel_focused, usize::from(left[1].height.saturating_sub(2))),
-        )
+        Paragraph::new(state.containers.lines(
+            panel_focused,
+            usize::from(left[1].height.saturating_sub(2)),
+            usize::from(left[1].width.saturating_sub(2)),
+        ))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -5581,5 +5582,40 @@ mod tests {
         assert!(footer_text(&state).contains("Tab containers"));
         let state = test_state(Vec::new());
         assert!(footer_text(&state).contains("Tab containers"));
+    }
+
+    #[test]
+    fn a_narrow_panel_wraps_the_fix_command_in_full() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let offer = crate::app::Offer::JoinGroup {
+            user: "deploy".into(),
+            socket: "/var/run/docker.sock".into(),
+        };
+        let command = crate::container::remote_command(&offer.words());
+        let issue = crate::app::DockerIssue {
+            target: Target::Host("dev".into()),
+            problem: crate::container::DockerProblem::PermissionDenied,
+            headline: "deploy cannot use Docker on dev.".into(),
+            next: vec![format!("Add deploy to the docker group: {command}")],
+            offer: Some(offer),
+            stderr: String::new(),
+        };
+        state.containers.finish(
+            Target::Host("dev".into()),
+            Err(crate::app::ContainerError::from(issue)),
+        );
+        let backend = TestBackend::new(60, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let panel: String = (0..buffer.area.height)
+            .map(|y| (1..20).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let squashed = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(
+            squashed(&panel).contains(&squashed(&command)),
+            "{}",
+            buffer_text(&buffer)
+        );
     }
 }

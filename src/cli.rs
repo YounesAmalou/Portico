@@ -182,8 +182,9 @@ impl Interrupts {
     }
 }
 
-/// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets `portico test` catch SIGINT, SIGTERM and SIGHUP to stop
-/// its `ssh`; only the real program sets it, so tests never install process-wide handlers.
+/// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets
+/// `portico test` catch SIGINT, SIGTERM and SIGHUP to stop its `ssh`; only the real program sets
+/// it, so tests never install process-wide handlers.
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,

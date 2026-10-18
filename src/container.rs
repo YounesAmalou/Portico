@@ -452,7 +452,10 @@ pub fn decide(probe: &Probe) -> Access {
         };
     }
     let socket_is_unclaimed = matches!(probe.socket_group.as_deref(), Some("docker" | "root"));
-    if !has(&probe.database_groups) && (socket_is_unclaimed || !probe.group_exists) {
+    // Without the group, only a socket that no other group claims can be handed to it.
+    let group_is_missing =
+        !probe.group_exists && matches!(probe.socket_group.as_deref(), None | Some("root"));
+    if !has(&probe.database_groups) && (socket_is_unclaimed || group_is_missing) {
         Access::OfferJoin
     } else {
         Access::NoOffer
@@ -895,6 +898,14 @@ mod tests {
         p.process_groups.push("docker".into());
         p.database_groups.push("docker".into());
         p.socket_group = Some("docker".into());
+        assert_eq!(decide(&p), Access::NoOffer);
+    }
+
+    #[test]
+    fn no_offer_when_the_group_is_missing_and_another_group_owns_the_socket() {
+        let mut p = probe();
+        p.group_exists = false;
+        p.socket_group = Some("wheel".into());
         assert_eq!(decide(&p), Access::NoOffer);
     }
 

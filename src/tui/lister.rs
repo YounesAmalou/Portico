@@ -273,7 +273,7 @@ mod tests {
 
         assert!(!lister.is_running());
         let text: Vec<String> = panel
-            .lines(false, 10)
+            .lines(false, 10, 80)
             .iter()
             .map(ToString::to_string)
             .collect();

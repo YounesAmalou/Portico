@@ -8,7 +8,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::{TextInput, TuiError, explanation_lines};
+use super::{TextInput, TuiError, display_width, explanation_lines};
 use crate::{
     app::{ContainerError, ContainerList, Offer, Target},
     container::{Container, GroupTool, display_name, group, remote_command},
@@ -229,11 +229,12 @@ impl Panel {
         }
     }
 
-    /// The panel's lines for `height` rows, scrolled so the selected row shows, with the user
-    /// line kept last while focused.
-    pub(super) fn lines(&self, focused: bool, height: usize) -> Vec<Line<'static>> {
+    /// The panel's lines for `height` rows of `width` columns, scrolled so the selected row
+    /// shows, with the user line kept last while focused. Messages wrap to the width; container
+    /// rows are cut at the edge instead, so each stays one line.
+    pub(super) fn lines(&self, focused: bool, height: usize, width: usize) -> Vec<Line<'static>> {
         let dim = Style::default().add_modifier(Modifier::DIM);
-        let (mut lines, selected) = self.body();
+        let (mut lines, selected) = self.body(width);
         let room = height.saturating_sub(usize::from(focused));
         if lines.len() > room {
             let mut first = self.scroll.get();
@@ -262,9 +263,14 @@ impl Panel {
     }
 
     /// Every line above the user line, and the index of the selected row's line.
-    fn body(&self) -> (Vec<Line<'static>>, Option<usize>) {
+    fn body(&self, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let bold = Style::default().add_modifier(Modifier::BOLD);
+        let wrapped = |text: &str, style: Style| {
+            wrap(text, width)
+                .into_iter()
+                .map(move |line| Line::styled(line, style))
+        };
         let Some(target) = self.target() else {
             return (vec![Line::raw("No host selected")], None);
         };
@@ -273,22 +279,30 @@ impl Panel {
             PanelState::Unlisted => vec![Line::raw("Tab to list containers")],
             PanelState::Listing => vec![Line::raw("Listing…")],
             PanelState::Failed(failure) => {
-                let mut lines: Vec<Line> = failure.lines.iter().cloned().map(Line::raw).collect();
-                match failure.offer {
-                    Some(Offer::JoinGroup { .. }) => lines.push(Line::raw("g add to docker group")),
-                    Some(Offer::StartDaemon) => lines.push(Line::raw("s start docker")),
-                    None => {}
-                }
+                let mut lines: Vec<Line> = failure
+                    .lines
+                    .iter()
+                    .flat_map(|line| wrapped(line, Style::default()))
+                    .collect();
+                let hint = match failure.offer {
+                    Some(Offer::JoinGroup { .. }) => Some("g add to docker group"),
+                    Some(Offer::StartDaemon) => Some("s start docker"),
+                    None => None,
+                };
+                lines.extend(
+                    hint.into_iter()
+                        .flat_map(|hint| wrapped(hint, Style::default())),
+                );
                 lines
             }
             PanelState::Listed(list) => {
                 let mut lines = Vec::new();
                 if let (Some(_), Some(note)) = (list.via, &list.note) {
-                    lines.push(Line::styled(note.clone(), dim));
+                    lines.extend(wrapped(note, dim));
                 }
                 if list.listing.skipped > 0 {
-                    lines.push(Line::styled(
-                        format!(
+                    lines.extend(wrapped(
+                        &format!(
                             "Skipped {} lines docker printed that Portico could not read.",
                             list.listing.skipped
                         ),
@@ -297,7 +311,10 @@ impl Panel {
                 }
                 let all = &list.listing.containers;
                 if all.is_empty() {
-                    lines.push(Line::raw(format!("No running containers on {target}.")));
+                    lines.extend(wrapped(
+                        &format!("No running containers on {target}."),
+                        Style::default(),
+                    ));
                 }
                 let mut row = 0;
                 for group in group(all) {
@@ -406,6 +423,74 @@ impl Panel {
             new_terminal,
         }
     }
+}
+
+/// `text` wrapped at spaces to `width` columns, breaking a word longer than that. Continuation
+/// lines keep the text's indentation unless it would take more than half the width.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if display_width(text) <= width {
+        return vec![text.to_owned()];
+    }
+    let indent: String = text.chars().take_while(|&c| c == ' ').collect();
+    let indent = if display_width(&indent) * 2 > width {
+        String::new()
+    } else {
+        indent
+    };
+    let mut lines = Vec::new();
+    let mut line = indent.clone();
+    for mut word in text.split_whitespace() {
+        loop {
+            let empty = line.len() == indent.len();
+            let gap = usize::from(!empty);
+            if display_width(&line) + gap + display_width(word) <= width {
+                if !empty {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                break;
+            }
+            if !empty {
+                lines.push(std::mem::replace(&mut line, indent.clone()));
+                continue;
+            }
+            let room = width - display_width(&line);
+            let mut split = 0;
+            for (index, character) in word.char_indices() {
+                let next = index + character.len_utf8();
+                if split > 0 && display_width(&word[..next]) > room {
+                    break;
+                }
+                split = next;
+            }
+            line.push_str(&word[..split]);
+            lines.push(std::mem::replace(&mut line, indent.clone()));
+            word = &word[split..];
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if line.len() > indent.len() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Says on the terminal which command a fix is about to run, so it is on screen when sudo
+/// asks for a password.
+pub(super) fn show_fix(
+    out: &mut impl std::io::Write,
+    target: &Target,
+    offer: &Offer,
+) -> std::io::Result<()> {
+    let command = remote_command(&offer.words());
+    match target {
+        Target::Local => writeln!(out, "This runs: {command}"),
+        Target::Host(alias) => writeln!(out, "This runs on {alias}: {command}"),
+    }?;
+    out.flush()
 }
 
 /// The status line after a shell on `target`.
@@ -616,7 +701,7 @@ mod tests {
     fn selection_skips_headers() {
         let mut panel = listed_panel();
         let selected = |panel: &Panel| {
-            texts(&panel.lines(true, 100))
+            texts(&panel.lines(true, 100, 200))
                 .into_iter()
                 .filter(|line| line.starts_with('>'))
                 .collect::<Vec<_>>()
@@ -683,7 +768,10 @@ mod tests {
             PanelAction::None,
             "applies"
         );
-        assert_eq!(texts(&panel.lines(true, 100)).last().unwrap(), "user: root");
+        assert_eq!(
+            texts(&panel.lines(true, 100, 200)).last().unwrap(),
+            "user: root"
+        );
 
         press(&mut panel, KeyCode::Down);
         assert_eq!(
@@ -702,7 +790,7 @@ mod tests {
     fn esc_while_editing_user_restores() {
         let mut panel = listed_panel();
         assert_eq!(
-            texts(&panel.lines(true, 100)).last().unwrap(),
+            texts(&panel.lines(true, 100, 200)).last().unwrap(),
             "user: image default"
         );
         press(&mut panel, KeyCode::Char('u'));
@@ -714,7 +802,7 @@ mod tests {
         );
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None, "stays");
         assert_eq!(
-            texts(&panel.lines(true, 100)).last().unwrap(),
+            texts(&panel.lines(true, 100, 200)).last().unwrap(),
             "user: image default"
         );
         assert_eq!(
@@ -740,7 +828,7 @@ mod tests {
         let mut panel = Panel::default();
         panel.follow(Some("dev"));
         panel.set_listing(host("dev"));
-        assert_eq!(texts(&panel.lines(true, 100))[0], "Listing…");
+        assert_eq!(texts(&panel.lines(true, 100, 200))[0], "Listing…");
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::CancelList);
         assert_eq!(
             panel.on_focus(),
@@ -786,9 +874,12 @@ mod tests {
     #[test]
     fn renders_groups_and_hint() {
         let mut panel = Panel::default();
-        assert_eq!(texts(&panel.lines(false, 100)), ["No host selected"]);
+        assert_eq!(texts(&panel.lines(false, 100, 200)), ["No host selected"]);
         panel.follow(Some("dev"));
-        assert_eq!(texts(&panel.lines(false, 100)), ["Tab to list containers"]);
+        assert_eq!(
+            texts(&panel.lines(false, 100, 200)),
+            ["Tab to list containers"]
+        );
 
         let mut listed = list(host("dev"), containers());
         listed.via = Some(GroupTool::Sg);
@@ -796,7 +887,7 @@ mod tests {
         listed.listing.skipped = 2;
         panel.finish(host("dev"), Ok(listed));
         assert_eq!(
-            texts(&panel.lines(false, 100)),
+            texts(&panel.lines(false, 100, 200)),
             [
                 "Listed through sg: other shells still lack the docker group.",
                 "Skipped 2 lines docker printed that Portico could not read.",
@@ -810,13 +901,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            texts(&panel.lines(true, 100)).last().unwrap(),
+            texts(&panel.lines(true, 100, 200)).last().unwrap(),
             "user: image default"
         );
 
         panel.finish(host("dev"), Ok(list(host("dev"), Vec::new())));
         assert_eq!(
-            texts(&panel.lines(false, 100)),
+            texts(&panel.lines(false, 100, 200)),
             ["No running containers on dev."]
         );
         assert_eq!(press(&mut panel, KeyCode::Enter), PanelAction::None);
@@ -881,7 +972,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            texts(&panel.lines(false, 100)),
+            texts(&panel.lines(false, 100, 200)),
             [
                 "ssh to dev failed \u{2014} the connection was refused",
                 "  user: deploy",
@@ -898,13 +989,13 @@ mod tests {
             }),
         );
         assert_eq!(
-            texts(&panel.lines(false, 100)),
+            texts(&panel.lines(false, 100, 200)),
             ["ssh to dev failed", "ssh: Could not resolve hostname dev"]
         );
 
         panel.finish(host("dev"), Err(issue(Some(Offer::StartDaemon))));
         assert_eq!(
-            texts(&panel.lines(false, 100)),
+            texts(&panel.lines(false, 100, 200)),
             [
                 "The docker daemon is not running on dev.",
                 "Start it with: sudo systemctl start docker",
@@ -918,7 +1009,7 @@ mod tests {
         };
         panel.finish(host("dev"), Err(issue(Some(join))));
         assert_eq!(
-            texts(&panel.lines(false, 100)).last().unwrap(),
+            texts(&panel.lines(false, 100, 200)).last().unwrap(),
             "g add to docker group"
         );
 
@@ -930,7 +1021,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            texts(&panel.lines(false, 100)),
+            texts(&panel.lines(false, 100, 200)),
             ["no container matches web on dev"]
         );
     }
@@ -938,15 +1029,15 @@ mod tests {
     #[test]
     fn esc_during_refresh_restores_listing() {
         let mut panel = listed_panel();
-        let before = texts(&panel.lines(false, 100));
+        let before = texts(&panel.lines(false, 100, 200));
         assert_eq!(
             press(&mut panel, KeyCode::Char('r')),
             PanelAction::List(host("dev"))
         );
         panel.set_listing(host("dev"));
-        assert_eq!(texts(&panel.lines(false, 100)), ["Listing…"]);
+        assert_eq!(texts(&panel.lines(false, 100, 200)), ["Listing…"]);
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::CancelList);
-        assert_eq!(texts(&panel.lines(false, 100)), before);
+        assert_eq!(texts(&panel.lines(false, 100, 200)), before);
         assert_eq!(panel.on_focus(), PanelAction::None);
 
         panel.set_listing(host("dev"));
@@ -975,7 +1066,7 @@ mod tests {
         ));
         assert!(panel.details().unwrap().ends_with("user: image default"));
         assert_eq!(
-            texts(&panel.lines(true, 100)).last().unwrap(),
+            texts(&panel.lines(true, 100, 200)).last().unwrap(),
             "user: image default"
         );
 
@@ -994,7 +1085,7 @@ mod tests {
     #[test]
     fn long_listing_scrolls_to_selection() {
         let mut panel = listed_panel();
-        let shown = |panel: &Panel| texts(&panel.lines(true, 4));
+        let shown = |panel: &Panel| texts(&panel.lines(true, 4, 200));
         assert_eq!(
             shown(&panel),
             [
@@ -1027,8 +1118,11 @@ mod tests {
             shown(&panel)[..3],
             ["> web  Up 2 hours", "wiki", "  db  Up 2 hours"]
         );
-        assert_eq!(texts(&panel.lines(false, 2)), ["> web  Up 2 hours", "wiki"]);
-        assert_eq!(texts(&panel.lines(true, 0)), ["user: image default"]);
+        assert_eq!(
+            texts(&panel.lines(false, 2, 200)),
+            ["> web  Up 2 hours", "wiki"]
+        );
+        assert_eq!(texts(&panel.lines(true, 0, 200)), ["user: image default"]);
     }
 
     #[test]
@@ -1096,6 +1190,61 @@ mod tests {
         assert_eq!(panel.on_focus(), PanelAction::List(host("web")));
         panel.follow(Some("dev"));
         assert_eq!(panel.on_focus(), PanelAction::None);
-        assert_eq!(texts(&panel.lines(false, 100))[1], "> api  Up 2 hours");
+        assert_eq!(texts(&panel.lines(false, 100, 200))[1], "> api  Up 2 hours");
+    }
+
+    #[test]
+    fn long_failures_wrap_to_the_width() {
+        assert_eq!(wrap("short", 10), ["short"]);
+        assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
+        assert_eq!(
+            wrap("  next: abcdefghij", 8),
+            ["  next:", "  abcdef", "  ghij"]
+        );
+        assert_eq!(wrap("abc", 1), ["a", "b", "c"]);
+
+        let join = Offer::JoinGroup {
+            user: "deploy".into(),
+            socket: "/var/run/docker.sock".into(),
+        };
+        let command = remote_command(&join.words());
+        let mut panel = Panel::default();
+        panel.follow(Some("dev"));
+        let ContainerError::Docker(mut issue) = issue(Some(join)) else {
+            unreachable!()
+        };
+        issue.next = vec![format!("Add deploy to the docker group: {command}")];
+        panel.finish(host("dev"), Err(ContainerError::Docker(issue)));
+        let lines = texts(&panel.lines(false, 100, 20));
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 20),
+            "{lines:#?}"
+        );
+        let squashed = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(
+            squashed(&lines.concat()).contains(&squashed(&command)),
+            "{lines:#?}"
+        );
+        assert_eq!(lines[lines.len() - 2..], ["g add to docker", "group"]);
+    }
+
+    #[test]
+    fn a_fix_shows_its_command_first() {
+        let mut out = Vec::new();
+        show_fix(&mut out, &host("dev"), &Offer::StartDaemon).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "This runs on dev: {}\n",
+                remote_command(&Offer::StartDaemon.words())
+            )
+        );
+        let mut out = Vec::new();
+        show_fix(&mut out, &Target::Local, &Offer::StartDaemon).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .starts_with("This runs: sudo")
+        );
     }
 }

@@ -197,7 +197,7 @@ portico shell myapp/api#2 -u root
 portico shell 3f9a1c -n
 ```
 
-`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens `sh` in one, as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in a terminal: `fzf` when it is installed, a numbered menu otherwise. Cancelling exits with 130.
+`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in a terminal: `fzf` when it is installed, a numbered menu otherwise. Cancelling exits with 130.
 
 A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name, or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
 

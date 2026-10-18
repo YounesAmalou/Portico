@@ -117,6 +117,9 @@ impl From<DockerIssue> for ContainerError {
 }
 
 /// The programs container commands run on this machine. On a host the bare names are used.
+///
+/// Only the first word of a local command is mapped, so the `docker` inside an `sg` or `newgrp`
+/// rerun (`sg docker -c 'docker ps …'`) is the bare name, found on PATH.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerPrograms {
     pub docker: PathBuf,
