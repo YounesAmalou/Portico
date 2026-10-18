@@ -302,10 +302,9 @@ fn execute<I: BufRead, O: Write, E: Write>(
                             writeln!(error, "Press Enter to close")
                                 .map_err(|error| error.to_string())?;
                             error.flush().map_err(|error| error.to_string())?;
-                            // End of input also ends the wait.
-                            input
-                                .read_line(&mut String::new())
-                                .map_err(|error| error.to_string())?;
+                            // Best effort: end of input or a read error ends the wait, and
+                            // the exit code stays ssh's either way.
+                            let _ = input.read_line(&mut String::new());
                         }
                     }
                     status

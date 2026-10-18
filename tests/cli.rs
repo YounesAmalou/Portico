@@ -639,12 +639,33 @@ fn hold_waits_for_enter_only_after_an_explained_failure() {
         RESOLVES,
         "printf 'user@h: Permission denied (publickey).\\n' >&2; exit 255",
     );
-    let refused = env.run_with_stdin(["connect", "x", "--hold"], "\n");
-    let stderr = String::from_utf8_lossy(&refused.0.stderr).into_owned();
-    assert!(
-        refused.0.status.code() == Some(255) && stderr.ends_with("Press Enter to close\n"),
-        "{stderr}"
-    );
+    let mut child = env.spawn_piped(["connect", "x", "--hold"]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 256];
+            while let Ok(read) = std::io::Read::read(&mut stderr, &mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                seen.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !String::from_utf8_lossy(&seen.lock().unwrap()).ends_with("Press Enter to close\n") {
+        assert!(std::time::Instant::now() < deadline, "no prompt shown");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Still waiting: stdin is open and nothing has been sent.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(child.try_wait().unwrap().is_none(), "exited without Enter");
+    std::io::Write::write_all(&mut stdin, b"\n").unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(255));
+    reader.join().unwrap();
     // End of input also ends the wait.
     env.run_with_stdin(["connect", "x", "--hold"], "")
         .assert_exit_code_and_stderr_contains(255, "Press Enter to close");

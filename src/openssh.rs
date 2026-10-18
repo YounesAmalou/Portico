@@ -164,8 +164,10 @@ pub enum OpenSshError {
 
 impl OpenSsh {
     pub fn system() -> Self {
-        Self::new("ssh".into(), "xdg-terminal-exec".into())
-            .with_portico(std::env::current_exe().ok())
+        Self::new("ssh".into(), "xdg-terminal-exec".into()).with_portico(
+            // A replaced binary reports a path that no longer exists.
+            std::env::current_exe().ok().filter(|path| path.exists()),
+        )
     }
 
     pub fn new(ssh: PathBuf, terminal: PathBuf) -> Self {

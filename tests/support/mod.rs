@@ -90,6 +90,20 @@ impl TestEnv {
         RunResult(child.wait_with_output().unwrap())
     }
 
+    /// Starts Portico with stdin, stdout and stderr all piped.
+    pub fn spawn_piped<I, S>(&self, args: I) -> std::process::Child
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
     /// Starts Portico without waiting for it, its output piped.
     pub fn spawn<I, S>(&self, args: I) -> std::process::Child
     where
