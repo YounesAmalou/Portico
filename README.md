@@ -14,9 +14,9 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Tests on demand whether a host's login works, without opening a shell.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
-- Preserves existing SSH configuration and treats externally configured hosts as read-only.
+- Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
-Portico owns only `~/.ssh/portico/config`. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
+Portico owns only `~/.ssh/portico/config`. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH files, and each shows a preview and asks for confirmation first. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents.
 
@@ -189,7 +189,7 @@ The first time a host is tested its key is usually unknown. In a terminal, Porti
 - **Saving** (`add`, `edit`, `init`): when OpenSSH rejects a value, the error names the host and the field (the TUI form focuses that field). When the problem is a line in your own SSH configuration, it names that file and line (`line 12 of ~/.ssh/config`), and nothing is saved until you fix it. `portico test` and `portico connect` explain a configuration OpenSSH rejects the same way, naming the file and line.
 - **In the TUI**, the status line shows the short explanation and the details pane shows the facts and next steps for the last test and the last connection. Press `o` to unfold ssh's own output in the details pane and `o` again to fold it; in a form, `Ctrl+O` does the same for the test result. The footer offers the key only when there is output to show.
 
-Remove a managed host. Unknown and external (read-only) aliases are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
+Remove a managed host. Unknown and external aliases (adopt them first) are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
 
 ```sh
 portico remove development
