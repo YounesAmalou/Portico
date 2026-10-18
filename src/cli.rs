@@ -86,6 +86,17 @@ enum Command {
     },
 }
 
+/// ssh's exit status as Portico's: its code, or 128 plus the signal that killed it, as a shell
+/// reports it.
+fn exit_code(status: std::process::ExitStatus) -> ExitCode {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .and_then(|code| u8::try_from(code).ok())
+        .map_or(ExitCode::FAILURE, ExitCode::from)
+}
+
 /// The exit status of a `portico test` that a signal cancelled, as for SIGINT.
 const CANCELLED: u8 = 130;
 
@@ -311,10 +322,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 }
                 ConnectionOutcome::LaunchFailed(status) => status,
             };
-            Ok(status
-                .code()
-                .and_then(|code| u8::try_from(code).ok())
-                .map_or(ExitCode::FAILURE, ExitCode::from))
+            Ok(exit_code(status))
         }
         Some(Command::Test {
             alias,
