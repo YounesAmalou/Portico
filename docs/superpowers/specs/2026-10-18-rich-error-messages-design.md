@@ -36,11 +36,11 @@ Its input is the `Diagnosis` produced by `probe::classify` plus context Portico 
 | Name does not resolve | `Could not resolve hostname <name>` | the name; when no HostName is configured, that ssh looked up the alias itself → check HostName |
 | Connection refused | `Connection refused` | address and port → check the port, and that an SSH server runs there |
 | Unreachable | `No route to host`, `Network is unreachable` | address → check the address and your network |
-| Timed out | `Connection timed out`, `Operation timed out`, or Portico's deadline | address and port; which limit fired (the 5 s connect timeout or the 15 s test deadline) → check the address, port and firewall |
+| Timed out | `Connection timed out`, `Operation timed out`, or Portico's deadline | address and port; for a test, which limit fired (the 5 s connect timeout or the 15 s test deadline); a connection runs with the user's own timeout, so none is named → check the address, port and firewall |
 | Jump host failed | as today | the jump host and its own diagnosis, explained by the same rules → `portico test <jump>` when the jump is a known alias |
 | Host key unknown | as today | test: the trust prompt, unchanged; connect: that the key was declined → `portico test <alias>` to review and trust it |
-| Host key changed | the `REMOTE HOST IDENTIFICATION HAS CHANGED` banner and `Offending … key in <file>:<line>` | known-hosts file and line, and that this can mean an attack → once the new key is confirmed with the server's administrator, `ssh-keygen -R <host>`; Portico never runs it |
-| Config rejected | `<file> line <n>: <message>` (or `<file>: line <n>: …`) | the managed host and field, or the user's own file and line (see Saving) |
+| Host key changed | the `REMOTE HOST IDENTIFICATION HAS CHANGED` banner and `Offending … key in <file>:<line>` | known-hosts file and line, and that this can mean an attack → once the new key is confirmed with the server's administrator, `ssh-keygen -R <host>` (`[host]:port` off port 22); for a jump given as a known alias or a multi-hop chain, whose known_hosts name Portico cannot be sure of, remove the old entry at the Offending `<file>:<line>` instead; Portico never runs it |
+| Config rejected | `<file> line <n>: <message>` (or `<file>: line <n>: …`) | the managed host and field → `portico edit <alias>`, or in an add form (the host does not exist yet) correct that field and try again; or the user's own file and line (see Saving) |
 | Connection lost | after a session, `Broken pipe`, `Connection … closed by remote host`, `Timeout, server … not responding` | the line → connect only; no further step beyond reconnecting |
 | Other | anything else | the raw lines, always shown |
 
