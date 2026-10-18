@@ -571,6 +571,17 @@ struct Replacement {
     backup: Option<PendingFile>,
 }
 
+impl Drop for Replacement {
+    /// Keeps the backup when a panic unwinds, as the file itself may already be replaced.
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(backup) = self.backup.take()
+        {
+            backup.keep();
+        }
+    }
+}
+
 /// The temporary name stem of `kind` for `path`: `.<file name>.portico-adopt-<kind>`.
 fn temporary_stem(path: &Path, kind: &str) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -1750,6 +1761,44 @@ mod tests {
             error.to_string(),
             "effective configuration of dev would change"
         );
+    }
+
+    #[test]
+    fn a_panic_after_activation_keeps_every_backup() {
+        let fixture = two_source_fixture();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let before = tree(&fixture.paths);
+        let calls = std::cell::Cell::new(0);
+        // Validation runs two probes per alias; the first verification probe then panics.
+        let effective: Effective = &|_, alias| {
+            calls.set(calls.get() + 1);
+            assert!(calls.get() <= 4, "verification panicked");
+            Ok(format!("{alias}\n"))
+        };
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture
+                .store
+                .migrate(&plan, &["a".into(), "b".into()], effective, None)
+        }));
+        assert!(unwound.is_err());
+        let after = tree(&fixture.paths);
+        for (path, bytes) in &plan.snapshot {
+            let stem = temporary_stem(path, "backup");
+            let backups = after
+                .iter()
+                .filter(|(kept, _)| {
+                    kept.parent() == path.parent()
+                        && kept
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(&stem)
+                })
+                .map(|(_, kept)| kept)
+                .collect::<Vec<_>>();
+            assert_eq!(backups, [bytes], "{}", path.display());
+            assert_eq!(&before[path], bytes);
+        }
     }
 
     #[test]
