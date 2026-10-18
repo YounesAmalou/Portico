@@ -7,6 +7,12 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-18
+
+### Fixed
+
+- Fit jump host suggestions to the pane and ignore accents when matching
+
 ## [0.2.5] - 2026-10-18
 
 ### Added
