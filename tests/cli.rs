@@ -723,3 +723,105 @@ fn a_test_rejected_by_the_users_own_config_names_that_file() {
         "x: failed \u{2014} OpenSSH rejected the configuration\n  file: ~/.ssh/config\n  line: 3 (Bad configuration option: bogus)\n  next: fix that line, then try again\n",
     );
 }
+
+const INCLUDE: &str = "Include ~/.ssh/portico/config\n";
+
+/// An initialized home whose entry config declares `hosts` below the Portico include.
+fn env_with_external(hosts: &str) -> (TestEnv, String) {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    let entry = format!("{INCLUDE}{hosts}");
+    std::fs::write(env.ssh_config(), &entry).unwrap();
+    (env, entry)
+}
+
+#[test]
+fn adopt_requires_yes_without_a_terminal() {
+    let (env, entry) = env_with_external("Host dev\n  HostName dev.example\n");
+    let managed = std::fs::read(env.managed_config()).unwrap();
+    env.run(["adopt", "dev"])
+        .assert_failure_stderr_contains("adopt requires --yes in non-interactive mode");
+    env.run(["adopt"]).assert_failure_stderr_contains(
+        "adopt requires host aliases or --all in non-interactive mode",
+    );
+    assert_eq!(std::fs::read_to_string(env.ssh_config()).unwrap(), entry);
+    assert_eq!(std::fs::read(env.managed_config()).unwrap(), managed);
+}
+
+#[test]
+fn adopt_named_hosts_moves_only_those() {
+    let (env, _) =
+        env_with_external("Host one\n  HostName one.example\n\nHost two\n  HostName two.example\n");
+    env.run(["adopt", "two", "-y"])
+        .assert_stdout_contains("Adopted: two");
+    let entry = std::fs::read_to_string(env.ssh_config()).unwrap();
+    assert!(entry.contains("Host one") && !entry.contains("Host two"));
+    env.run(["hosts"]).assert_stdout_contains("two  managed");
+    env.run(["hosts"]).assert_stdout_contains("one  external");
+}
+
+#[test]
+fn adopt_all_skips_ineligible_hosts_with_reasons() {
+    let (env, _) = env_with_external(
+        "Host dev\n  HostName dev.example\n\nHost multi other\n  HostName m.example\n",
+    );
+    env.run(["adopt", "--all", "--yes"])
+        .assert_stdout_contains("Skipped multi: Host line declares 2 aliases");
+    env.run(["hosts"]).assert_stdout_contains("dev  managed");
+    env.run(["hosts"]).assert_stdout_contains("multi  external");
+}
+
+#[test]
+fn adopt_named_ineligible_host_fails_without_changes() {
+    let (env, entry) = env_with_external(
+        "Host dev\n  HostName dev.example\n\nHost multi other\n  HostName m.example\n",
+    );
+    let managed = std::fs::read(env.managed_config()).unwrap();
+    env.run(["adopt", "dev", "multi", "-y"])
+        .assert_failure_stderr_contains("cannot adopt multi: Host line declares 2 aliases");
+    env.run(["adopt", "nope", "-y"])
+        .assert_failure_stderr_contains("unknown host: nope");
+    assert_eq!(std::fs::read_to_string(env.ssh_config()).unwrap(), entry);
+    assert_eq!(std::fs::read(env.managed_config()).unwrap(), managed);
+}
+
+#[test]
+fn adopt_all_conflicts_with_aliases() {
+    let (env, _) = env_with_external("Host dev\n  HostName dev.example\n");
+    env.run(["adopt", "dev", "--all", "-y"])
+        .assert_failure_stderr_contains("cannot be used with");
+}
+
+#[test]
+fn export_moves_hosts_back_below_the_include() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    env.run(["export", "dev"])
+        .assert_failure_stderr_contains("export requires --yes in non-interactive mode");
+    env.run(["export", "dev", "-y"])
+        .assert_stdout_contains("Exported: dev");
+    let entry = std::fs::read_to_string(env.ssh_config()).unwrap();
+    assert!(entry.starts_with(INCLUDE));
+    assert!(entry.contains("Host dev\n"));
+    env.run(["hosts"]).assert_stdout_contains("dev  external");
+}
+
+#[test]
+fn adopt_refuses_a_block_whose_effective_configuration_would_change() {
+    if !std::path::Path::new("/usr/bin/ssh").exists() {
+        eprintln!("skipped: /usr/bin/ssh is not installed");
+        return;
+    }
+    let env = TestEnv::new();
+    env.install_program("ssh", "#!/bin/sh\nexec /usr/bin/ssh \"$@\"\n");
+    env.run(["init", "-y"]).assert_success();
+    let entry = format!("{INCLUDE}Host *\n  User root\n\nHost dev\n  HostName d\n  User alice\n");
+    std::fs::write(env.ssh_config(), &entry).unwrap();
+    let managed = std::fs::read(env.managed_config()).unwrap();
+    env.run(["adopt", "dev", "-y"])
+        .assert_failure_stderr_contains("effective configuration would change");
+    assert_eq!(std::fs::read_to_string(env.ssh_config()).unwrap(), entry);
+    assert_eq!(std::fs::read(env.managed_config()).unwrap(), managed);
+}

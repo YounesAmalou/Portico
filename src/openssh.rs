@@ -218,7 +218,6 @@ impl OpenSsh {
 
     /// The raw `ssh -G` output for `alias` when reading `entry`, for comparing
     /// effective configurations.
-    #[allow(dead_code)] // first caller arrives with the adoption preview
     pub(crate) fn effective(
         &self,
         entry: &Path,

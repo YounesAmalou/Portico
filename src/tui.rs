@@ -434,6 +434,10 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
             | TransactionError::Rollback { .. } => true,
         },
         AppError::Init(_) => true,
+        AppError::Adopt(error) => matches!(
+            error,
+            crate::adopt::AdoptError::Io { .. } | crate::adopt::AdoptError::Rollback { .. }
+        ),
         AppError::Discovery(_)
         | AppError::OpenSsh(_)
         | AppError::InvalidHost(_)
