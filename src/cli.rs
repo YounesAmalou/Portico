@@ -13,7 +13,6 @@ use crate::{
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
-    probe::ProbeResult,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -77,6 +76,9 @@ enum Command {
         alias: String,
         #[arg(long = "accept-host-key", value_name = "FINGERPRINT")]
         accept_host_key: Option<String>,
+        /// Show what ssh itself said, below the explanation.
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -293,6 +295,7 @@ fn execute<I: BufRead, O: Write>(
         Some(Command::Test {
             alias,
             accept_host_key,
+            raw,
         }) => {
             let target = TestTarget::Saved(alias);
             let interrupts = Interrupts::install(handle_signals)
@@ -305,7 +308,7 @@ fn execute<I: BufRead, O: Write>(
                     outcome => outcome.map_err(|error| error.to_string())?,
                 };
             let (report, key) = match outcome {
-                TestOutcome::Done(report) => return print_report(output, &report),
+                TestOutcome::Done(report) => return print_report(output, &report, raw),
                 TestOutcome::UnknownHostKey { report, key } => (report, key),
             };
             print_untrusted_key(output, &report.alias, &key)?;
@@ -356,7 +359,7 @@ fn execute<I: BufRead, O: Write>(
                 retested => retested.map_err(|error| error.to_string())?,
             } {
                 TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. } => {
-                    print_report(output, &report)
+                    print_report(output, &report, raw)
                 }
             }
         }
@@ -382,14 +385,18 @@ fn print_cancelled(output: &mut impl Write, alias: &str) -> Result<ExitCode, Str
     Ok(ExitCode::from(CANCELLED))
 }
 
-fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
-    let mut text = format!("{}: {}\n", report.alias, report.summary());
-    if let ProbeResult::Failed(_) = &report.result
-        && let Some(fetch) = &report.key_fetch_failure
-    {
-        text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
+fn print_report(
+    output: &mut impl Write,
+    report: &TestReport,
+    raw: bool,
+) -> Result<ExitCode, String> {
+    let lines = match &report.explanation {
+        Some(explanation) => explanation.render(&report.alias, raw),
+        None => vec![format!("{}: {}", report.alias, report.summary())],
+    };
+    for line in lines {
+        writeln!(output, "{line}").map_err(|error| error.to_string())?;
     }
-    write!(output, "{text}").map_err(|error| error.to_string())?;
     Ok(if report.passed() {
         ExitCode::SUCCESS
     } else {

@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::atomic::AtomicBool,
@@ -7,14 +8,16 @@ use std::{
 use thiserror::Error;
 
 use crate::{
+    config_error::{ConfigFiles, ConfigRejection, interpret},
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
+    explain::{Context, Explanation, Operation, explain},
     host::{Change, Host, HostChanges, HostError},
     managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
     openssh::{
         ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
         append_known_hosts,
     },
-    probe::{Failure, ProbeResult, known_hosts_path},
+    probe::{Diagnosis, Failure, ProbeResult, known_hosts_path},
 };
 
 pub struct App {
@@ -79,9 +82,21 @@ pub struct TestReport {
     pub result: ProbeResult,
     /// Why the server's key could not be fetched after an untrusted-key failure.
     pub key_fetch_failure: Option<Failure>,
+    /// What went wrong in plain words; `Some` exactly when the result is `Failed`.
+    pub explanation: Option<Explanation>,
 }
 
 impl TestReport {
+    /// Records why the server's key could not be fetched, as a further next step.
+    fn fail_key_fetch(&mut self, failure: Failure) {
+        if let Some(explanation) = &mut self.explanation {
+            explanation
+                .next
+                .push(format!("could not fetch the host key: {failure}"));
+        }
+        self.key_fetch_failure = Some(failure);
+    }
+
     pub fn passed(&self) -> bool {
         matches!(self.result, ProbeResult::Authenticated(_))
     }
@@ -415,8 +430,9 @@ impl App {
         cancelled: &AtomicBool,
     ) -> Result<TestOutcome, AppError> {
         let alias = target.alias();
-        let run =
-            |entry: Option<&Path>, alias: &str| self.test_entry(entry, alias, trust, cancelled);
+        let run = |entry: Option<&Path>, files: &ConfigFiles<'_>, alias: &str| {
+            self.test_entry(entry, files, alias, trust, cancelled)
+        };
         match target {
             TestTarget::Saved(alias) => {
                 let alias = self
@@ -426,11 +442,19 @@ impl App {
                     .find(|host| host.alias.eq_ignore_ascii_case(alias))
                     .ok_or_else(|| AppError::UnknownHost(alias.clone()))?
                     .alias;
-                run(None, &alias)
+                let paths = self.store.paths();
+                let managed_text = fs::read_to_string(&paths.managed).unwrap_or_default();
+                let files = ConfigFiles {
+                    managed: &paths.managed,
+                    managed_text: &managed_text,
+                    entry: &paths.entry,
+                };
+                // ssh reads the user's own configuration, not a staged one.
+                run(None, &files, &alias)
             }
             TestTarget::Add(host) => self.store.preview(
                 |config| self.add_mutation(config, host.clone()),
-                |files| run(Some(files.entry), alias),
+                |files| run(Some(files.entry), &files, alias),
                 Some(cancelled),
             ),
             TestTarget::Edit {
@@ -438,20 +462,36 @@ impl App {
                 changes,
             } => self.store.preview(
                 |config| self.edit_mutation(config, saved, changes.clone()),
-                |files| run(Some(files.entry), alias),
+                |files| run(Some(files.entry), &files, alias),
                 Some(cancelled),
             ),
         }
     }
 
+    /// Tests `alias`, reading `entry` instead of the user's configuration when given; `files`
+    /// name the files a configuration error is traced to.
     fn test_entry(
         &self,
         entry: Option<&Path>,
+        files: &ConfigFiles<'_>,
         alias: &str,
         trust: Option<&PresentedKey>,
         cancelled: &AtomicBool,
     ) -> Result<TestOutcome, AppError> {
-        let resolved = self.openssh.resolve_with(entry, alias, Some(cancelled))?;
+        let resolved = match self.openssh.resolve_with(entry, alias, Some(cancelled)) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if let OpenSshError::Failed { stderr, .. } = &error {
+                    let rejection = interpret(stderr, files);
+                    if !matches!(rejection, ConfigRejection::Unrecognised { .. }) {
+                        return Ok(TestOutcome::Done(
+                            self.rejected_report(alias, stderr, rejection),
+                        ));
+                    }
+                }
+                return Err(error.into());
+            }
+        };
         if let Some(key) = trust {
             let paths = self.store.paths();
             let home = paths.ssh_dir.parent().unwrap_or(&paths.ssh_dir);
@@ -471,12 +511,24 @@ impl App {
             })?;
         }
         let route = resolved.route();
-        let result = self.openssh.probe(entry, alias, route, cancelled)?;
+        let (result, raw) = self.openssh.probe(entry, alias, route, cancelled)?;
+        let explanation = match &result {
+            ProbeResult::Failed(failure) => Some(self.explain_failure(
+                Diagnosis {
+                    failure: failure.clone(),
+                    raw,
+                },
+                alias,
+                &resolved,
+            )),
+            ProbeResult::Authenticated(_) => None,
+        };
         let mut report = TestReport {
             alias: alias.into(),
             user: resolved.user.clone(),
             result,
             key_fetch_failure: None,
+            explanation,
         };
         if report.result != ProbeResult::Failed(Failure::HostKeyUnknown) {
             return Ok(TestOutcome::Done(report));
@@ -488,16 +540,92 @@ impl App {
             {
                 // A key nobody can see the fingerprint of must not be offered for trust.
                 KeyFetch::Presented(key) if key.fingerprints.is_empty() => {
-                    report.key_fetch_failure = Some(Failure::Other(
+                    report.fail_key_fetch(Failure::Other(
                         "ssh-keygen reported no fingerprint for the host key".into(),
                     ));
                     TestOutcome::Done(report)
                 }
                 KeyFetch::Presented(key) => TestOutcome::UnknownHostKey { report, key },
                 KeyFetch::Failed(failure) => {
-                    report.key_fetch_failure = Some(failure);
+                    report.fail_key_fetch(failure);
                     TestOutcome::Done(report)
                 }
+            },
+        )
+    }
+
+    fn home(&self) -> &Path {
+        let paths = self.store.paths();
+        paths.ssh_dir.parent().unwrap_or(&paths.ssh_dir)
+    }
+
+    /// The test result for a configuration OpenSSH refused before it could connect.
+    fn rejected_report(&self, alias: &str, stderr: &str, rejection: ConfigRejection) -> TestReport {
+        let diagnosis = Diagnosis {
+            failure: Failure::ConfigRejected(rejection),
+            raw: stderr
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.trim_end().to_string())
+                .collect(),
+        };
+        let context = Context {
+            alias,
+            operation: Operation::Test,
+            user: None,
+            hostname: None,
+            port: None,
+            identity_files: &[],
+            jump_is_known: false,
+            home: self.home(),
+        };
+        TestReport {
+            alias: alias.into(),
+            user: None,
+            explanation: Some(explain(&diagnosis, &context)),
+            result: ProbeResult::Failed(diagnosis.failure),
+            key_fetch_failure: None,
+        }
+    }
+
+    fn explain_failure(
+        &self,
+        diagnosis: Diagnosis,
+        alias: &str,
+        resolved: &ResolvedConfig,
+    ) -> Explanation {
+        let home = self.home();
+        let identity_files: Vec<(String, bool)> = resolved
+            .identity_files
+            .iter()
+            .map(|file| {
+                let path = match file.strip_prefix("~/") {
+                    Some(rest) => home.join(rest),
+                    None => PathBuf::from(file),
+                };
+                (file.clone(), path.exists())
+            })
+            .collect();
+        let jump_is_known = match &diagnosis.failure {
+            Failure::JumpHostFailed { jump, .. } => self.hosts().is_ok_and(|inventory| {
+                inventory
+                    .hosts
+                    .iter()
+                    .any(|host| host.alias.eq_ignore_ascii_case(jump))
+            }),
+            _ => false,
+        };
+        explain(
+            &diagnosis,
+            &Context {
+                alias,
+                operation: Operation::Test,
+                user: resolved.user.as_deref(),
+                hostname: Some(&resolved.hostname),
+                port: resolved.port,
+                identity_files: &identity_files,
+                jump_is_known,
+                home,
             },
         )
     }
@@ -815,6 +943,54 @@ mod tests {
         assert_eq!(report.result, ProbeResult::Failed(Failure::HostKeyUnknown));
         assert_eq!(key.fingerprints.len(), 1);
         assert_eq!(key.lines, b"h ssh-ed25519 AAAA\n");
+    }
+
+    #[test]
+    fn a_failed_test_carries_its_explanation_and_a_pass_has_none() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        app.install_ssh(USER_DEPLOY, &print_fixture("auth-refused"), ":");
+
+        let TestOutcome::Done(report) = app.test(&TestTarget::Saved("dev".into())).unwrap() else {
+            panic!("expected a report")
+        };
+        let lines = report.explanation.unwrap().render("dev", false);
+
+        assert_eq!(
+            lines[0],
+            "dev: failed \u{2014} the server refused the login"
+        );
+        assert_eq!(lines[1], "  user:    deploy@h:22");
+
+        app.install_ssh(USER_DEPLOY, &print_fixture("authenticated"), ":");
+        let TestOutcome::Done(report) = app.test(&TestTarget::Saved("dev".into())).unwrap() else {
+            panic!("expected a report")
+        };
+        assert_eq!(report.explanation, None);
+    }
+
+    #[test]
+    fn a_configuration_ssh_refuses_is_a_failed_report_not_an_error() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        write_executable(
+            app._dir.path().join("ssh"),
+            "#!/bin/sh\necho '/home/x/.ssh/extra: line 4: Bad configuration option: bogus' >&2\nexit 255\n",
+        );
+
+        let TestOutcome::Done(report) = app.test(&TestTarget::Saved("dev".into())).unwrap() else {
+            panic!("expected a report")
+        };
+
+        assert_eq!(
+            report.result,
+            ProbeResult::Failed(Failure::ConfigRejected(ConfigRejection::UserFile {
+                path: "/home/x/.ssh/extra".into(),
+                line: 4,
+                message: "Bad configuration option: bogus".into(),
+            }))
+        );
+        assert!(report.explanation.is_some());
     }
 
     #[test]

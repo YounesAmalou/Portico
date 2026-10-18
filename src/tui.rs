@@ -3706,6 +3706,7 @@ mod tests {
             user: Some("u".into()),
             result,
             key_fetch_failure: None,
+            explanation: None,
         }
     }
 

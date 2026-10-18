@@ -357,18 +357,28 @@ fn test_reports_success_and_exits_zero() {
 }
 
 #[test]
-#[ignore = "rendered in Task 5"]
-fn test_reports_each_failure_with_its_hint_and_exits_one() {
+fn test_reports_each_failure_as_an_explanation_and_exits_one() {
     let env = env_with_dev();
     let refused = format!("cat '{}' >&2; exit 255", fixture("auth-refused"));
     install_fake_ssh(&env, &refused, &refused);
-    let result = env.run(["test", "dev"]);
+    env.run(["test", "dev"]).assert_exit_code_and_stdout_contains(
+        1,
+        "dev: failed \u{2014} the server refused the login\n  user:    deploy@h:22\n  offered: /tmp/portico-fixture/wrong (file)\n  next:    check User and IdentityFile for dev, and that the public key is in the\n           server's authorized_keys\n",
+    );
+}
+
+#[test]
+fn test_raw_prints_what_ssh_said() {
+    let env = env_with_dev();
+    let refused = "printf 'user@h: Permission denied (publickey).\\n' >&2; exit 255";
+    install_fake_ssh(&env, refused, refused);
+    let result = env.run(["test", "x", "--raw"]);
+    result.assert_failure_stderr_contains("unknown host: x");
+    let result = env.run(["test", "dev", "--raw"]);
     result.assert_exit_code_and_stdout_contains(
         1,
-        "dev: failed \u{2014} authentication refused (server accepts: publickey)",
+        "  ssh said:\n    user@h: Permission denied (publickey).\n",
     );
-    let result = env.run(["test", "dev"]);
-    result.assert_exit_code_and_stdout_contains(1, "hint: check the user and the key");
 }
 
 #[test]

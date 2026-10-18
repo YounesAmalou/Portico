@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::managed::write_unique;
 use crate::probe::{
     Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, TEST_STDERR_LIMIT, authenticated,
-    classify, fetch_key_args, test_args,
+    classify, diagnose, fetch_key_args, test_args,
 };
 
 /// How long a new-terminal launcher may run before its launch counts as requested.
@@ -263,7 +263,7 @@ impl OpenSsh {
     }
 
     /// Tries to log in to `alias` without a terminal, stopping as soon as
-    /// OpenSSH reports success. `route` says whether the alias goes through a
+    /// OpenSSH reports success; a failure comes with ssh's own lines. `route` says whether the alias goes through a
     /// jump host or proxy, which decides the success line to wait for and lets
     /// a failure at the jump host be told apart from one at the target.
     pub(crate) fn probe(
@@ -272,7 +272,7 @@ impl OpenSsh {
         alias: &str,
         route: Route<'_>,
         cancelled: &AtomicBool,
-    ) -> Result<ProbeResult, OpenSshError> {
+    ) -> Result<(ProbeResult, Vec<String>), OpenSshError> {
         self.probe_with_deadline(entry, alias, route, cancelled, TEST_DEADLINE)
     }
 
@@ -283,14 +283,19 @@ impl OpenSsh {
         route: Route<'_>,
         cancelled: &AtomicBool,
         deadline: Duration,
-    ) -> Result<ProbeResult, OpenSshError> {
+    ) -> Result<(ProbeResult, Vec<String>), OpenSshError> {
         Ok(
             match self.watch_ssh(test_args(entry, alias), route, cancelled, deadline)? {
-                Watched::Authenticated(success) => ProbeResult::Authenticated(success),
+                Watched::Authenticated(success) => {
+                    (ProbeResult::Authenticated(success), Vec::new())
+                }
                 Watched::Ended {
                     stderr,
                     deadline_reached,
-                } => ProbeResult::Failed(classify(&stderr, deadline_reached, route.jump())),
+                } => {
+                    let diagnosis = diagnose(&stderr, deadline_reached, route);
+                    (ProbeResult::Failed(diagnosis.failure), diagnosis.raw)
+                }
             },
         )
     }
@@ -1571,7 +1576,8 @@ mod tests {
 
         let result = openssh
             .probe(None, "dev", Route::Direct, &AtomicBool::new(false))
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -1603,7 +1609,8 @@ mod tests {
 
         let result = openssh
             .probe(None, "dev", route, &AtomicBool::new(false))
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert_eq!(
             result,
@@ -1631,7 +1638,8 @@ mod tests {
 
         let result = openssh
             .probe(None, "dev", route, &AtomicBool::new(false))
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert!(matches!(result, ProbeResult::Failed(_)), "{result:?}");
     }
@@ -1674,7 +1682,8 @@ mod tests {
         assert_eq!(
             openssh
                 .probe(None, "dev", Route::Direct, &AtomicBool::new(false))
-                .unwrap(),
+                .unwrap()
+                .0,
             ProbeResult::Failed(Failure::AuthRefused {
                 methods: "publickey".into(),
                 offered: vec![OfferedKey {
@@ -1723,7 +1732,7 @@ mod tests {
                 Duration::from_secs(1),
             )
         });
-        let result = probe.join().unwrap().unwrap();
+        let result = probe.join().unwrap().unwrap().0;
 
         assert_eq!(
             result,
@@ -1758,7 +1767,8 @@ mod tests {
         let result = results
             .recv_timeout(Duration::from_secs(5))
             .expect("the probe ran past its deadline")
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert_eq!(
             result,

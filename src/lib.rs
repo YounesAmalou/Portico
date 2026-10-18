@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod config_error;
 pub mod discovery;
+pub mod explain;
 pub mod host;
 pub mod managed;
 pub mod openssh;
