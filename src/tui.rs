@@ -1503,12 +1503,12 @@ impl UiState {
     }
 
     /// Opens, recomputes or closes the jump host dropdown for the hop under the ProxyJump cursor.
-    /// `forced` (Ctrl+Space) keeps it open for an empty hop or an exact match, for as long as it
-    /// stays open.
-    fn suggest(&mut self, forced: bool) {
+    /// `on_demand` (Ctrl+Space) opens it even for an empty hop or an exact match; afterwards it
+    /// stays open for an empty hop for as long as it stays open, but an exact match still closes it.
+    fn suggest(&mut self, on_demand: bool) {
         let form = &mut self.form;
         let previous = form.suggestions.take();
-        let forced = forced || previous.as_ref().is_some_and(|list| list.forced);
+        let forced = on_demand || previous.as_ref().is_some_and(|list| list.forced);
         if form.active != PROXY_JUMP {
             return;
         }
@@ -1547,7 +1547,7 @@ impl UiState {
         let exact = items
             .iter()
             .any(|item| item.alias.eq_ignore_ascii_case(&hop.query));
-        if items.is_empty() || (!forced && (hop.query.is_empty() || exact)) {
+        if items.is_empty() || (!forced && hop.query.is_empty()) || (!on_demand && exact) {
             return;
         }
         let selected = previous
@@ -1575,12 +1575,13 @@ impl UiState {
         let Some(hop) = suggest::current_hop(input.as_str(), input.cursor) else {
             return UiAction::None;
         };
+        let (before, cursor) = (input.as_str().to_owned(), input.cursor);
         (input.text, input.cursor) =
             suggest::apply(input.as_str(), &hop, &list.items[list.selected].alias);
-        self.form.error = None;
-        self.form.test_result = None;
-        self.show_raw = false;
-        UiAction::FormEdited
+        let action = self.form_input_changed(&before, cursor);
+        // A pick always closes the dropdown, whatever recomputing it found.
+        self.form.suggestions = None;
+        action
     }
 
     fn submit_form(&mut self) -> UiAction {
@@ -5137,5 +5138,24 @@ mod tests {
         );
         let state = form_with_active_field(0);
         assert!(!footer_text(&state).contains("Ctrl+Space"));
+    }
+
+    #[test]
+    fn typing_an_exact_alias_after_ctrl_space_closes_suggestions() {
+        let mut state = proxy_jump_form(jump_hosts());
+        state.handle_key(ctrl(' '));
+        type_text(&mut state, "bastion");
+        assert_eq!(state.form.suggestions, None);
+    }
+
+    #[test]
+    fn picking_the_alias_already_typed_is_not_an_edit() {
+        let mut state = proxy_jump_form(jump_hosts());
+        type_text(&mut state, "bastion");
+        state.handle_key(ctrl(' '));
+        assert_eq!(listed(&state), ["bastion", "bastion-eu"]);
+        assert_eq!(press(&mut state, KeyCode::Enter), UiAction::None);
+        assert_eq!(state.form.values[PROXY_JUMP].as_str(), "bastion");
+        assert_eq!(state.form.suggestions, None);
     }
 }
