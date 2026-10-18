@@ -10,16 +10,17 @@ use std::fs;
 use std::io;
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use thiserror::Error;
 
 use crate::discovery::{DiscoveryError, DiscoveryWarning, discover};
 use crate::host::Host;
 use crate::managed::{
-    HostComments, ManagedConfig, ManagedStore, TransactionError, normalize_path, render_host,
-    symlink_target, write_unique,
+    HostComments, ManagedConfig, ManagedStore, PendingFile, TransactionError, acquire_lock,
+    normalize_path, open_lock, render_host, symlink_target, sync_dir, write_unique,
 };
 
 /// Whether hosts move into the managed fragment or out of it.
@@ -514,6 +515,344 @@ impl ManagedStore {
     }
 }
 
+/// A step of the transaction at which a test makes the next attempt fail.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailPoint {
+    ManagedRename,
+    /// The n-th rename of a user file, from 0.
+    FileRename(usize),
+    DirectorySync,
+    Verify,
+    /// The first write of a restored file.
+    Restore,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The armed fail points; each fails once.
+    static FAIL_AT: std::cell::RefCell<Vec<FailPoint>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Fails with an injected error when the test armed `point`.
+#[cfg(test)]
+fn fail_point(point: FailPoint) -> io::Result<()> {
+    let armed = FAIL_AT.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let index = armed.iter().position(|armed| *armed == point);
+        index.map(|index| armed.remove(index)).is_some()
+    });
+    if armed {
+        return Err(io::Error::other(format!("injected failure at {point:?}")));
+    }
+    Ok(())
+}
+
+/// One file the transaction replaces, in activation order.
+struct Replacement {
+    /// The file, symlinks resolved; a key of the plan's snapshot.
+    path: PathBuf,
+    dir: PathBuf,
+    mode: u32,
+    /// Whether it is the managed fragment rather than a user file.
+    managed: bool,
+    /// The new contents, staged beside the file until activated.
+    candidate: Option<PendingFile>,
+    /// The previous contents, beside the file, removed when dropped.
+    backup: Option<PendingFile>,
+}
+
+/// The temporary name stem of `kind` for `path`: `.<file name>.portico-adopt-<kind>`.
+fn temporary_stem(path: &Path, kind: &str) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    format!(".{name}.portico-adopt-{kind}")
+}
+
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.into(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// The `ssh -G` output of `alias` against `entry`, or the OpenSSH error naming the alias.
+fn resolve(effective: Effective<'_>, entry: &Path, alias: &str) -> Result<String, AdoptError> {
+    effective(entry, alias).map_err(|stderr| AdoptError::OpenSsh {
+        alias: alias.into(),
+        stderr: stderr.trim().into(),
+    })
+}
+
+/// `Changed` when the effective configuration of `alias` differs between `before` and `after`.
+fn require_same(alias: &str, before: &str, after: &str) -> Result<(), AdoptError> {
+    if before == after {
+        return Ok(());
+    }
+    let (removed, added) = changed_lines(before, after);
+    Err(AdoptError::Changed {
+        alias: alias.into(),
+        removed,
+        added,
+    })
+}
+
+impl ManagedStore {
+    /// Moves the selected hosts of `plan` as one all-or-nothing transaction and returns their
+    /// aliases as declared, in alphabetical order.
+    ///
+    /// Under Portico's lock, every file the plan read must still hold the bytes it read, or
+    /// nothing is written. The candidates of every file are staged and validated with `ssh -G`
+    /// before anything is activated, every replaced file is backed up beside itself, and a
+    /// failure while activating or verifying restores every replaced file from its backup.
+    /// `cancelled` is honoured only while waiting for the lock.
+    pub fn migrate(
+        &self,
+        plan: &MigrationPlan,
+        selection: &[String],
+        effective: Effective<'_>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Vec<String>, AdoptError> {
+        let moves = plan.selected(selection)?;
+        let changes = plan.changes(&moves)?;
+        if moves.is_empty() {
+            return Ok(Vec::new());
+        }
+        let aliases = moves
+            .iter()
+            .map(|item| item.host.alias().to_owned())
+            .collect::<Vec<_>>();
+        let paths = self.paths();
+
+        // 1. Lock.
+        self.ensure_ready()?;
+        let lock = open_lock(&paths.lock).map_err(|source| io_error(&paths.lock, source))?;
+        acquire_lock(&lock, cancelled).map_err(|source| io_error(&paths.lock, source))?;
+
+        // 2. Re-check.
+        self.recheck(plan, &moves)?;
+
+        // 3. Stage.
+        let mut replacements = Vec::with_capacity(changes.len());
+        for (path, contents) in &changes {
+            let managed = *path == plan.managed;
+            let mode = if managed {
+                0o600
+            } else {
+                fs::metadata(path)
+                    .map_err(|source| io_error(path, source))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+            };
+            let dir = parent_dir(path);
+            let candidate = write_unique(&dir, &temporary_stem(path, "candidate"), contents, mode)
+                .map_err(|source| io_error(&dir, source))?;
+            replacements.push(Replacement {
+                path: path.clone(),
+                dir,
+                mode,
+                managed,
+                candidate: Some(candidate),
+                backup: None,
+            });
+        }
+
+        // 4. Validate before activation.
+        let candidate_of = |path: &Path| {
+            replacements
+                .iter()
+                .find(|replacement| replacement.path == path)
+                .and_then(|replacement| replacement.candidate.as_ref())
+                .map(PendingFile::path)
+        };
+        let managed_candidate = candidate_of(&plan.managed).expect("the managed fragment changes");
+        let entry = &plan.snapshot[&plan.entry];
+        let after_entry = match plan.direction {
+            Direction::Adopt => entry,
+            Direction::Export => {
+                &changes
+                    .iter()
+                    .find(|(path, _)| *path == plan.entry)
+                    .expect("export changes the entry config")
+                    .1
+            }
+        };
+        let before_file = self.stage_entry(entry, &paths.managed)?;
+        let after_file = self.stage_entry(after_entry, managed_candidate)?;
+        let mut before = Vec::with_capacity(aliases.len());
+        for alias in &aliases {
+            let old = resolve(effective, before_file.path(), alias)?;
+            require_same(alias, &old, &resolve(effective, after_file.path(), alias)?)?;
+            before.push(old);
+        }
+        drop((before_file, after_file));
+
+        // 5. Back up.
+        let mut dirs = Vec::new();
+        for replacement in &mut replacements {
+            let backup = write_unique(
+                &replacement.dir,
+                &temporary_stem(&replacement.path, "backup"),
+                &plan.snapshot[&replacement.path],
+                replacement.mode,
+            )
+            .map_err(|source| io_error(&replacement.dir, source))?;
+            replacement.backup = Some(backup);
+            if !dirs.contains(&replacement.dir) {
+                dirs.push(replacement.dir.clone());
+            }
+        }
+        for dir in &dirs {
+            sync_dir(dir).map_err(|source| io_error(dir, source))?;
+        }
+
+        // 6. Activate, then 7. verify.
+        let mut activated = 0;
+        let result = (|| {
+            for replacement in &mut replacements {
+                let candidate = replacement.candidate.take().expect("staged once");
+                if replacement.managed {
+                    write_unique(
+                        &paths.portico_dir,
+                        ".config.portico-backup",
+                        &plan.snapshot[&plan.managed],
+                        0o600,
+                    )
+                    .and_then(|backup| backup.rename_to(&paths.backup))
+                    .map_err(|source| io_error(&paths.backup, source))?;
+                    #[cfg(test)]
+                    fail_point(FailPoint::ManagedRename)
+                        .map_err(|source| io_error(&replacement.path, source))?;
+                    candidate
+                        .rename_to(&replacement.path)
+                        .map_err(|source| io_error(&replacement.path, source))?;
+                } else {
+                    // ponytail: editors do not share the lock; this narrows their window to
+                    // the instant between this read and the rename, as `portico init` accepts.
+                    match fs::read(&replacement.path) {
+                        Ok(bytes) if bytes == plan.snapshot[&replacement.path] => {}
+                        _ => return Err(AdoptError::Stale),
+                    }
+                    #[cfg(test)]
+                    fail_point(FailPoint::FileRename(match plan.direction {
+                        // The managed fragment was activated first.
+                        Direction::Adopt => activated - 1,
+                        Direction::Export => activated,
+                    }))
+                    .map_err(|source| io_error(&replacement.path, source))?;
+                    candidate
+                        .rename_to(&replacement.path)
+                        .map_err(|source| io_error(&replacement.path, source))?;
+                }
+                activated += 1;
+            }
+            for dir in &dirs {
+                #[cfg(test)]
+                fail_point(FailPoint::DirectorySync).map_err(|source| io_error(dir, source))?;
+                sync_dir(dir).map_err(|source| io_error(dir, source))?;
+            }
+
+            #[cfg(test)]
+            fail_point(FailPoint::Verify).map_err(|source| io_error(&plan.entry, source))?;
+            let installed =
+                fs::read(&plan.entry).map_err(|source| io_error(&plan.entry, source))?;
+            let installed = self.stage_entry(&installed, &paths.managed)?;
+            for (alias, old) in aliases.iter().zip(&before) {
+                require_same(alias, old, &resolve(effective, installed.path(), alias)?)?;
+            }
+            Ok(())
+        })();
+
+        // 8. Finish: dropping the replacements removes the backups and any unused candidate.
+        let Err(original) = result else {
+            return Ok(aliases);
+        };
+        let replaced = &mut replacements[..activated];
+        let mut failures = Vec::new();
+        for replacement in replaced.iter().rev() {
+            // The backup holds these same bytes; restoring from memory needs no extra read.
+            let restored = (|| {
+                #[cfg(test)]
+                fail_point(FailPoint::Restore)?;
+                write_unique(
+                    &replacement.dir,
+                    &temporary_stem(&replacement.path, "restore"),
+                    &plan.snapshot[&replacement.path],
+                    replacement.mode,
+                )?
+                .rename_to(&replacement.path)
+            })();
+            if let Err(source) = restored {
+                failures.push(io_error(&replacement.path, source).to_string());
+            }
+        }
+        let mut synced = Vec::new();
+        for replacement in replaced.iter() {
+            if !synced.contains(&replacement.dir) {
+                if let Err(source) = sync_dir(&replacement.dir) {
+                    failures.push(io_error(&replacement.dir, source).to_string());
+                }
+                synced.push(replacement.dir.clone());
+            }
+        }
+        if failures.is_empty() {
+            return Err(original);
+        }
+        let backups = replaced
+            .iter_mut()
+            .map(|replacement| {
+                let backup = replacement
+                    .backup
+                    .take()
+                    .expect("backed up before activation");
+                (replacement.path.clone(), backup.keep())
+            })
+            .collect();
+        Err(AdoptError::Rollback {
+            original: Box::new(original),
+            failures,
+            backups,
+        })
+    }
+
+    /// `Stale` unless every file `plan` read still holds the bytes it read, the entry config
+    /// still resolves to the same file and, for adoption, discovery still finds each selected
+    /// alias declared once, in the file it moves from.
+    fn recheck(&self, plan: &MigrationPlan, moves: &[&Move]) -> Result<(), AdoptError> {
+        for (path, bytes) in &plan.snapshot {
+            match fs::read(path) {
+                Ok(current) if current == *bytes => {}
+                _ => return Err(AdoptError::Stale),
+            }
+        }
+        if self.entry_file().ok().map(file_key).as_ref() != Some(&plan.entry) {
+            return Err(AdoptError::Stale);
+        }
+        if plan.direction == Direction::Adopt {
+            let paths = self.paths();
+            let discovery = discover(&paths.entry, &paths.managed)?;
+            if !discovery.aliases_complete {
+                return Err(AdoptError::Stale);
+            }
+            for item in moves {
+                let mut declarations = discovery
+                    .hosts
+                    .iter()
+                    .filter(|external| external.alias.eq_ignore_ascii_case(item.host.alias()));
+                let unchanged = match (declarations.next(), declarations.next()) {
+                    (Some(external), None) => symlink_target(&external.source)
+                        .is_ok_and(|target| file_key(target) == item.file),
+                    _ => false,
+                };
+                if !unchanged {
+                    return Err(AdoptError::Stale);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl MigrationPlan {
     /// The candidates that may be selected.
     pub fn eligible(&self) -> impl Iterator<Item = &Candidate> {
@@ -624,6 +963,7 @@ impl MigrationPlan {
 mod tests {
     use super::*;
     use crate::managed::{ConfigPaths, ManagedStore};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
@@ -1024,6 +1364,530 @@ mod tests {
             format!(
                 "{original}; rollback also failed, so the state is uncertain; restore /a from /.a.bak; restore /b from /.b.bak; rollback: disk full"
             )
+        );
+    }
+    /// Every file under the temporary home with its bytes, apart from Portico's lock and the
+    /// managed fragment's `config.bak`; comparing two of these also proves no temporary file
+    /// was left behind.
+    fn tree(paths: &ConfigPaths) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let kind = fs::symlink_metadata(&path).unwrap().file_type();
+                if kind.is_dir() {
+                    walk(&path, files);
+                } else if kind.is_symlink() {
+                    let target = fs::read_link(&path).unwrap();
+                    files.insert(path, target.into_os_string().into_encoded_bytes());
+                } else {
+                    files.insert(path.clone(), fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        walk(&paths.ssh_dir, &mut files);
+        files.remove(&paths.lock);
+        files.remove(&paths.backup);
+        files
+    }
+
+    /// Asserts that no temporary file of a transaction remains anywhere under `.ssh`.
+    fn assert_no_temporary_files(paths: &ConfigPaths) {
+        for path in tree(paths).keys() {
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.starts_with(".config.portico-") && !name.contains(".portico-adopt-"),
+                "left behind {}",
+                path.display()
+            );
+        }
+    }
+
+    fn arm(points: &[FailPoint]) {
+        FAIL_AT.with(|armed| *armed.borrow_mut() = points.to_vec());
+    }
+
+    fn migrate(
+        fixture: &Fixture,
+        plan: &MigrationPlan,
+        aliases: &[&str],
+    ) -> Result<Vec<String>, AdoptError> {
+        let selection = aliases
+            .iter()
+            .map(|alias| alias.to_string())
+            .collect::<Vec<_>>();
+        fixture.store.migrate(plan, &selection, same(), None)
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn adopting_moves_exactly_the_shown_lines() {
+        let fixture = fixture(
+            "\nHost keep\n  HostName k\n\n# box\nHost dev\n  HostName d\n  User bob\n\nHost after\n  HostName a\n",
+        );
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        assert_eq!(migrate(&fixture, &plan, &["DEV"]).unwrap(), ["dev"]);
+        assert_eq!(
+            read(&fixture.paths.entry),
+            "Include ~/.ssh/portico/config\n\nHost keep\n  HostName k\n\nHost after\n  HostName a\n"
+        );
+        assert_eq!(
+            read(&fixture.paths.managed),
+            format!("{HEADER}\n# box\nHost dev\n    HostName d\n    User bob\n")
+        );
+        assert_eq!(
+            read(&fixture.paths.backup),
+            HEADER,
+            "config.bak holds the previous fragment"
+        );
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn adopting_from_an_included_file_and_the_entry_in_one_go() {
+        let fixture = fixture("Include extra.conf\nHost a\n  HostName a\n");
+        let extra = fixture.write(
+            "extra.conf",
+            b"Host b\n  HostName b\n\nHost c\n  HostName c\n# tail\n",
+        );
+        fs::set_permissions(&extra, fs::Permissions::from_mode(0o640)).unwrap();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        assert_eq!(migrate(&fixture, &plan, &["b", "a"]).unwrap(), ["a", "b"]);
+        assert_eq!(
+            read(&fixture.paths.entry),
+            "Include ~/.ssh/portico/config\nInclude extra.conf\n"
+        );
+        assert_eq!(read(&extra), "Host c\n  HostName c\n# tail\n");
+        assert_eq!(
+            fs::metadata(&extra).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        assert_eq!(
+            read(&fixture.paths.managed),
+            format!("{HEADER}\nHost a\n    HostName a\n\nHost b\n    HostName b\n")
+        );
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn two_blocks_in_one_file_are_removed_together() {
+        let fixture = fixture("Include extra.conf\n");
+        let extra = fixture.write(
+            "extra.conf",
+            b"Host b\n  HostName b\n\nHost c\r\n  HostName c\r\n\r\nHost d\n  HostName d\n",
+        );
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let preview = plan.preview(&["b".into(), "d".into()]).unwrap();
+        assert_eq!(
+            preview.files.len(),
+            2,
+            "one change for the managed fragment, one for the file"
+        );
+        assert_eq!(migrate(&fixture, &plan, &["d", "b"]).unwrap(), ["b", "d"]);
+        assert_eq!(read(&extra), "Host c\r\n  HostName c\r\n\r\n");
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn stale_snapshot_is_refused_and_nothing_changes() {
+        let fixture = fixture("Host dev\n  HostName d\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let mut entry = fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.paths.entry)
+            .unwrap();
+        std::io::Write::write_all(&mut entry, b"# edited\n").unwrap();
+        let before = tree(&fixture.paths);
+        let error = migrate(&fixture, &plan, &["dev"]).unwrap_err();
+        assert!(matches!(error, AdoptError::Stale), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "the configuration changed since the preview; run the command again to see a fresh preview"
+        );
+        assert_eq!(tree(&fixture.paths), before);
+        assert!(!fixture.paths.backup.exists());
+    }
+
+    #[test]
+    fn a_retargeted_entry_link_is_stale() {
+        let fixture = fixture("Host dev\n  HostName d\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let moved = fixture.paths.ssh_dir.join("moved");
+        fs::copy(&fixture.paths.entry, &moved).unwrap();
+        fs::remove_file(&fixture.paths.entry).unwrap();
+        symlink("moved", &fixture.paths.entry).unwrap();
+        let before = tree(&fixture.paths);
+        assert!(matches!(
+            migrate(&fixture, &plan, &["dev"]),
+            Err(AdoptError::Stale)
+        ));
+        assert_eq!(tree(&fixture.paths), before);
+    }
+
+    #[test]
+    fn a_new_declaration_found_by_discovery_is_stale() {
+        let fixture = fixture("Include conf.d/*\n");
+        fixture.write("conf.d/a.conf", b"Host dev\n  HostName d\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        fixture.write("conf.d/b.conf", b"Host dev\n  HostName other\n");
+        let before = tree(&fixture.paths);
+        assert!(matches!(
+            migrate(&fixture, &plan, &["dev"]),
+            Err(AdoptError::Stale)
+        ));
+        assert_eq!(tree(&fixture.paths), before);
+    }
+
+    #[test]
+    fn unknown_ineligible_and_empty_selections_take_no_lock() {
+        let fixture = fixture("Host dev\n  HostName d\nHost fwd\n  ForwardAgent yes\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let before = tree(&fixture.paths);
+        assert!(matches!(
+            migrate(&fixture, &plan, &["nope"]),
+            Err(AdoptError::UnknownHost(alias)) if alias == "nope"
+        ));
+        assert_eq!(
+            migrate(&fixture, &plan, &["dev", "fwd"])
+                .unwrap_err()
+                .to_string(),
+            "cannot adopt fwd: ForwardAgent is not supported by Portico"
+        );
+        assert!(migrate(&fixture, &plan, &[]).unwrap().is_empty());
+        assert!(!fixture.paths.lock.exists());
+        assert_eq!(tree(&fixture.paths), before);
+    }
+
+    #[test]
+    fn validation_difference_at_apply_time_changes_nothing() {
+        let fixture = fixture("Host dev\n  HostName d\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let before = tree(&fixture.paths);
+        let effective: Effective = &|entry, _| {
+            Ok(if read(entry).contains("adopt-candidate") {
+                "user alice\n".into()
+            } else {
+                "user root\n".into()
+            })
+        };
+        let error = fixture
+            .store
+            .migrate(&plan, &["dev".into()], effective, None)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "effective configuration of dev would change: -user root, +user alice"
+        );
+        let failing: Effective = &|_, _| Err("ssh: bad option\n".into());
+        let error = fixture
+            .store
+            .migrate(&plan, &["dev".into()], failing, None)
+            .unwrap_err();
+        assert!(
+            matches!(error, AdoptError::OpenSsh { ref alias, .. } if alias == "dev"),
+            "{error}"
+        );
+        assert_eq!(tree(&fixture.paths), before);
+        assert!(!fixture.paths.backup.exists());
+    }
+
+    /// A ready home with hosts to adopt from the entry and from an included file.
+    fn two_source_fixture() -> Fixture {
+        let fixture = fixture(
+            "Include extra.conf\n\n# entry host\nHost a\n  HostName a\r\n\nHost z\n  HostName z\n",
+        );
+        fixture.write(
+            "extra.conf",
+            b"Host b\n  HostName b\n  User bob # old\n\nHost y\n  HostName y\n",
+        );
+        fixture
+    }
+
+    #[test]
+    fn each_activation_failure_rolls_back_byte_for_byte() {
+        for point in [
+            FailPoint::ManagedRename,
+            FailPoint::FileRename(0),
+            FailPoint::FileRename(1),
+            FailPoint::DirectorySync,
+            FailPoint::Verify,
+        ] {
+            let fixture = two_source_fixture();
+            let plan = fixture.store.adoption_plan(same()).unwrap();
+            let before = tree(&fixture.paths);
+            arm(&[point]);
+            let error = migrate(&fixture, &plan, &["a", "b"]).unwrap_err();
+            arm(&[]);
+            assert!(matches!(error, AdoptError::Io { .. }), "{point:?}: {error}");
+            assert!(error.to_string().contains("injected"), "{point:?}: {error}");
+            assert_eq!(tree(&fixture.paths), before, "{point:?}");
+        }
+    }
+
+    #[test]
+    fn each_export_activation_failure_rolls_back_byte_for_byte() {
+        for point in [
+            FailPoint::FileRename(0),
+            FailPoint::ManagedRename,
+            FailPoint::DirectorySync,
+            FailPoint::Verify,
+        ] {
+            let fixture = fixture_with(
+                "Host other\n  HostName o\n",
+                "\n# box\nHost dev\n    HostName d\n",
+            );
+            let plan = fixture.store.export_plan(same()).unwrap();
+            let before = tree(&fixture.paths);
+            arm(&[point]);
+            let error = migrate(&fixture, &plan, &["dev"]).unwrap_err();
+            arm(&[]);
+            assert!(error.to_string().contains("injected"), "{point:?}: {error}");
+            assert_eq!(tree(&fixture.paths), before, "{point:?}");
+        }
+    }
+
+    #[test]
+    fn a_verification_difference_rolls_back() {
+        let fixture = two_source_fixture();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let before = tree(&fixture.paths);
+        let calls = std::cell::Cell::new(0);
+        // Validation runs two probes per alias; the installed configuration then differs.
+        let effective: Effective = &|_, alias| {
+            calls.set(calls.get() + 1);
+            Ok(if calls.get() > 4 {
+                format!("{alias} changed\n")
+            } else {
+                format!("{alias}\n")
+            })
+        };
+        let error = fixture
+            .store
+            .migrate(&plan, &["a".into(), "b".into()], effective, None)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "effective configuration of a would change: -a, +a changed"
+        );
+        assert_eq!(tree(&fixture.paths), before);
+    }
+
+    #[test]
+    fn an_editor_change_during_the_transaction_is_caught_before_its_rename() {
+        let fixture = two_source_fixture();
+        let extra = fixture.paths.ssh_dir.join("extra.conf");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let edited = b"Host b\n  HostName b\n  User bob # old\n\nHost y\n  HostName y\n# editor\n";
+        let effective: Effective = &|_, _| {
+            fs::write(&extra, edited).unwrap();
+            Ok(String::new())
+        };
+        let mut expected = tree(&fixture.paths);
+        expected.insert(extra.clone(), edited.to_vec());
+        let error = fixture
+            .store
+            .migrate(&plan, &["a".into(), "b".into()], effective, None)
+            .unwrap_err();
+        assert!(matches!(error, AdoptError::Stale), "{error}");
+        assert_eq!(
+            tree(&fixture.paths),
+            expected,
+            "the editor's change is kept, the rest restored"
+        );
+    }
+
+    #[test]
+    fn failed_restore_keeps_backups_and_names_them() {
+        let fixture = two_source_fixture();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let before = tree(&fixture.paths);
+        arm(&[FailPoint::FileRename(1), FailPoint::Restore]);
+        let error = migrate(&fixture, &plan, &["a", "b"]).unwrap_err();
+        arm(&[]);
+        let AdoptError::Rollback {
+            original,
+            failures,
+            backups,
+        } = &error
+        else {
+            panic!("expected a rollback error, got {error}");
+        };
+        assert!(original.to_string().contains("injected"), "{original}");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        let files = backups
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            [fixture.paths.managed.clone(), fixture.paths.entry.clone()],
+            "every replaced file, in activation order"
+        );
+        let message = error.to_string();
+        for (file, backup) in backups {
+            assert!(
+                message.contains(&format!(
+                    "restore {} from {}",
+                    file.display(),
+                    backup.display()
+                )),
+                "{message}"
+            );
+            assert_eq!(
+                fs::read(backup).unwrap(),
+                before[file],
+                "{}",
+                backup.display()
+            );
+            let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+            let stem = format!(
+                ".{}.portico-adopt-backup-",
+                file.file_name().unwrap().to_string_lossy()
+            );
+            assert!(name.starts_with(&stem), "{name}");
+            assert_eq!(backup.parent(), file.parent());
+        }
+        // The entry restore was the one that failed; the managed fragment was restored.
+        assert_eq!(
+            fs::read(&fixture.paths.managed).unwrap(),
+            before[&fixture.paths.managed]
+        );
+        let mut after = tree(&fixture.paths);
+        for (_, backup) in backups {
+            after.remove(backup);
+        }
+        after.remove(&fixture.paths.entry);
+        let mut expected = before.clone();
+        expected.remove(&fixture.paths.entry);
+        assert_eq!(
+            after, expected,
+            "only the kept backups remain besides the files"
+        );
+    }
+
+    #[test]
+    fn symlinked_source_keeps_the_link() {
+        let fixture = fixture("");
+        let target = fixture.write(
+            "dotfiles/config",
+            b"Include ~/.ssh/portico/config\nHost dev\n  HostName d\n",
+        );
+        fs::remove_file(&fixture.paths.entry).unwrap();
+        symlink("dotfiles/config", &fixture.paths.entry).unwrap();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        assert_eq!(migrate(&fixture, &plan, &["dev"]).unwrap(), ["dev"]);
+        assert!(
+            fs::symlink_metadata(&fixture.paths.entry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read(&target), "Include ~/.ssh/portico/config\n");
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn export_inserts_below_include_and_empties_managed() {
+        let fixture = fixture_with(
+            "Host other\n  HostName o\n",
+            "\n# box\nHost dev\n    HostName d\n    User bob\n\nHost abc\n    HostName c\n",
+        );
+        let plan = fixture.store.export_plan(same()).unwrap();
+        assert_eq!(
+            migrate(&fixture, &plan, &["dev", "abc"]).unwrap(),
+            ["abc", "dev"]
+        );
+        assert_eq!(
+            read(&fixture.paths.entry),
+            "Include ~/.ssh/portico/config\nHost abc\n    HostName c\n\n# box\nHost dev\n    HostName d\n    User bob\n\nHost other\n  HostName o\n"
+        );
+        assert_eq!(read(&fixture.paths.managed), HEADER);
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn adopt_then_export_round_trips_comments() {
+        let fixture = fixture(
+            "\n# box\n# second\nHost dev\n  # the name\n  HostName d\n  User bob  # old account\n\nHost other\n  HostName o\n",
+        );
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        migrate(&fixture, &plan, &["dev"]).unwrap();
+        let plan = fixture.store.export_plan(same()).unwrap();
+        migrate(&fixture, &plan, &["dev"]).unwrap();
+        assert_eq!(
+            read(&fixture.paths.entry),
+            "Include ~/.ssh/portico/config\n# box\n# second\nHost dev\n    # the name\n    HostName d\n    # old account\n    User bob\n\n\nHost other\n  HostName o\n"
+        );
+        assert_eq!(read(&fixture.paths.managed), HEADER);
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn export_through_a_symlinked_entry_keeps_the_link() {
+        let fixture = fixture_with("", "\nHost dev\n    HostName d\n");
+        let target = fixture.paths.ssh_dir.join("dotfiles/config");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::rename(&fixture.paths.entry, &target).unwrap();
+        symlink("dotfiles/config", &fixture.paths.entry).unwrap();
+        let plan = fixture.store.export_plan(same()).unwrap();
+        assert_eq!(migrate(&fixture, &plan, &["dev"]).unwrap(), ["dev"]);
+        assert!(
+            fs::symlink_metadata(&fixture.paths.entry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            read(&target),
+            "Include ~/.ssh/portico/config\nHost dev\n    HostName d\n\n"
+        );
+        assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn concurrent_portico_mutation_waits_for_the_lock() {
+        use fs2::FileExt;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let fixture = fixture("Host dev\n  HostName d\n");
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        let lock = fs::File::create(&fixture.paths.lock).unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let before = tree(&fixture.paths);
+        let cancelled = AtomicBool::new(true);
+        let error = fixture
+            .store
+            .migrate(&plan, &["dev".into()], same(), Some(&cancelled))
+            .unwrap_err();
+        assert!(error.to_string().contains("operation cancelled"), "{error}");
+        assert_eq!(tree(&fixture.paths), before);
+
+        let (locked, released) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            FileExt::unlock(&lock).unwrap();
+            locked.send(Instant::now()).unwrap();
+        });
+        let not_cancelled = AtomicBool::new(false);
+        let result = fixture
+            .store
+            .migrate(&plan, &["dev".into()], same(), Some(&not_cancelled));
+        let finished = Instant::now();
+        holder.join().unwrap();
+        assert_eq!(result.unwrap(), ["dev"]);
+        assert!(
+            finished >= released.recv().unwrap(),
+            "migrate waited for the lock"
+        );
+        assert_eq!(
+            read(&fixture.paths.entry),
+            "Include ~/.ssh/portico/config\n"
         );
     }
 }

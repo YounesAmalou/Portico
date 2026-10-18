@@ -1436,6 +1436,11 @@ impl PendingFile {
         self.path = None;
         Ok(())
     }
+
+    /// Keeps the file instead of removing it when dropped, and returns its path.
+    pub(crate) fn keep(mut self) -> PathBuf {
+        self.path.take().expect("pending file has a path")
+    }
 }
 
 impl Drop for PendingFile {
