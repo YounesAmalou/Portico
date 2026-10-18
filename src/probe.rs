@@ -342,13 +342,16 @@ fn offending_key(line: &str) -> Option<(String, u32)> {
 
 fn key_facts(all: &[&str], route: Route<'_>) -> KeyFacts {
     // OpenSSH does not pass its log level to a ProxyJump child, so debug key lines are normally
-    // the target's. A jump host the user configured verbose logs its own, ending in a direct
-    // `Authenticated to` line; only what follows that line is the target's.
+    // the target's. A jump host the user configured verbose logs its own, ending in its own
+    // `Authenticated to` line (any that is not the target's); only what follows the last such
+    // line is the target's.
     let from = match route {
         Route::Direct => 0,
         Route::Proxied { .. } => all
             .iter()
-            .rposition(|line| authenticated(line, Route::Direct).is_some())
+            .rposition(|line| {
+                line.trim().starts_with("Authenticated to ") && authenticated(line, route).is_none()
+            })
             .map_or(0, |at| at + 1),
     };
     let lines = &all[from..];
@@ -879,6 +882,26 @@ mod tests {
                     debug1: Offering public key: /k/target ED25519 SHA256:t explicit\n\
                     user@target: Permission denied (publickey).\n";
         let Failure::AuthRefused { offered, .. } = diagnose(text, false, jump).failure else {
+            panic!()
+        };
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].path, "/k/target");
+    }
+
+    #[test]
+    fn keys_after_a_later_hops_proxied_login_are_the_targets() {
+        let route = Route::Proxied {
+            jump: Some("hopa,hopb"),
+            hostname: "127.0.0.3",
+            port: 22999,
+            fd_passing: false,
+        };
+        let text = "Authenticated to 127.0.0.1 ([127.0.0.1]:22999) using \"publickey\".\n\
+                    debug1: Offering public key: /k/hopb ED25519 SHA256:b explicit\n\
+                    Authenticated to 127.0.0.2 (via proxy) using \"publickey\".\n\
+                    debug1: Offering public key: /k/target ED25519 SHA256:t explicit\n\
+                    user@target: Permission denied (publickey).\n";
+        let Failure::AuthRefused { offered, .. } = diagnose(text, false, route).failure else {
             panic!()
         };
         assert_eq!(offered.len(), 1);
