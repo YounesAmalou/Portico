@@ -12,6 +12,41 @@ release_always = false
 semver_check = false
 # Only user-visible commits open or update a release pull request.
 release_commits = "^(feat|fix|security|perf|refactor|changed)"
+# Before 1.0, a feature raises the minor version (0.2.6 -> 0.3.0) and a fix the patch.
+features_always_increment_minor = true
+# release-plz's default body without its credit footer.
+pr_body = """
+{% set changes %}
+{%- for release in releases %}
+{%- if release.changelog %}{% if releases | length > 1 %}
+## `{{ release.package }}`
+{% endif %}
+<blockquote>
+
+{% if release.title %}## {{ release.title }}
+{% endif %}
+{{ release.changelog }}
+</blockquote>{% endif %}
+{% endfor %}
+{% endset %}
+
+## New release
+{% for release in releases %}
+* `{{ release.package }}`: {% if release.previous_version and release.previous_version != release.next_version %}{{ release.previous_version }} -> {% endif %}{{ release.next_version }}{% if release.semver_check == "incompatible" %} (⚠ API breaking changes){% elif release.semver_check == "compatible" %} (✓ API compatible changes){% endif %}
+{%- endfor %}
+{%- for release in releases %}{% if release.breaking_changes %}
+
+### ⚠ `{{ release.package }}` breaking changes
+
+```text
+{{ release.breaking_changes }}
+```{% endif %}{% endfor %}
+{% if changes %}
+<details><summary><i><b>Changelog</b></i></summary><p>
+{{ changes }}
+</p></details>
+{% endif %}
+"""
 
 [changelog]
 header = """# Changelog
