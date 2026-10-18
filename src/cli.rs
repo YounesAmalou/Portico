@@ -384,12 +384,10 @@ fn print_cancelled(output: &mut impl Write, alias: &str) -> Result<ExitCode, Str
 
 fn print_report(output: &mut impl Write, report: &TestReport) -> Result<ExitCode, String> {
     let mut text = format!("{}: {}\n", report.alias, report.summary());
-    if let ProbeResult::Failed(failure) = &report.result {
-        if let Some(fetch) = &report.key_fetch_failure {
-            text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
-        } else if let Some(hint) = failure.hint() {
-            text.push_str(&format!("hint: {hint}\n"));
-        }
+    if let ProbeResult::Failed(_) = &report.result
+        && let Some(fetch) = &report.key_fetch_failure
+    {
+        text.push_str(&format!("hint: could not fetch the host key: {fetch}\n"));
     }
     write!(output, "{text}").map_err(|error| error.to_string())?;
     Ok(if report.passed() {

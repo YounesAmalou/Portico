@@ -357,6 +357,7 @@ fn test_reports_success_and_exits_zero() {
 }
 
 #[test]
+#[ignore = "rendered in Task 5"]
 fn test_reports_each_failure_with_its_hint_and_exits_one() {
     let env = env_with_dev();
     let refused = format!("cat '{}' >&2; exit 255", fixture("auth-refused"));

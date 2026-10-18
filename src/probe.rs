@@ -41,18 +41,63 @@ impl<'a> Route<'a> {
     }
 }
 
+/// Where an offered key came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeySource {
+    File,
+    Agent,
+}
+
+/// A public key ssh offered the server, as its debug log names it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfferedKey {
+    pub path: String,
+    pub fingerprint: String,
+    pub source: KeySource,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Failure {
     HostKeyUnknown,
-    HostKeyChanged,
-    AuthRefused { methods: String },
-    NameUnresolved { host: String },
+    /// `known_hosts` is the file and line OpenSSH names as holding the old key.
+    HostKeyChanged {
+        known_hosts: Option<(String, u32)>,
+    },
+    /// `unusable` lists keys the server would accept but ssh could not use (a passphrase, say).
+    AuthRefused {
+        methods: String,
+        offered: Vec<OfferedKey>,
+        unusable: Vec<String>,
+    },
+    NameUnresolved {
+        host: String,
+    },
     ConnectionRefused,
     Unreachable,
-    TimedOut,
-    JumpHostFailed { jump: String, detail: String },
+    /// `deadline` is true when Portico's own deadline fired rather than ssh timing out.
+    TimedOut {
+        deadline: bool,
+    },
+    JumpHostFailed {
+        jump: String,
+        cause: Box<Failure>,
+    },
+    /// The session was established and then dropped.
+    ConnectionLost {
+        line: String,
+    },
     Other(String),
 }
+
+/// A failure with every line of ssh's own message (debug output left out) behind it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Diagnosis {
+    pub failure: Failure,
+    pub raw: Vec<String>,
+}
+
+/// The most ssh stderr a test keeps, counted from the end.
+pub const TEST_STDERR_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProbeResult {
@@ -64,41 +109,19 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failure::HostKeyUnknown => write!(f, "host key not trusted"),
-            Failure::HostKeyChanged => write!(f, "host key changed"),
-            Failure::AuthRefused { methods } => {
+            Failure::HostKeyChanged { .. } => write!(f, "host key changed"),
+            Failure::AuthRefused { methods, .. } => {
                 write!(f, "authentication refused (server accepts: {methods})")
             }
             Failure::NameUnresolved { host } => write!(f, "host name {host} does not resolve"),
             Failure::ConnectionRefused => write!(f, "connection refused"),
             Failure::Unreachable => write!(f, "host unreachable"),
-            Failure::TimedOut => write!(f, "timed out"),
-            Failure::JumpHostFailed { jump, detail } => {
-                write!(f, "jump host {jump} failed: {detail}")
+            Failure::TimedOut { .. } => write!(f, "timed out"),
+            Failure::JumpHostFailed { jump, cause } => {
+                write!(f, "jump host {jump} failed: {cause}")
             }
+            Failure::ConnectionLost { .. } => write!(f, "connection lost"),
             Failure::Other(line) => write!(f, "{line}"),
-        }
-    }
-}
-
-impl Failure {
-    pub fn hint(&self) -> Option<&'static str> {
-        match self {
-            Failure::HostKeyUnknown | Failure::Other(_) => None,
-            Failure::HostKeyChanged => Some(
-                "the server's host key differs from the one you trusted, which can mean an attack; confirm the new key with the server's administrator before changing known_hosts",
-            ),
-            Failure::AuthRefused { .. } => Some(
-                "check the user and the key; a key with a passphrase must be loaded in an agent",
-            ),
-            Failure::NameUnresolved { .. } => Some("check the host name"),
-            Failure::ConnectionRefused => {
-                Some("check the port, and that an SSH server is running there")
-            }
-            Failure::Unreachable => Some("check the address and your network"),
-            Failure::TimedOut => Some(
-                "the host did not answer in time; check the address, the port and any firewall",
-            ),
-            Failure::JumpHostFailed { .. } => Some("test the jump host on its own first"),
         }
     }
 }
@@ -228,10 +251,92 @@ fn last_line(lines: &[&str]) -> String {
         .to_string()
 }
 
-fn classify_lines(lines: &[&str], deadline_reached: bool) -> Failure {
+/// What ssh's debug log says about keys and `known_hosts`.
+#[derive(Default)]
+struct KeyFacts {
+    offered: Vec<OfferedKey>,
+    unusable: Vec<String>,
+    known_hosts: Option<(String, u32)>,
+}
+
+/// Splits `<path> <type> <fingerprint> <flags…>`; the path may contain spaces.
+fn key_fields(rest: &str) -> Option<(String, &str, Vec<&str>)> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let at = tokens
+        .iter()
+        .position(|token| token.starts_with("SHA256:") || token.starts_with("MD5:"))?;
+    if at < 2 {
+        return None;
+    }
+    Some((
+        tokens[..at - 1].join(" "),
+        tokens[at],
+        tokens[at + 1..].to_vec(),
+    ))
+}
+
+fn offered_key(line: &str) -> Option<OfferedKey> {
+    let rest = line.trim().strip_prefix("debug1: Offering public key: ")?;
+    let (path, fingerprint, flags) = key_fields(rest)?;
+    Some(OfferedKey {
+        path,
+        fingerprint: fingerprint.to_string(),
+        source: if flags.contains(&"agent") {
+            KeySource::Agent
+        } else {
+            KeySource::File
+        },
+    })
+}
+
+fn accepted_key_path(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("debug1: Server accepts key: ")?;
+    Some(key_fields(rest)?.0)
+}
+
+/// `Offending <type> key in <file>:<line>`
+fn offending_key(line: &str) -> Option<(String, u32)> {
+    let rest = line.trim().strip_prefix("Offending ")?;
+    let (_, location) = rest.split_once(" key in ")?;
+    let (file, number) = location.rsplit_once(':')?;
+    Some((file.to_string(), number.parse().ok()?))
+}
+
+fn key_facts(all: &[&str], route: Route<'_>) -> KeyFacts {
+    // OpenSSH does not pass its log level to a ProxyJump child, so debug key lines are normally
+    // the target's. A jump host the user configured verbose logs its own, ending in a direct
+    // `Authenticated to` line; only what follows that line is the target's.
+    let from = match route {
+        Route::Direct => 0,
+        Route::Proxied { .. } => all
+            .iter()
+            .rposition(|line| authenticated(line, Route::Direct).is_some())
+            .map_or(0, |at| at + 1),
+    };
+    let lines = &all[from..];
+    let mut facts = KeyFacts::default();
+    for (at, line) in lines.iter().enumerate() {
+        if let Some(key) = offered_key(line) {
+            facts.offered.push(key);
+        } else if let Some(path) = accepted_key_path(line) {
+            let logged_in = lines[at + 1..]
+                .iter()
+                .any(|line| line.trim().starts_with("Authenticated to "));
+            if !logged_in && !facts.unusable.contains(&path) {
+                facts.unusable.push(path);
+            }
+        }
+    }
+    facts.known_hosts = all.iter().find_map(|line| offending_key(line));
+    facts
+}
+
+fn classify_lines(lines: &[&str], deadline_reached: bool, facts: &KeyFacts) -> Failure {
     let text = lines.join("\n");
     if text.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
-        return Failure::HostKeyChanged;
+        return Failure::HostKeyChanged {
+            known_hosts: facts.known_hosts.clone(),
+        };
     }
     if lines
         .iter()
@@ -243,7 +348,11 @@ fn classify_lines(lines: &[&str], deadline_reached: bool) -> Failure {
         let rest = line.split_once("Permission denied (")?.1;
         Some(rest.split_once(')')?.0.to_string())
     }) {
-        return Failure::AuthRefused { methods };
+        return Failure::AuthRefused {
+            methods,
+            offered: facts.offered.clone(),
+            unusable: facts.unusable.clone(),
+        };
     }
     if let Some(host) = lines.iter().find_map(|line| {
         let rest = line.split_once("Could not resolve hostname ")?.1;
@@ -257,11 +366,20 @@ fn classify_lines(lines: &[&str], deadline_reached: bool) -> Failure {
     if text.contains("No route to host") || text.contains("Network is unreachable") {
         return Failure::Unreachable;
     }
-    if deadline_reached
-        || text.contains("Connection timed out")
-        || text.contains("Operation timed out")
-    {
-        return Failure::TimedOut;
+    if let Some(line) = lines.iter().find(|line| {
+        ["Broken pipe", "closed by remote host", "not responding"]
+            .iter()
+            .any(|marker| line.contains(marker))
+    }) {
+        return Failure::ConnectionLost {
+            line: line.trim().to_string(),
+        };
+    }
+    if deadline_reached {
+        return Failure::TimedOut { deadline: true };
+    }
+    if text.contains("Connection timed out") || text.contains("Operation timed out") {
+        return Failure::TimedOut { deadline: false };
     }
     Failure::Other(last_line(lines))
 }
@@ -286,8 +404,37 @@ fn mentions_host(line: &str, host: &str) -> bool {
 }
 
 pub fn classify(stderr: &str, deadline_reached: bool, jump: Option<&str>) -> Failure {
-    let lines: Vec<&str> = stderr.lines().filter(|line| !is_debug(line)).collect();
-    let first = classify_lines(&lines, deadline_reached);
+    let route = match jump {
+        None => Route::Direct,
+        Some(_) => Route::Proxied {
+            jump,
+            hostname: "",
+            port: 0,
+        },
+    };
+    diagnose(stderr, deadline_reached, route).failure
+}
+
+pub fn diagnose(stderr: &str, deadline_reached: bool, route: Route<'_>) -> Diagnosis {
+    let all: Vec<&str> = stderr.lines().collect();
+    let lines: Vec<&str> = all.iter().copied().filter(|line| !is_debug(line)).collect();
+    let facts = key_facts(&all, route);
+    let failure = classify_route(&lines, deadline_reached, route.jump(), &facts);
+    let raw = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.trim_end().to_string())
+        .collect();
+    Diagnosis { failure, raw }
+}
+
+fn classify_route(
+    lines: &[&str],
+    deadline_reached: bool,
+    jump: Option<&str>,
+    facts: &KeyFacts,
+) -> Failure {
+    let first = classify_lines(lines, deadline_reached, facts);
     let Some(jump) = jump else {
         return first;
     };
@@ -295,7 +442,11 @@ pub fn classify(stderr: &str, deadline_reached: bool, jump: Option<&str>) -> Fai
     // OpenSSH names no hop for a key failure, but when the jump child fails it
     // is followed by "Connection closed by UNKNOWN port 65535", which a
     // failure of the final host's own key is not.
-    if matches!(first, Failure::HostKeyChanged | Failure::HostKeyUnknown) && !handed_off {
+    if matches!(
+        first,
+        Failure::HostKeyChanged { .. } | Failure::HostKeyUnknown
+    ) && !handed_off
+    {
         return first;
     }
     let host = host_part(jump);
@@ -314,13 +465,9 @@ pub fn classify(stderr: &str, deadline_reached: bool, jump: Option<&str>) -> Fai
         .copied()
         .filter(|line| !is_noise(line) && !is_progress(line))
         .collect();
-    let detail = match classify_lines(&rest, false) {
-        Failure::Other(_) => last_line(&rest),
-        other => other.to_string(),
-    };
     Failure::JumpHostFailed {
         jump: jump.to_string(),
-        detail,
+        cause: Box::new(classify_lines(&rest, false, facts)),
     }
 }
 
@@ -428,23 +575,18 @@ mod tests {
         assert_eq!(authenticated(jump_only, jump), None);
     }
 
+    fn refused() -> Failure {
+        Failure::AuthRefused {
+            methods: "publickey".into(),
+            offered: Vec::new(),
+            unusable: Vec::new(),
+        }
+    }
+
     #[test]
     fn every_recorded_failure_has_its_own_result() {
         for (name, expected) in [
             ("host-key-unknown", Failure::HostKeyUnknown),
-            ("host-key-changed", Failure::HostKeyChanged),
-            (
-                "auth-refused",
-                Failure::AuthRefused {
-                    methods: "publickey".into(),
-                },
-            ),
-            (
-                "passphrase-key",
-                Failure::AuthRefused {
-                    methods: "publickey".into(),
-                },
-            ),
             ("connection-refused", Failure::ConnectionRefused),
             (
                 "name-unresolved",
@@ -455,33 +597,49 @@ mod tests {
         ] {
             assert_eq!(classify(&fixture(name), false, None), expected, "{name}");
         }
+        assert!(matches!(
+            classify(&fixture("host-key-changed"), false, None),
+            Failure::HostKeyChanged { .. }
+        ));
+        for name in ["auth-refused", "passphrase-key"] {
+            assert!(
+                matches!(
+                    classify(&fixture(name), false, None),
+                    Failure::AuthRefused { ref methods, .. } if methods == "publickey"
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn failures_through_a_jump_host_name_it() {
-        for (name, detail) in [
-            ("jump-connection-refused", "connection refused"),
-            ("jump-target-refused", "connection refused"),
+        for (name, cause) in [
+            ("jump-connection-refused", Failure::ConnectionRefused),
+            ("jump-target-refused", Failure::ConnectionRefused),
         ] {
             assert_eq!(
                 classify(&fixture(name), false, Some("127.0.0.1:22998")),
                 Failure::JumpHostFailed {
                     jump: "127.0.0.1:22998".into(),
-                    detail: detail.into()
+                    cause: Box::new(cause)
                 },
                 "{name}"
             );
         }
-        for (name, detail) in [
-            ("jump-host-key-unknown", "host key not trusted"),
-            ("jump-host-key-changed", "host key changed"),
-        ] {
-            assert_eq!(
-                classify(&fixture(name), false, Some("127.0.0.1:22999")),
-                Failure::JumpHostFailed {
-                    jump: "127.0.0.1:22999".into(),
-                    detail: detail.into()
-                },
+        for name in ["jump-host-key-unknown", "jump-host-key-changed"] {
+            let Failure::JumpHostFailed { jump, cause } =
+                classify(&fixture(name), false, Some("127.0.0.1:22999"))
+            else {
+                panic!("{name}");
+            };
+            assert_eq!(jump, "127.0.0.1:22999");
+            assert!(
+                matches!(
+                    (name, *cause),
+                    ("jump-host-key-unknown", Failure::HostKeyUnknown)
+                        | ("jump-host-key-changed", Failure::HostKeyChanged { .. })
+                ),
                 "{name}"
             );
         }
@@ -497,20 +655,133 @@ mod tests {
             ("user@db1.example: Permission denied (publickey).\n", "db"),
             ("user@target: Permission denied (publickey).\n", "arg"),
         ] {
-            assert_eq!(
-                classify(line, false, Some(jump)),
-                Failure::AuthRefused {
-                    methods: "publickey".into()
-                },
-                "{jump}"
-            );
+            assert_eq!(classify(line, false, Some(jump)), refused(), "{jump}");
         }
-        assert_eq!(
+        assert!(matches!(
             classify(&fixture("auth-refused"), false, Some("jump.example")),
-            Failure::AuthRefused {
-                methods: "publickey".into()
+            Failure::AuthRefused { .. }
+        ));
+    }
+
+    #[test]
+    fn offered_keys_and_their_source_are_read_from_debug_lines() {
+        let Failure::AuthRefused {
+            offered,
+            unusable,
+            methods,
+        } = classify(&fixture("auth-refused"), false, None)
+        else {
+            panic!()
+        };
+        assert_eq!(methods, "publickey");
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].source, KeySource::File);
+        assert!(offered[0].fingerprint.starts_with("SHA256:"));
+        assert!(unusable.is_empty());
+        let line = "debug1: Offering public key: me@laptop ED25519 SHA256:abc agent";
+        assert_eq!(offered_key(line).unwrap().source, KeySource::Agent);
+    }
+
+    #[test]
+    fn a_key_the_server_accepts_but_ssh_cannot_use_is_unusable() {
+        let Failure::AuthRefused { unusable, .. } =
+            classify(&fixture("passphrase-key"), false, None)
+        else {
+            panic!()
+        };
+        assert_eq!(unusable, ["/tmp/portico-fixture/pass"]);
+    }
+
+    #[test]
+    fn password_only_and_missing_identity_are_refusals_with_their_facts() {
+        assert!(matches!(
+            classify(&fixture("password-only"), false, None),
+            Failure::AuthRefused { ref methods, .. } if !methods.contains("publickey")
+        ));
+        assert!(matches!(
+            classify(&fixture("missing-identity"), false, None),
+            Failure::AuthRefused { ref offered, .. } if offered.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_changed_key_names_the_offending_known_hosts_line() {
+        let Failure::HostKeyChanged {
+            known_hosts: Some((file, line)),
+        } = classify(&fixture("host-key-changed"), false, None)
+        else {
+            panic!()
+        };
+        assert!(file.ends_with("kh_bad") && line >= 1);
+    }
+
+    #[test]
+    fn a_jump_failure_carries_the_jump_hosts_own_cause() {
+        let jump = Route::Proxied {
+            jump: Some("jump"),
+            hostname: "127.0.0.1",
+            port: 22997,
+        };
+        let failure = diagnose(&fixture("jump-target-key-refused"), false, jump).failure;
+        // The jump host logged in; the target refused the key, so this is the target's refusal,
+        // and only keys offered after the jump's own `Authenticated to` line are listed.
+        let Failure::AuthRefused { offered, .. } = failure else {
+            panic!("{failure:?}")
+        };
+        assert!(offered.iter().all(|key| key.path.ends_with("wrong")));
+        assert_eq!(
+            classify(
+                &fixture("jump-connection-refused"),
+                false,
+                Some("127.0.0.1:22998")
+            ),
+            Failure::JumpHostFailed {
+                jump: "127.0.0.1:22998".into(),
+                cause: Box::new(Failure::ConnectionRefused)
             }
         );
+    }
+
+    #[test]
+    fn keys_after_a_verbose_jump_hosts_login_are_the_targets() {
+        let jump = Route::Proxied {
+            jump: Some("jump"),
+            hostname: "127.0.0.1",
+            port: 22997,
+        };
+        let text = "debug1: Offering public key: /k/jump ED25519 SHA256:j explicit\n\
+                    Authenticated to jump ([127.0.0.1]:22999) using \"publickey\".\n\
+                    debug1: Offering public key: /k/target ED25519 SHA256:t explicit\n\
+                    user@target: Permission denied (publickey).\n";
+        let Failure::AuthRefused { offered, .. } = diagnose(text, false, jump).failure else {
+            panic!()
+        };
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].path, "/k/target");
+    }
+
+    #[test]
+    fn a_dropped_session_is_lost_not_refused() {
+        assert!(matches!(
+            classify(&fixture("connection-lost"), false, None),
+            Failure::ConnectionLost { .. }
+        ));
+        for line in [
+            "client_loop: send disconnect: Broken pipe",
+            "Timeout, server 10.0.0.1 not responding.",
+        ] {
+            assert!(
+                matches!(classify(line, false, None), Failure::ConnectionLost { .. }),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_lines_leave_out_debug_output() {
+        let raw = diagnose(&fixture("auth-refused"), false, Route::Direct).raw;
+        assert!(raw.iter().all(|line| !line.starts_with("debug")));
+        assert!(raw.last().unwrap().contains("Permission denied"));
     }
 
     #[test]
@@ -547,9 +818,12 @@ mod tests {
                 false,
                 None
             ),
-            Failure::TimedOut
+            Failure::TimedOut { deadline: false }
         );
-        assert_eq!(classify("", true, None), Failure::TimedOut);
+        assert_eq!(
+            classify("", true, None),
+            Failure::TimedOut { deadline: true }
+        );
     }
 
     #[test]
@@ -649,36 +923,33 @@ mod tests {
     }
 
     #[test]
-    fn reasons_and_hints_match_the_spec() {
+    fn reasons_match_the_spec() {
         let refused = Failure::AuthRefused {
             methods: "publickey,password".into(),
+            offered: Vec::new(),
+            unusable: Vec::new(),
         };
         assert_eq!(
             refused.to_string(),
             "authentication refused (server accepts: publickey,password)"
         );
         assert_eq!(
-            refused.hint(),
-            Some("check the user and the key; a key with a passphrase must be loaded in an agent")
-        );
-        assert_eq!(Failure::HostKeyChanged.to_string(), "host key changed");
-        assert_eq!(
-            Failure::HostKeyChanged.hint(),
-            Some(
-                "the server's host key differs from the one you trusted, which can mean an attack; confirm the new key with the server's administrator before changing known_hosts"
-            )
+            Failure::HostKeyChanged { known_hosts: None }.to_string(),
+            "host key changed"
         );
         let jump = Failure::JumpHostFailed {
             jump: "bastion".into(),
-            detail: "connection refused".into(),
+            cause: Box::new(Failure::ConnectionRefused),
         };
         assert_eq!(
             jump.to_string(),
             "jump host bastion failed: connection refused"
         );
-        assert_eq!(jump.hint(), Some("test the jump host on its own first"));
         assert_eq!(Failure::HostKeyUnknown.to_string(), "host key not trusted");
-        assert_eq!(Failure::HostKeyUnknown.hint(), None);
+        assert_eq!(
+            Failure::TimedOut { deadline: true }.to_string(),
+            "timed out"
+        );
         assert_eq!(Failure::Other("boom".into()).to_string(), "boom");
     }
 }

@@ -19,8 +19,8 @@ use thiserror::Error;
 
 use crate::managed::write_unique;
 use crate::probe::{
-    Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, authenticated, classify,
-    fetch_key_args, test_args,
+    Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, TEST_STDERR_LIMIT, authenticated,
+    classify, fetch_key_args, test_args,
 };
 
 /// How long a new-terminal launcher may run before its launch counts as requested.
@@ -383,8 +383,7 @@ impl OpenSsh {
                         terminate_process_group(&mut child);
                         return Ok(Watched::Authenticated(success));
                     }
-                    stderr.push_str(&line);
-                    stderr.push('\n');
+                    push_capped(&mut stderr, &line);
                     // A steady trickle of output must not hold off the deadline.
                     if Instant::now() < deadline {
                         continue;
@@ -423,8 +422,7 @@ impl OpenSsh {
                     if let Some(success) = authenticated(&line, route) {
                         return Ok(Watched::Authenticated(success));
                     }
-                    stderr.push_str(&line);
-                    stderr.push('\n');
+                    push_capped(&mut stderr, &line);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < drain_deadline => {}
                 Err(_) => break,
@@ -1000,6 +998,20 @@ fn kill_process_group(child: &mut std::process::Child) {
 }
 
 /// Sends each line of `pipe` as it arrives; the channel closes at end of file.
+/// Appends `line`, then drops whole lines from the front until at most `TEST_STDERR_LIMIT`
+/// bytes remain, so a chatty ssh keeps its newest output.
+fn push_capped(stderr: &mut String, line: &str) {
+    stderr.push_str(line);
+    stderr.push('\n');
+    if let Some(excess) = stderr.len().checked_sub(TEST_STDERR_LIMIT) {
+        let cut = stderr.as_bytes()[excess..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(stderr.len(), |at| excess + at + 1);
+        stderr.drain(..cut);
+    }
+}
+
 fn read_lines(pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -1079,7 +1091,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::probe::{Authenticated, test_args};
+    use crate::probe::{Authenticated, KeySource, OfferedKey, test_args};
     use crate::test_executable::write_executable;
 
     struct FakeProgram {
@@ -1657,9 +1669,28 @@ mod tests {
                 .probe(None, "dev", Route::Direct, &AtomicBool::new(false))
                 .unwrap(),
             ProbeResult::Failed(Failure::AuthRefused {
-                methods: "publickey".into()
+                methods: "publickey".into(),
+                offered: vec![OfferedKey {
+                    path: "/tmp/portico-fixture/wrong".into(),
+                    fingerprint: "SHA256:DEPp8rJWkCfro2273hHcjabe3DX963MQEi2ggf+UeW4".into(),
+                    source: KeySource::File,
+                }],
+                unusable: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn captured_stderr_keeps_the_newest_whole_lines_within_the_limit() {
+        let mut stderr = String::new();
+        let line = "x".repeat(1023);
+        for n in 0..400 {
+            push_capped(&mut stderr, &format!("{n}{line}"));
+        }
+        assert!(stderr.len() <= TEST_STDERR_LIMIT);
+        assert!(stderr.ends_with(&format!("399{line}\n")));
+        assert!(stderr.lines().all(|l| l.ends_with(&line)));
+        assert!(!stderr.starts_with("0x"));
     }
 
     #[test]
@@ -1678,7 +1709,10 @@ mod tests {
         });
         let result = probe.join().unwrap().unwrap();
 
-        assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
+        assert_eq!(
+            result,
+            ProbeResult::Failed(Failure::TimedOut { deadline: true })
+        );
         assert_recorded_process_dies(&pid);
     }
 
@@ -1710,7 +1744,10 @@ mod tests {
             .expect("the probe ran past its deadline")
             .unwrap();
 
-        assert_eq!(result, ProbeResult::Failed(Failure::TimedOut));
+        assert_eq!(
+            result,
+            ProbeResult::Failed(Failure::TimedOut { deadline: true })
+        );
         assert_recorded_process_dies(&pid);
     }
 
