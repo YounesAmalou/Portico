@@ -7,6 +7,22 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-18
+
+### Added
+
+- Trust a new host key from the TUI
+- Test hosts from the TUI
+- Add portico test
+
+### Fixed
+
+- Keep TUI test prompts and results where the test started
+- Stop ssh when portico test is interrupted
+- Never offer a host key without a fingerprint
+- Hold the test deadline while ssh keeps writing
+- Recognise a login through a jump host or proxy
+
 ## [0.2.3] - 2026-10-14
 
 The `v0.2.0`, `v0.2.1` and `v0.2.2` tags were pushed on commits whose `Cargo.toml` version did not match, so their releases failed and published nothing; tags are immutable, so this release supersedes them.
