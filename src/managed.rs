@@ -1597,7 +1597,7 @@ fn set_once<T>(
     Ok(())
 }
 
-fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
+pub(crate) fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
     if input.is_empty() {
         return Err(ManagedError::Parse {
             line,
