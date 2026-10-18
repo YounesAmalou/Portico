@@ -1,5 +1,7 @@
 # Portico Publish Foundation Design
 
+**Status:** Approved; implemented (released as v0.1.0)
+
 ## Purpose
 
 Publish Portico v0.1 as a public, installable, continuously verified open-source project and lay the base for production-grade releases. This is sub-project 1 of the production-readiness effort; each later sub-project gets its own design review.

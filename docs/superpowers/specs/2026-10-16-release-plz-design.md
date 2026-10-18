@@ -1,6 +1,6 @@
 # Release automation with release-plz
 
-**Status:** Approved; implemented in the same pull request, rehearsal on GitHub pending
+**Status:** Approved; implemented and rehearsed on GitHub: v0.2.4, v0.2.5 and v0.2.6 were released through it (the `aur` job stays red while AUR publishing is suspended)
 **Date:** 2026-10-16
 
 ## Purpose

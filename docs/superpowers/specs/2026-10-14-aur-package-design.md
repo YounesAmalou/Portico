@@ -1,5 +1,7 @@
 # Portico AUR Package Design
 
+**Status:** Approved; implemented; publishing is suspended until an AUR account and key exist
+
 ## Purpose
 
 Let Arch Linux users install Portico with `yay -S portico`, without having Rust installed beforehand. This is a follow-up slice of the production-readiness effort (see `ROADMAP.md`).

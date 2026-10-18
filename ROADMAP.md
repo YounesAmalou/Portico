@@ -1,6 +1,6 @@
 # Roadmap
 
-Scheduling an item here never cancels it. Items keep their requirements until they ship, and each needs its own design review before implementation.
+Scheduling an item here never cancels it. Items keep their requirements until they ship, and each needs its own design review before implementation. A shipped item leaves this file: the product slices delivered so far are listed under "Delivered follow-up slices" in the v1 design (`docs/superpowers/specs/2026-09-13-portico-host-management-design.md`), each design under `docs/superpowers/specs/` records its status, and `CHANGELOG.md` records every release.
 
 ## Rules that keep Portico simple
 
@@ -60,7 +60,6 @@ Tunnels outlive the command that starts them, and the desktop surface reads ever
 
 | Item | Prerequisite |
 |---|---|
-| Release automation with release-plz: a release pull request kept open on `main` that bumps the version and changelog, and that tags, releases and publishes to crates.io when merged | A GitHub App (the default workflow token neither triggers CI on its pull requests nor starts the release on its tags) added to the tag ruleset's bypass list; a decision on the changelog format (generated from commit messages) and on how `release.yml` keeps building the release tarballs. The pull-request rule on `main` stays. Rehearsed on GitHub before a real release relies on it |
 | Project website and documentation: a static site that presents Portico (what it is, install, a short tour) and holds the user documentation now living in the README, kept in this repository and published from CI | A choice of generator (a docs-oriented static site tool) and hosting (GitHub Pages is the default candidate); the README stays the short entry point. Whatever is built is verified on GitHub, not only locally |
 | Automated end-to-end tests with a real OpenSSH and a real terminal in CI | Its own design |
 | Leaner CI and CD, remainder: merge small jobs (for example `fmt` into `clippy`) so they share the setup each job pays (about 30 s: starting the container, installing packages and the toolchain) | Measured and left out: it saves runner time but no wall-clock time, because the jobs run in parallel and the slowest one sets the pace, and it renames checks that pull requests must pass. Revisit if runner time starts to matter |

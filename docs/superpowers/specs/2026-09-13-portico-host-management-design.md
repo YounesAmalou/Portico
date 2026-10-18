@@ -1,6 +1,6 @@
 # Portico v1 Host Management Design
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved; implemented (released as v0.1.0)
 **Date:** 2026-09-13
 
 ## Purpose
@@ -238,3 +238,6 @@ Each slice requires its own design review before implementation.
 ### Delivered follow-up slices
 
 - **TUI refresh:** a refresh key that discards cached host details and re-reads the inventory, so edits made outside Portico (including changes to external included configs) appear without restarting. v1 cached details until Portico itself changed the inventory. Designed in `2026-10-14-tui-refresh-design.md`.
+- **Manual connection test:** `portico test` and the TUI test key check that a host authenticates, through jump hosts and proxies, and offer to trust a new host key. Designed in `2026-10-17-connection-test-design.md`; three rare configurations it does not handle yet stay on the roadmap as its edge cases.
+- **Rich error messages:** failed saves, connections and connection tests name the host, field or file at fault and the next step, keeping OpenSSH's own output. Designed in `2026-10-18-rich-error-messages-design.md`.
+- **Jump host suggestions:** the host forms suggest known aliases while a ProxyJump value is typed. Designed in `2026-10-18-jump-host-suggestions-design.md`.
