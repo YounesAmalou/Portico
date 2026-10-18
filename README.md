@@ -175,7 +175,7 @@ portico test development
 portico test development --accept-host-key SHA256:...
 ```
 
-A test passes only when OpenSSH completes authentication. It never opens a shell or runs a command, so hosts that only allow port forwarding pass too, and it is never run automatically. It works for managed and external hosts, prints one line (`development: authenticated as deploy@10.0.0.5:22 (publickey)`) and exits 0 on a pass, or prints the reason and exits 1. The test never prompts for a password or passphrase, so a key with a passphrase must be loaded in an agent.
+A test passes only when OpenSSH completes authentication. It never opens a shell or runs a command, so hosts that only allow port forwarding pass too, and it is never run automatically. It works for managed and external hosts, prints one line (`development: authenticated as deploy@10.0.0.5:22 (publickey)`, with `via bastion` before the method when the host is reached through a jump host, or `via proxy` through a `ProxyCommand`) and exits 0 on a pass, or prints the reason and exits 1. The test never prompts for a password or passphrase, so a key with a passphrase must be loaded in an agent.
 
 The first time a host is tested its key is usually unknown. In a terminal, Portico shows the key's fingerprint and asks before trusting it. Without a terminal it trusts nothing, prints the fingerprint and fails; `--accept-host-key` trusts the key only if its fingerprint matches the one given exactly, then tests again. A changed host key is never offered for trust.
 

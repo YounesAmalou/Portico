@@ -19,8 +19,8 @@ use thiserror::Error;
 
 use crate::managed::write_unique;
 use crate::probe::{
-    Authenticated, Failure, ProbeResult, TEST_DEADLINE, authenticated, classify, fetch_key_args,
-    test_args,
+    Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, authenticated, classify,
+    fetch_key_args, test_args,
 };
 
 /// How long a new-terminal launcher may run before its launch counts as requested.
@@ -40,7 +40,28 @@ pub struct ResolvedConfig {
     pub port: Option<u16>,
     pub identity_files: Vec<String>,
     pub proxy_jump: Option<String>,
+    pub proxy_command: Option<String>,
     pub known_hosts_files: Vec<String>,
+}
+
+impl ResolvedConfig {
+    /// How ssh reaches the host: through its jump host or proxy command, if either is set.
+    pub fn route(&self) -> Route<'_> {
+        fn set(value: &Option<String>) -> Option<&str> {
+            value
+                .as_deref()
+                .filter(|value| !value.eq_ignore_ascii_case("none"))
+        }
+        let jump = set(&self.proxy_jump);
+        if jump.is_none() && set(&self.proxy_command).is_none() {
+            return Route::Direct;
+        }
+        Route::Proxied {
+            jump,
+            hostname: &self.hostname,
+            port: self.port.unwrap_or(22),
+        }
+    }
 }
 
 /// One line of `ssh-keygen -l`: `<bits> <fingerprint> <host> (<TYPE>)`.
@@ -203,6 +224,7 @@ impl OpenSsh {
         let mut port = None;
         let mut identity_files = Vec::new();
         let mut proxy_jump = None;
+        let mut proxy_command = None;
         let mut known_hosts_files = Vec::new();
         for line in text.lines() {
             let Some((key, value)) = line.split_once(char::is_whitespace) else {
@@ -222,6 +244,8 @@ impl OpenSsh {
                 identity_files.push(value.into());
             } else if key.eq_ignore_ascii_case("proxyjump") {
                 proxy_jump = Some(value.into());
+            } else if key.eq_ignore_ascii_case("proxycommand") {
+                proxy_command = Some(value.into());
             } else if key.eq_ignore_ascii_case("userknownhostsfile") {
                 known_hosts_files = value.split_whitespace().map(String::from).collect();
             }
@@ -233,38 +257,40 @@ impl OpenSsh {
             port,
             identity_files,
             proxy_jump,
+            proxy_command,
             known_hosts_files,
         })
     }
 
     /// Tries to log in to `alias` without a terminal, stopping as soon as
-    /// OpenSSH reports success. `jump` names the alias's jump host, if any,
-    /// so a failure there is told apart from one at the target.
+    /// OpenSSH reports success. `route` says whether the alias goes through a
+    /// jump host or proxy, which decides the success line to wait for and lets
+    /// a failure at the jump host be told apart from one at the target.
     pub(crate) fn probe(
         &self,
         entry: Option<&Path>,
         alias: &str,
-        jump: Option<&str>,
+        route: Route<'_>,
         cancelled: &AtomicBool,
     ) -> Result<ProbeResult, OpenSshError> {
-        self.probe_with_deadline(entry, alias, jump, cancelled, TEST_DEADLINE)
+        self.probe_with_deadline(entry, alias, route, cancelled, TEST_DEADLINE)
     }
 
     fn probe_with_deadline(
         &self,
         entry: Option<&Path>,
         alias: &str,
-        jump: Option<&str>,
+        route: Route<'_>,
         cancelled: &AtomicBool,
         deadline: Duration,
     ) -> Result<ProbeResult, OpenSshError> {
         Ok(
-            match self.watch_ssh(test_args(entry, alias), cancelled, deadline)? {
+            match self.watch_ssh(test_args(entry, alias), route, cancelled, deadline)? {
                 Watched::Authenticated(success) => ProbeResult::Authenticated(success),
                 Watched::Ended {
                     stderr,
                     deadline_reached,
-                } => ProbeResult::Failed(classify(&stderr, deadline_reached, jump)),
+                } => ProbeResult::Failed(classify(&stderr, deadline_reached, route.jump())),
             },
         )
     }
@@ -277,7 +303,7 @@ impl OpenSsh {
         &self,
         entry: Option<&Path>,
         alias: &str,
-        jump: Option<&str>,
+        route: Route<'_>,
         cancelled: &AtomicBool,
     ) -> Result<KeyFetch, OpenSshError> {
         let io_error = |source| OpenSshError::Io {
@@ -288,16 +314,21 @@ impl OpenSsh {
             .map_err(io_error)?;
         let args = fetch_key_args(entry, known_hosts.path(), alias);
         // Every login method is off, so the run can only end or time out.
-        let (stderr, deadline_reached) = match self.watch_ssh(args, cancelled, TEST_DEADLINE)? {
-            Watched::Authenticated(_) => (String::new(), false),
-            Watched::Ended {
-                stderr,
-                deadline_reached,
-            } => (stderr, deadline_reached),
-        };
+        let (stderr, deadline_reached) =
+            match self.watch_ssh(args, route, cancelled, TEST_DEADLINE)? {
+                Watched::Authenticated(_) => (String::new(), false),
+                Watched::Ended {
+                    stderr,
+                    deadline_reached,
+                } => (stderr, deadline_reached),
+            };
         let lines = fs::read(known_hosts.path()).map_err(io_error)?;
         if lines.is_empty() {
-            return Ok(KeyFetch::Failed(classify(&stderr, deadline_reached, jump)));
+            return Ok(KeyFetch::Failed(classify(
+                &stderr,
+                deadline_reached,
+                route.jump(),
+            )));
         }
         let output = self.checked_output(
             Command::new(&self.keygen)
@@ -323,6 +354,7 @@ impl OpenSsh {
     fn watch_ssh(
         &self,
         args: Vec<OsString>,
+        route: Route<'_>,
         cancelled: &AtomicBool,
         deadline: Duration,
     ) -> Result<Watched, OpenSshError> {
@@ -347,7 +379,7 @@ impl OpenSsh {
             }
             match lines.recv_timeout(Duration::from_millis(20)) {
                 Ok(line) => {
-                    if let Some(success) = authenticated(&line) {
+                    if let Some(success) = authenticated(&line, route) {
                         terminate_process_group(&mut child);
                         return Ok(Watched::Authenticated(success));
                     }
@@ -385,7 +417,7 @@ impl OpenSsh {
             match lines.recv_timeout(Duration::from_millis(20)) {
                 Ok(line) => {
                     // ssh may log success just before the server drops it.
-                    if let Some(success) = authenticated(&line) {
+                    if let Some(success) = authenticated(&line, route) {
                         return Ok(Watched::Authenticated(success));
                     }
                     stderr.push_str(&line);
@@ -1155,6 +1187,37 @@ mod tests {
         assert_eq!(resolved.port, Some(2222));
         assert_eq!(resolved.identity_files, ["~/.ssh/id_dev"]);
         assert_eq!(resolved.proxy_jump.as_deref(), Some("bastion"));
+        assert_eq!(
+            resolved.route(),
+            Route::Proxied {
+                jump: Some("bastion"),
+                hostname: "dev.example",
+                port: 2222,
+            }
+        );
+    }
+
+    #[test]
+    fn a_proxy_command_or_none_decides_the_route() {
+        let resolve = |output: &str| {
+            let fake = fake_resolver(output);
+            OpenSsh::new(fake.path(), "xdg-terminal-exec".into())
+                .resolve("dev")
+                .unwrap()
+        };
+        let command = resolve("hostname h\nproxycommand nc %h %p\n");
+        assert_eq!(command.proxy_command.as_deref(), Some("nc %h %p"));
+        assert_eq!(
+            command.route(),
+            Route::Proxied {
+                jump: None,
+                hostname: "h",
+                port: 22,
+            }
+        );
+        let none = resolve("hostname h\nport 2200\nproxyjump none\nproxycommand none\n");
+        assert_eq!(none.route(), Route::Direct);
+        assert_eq!(resolve("hostname h\n").route(), Route::Direct);
     }
 
     #[test]
@@ -1469,7 +1532,7 @@ mod tests {
         let started = Instant::now();
 
         let result = openssh
-            .probe(None, "dev", None, &AtomicBool::new(false))
+            .probe(None, "dev", Route::Direct, &AtomicBool::new(false))
             .unwrap();
 
         assert!(
@@ -1484,9 +1547,55 @@ mod tests {
                 address: "127.0.0.1".into(),
                 port: 22999,
                 method: "publickey".into(),
+                via: None,
             })
         );
         assert_dies(&fs::read_to_string(pid).unwrap());
+    }
+
+    #[test]
+    fn a_proxied_probe_stops_at_the_targets_line_not_the_jump_hosts() {
+        let (fake, pid) = fake_hanging_ssh(Some("authenticated-via-verbose-jump"));
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: Some("jumpv"),
+            hostname: "db.internal",
+            port: 2222,
+        };
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(
+            result,
+            ProbeResult::Authenticated(Authenticated {
+                host: "127.0.0.1".into(),
+                address: "db.internal".into(),
+                port: 2222,
+                method: "publickey".into(),
+                via: Some("jumpv".into()),
+            })
+        );
+        assert_dies(&wait_for_file(&pid));
+    }
+
+    #[test]
+    fn a_jump_hosts_own_success_is_not_the_targets() {
+        let fake =
+            fake_failure("Authenticated to 127.0.0.1 ([127.0.0.1]:22999) using \"publickey\".\n");
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let route = Route::Proxied {
+            jump: Some("jumpv"),
+            hostname: "127.0.0.1",
+            port: 22999,
+        };
+
+        let result = openssh
+            .probe(None, "dev", route, &AtomicBool::new(false))
+            .unwrap();
+
+        assert!(matches!(result, ProbeResult::Failed(_)), "{result:?}");
     }
 
     #[test]
@@ -1502,7 +1611,7 @@ mod tests {
         let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
 
         openssh
-            .probe(None, "dev", None, &AtomicBool::new(false))
+            .probe(None, "dev", Route::Direct, &AtomicBool::new(false))
             .unwrap();
 
         let expected: String = test_args(None, "dev")
@@ -1526,7 +1635,7 @@ mod tests {
 
         assert_eq!(
             openssh
-                .probe(None, "dev", None, &AtomicBool::new(false))
+                .probe(None, "dev", Route::Direct, &AtomicBool::new(false))
                 .unwrap(),
             ProbeResult::Failed(Failure::AuthRefused {
                 methods: "publickey".into()
@@ -1543,7 +1652,7 @@ mod tests {
             .probe_with_deadline(
                 None,
                 "dev",
-                None,
+                Route::Direct,
                 &AtomicBool::new(false),
                 Duration::from_millis(200),
             )
@@ -1569,7 +1678,7 @@ mod tests {
         });
         let started = Instant::now();
 
-        let result = openssh.probe(None, "dev", None, &cancelled);
+        let result = openssh.probe(None, "dev", Route::Direct, &cancelled);
 
         cancel.join().unwrap();
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
@@ -1610,7 +1719,7 @@ mod tests {
             OpenSsh::new(ssh.path(), "xdg-terminal-exec".into()).with_keygen(keygen.path());
 
         let result = openssh
-            .fetch_host_key(None, "dev", None, &AtomicBool::new(false))
+            .fetch_host_key(None, "dev", Route::Direct, &AtomicBool::new(false))
             .unwrap();
 
         assert_eq!(
@@ -1644,7 +1753,7 @@ mod tests {
 
         assert_eq!(
             openssh
-                .fetch_host_key(None, "dev", None, &AtomicBool::new(false))
+                .fetch_host_key(None, "dev", Route::Direct, &AtomicBool::new(false))
                 .unwrap(),
             KeyFetch::Failed(Failure::ConnectionRefused)
         );

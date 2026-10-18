@@ -1,0 +1,3 @@
+Authenticated to 127.0.0.1 (via proxy) using "publickey".
+Transferred: sent 3596, received 3556 bytes, in 4.8 seconds
+Bytes per second: sent 742.3, received 734.1

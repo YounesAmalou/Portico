@@ -149,8 +149,10 @@ fn portico_test_against_a_real_sshd() {
     );
     assert!(portico(&env, &["init", "-y"]).status.success());
     let env_known_hosts = env.home().join(".ssh/known_hosts");
+    // `realjump` reaches the same sshd through `real` as its jump host.
     let external = format!(
-        "\nHost real\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  \
+        "\nHost realjump\n  ProxyJump real\n\
+         \nHost real realjump\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  \
          IdentityFile {key}\n  IdentitiesOnly yes\n  IdentityAgent none\n  \
          UserKnownHostsFile {known}\n  GlobalKnownHostsFile /dev/null\n",
         key = dir.join("client_key").display(),
@@ -199,6 +201,24 @@ fn portico_test_against_a_real_sshd() {
             .trim()
             .is_empty(),
         "the host key was not recorded"
+    );
+
+    // A login through a jump host is recognised as soon as it happens, well
+    // before the test's 15 second deadline.
+    let started = Instant::now();
+    let jumped = portico(&env, &["test", "realjump"]);
+    let jumped_text = text(&jumped);
+    assert_eq!(jumped.status.code(), Some(0), "{jumped_text}");
+    assert!(
+        jumped_text.contains(&format!(
+            "authenticated as {user}@127.0.0.1:{port} via real (publickey)"
+        )),
+        "{jumped_text}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the jump test took {:?}",
+        started.elapsed()
     );
 
     // A key the server no longer accepts is an authentication failure.

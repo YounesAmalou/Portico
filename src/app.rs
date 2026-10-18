@@ -86,15 +86,21 @@ impl TestReport {
         matches!(self.result, ProbeResult::Authenticated(_))
     }
 
-    /// The outcome in one line, without the alias: `authenticated as user@address:port (method)`
-    /// or `failed — reason`.
+    /// The outcome in one line, without the alias: `authenticated as user@address:port (method)`,
+    /// with `via <jump>` before the method through a jump host or proxy, or `failed — reason`.
     pub fn summary(&self) -> String {
         match &self.result {
             ProbeResult::Authenticated(success) => {
                 let (address, port, method) = (&success.address, success.port, &success.method);
+                let via = success
+                    .via
+                    .as_ref()
+                    .map_or(String::new(), |via| format!(" via {via}"));
                 match &self.user {
-                    Some(user) => format!("authenticated as {user}@{address}:{port} ({method})"),
-                    None => format!("authenticated to {address}:{port} ({method})"),
+                    Some(user) => {
+                        format!("authenticated as {user}@{address}:{port}{via} ({method})")
+                    }
+                    None => format!("authenticated to {address}:{port}{via} ({method})"),
                 }
             }
             ProbeResult::Failed(failure) => format!("failed \u{2014} {failure}"),
@@ -466,14 +472,11 @@ impl App {
                 reason: error.to_string(),
             })?;
         }
-        let jump = resolved
-            .proxy_jump
-            .as_deref()
-            .filter(|jump| !jump.eq_ignore_ascii_case("none"));
-        let result = self.openssh.probe(entry, alias, jump, cancelled)?;
+        let route = resolved.route();
+        let result = self.openssh.probe(entry, alias, route, cancelled)?;
         let mut report = TestReport {
             alias: alias.into(),
-            user: resolved.user,
+            user: resolved.user.clone(),
             result,
             key_fetch_failure: None,
         };
@@ -481,7 +484,10 @@ impl App {
             return Ok(TestOutcome::Done(report));
         }
         Ok(
-            match self.openssh.fetch_host_key(entry, alias, jump, cancelled)? {
+            match self
+                .openssh
+                .fetch_host_key(entry, alias, route, cancelled)?
+            {
                 KeyFetch::Presented(key) => TestOutcome::UnknownHostKey { report, key },
                 KeyFetch::Failed(failure) => {
                     report.key_fetch_failure = Some(failure);
@@ -703,6 +709,31 @@ mod tests {
         let args = fs::read_to_string(&app.fake_log).unwrap();
         assert!(!args.lines().any(|arg| arg == "-F"), "{args}");
         assert!(args.ends_with("--\ndev\n"), "{args}");
+    }
+
+    #[test]
+    fn a_login_through_a_jump_host_or_proxy_names_the_resolved_target() {
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        for (resolved, summary) in [
+            (
+                "hostname db.internal\\nuser deploy\\nport 2222\\nproxyjump bastion\\n",
+                "authenticated as deploy@db.internal:2222 via bastion (publickey)",
+            ),
+            (
+                "hostname db.internal\\nport 22\\nproxycommand nc %%h %%p\\n",
+                "authenticated to db.internal:22 via proxy (publickey)",
+            ),
+        ] {
+            app.install_ssh(resolved, &print_fixture("authenticated-via-proxy"), ":");
+
+            let outcome = app.test(&TestTarget::Saved("dev".into())).unwrap();
+
+            let TestOutcome::Done(report) = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(report.summary(), summary);
+        }
     }
 
     #[test]

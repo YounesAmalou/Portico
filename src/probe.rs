@@ -14,6 +14,31 @@ pub struct Authenticated {
     pub address: String,
     pub port: u16,
     pub method: String,
+    /// The jump host the login went through, or `proxy` for a `ProxyCommand`.
+    pub via: Option<String>,
+}
+
+/// How ssh reaches the host, as `ssh -G` resolves it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Route<'a> {
+    Direct,
+    /// Through `ProxyJump` (`jump` names it) or a `ProxyCommand` (`jump` is `None`), to the
+    /// resolved `hostname` and `port`.
+    Proxied {
+        jump: Option<&'a str>,
+        hostname: &'a str,
+        port: u16,
+    },
+}
+
+impl<'a> Route<'a> {
+    /// The jump host, whose failures are told apart from the target's.
+    pub fn jump(self) -> Option<&'a str> {
+        match self {
+            Route::Direct => None,
+            Route::Proxied { jump, .. } => jump,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,19 +160,43 @@ pub fn fetch_key_args(entry: Option<&Path>, known_hosts: &Path, alias: &str) -> 
     args
 }
 
-/// Parses `Authenticated to <host> ([<address>]:<port>) using "<method>".`
-pub fn authenticated(line: &str) -> Option<Authenticated> {
+/// Parses the target's success line. A direct login logs
+/// `Authenticated to <host> ([<address>]:<port>) using "<method>".`, one through a proxy
+/// `Authenticated to <host> (via proxy) using "<method>".`; only the form `route` produces is
+/// accepted, so a jump host's own success line, logged when its configuration is verbose, is
+/// never taken for the target's.
+pub fn authenticated(line: &str, route: Route<'_>) -> Option<Authenticated> {
     let rest = line.trim().strip_prefix("Authenticated to ")?;
-    let (host, rest) = rest.split_once(" ([")?;
-    let (address, rest) = rest.split_once("]:")?;
-    let (port, rest) = rest.split_once(") using \"")?;
-    let method = rest.strip_suffix("\".")?;
-    Some(Authenticated {
-        host: host.to_string(),
-        address: address.to_string(),
-        port: port.parse().ok()?,
-        method: method.to_string(),
-    })
+    match route {
+        Route::Direct => {
+            let (host, rest) = rest.split_once(" ([")?;
+            let (address, rest) = rest.split_once("]:")?;
+            let (port, rest) = rest.split_once(") using \"")?;
+            let method = rest.strip_suffix("\".")?;
+            Some(Authenticated {
+                host: host.to_string(),
+                address: address.to_string(),
+                port: port.parse().ok()?,
+                method: method.to_string(),
+                via: None,
+            })
+        }
+        Route::Proxied {
+            jump,
+            hostname,
+            port,
+        } => {
+            let (host, rest) = rest.split_once(" (via proxy) using \"")?;
+            let method = rest.strip_suffix("\".")?;
+            Some(Authenticated {
+                host: host.to_string(),
+                address: hostname.to_string(),
+                port,
+                method: method.to_string(),
+                via: Some(jump.unwrap_or("proxy").to_string()),
+            })
+        }
+    }
 }
 
 /// Lines of the jump host's own hand-off, which say nothing about why it failed.
@@ -301,13 +350,73 @@ mod tests {
     fn the_success_line_names_the_address_port_and_method() {
         let line = fixture("authenticated")
             .lines()
-            .find_map(authenticated)
+            .find_map(|line| authenticated(line, Route::Direct))
             .unwrap();
         assert_eq!(
             (line.address.as_str(), line.port, line.method.as_str()),
             ("127.0.0.1", 22999, "publickey")
         );
-        assert_eq!(authenticated("Transferred: sent 1, received 2 bytes"), None);
+        assert_eq!(line.via, None);
+        assert_eq!(
+            authenticated("Transferred: sent 1, received 2 bytes", Route::Direct),
+            None
+        );
+    }
+
+    #[test]
+    fn a_proxied_success_is_recognised_only_through_a_proxy() {
+        let text = fixture("authenticated-via-proxy");
+        let jump = Route::Proxied {
+            jump: Some("bastion"),
+            hostname: "db.internal",
+            port: 2222,
+        };
+        assert_eq!(
+            text.lines().find_map(|line| authenticated(line, jump)),
+            Some(Authenticated {
+                host: "127.0.0.1".into(),
+                address: "db.internal".into(),
+                port: 2222,
+                method: "publickey".into(),
+                via: Some("bastion".into()),
+            })
+        );
+        let command = Route::Proxied {
+            jump: None,
+            hostname: "db.internal",
+            port: 22,
+        };
+        let success = text.lines().find_map(|line| authenticated(line, command));
+        assert_eq!(success.and_then(|s| s.via), Some("proxy".into()));
+        assert_eq!(
+            text.lines()
+                .find_map(|line| authenticated(line, Route::Direct)),
+            None
+        );
+        assert_eq!(
+            fixture("authenticated")
+                .lines()
+                .find_map(|line| authenticated(line, jump)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_verbose_jump_hosts_own_login_is_not_the_targets() {
+        let jump = Route::Proxied {
+            jump: Some("jumpv"),
+            hostname: "127.0.0.1",
+            port: 22999,
+        };
+        let text = fixture("authenticated-via-verbose-jump");
+        assert!(text.lines().next().unwrap().contains("([127.0.0.1]:22999)"));
+        let success = text
+            .lines()
+            .find_map(|line| authenticated(line, jump))
+            .unwrap();
+        assert_eq!(success.via.as_deref(), Some("jumpv"));
+        let jump_only = text.lines().next().unwrap();
+        assert_eq!(authenticated(jump_only, jump), None);
     }
 
     #[test]

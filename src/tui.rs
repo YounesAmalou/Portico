@@ -2209,6 +2209,7 @@ mod tests {
                 port: Some(22),
                 identity_files: vec!["~/.ssh/id_ed25519".into()],
                 proxy_jump: Some("bastion".into()),
+                proxy_command: None,
                 known_hosts_files: vec!["~/.ssh/known_hosts".into()],
             }),
             warnings: Vec::new(),
@@ -3622,6 +3623,7 @@ mod tests {
                 address: "10.0.0.5".into(),
                 port: 22,
                 method: "publickey".into(),
+                via: None,
             }),
         ))
     }
