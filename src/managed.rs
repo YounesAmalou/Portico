@@ -1,6 +1,8 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    mem,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -16,7 +18,7 @@ use std::sync::Arc;
 
 use crate::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
 use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
-use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
+use crate::host::{Change, Host, HostChanges, HostError, HostField, parse_port};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
 const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
@@ -51,9 +53,26 @@ pub enum ManagedError {
     },
 }
 
+/// Comment lines attached to a managed host, each a full `#` line without indentation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostComments {
+    /// Rendered directly above the `Host` line.
+    pub leading: Vec<String>,
+    /// Rendered directly above the directive of the field.
+    pub fields: BTreeMap<HostField, Vec<String>>,
+}
+
+impl HostComments {
+    pub fn is_empty(&self) -> bool {
+        self.leading.is_empty() && self.fields.values().all(Vec::is_empty)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ManagedConfig {
     hosts: Vec<Host>,
+    /// Keyed by lowercase alias; a host without comments has no entry.
+    comments: BTreeMap<String, HostComments>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -851,11 +870,17 @@ impl ManagedConfig {
     pub fn parse(input: &str) -> Result<Self, ManagedError> {
         let mut config = Self::empty();
         let mut current = None;
+        let mut pending: Vec<String> = Vec::new();
 
         for (index, raw_line) in input.lines().enumerate() {
             let line = index + 1;
             let trimmed = raw_line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() {
+                pending.clear();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                pending.push(trimmed.to_owned());
                 continue;
             }
 
@@ -865,7 +890,7 @@ impl ManagedConfig {
                     config.push_parsed(host)?;
                 }
                 let alias = parse_value(argument, line)?;
-                current = Some(ParsedHost::new(alias, line));
+                current = Some(ParsedHost::new(alias, line, mem::take(&mut pending)));
                 continue;
             }
 
@@ -885,18 +910,27 @@ impl ManagedConfig {
             } else {
                 parse_value(argument, line)?
             };
-            if directive.eq_ignore_ascii_case("HostName") {
+            let field = if directive.eq_ignore_ascii_case("HostName") {
                 set_once(&mut host.hostname, value, line, directive)?;
+                HostField::Hostname
             } else if directive.eq_ignore_ascii_case("User") {
                 set_once(&mut host.user, value, line, directive)?;
+                HostField::User
             } else if directive.eq_ignore_ascii_case("Port") {
                 let port = parse_port(&value)
                     .map_err(|source| ManagedError::InvalidHost { line, source })?;
                 set_once(&mut host.port, port, line, directive)?;
+                HostField::Port
             } else if directive.eq_ignore_ascii_case("IdentityFile") {
                 set_once(&mut host.identity_file, value, line, directive)?;
-            } else if directive.eq_ignore_ascii_case("ProxyJump") {
+                HostField::IdentityFile
+            } else {
                 set_once(&mut host.proxy_jump, value, line, directive)?;
+                HostField::ProxyJump
+            };
+            let attached = mem::take(&mut pending);
+            if !attached.is_empty() {
+                host.field_comments.insert(field, attached);
             }
         }
 
@@ -909,7 +943,10 @@ impl ManagedConfig {
     pub fn render(&self) -> String {
         let mut hosts = self.hosts.iter().collect::<Vec<_>>();
         hosts.sort_by_key(|host| host.alias().to_ascii_lowercase());
-        let blocks = hosts.into_iter().map(render_host).collect::<Vec<_>>();
+        let blocks = hosts
+            .into_iter()
+            .map(|host| render_host(host, self.comments(host.alias())))
+            .collect::<Vec<_>>();
         if blocks.is_empty() {
             format!("{HEADER}\n")
         } else {
@@ -919,6 +956,10 @@ impl ManagedConfig {
 
     pub fn hosts(&self) -> &[Host] {
         &self.hosts
+    }
+
+    pub fn comments(&self, alias: &str) -> Option<&HostComments> {
+        self.comments.get(&alias.to_ascii_lowercase())
     }
 
     /// Aliases declared here that are new or differ from their declaration in `previous`.
@@ -937,8 +978,20 @@ impl ManagedConfig {
     }
 
     pub fn insert(&mut self, host: Host) -> Result<(), ManagedError> {
+        self.insert_with_comments(host, HostComments::default())
+    }
+
+    pub fn insert_with_comments(
+        &mut self,
+        host: Host,
+        comments: HostComments,
+    ) -> Result<(), ManagedError> {
         if self.find(host.alias()).is_some() {
             return Err(ManagedError::DuplicateAlias(host.alias().into()));
+        }
+        if !comments.is_empty() {
+            self.comments
+                .insert(host.alias().to_ascii_lowercase(), comments);
         }
         self.hosts.push(host);
         self.sort_hosts();
@@ -956,11 +1009,31 @@ impl ManagedConfig {
         }) {
             return Err(ManagedError::DuplicateAlias(host.alias().into()));
         }
+        if let Some(comments) = self.comments.remove(&old_alias.to_ascii_lowercase()) {
+            self.comments
+                .insert(host.alias().to_ascii_lowercase(), comments);
+        }
         self.hosts[index] = host;
         Ok(())
     }
 
     pub fn apply(&mut self, alias: &str, changes: HostChanges) -> Result<(), ManagedError> {
+        let cleared = [
+            (
+                HostField::Hostname,
+                matches!(changes.hostname, Change::Clear),
+            ),
+            (HostField::User, matches!(changes.user, Change::Clear)),
+            (HostField::Port, matches!(changes.port, Change::Clear)),
+            (
+                HostField::IdentityFile,
+                matches!(changes.identity_file, Change::Clear),
+            ),
+            (
+                HostField::ProxyJump,
+                matches!(changes.proxy_jump, Change::Clear),
+            ),
+        ];
         let host = self
             .find(alias)
             .ok_or_else(|| ManagedError::UnknownAlias(alias.into()))?
@@ -969,16 +1042,35 @@ impl ManagedConfig {
                 alias: alias.into(),
                 source,
             })?;
-        self.replace(alias, host)
+        let new_alias = host.alias().to_owned();
+        self.replace(alias, host)?;
+        if let Some(comments) = self.comments.get_mut(&new_alias.to_ascii_lowercase()) {
+            for (field, _) in cleared.iter().filter(|(_, clear)| *clear) {
+                comments.fields.remove(field);
+            }
+            if comments.is_empty() {
+                self.comments.remove(&new_alias.to_ascii_lowercase());
+            }
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, alias: &str) -> Result<Host, ManagedError> {
+        self.remove_entry(alias).map(|(host, _)| host)
+    }
+
+    pub fn remove_entry(&mut self, alias: &str) -> Result<(Host, HostComments), ManagedError> {
         let index = self
             .hosts
             .iter()
             .position(|host| host.alias().eq_ignore_ascii_case(alias))
             .ok_or_else(|| ManagedError::UnknownAlias(alias.into()))?;
-        Ok(self.hosts.remove(index))
+        let host = self.hosts.remove(index);
+        let comments = self
+            .comments
+            .remove(&alias.to_ascii_lowercase())
+            .unwrap_or_default();
+        Ok((host, comments))
     }
 
     fn push_parsed(&mut self, parsed: ParsedHost) -> Result<(), ManagedError> {
@@ -990,6 +1082,8 @@ impl ManagedConfig {
             port,
             identity_file,
             proxy_jump,
+            leading_comments,
+            field_comments,
         } = parsed;
         let hostname = hostname.ok_or(ManagedError::MissingHostName { line })?;
         let hostname_line = hostname.1;
@@ -1024,6 +1118,14 @@ impl ManagedConfig {
                 line,
                 alias: host.alias().into(),
             });
+        }
+        let comments = HostComments {
+            leading: leading_comments,
+            fields: field_comments,
+        };
+        if !comments.is_empty() {
+            self.comments
+                .insert(host.alias().to_ascii_lowercase(), comments);
         }
         self.hosts.push(host);
         self.sort_hosts();
@@ -1458,10 +1560,12 @@ struct ParsedHost {
     port: Option<(u16, usize)>,
     identity_file: Option<(String, usize)>,
     proxy_jump: Option<(String, usize)>,
+    leading_comments: Vec<String>,
+    field_comments: BTreeMap<HostField, Vec<String>>,
 }
 
 impl ParsedHost {
-    fn new(alias: String, line: usize) -> Self {
+    fn new(alias: String, line: usize, leading_comments: Vec<String>) -> Self {
         Self {
             alias,
             line,
@@ -1470,6 +1574,8 @@ impl ParsedHost {
             port: None,
             identity_file: None,
             proxy_jump: None,
+            leading_comments,
+            field_comments: BTreeMap::new(),
         }
     }
 }
@@ -1558,22 +1664,36 @@ fn parse_value(input: &str, line: usize) -> Result<String, ManagedError> {
     Ok(value)
 }
 
-fn render_host(host: &Host) -> String {
-    let mut lines = vec![
-        format!("Host {}", quote(host.alias())),
-        format!("    HostName {}", quote(host.hostname())),
-    ];
+fn render_host(host: &Host, comments: Option<&HostComments>) -> String {
+    let mut lines = Vec::new();
+    if let Some(comments) = comments {
+        lines.extend(comments.leading.iter().cloned());
+    }
+    lines.push(format!("Host {}", quote(host.alias())));
+    let mut directive = |field: HostField, line: String| {
+        if let Some(comments) = comments.and_then(|comments| comments.fields.get(&field)) {
+            lines.extend(comments.iter().map(|comment| format!("    {comment}")));
+        }
+        lines.push(format!("    {line}"));
+    };
+    directive(
+        HostField::Hostname,
+        format!("HostName {}", quote(host.hostname())),
+    );
     if let Some(user) = host.user() {
-        lines.push(format!("    User {}", quote(user)));
+        directive(HostField::User, format!("User {}", quote(user)));
     }
     if let Some(port) = host.port() {
-        lines.push(format!("    Port {port}"));
+        directive(HostField::Port, format!("Port {port}"));
     }
     if let Some(identity_file) = host.identity_file() {
-        lines.push(format!("    IdentityFile {}", quote(identity_file)));
+        directive(
+            HostField::IdentityFile,
+            format!("IdentityFile {}", quote(identity_file)),
+        );
     }
     if let Some(proxy_jump) = host.proxy_jump() {
-        lines.push(format!("    ProxyJump {proxy_jump}"));
+        directive(HostField::ProxyJump, format!("ProxyJump {proxy_jump}"));
     }
     lines.join("\n")
 }
@@ -1614,6 +1734,78 @@ mod tests {
             store,
             paths,
         }
+    }
+
+    #[test]
+    fn comments_round_trip_through_parse_and_render() {
+        let text = "# Managed by Portico. Do not edit manually.\n\n# work box\nHost dev\n    HostName dev.example\n    # old account\n    User bob\n";
+        let config = ManagedConfig::parse(text).unwrap();
+        assert_eq!(config.comments("dev").unwrap().leading, vec!["# work box"]);
+        assert_eq!(
+            config.comments("DEV").unwrap().fields[&HostField::User],
+            vec!["# old account"]
+        );
+        assert_eq!(config.render(), text);
+    }
+
+    #[test]
+    fn header_and_detached_comments_never_attach() {
+        let text = "# Managed by Portico. Do not edit manually.\n\n# detached\n\nHost dev\n    HostName dev.example\n";
+        let config = ManagedConfig::parse(text).unwrap();
+        assert!(config.comments("dev").is_none_or(HostComments::is_empty));
+        assert!(!config.render().contains("# detached"));
+    }
+
+    #[test]
+    fn rename_keeps_comments_and_clear_drops_field_comments() {
+        let mut config = ManagedConfig::empty();
+        let comments = HostComments {
+            leading: vec!["# lead".into()],
+            fields: BTreeMap::from([
+                (HostField::User, vec!["# who".into()]),
+                (HostField::Port, vec!["# p".into()]),
+            ]),
+        };
+        config
+            .insert_with_comments(
+                Host::new("dev", "h", Some("bob".into()), Some(2222), None, None).unwrap(),
+                comments,
+            )
+            .unwrap();
+        config
+            .apply(
+                "dev",
+                HostChanges {
+                    alias: Change::Set("box".into()),
+                    user: Change::Clear,
+                    ..HostChanges::default()
+                },
+            )
+            .unwrap();
+        let kept = config.comments("box").unwrap();
+        assert_eq!(kept.leading, vec!["# lead"]);
+        assert!(!kept.fields.contains_key(&HostField::User));
+        assert_eq!(kept.fields[&HostField::Port], vec!["# p"]);
+        assert!(config.comments("dev").is_none());
+    }
+
+    #[test]
+    fn remove_entry_returns_the_comments() {
+        let mut config = ManagedConfig::empty();
+        let comments = HostComments {
+            leading: vec!["# lead".into()],
+            fields: BTreeMap::from([(HostField::Hostname, vec!["# where".into()])]),
+        };
+        config
+            .insert_with_comments(
+                Host::new("dev", "h", None, None, None, None).unwrap(),
+                comments.clone(),
+            )
+            .unwrap();
+        let (host, returned) = config.remove_entry("dev").unwrap();
+        assert_eq!(host.alias(), "dev");
+        assert_eq!(returned, comments);
+        assert!(config.comments("dev").is_none());
     }
 
     #[test]
