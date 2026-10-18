@@ -420,6 +420,7 @@ impl App {
                     rejection => Some(self.explain_rejection(
                         alias,
                         Operation::Connect,
+                        false,
                         &rejection_diagnosis(&stderr, rejection),
                     )),
                 }
@@ -490,8 +491,10 @@ impl App {
         cancelled: &AtomicBool,
     ) -> Result<TestOutcome, AppError> {
         let alias = target.alias();
+        // A host being added does not exist yet, so `portico edit` cannot fix it.
+        let adding = matches!(target, TestTarget::Add(_));
         let run = |entry: Option<&Path>, files: &ConfigFiles<'_>, alias: &str| {
-            self.test_entry(entry, files, alias, trust, cancelled)
+            self.test_entry(entry, files, alias, adding, trust, cancelled)
         };
         match target {
             TestTarget::Saved(alias) => {
@@ -528,12 +531,13 @@ impl App {
     }
 
     /// Tests `alias`, reading `entry` instead of the user's configuration when given; `files`
-    /// name the files a configuration error is traced to.
+    /// name the files a configuration error is traced to. `adding` says the host is not saved yet.
     fn test_entry(
         &self,
         entry: Option<&Path>,
         files: &ConfigFiles<'_>,
         alias: &str,
+        adding: bool,
         trust: Option<&PresentedKey>,
         cancelled: &AtomicBool,
     ) -> Result<TestOutcome, AppError> {
@@ -544,7 +548,7 @@ impl App {
                     let rejection = interpret(stderr, files);
                     if !matches!(rejection, ConfigRejection::Unrecognised { .. }) {
                         return Ok(TestOutcome::Done(
-                            self.rejected_report(alias, stderr, rejection),
+                            self.rejected_report(alias, adding, stderr, rejection),
                         ));
                     }
                 }
@@ -619,12 +623,18 @@ impl App {
     }
 
     /// The test result for a configuration OpenSSH refused before it could connect.
-    fn rejected_report(&self, alias: &str, stderr: &str, rejection: ConfigRejection) -> TestReport {
+    fn rejected_report(
+        &self,
+        alias: &str,
+        adding: bool,
+        stderr: &str,
+        rejection: ConfigRejection,
+    ) -> TestReport {
         let diagnosis = rejection_diagnosis(stderr, rejection);
         TestReport {
             alias: alias.into(),
             user: None,
-            explanation: Some(self.explain_rejection(alias, Operation::Test, &diagnosis)),
+            explanation: Some(self.explain_rejection(alias, Operation::Test, adding, &diagnosis)),
             result: ProbeResult::Failed(diagnosis.failure),
             key_fetch_failure: None,
         }
@@ -635,6 +645,7 @@ impl App {
         &self,
         alias: &str,
         operation: Operation,
+        adding: bool,
         diagnosis: &Diagnosis,
     ) -> Explanation {
         let context = Context {
@@ -647,6 +658,7 @@ impl App {
             jump_is_known: false,
             home: self.home(),
             managed_file: Some(&self.store.paths().managed),
+            adding,
         };
         explain(diagnosis, &context)
     }
@@ -691,6 +703,7 @@ impl App {
                 jump_is_known,
                 home,
                 managed_file: Some(&self.store.paths().managed),
+                adding: false,
             },
         )
     }
@@ -1068,6 +1081,55 @@ mod tests {
             }))
         );
         assert!(report.explanation.is_some());
+    }
+
+    /// Next steps of a form test whose staged HostName line ssh rejects.
+    fn rejected_hostname_next(app: &TestApp, target: &TestTarget) -> Vec<String> {
+        write_executable(
+            app._dir.path().join("ssh"),
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -F ]; then entry="$2"; fi
+  shift
+done
+managed=$(sed -n 's/^Include "\(.*portico-candidate[^"]*\)".*/\1/p' "$entry")
+line=$(grep -n HostName "$managed" | head -n 1 | cut -d: -f1)
+printf '%s line %s: Bad hostname.\n' "$managed" "$line" >&2
+exit 255
+"#,
+        );
+        let TestOutcome::Done(report) = app.test(target).unwrap() else {
+            panic!("expected a report")
+        };
+        assert!(
+            matches!(
+                report.result,
+                ProbeResult::Failed(Failure::ConfigRejected(ConfigRejection::Managed { .. }))
+            ),
+            "{:?}",
+            report.result
+        );
+        report.explanation.unwrap().next
+    }
+
+    #[test]
+    fn a_rejected_field_is_corrected_in_an_add_form_and_edited_otherwise() {
+        let app = initialized_test_app();
+        assert_eq!(
+            rejected_hostname_next(&app, &TestTarget::Add(host("new"))),
+            ["correct the hostname field and try again"]
+        );
+
+        let app = initialized_test_app();
+        app.add(host("dev")).unwrap();
+        let edit = TestTarget::Edit {
+            alias: "dev".into(),
+            changes: HostChanges::default(),
+        };
+        assert_eq!(
+            rejected_hostname_next(&app, &edit),
+            ["change it with `portico edit dev`"]
+        );
     }
 
     #[test]

@@ -73,6 +73,9 @@ pub struct Context<'a> {
     pub home: &'a Path,
     /// The managed configuration file, which a rejected line of Portico's own is traced to.
     pub managed_file: Option<&'a Path>,
+    /// Whether the host is being added and does not exist yet, so a rejected field is corrected
+    /// in the form rather than with `portico edit`.
+    pub adding: bool,
 }
 
 struct Parts {
@@ -345,14 +348,20 @@ fn rejected(rejection: &ConfigRejection, context: &Context<'_>) -> Parts {
             alias,
             directive,
             message,
-            ..
+            field,
         } => {
             if let Some(file) = context.managed_file {
                 parts = parts.fact(Label::File, shorten(&file.display().to_string(), home));
             }
+            let next = if context.adding {
+                let field = field.map_or_else(|| directive.clone(), |field| field.to_string());
+                format!("correct the {field} field and try again")
+            } else {
+                format!("change it with `portico edit {alias}`")
+            };
             parts
                 .fact(Label::Line, format!("{directive} ({message})"))
-                .next(format!("change it with `portico edit {alias}`"))
+                .next(next)
         }
         ConfigRejection::UserFile {
             path,
@@ -514,6 +523,7 @@ mod tests {
             jump_is_known: false,
             home,
             managed_file: None,
+            adding: false,
         }
     }
 
@@ -1010,6 +1020,34 @@ mod tests {
                 "  next: change it with `portico edit web`",
             ]
         );
+    }
+
+    #[test]
+    fn a_managed_rejection_in_an_add_form_is_corrected_in_the_form() {
+        let home = home();
+        let mut context = context(&home, Operation::Test, &[]);
+        context.adding = true;
+        let rejection = |field| ConfigRejection::Managed {
+            alias: "web".into(),
+            field,
+            directive: "IdentityFile".into(),
+            message: "bad".into(),
+        };
+        let next = |field| {
+            explain(
+                &Diagnosis {
+                    failure: Failure::ConfigRejected(rejection(field)),
+                    raw: Vec::new(),
+                },
+                &context,
+            )
+            .next
+        };
+        assert_eq!(
+            next(Some(crate::host::HostField::IdentityFile)),
+            ["correct the identity file field and try again"]
+        );
+        assert_eq!(next(None), ["correct the IdentityFile field and try again"]);
     }
 
     #[test]
