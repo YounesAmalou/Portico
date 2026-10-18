@@ -7,6 +7,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
+    adopt::{AdoptError, MigrationPlan},
     config_error::{ConfigFiles, ConfigRejection, interpret},
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
     explain::{Context, Explanation, Operation, explain},
@@ -139,6 +140,8 @@ pub enum AppError {
     Init(#[from] InitError),
     #[error(transparent)]
     Transaction(#[from] TransactionError),
+    #[error(transparent)]
+    Adopt(#[from] AdoptError),
     #[error(transparent)]
     Discovery(#[from] DiscoveryError),
     #[error(transparent)]
@@ -455,6 +458,58 @@ impl App {
             .map_err(TransactionError::Operation)?)
     }
 
+    /// Which external hosts could move into the managed fragment, and what moving each would change.
+    pub fn adoption_plan(&self) -> Result<MigrationPlan, AppError> {
+        Ok(self.store.adoption_plan(&self.effective(None))?)
+    }
+
+    /// Which managed hosts could move back into the entry config, and what that would change.
+    pub fn export_plan(&self) -> Result<MigrationPlan, AppError> {
+        Ok(self.store.export_plan(&self.effective(None))?)
+    }
+
+    /// Moves the selected hosts of `plan` in one rollback-safe transaction and returns their
+    /// aliases.
+    pub fn migrate(
+        &self,
+        plan: &MigrationPlan,
+        selection: &[String],
+    ) -> Result<Vec<String>, AppError> {
+        self.migrate_inner(plan, selection, None)
+    }
+
+    pub(crate) fn migrate_cancellable(
+        &self,
+        plan: &MigrationPlan,
+        selection: &[String],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<String>, AppError> {
+        self.migrate_inner(plan, selection, Some(cancelled))
+    }
+
+    fn migrate_inner(
+        &self,
+        plan: &MigrationPlan,
+        selection: &[String],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Vec<String>, AppError> {
+        Ok(self
+            .store
+            .migrate(plan, selection, &self.effective(cancelled), cancelled)?)
+    }
+
+    /// `ssh -G` for an alias against a staged entry config, as the adoption checks need it.
+    fn effective<'a>(
+        &'a self,
+        cancelled: Option<&'a AtomicBool>,
+    ) -> impl Fn(&Path, &str) -> Result<String, String> + 'a {
+        move |entry, alias| {
+            self.openssh
+                .effective(entry, alias, cancelled)
+                .map_err(stderr_of)
+        }
+    }
+
     pub fn test(&self, target: &TestTarget) -> Result<TestOutcome, AppError> {
         self.test_cancellable(target, &AtomicBool::new(false))
     }
@@ -620,7 +675,8 @@ impl App {
         )
     }
 
-    fn home(&self) -> &Path {
+    /// The user's home directory as the configuration paths know it.
+    pub fn home(&self) -> &Path {
         let paths = self.store.paths();
         paths.ssh_dir.parent().unwrap_or(&paths.ssh_dir)
     }
@@ -952,12 +1008,12 @@ mod tests {
         app.add(host("dev")).unwrap();
         for (resolved, summary) in [
             (
-                "hostname db.internal\\nuser deploy\\nport 2222\\nproxyjump bastion\\n",
-                "authenticated as deploy@db.internal:2222 via bastion (publickey)",
+                "hostname 127.0.0.1\\nuser deploy\\nport 2222\\nproxyjump bastion\\n",
+                "authenticated as deploy@127.0.0.1:2222 via bastion (publickey)",
             ),
             (
-                "hostname db.internal\\nport 22\\nproxycommand nc %%h %%p\\n",
-                "authenticated to db.internal:22 via proxy (publickey)",
+                "hostname 127.0.0.1\\nport 22\\nproxycommand nc %%h %%p\\n",
+                "authenticated to 127.0.0.1:22 via proxy (publickey)",
             ),
         ] {
             app.install_ssh(resolved, &print_fixture("authenticated-via-proxy"), ":");

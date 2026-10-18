@@ -8,9 +8,10 @@ Thanks for helping improve Portico.
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+scripts/ci-checks.sh e2e
 ```
 
-The tests use temporary SSH homes and never connect to remote machines. The terminal tests need `python3` and OpenSSH installed, and the suite must run as a regular user: several tests prove that Portico refuses unreadable or unwritable SSH files, which root can always access. `scripts/ci-container.sh <check>` runs a CI check as an unprivileged user from inside a root container. Continuous integration runs these same checks, plus `cargo audit`, `cargo deny`, a minimum-Rust-version check and `cargo package`.
+The tests use temporary SSH homes and never connect to remote machines. `scripts/ci-checks.sh e2e` runs the end-to-end suite (`tests/e2e.rs`, ignored by a plain `cargo test`): the real binary, through a real pseudo-terminal where a terminal is involved, against a throwaway `sshd` that each test starts on `127.0.0.1` as the current user, so it needs OpenSSH's server (`/usr/bin/sshd`) installed. The terminal tests need `python3` and OpenSSH installed, and the suite must run as a regular user: several tests prove that Portico refuses unreadable or unwritable SSH files, which root can always access. `scripts/ci-container.sh <check>` runs a CI check as an unprivileged user from inside a root container. Continuous integration runs these same checks, plus `cargo audit`, `cargo deny`, a minimum-Rust-version check and `cargo package`.
 
 ## Continuous integration and releases
 
@@ -23,7 +24,7 @@ Four workflows live in `.github/workflows/`:
 | Pull request title | `pr-title.yml` | when a pull request is opened or its title changes |
 | Release | `release.yml` | on pushing a `vX.Y.Z` tag, and on a manual run |
 
-CI runs the seven jobs (`fmt`, `clippy`, `test`, `msrv`, `audit`, `deny`, `package`) in an Arch Linux container, as an unprivileged user. A pull request, a merge to `main` and a release all go through the same checks, so a green pull request is what a release will see. A first `changes` job decides which checks a change needs, and a job with nothing to check is skipped, which still counts as passing: a change that touches only Markdown files or `docs/` runs just the doc guards (`cargo test --test docs`), and `audit` and `deny` run only when `Cargo.toml`, `Cargo.lock`, `deny.toml` or the CI files change, plus in the daily run, because advisories are published independently of the code. Builds are cached per job: runs on `main` save the cache and pull requests restore it.
+CI runs the eight jobs (`fmt`, `clippy`, `test`, `e2e`, `msrv`, `audit`, `deny`, `package`) in an Arch Linux container, as an unprivileged user. A pull request, a merge to `main` and a release all go through the same checks, so a green pull request is what a release will see. A first `changes` job decides which checks a change needs, and a job with nothing to check is skipped, which still counts as passing: a change that touches only Markdown files or `docs/` runs just the doc guards (`cargo test --test docs`), and `audit` and `deny` run only when `Cargo.toml`, `Cargo.lock`, `deny.toml` or the CI files change, plus in the daily run, because advisories are published independently of the code. Builds are cached per job: runs on `main` save the cache and pull requests restore it.
 
 Release is not triggered by pull requests or pushes to branches. It has two modes:
 

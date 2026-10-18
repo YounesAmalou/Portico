@@ -39,7 +39,7 @@ pub enum ClearField {
 }
 
 /// A user-editable host field, as validated before it reaches the managed fragment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum HostField {
     Alias,
     Hostname,

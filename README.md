@@ -10,12 +10,13 @@ Portico is currently an early V1 focused on host management. Tunnels, identity-p
 - Adds, edits, inspects, renames, and removes managed hosts.
 - Shows the effective configuration reported by `ssh -G`.
 - Connects in the current terminal or through `xdg-terminal-exec`.
+- Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
-- Preserves existing SSH configuration and treats externally configured hosts as read-only.
+- Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
-Portico owns only `~/.ssh/portico/config`. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
+Portico owns only `~/.ssh/portico/config`. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents.
 
@@ -118,6 +119,8 @@ portico edit <alias> [options]  Change only the supplied fields
 portico remove <alias> [-f]     Remove a managed host
 portico connect <alias> [-n]    Connect using OpenSSH
 portico test <alias> [--raw]    Check that logging in works, without a shell
+portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
+portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
 ```
 
 Host fields and their aliases:
@@ -186,12 +189,26 @@ The first time a host is tested its key is usually unknown. In a terminal, Porti
 - **Saving** (`add`, `edit`, `init`): when OpenSSH rejects a value, the error names the host and the field (the TUI form focuses that field). When the problem is a line in your own SSH configuration, it names that file and line (`line 12 of ~/.ssh/config`), and nothing is saved until you fix it. `portico test` and `portico connect` explain a configuration OpenSSH rejects the same way, naming the file and line.
 - **In the TUI**, the status line shows the short explanation and the details pane shows the facts and next steps for the last test and the last connection. Press `o` to unfold ssh's own output in the details pane and `o` again to fold it; in a form, `Ctrl+O` does the same for the test result. The footer offers the key only when there is output to show.
 
-Remove a managed host. Unknown and external (read-only) aliases are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
+Remove a managed host. Unknown and external aliases (adopt them first) are rejected before any prompt. Interactive terminals ask for confirmation; scripts must pass `--force`/`-f`:
 
 ```sh
 portico remove development
 portico remove development --force
 ```
+
+### Adopt and export hosts
+
+`portico adopt` moves a host from your own SSH configuration into Portico, comments included, so you can edit it there; `ssh <alias>` behaves exactly as before. Only a simple block qualifies: a single concrete alias, declared once, using only `HostName`, `User`, `Port`, `IdentityFile` and `ProxyJump`, in a file you own and can write, where OpenSSH reports the same effective configuration after the move. Every other host is listed with the reason it cannot be adopted.
+
+```sh
+portico adopt                   # choose from a list
+portico adopt dev-vps --yes
+portico adopt --all
+```
+
+Portico shows an exact preview of both files first and, unless you pass `--yes`, asks before changing anything. Without `--yes` it asks in a terminal; scripts must pass `--yes` and name hosts or `--all`. Each file is backed up beside the original for the duration of the move and the backup is deleted once it succeeds; if anything fails, the files are restored. If the configuration changed since the preview, nothing is written and you run the command again.
+
+`portico export` is the way back: it moves managed hosts, comments included, into `~/.ssh/config` below the Portico include, with the same preview and options.
 
 Use `portico <command> --help` for the authoritative options for a command.
 
@@ -208,6 +225,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `Enter` | Connect in the current terminal |
 | `Ctrl+Enter` / `n` | Connect in a new terminal |
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
+| `m` | Adopt the selected external host, or export the selected managed host, after a preview |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |
@@ -223,7 +241,7 @@ Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolut
 
 A test shows `✓` or `✗` beside the host and its result in the details until the host is edited or removed or the inventory is refreshed. `Esc` cancels a running test. An unknown host key opens a prompt showing its fingerprint: `y` trusts it and tests again, `n` or `Esc` declines. If you have moved on by the time the result arrives (into the filter or a form, say), no prompt interrupts you: the host is marked untrusted, and `t` tests it again to review the key. Editing a form cancels its running test.
 
-External hosts can be inspected, tested and connected to, but Portico will not edit or remove them.
+External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
 
 ## Development checks

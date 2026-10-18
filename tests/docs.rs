@@ -357,3 +357,11 @@ fn readme_documents_the_connection_test() {
         assert!(readme.contains(expected), "README lacks {expected}");
     }
 }
+
+#[test]
+fn readme_documents_adoption() {
+    let readme = read("README.md");
+    for expected in ["portico adopt", "portico export", "| `m` |"] {
+        assert!(readme.contains(expected), "README lacks {expected}");
+    }
+}
