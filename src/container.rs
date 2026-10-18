@@ -61,8 +61,10 @@ pub fn parse_listing(stdout: &str) -> Listing {
             continue;
         }
         match parse_object(line) {
-            Some(fields) => listing.containers.push(container_from(fields)),
-            None => listing.skipped += 1,
+            Some(fields) if fields.get("id").is_some_and(|id| !id.is_empty()) => {
+                listing.containers.push(container_from(fields));
+            }
+            _ => listing.skipped += 1,
         }
     }
     listing
@@ -201,7 +203,9 @@ pub fn group(containers: &[Container]) -> Vec<Group<'_>> {
     let mut groups: Vec<Group> = projects
         .into_iter()
         .map(|(project, mut members)| {
-            members.sort_by(|a, b| (&a.service, a.number).cmp(&(&b.service, b.number)));
+            members.sort_by(|a, b| {
+                (&a.service, a.number, &a.name).cmp(&(&b.service, b.number, &b.name))
+            });
             Group {
                 project: Some(project),
                 containers: members,
@@ -290,10 +294,10 @@ mod tests {
 
     #[test]
     fn parses_escapes() {
-        let line = r#"{"name":"q\"b\\n\nt\tcéd…e😀"}"#;
+        let line = r#"{"id":"a","name":"q\"b\\n\nt\tcéd…e😀"}"#;
         let listing = parse_listing(line);
         assert_eq!(listing.containers[0].name, "q\"b\\n\nt\tcéd…e😀");
-        let raw = "{\"name\":\"é…\"}";
+        let raw = "{\"id\":\"a\",\"name\":\"é…\"}";
         assert_eq!(parse_listing(raw).containers[0].name, "é…");
     }
 
@@ -344,5 +348,38 @@ mod tests {
         ];
         let names: Vec<String> = all.iter().map(|c| display_name(c, &all)).collect();
         assert_eq!(names, ["web#1", "web#2", "db", "pgadmin"]);
+    }
+
+    #[test]
+    fn decodes_unicode_escapes_and_skips_lone_surrogates() {
+        let escaped = r#"{"id":"a","ports":"0.0.0.0:80>80/tcp 😀"}"#;
+        let listing = parse_listing(escaped);
+        assert_eq!(listing.containers[0].ports, "0.0.0.0:80>80/tcp 😀");
+        let lone = r#"{"id":"a","name":"\ud83dx"}"#;
+        let listing = parse_listing(lone);
+        assert!(listing.containers.is_empty());
+        assert_eq!(listing.skipped, 1);
+    }
+
+    #[test]
+    fn objects_without_an_id_are_skipped() {
+        let listing = parse_listing("{}\n{\"id\":\"\",\"name\":\"n\"}");
+        assert!(listing.containers.is_empty());
+        assert_eq!(listing.skipped, 2);
+    }
+
+    #[test]
+    fn group_breaks_ties_by_name() {
+        let all = vec![
+            container("shop-web-b", Some("shop"), Some("web"), 1),
+            container("shop-web-a", Some("shop"), Some("web"), 1),
+        ];
+        let groups = group(&all);
+        let names: Vec<&str> = groups[0]
+            .containers
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["shop-web-a", "shop-web-b"]);
     }
 }
