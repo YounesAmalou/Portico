@@ -40,7 +40,8 @@ use crate::{
     discovery::DiscoveryWarning,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::{InitPlan, TransactionError},
-    openssh::{ConnectionOutcome, ResolvedConfig},
+    openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
+    probe::ProbeResult,
 };
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
@@ -359,6 +360,17 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }
             UiAction::Test { origin, target } => tester.start(origin, Job::Test(target)),
             UiAction::CancelTest => tester.cancel(),
+            UiAction::Trust(trusted) => {
+                if let Some(pending) = state.trust.take()
+                    && trusted
+                {
+                    let job = Job::Trust {
+                        target: pending.target,
+                        key: pending.key,
+                    };
+                    tester.start(pending.origin, job);
+                }
+            }
         }
         // A form's result is only shown in that form.
         if !state.in_form() {
@@ -871,6 +883,7 @@ enum Mode {
     AddForm,
     EditForm,
     ConfirmRemove,
+    ConfirmTrust,
 }
 
 /// A single-line text field edited at a cursor.
@@ -1052,6 +1065,8 @@ struct UiState {
     testing: Option<String>,
     /// Connection test results of saved hosts, kept for the session.
     results: TestResults,
+    /// The host key awaiting the user's decision while in `Mode::ConfirmTrust`.
+    trust: Option<PendingTrust>,
 }
 
 /// The outcome of a host's last connection test.
@@ -1107,17 +1122,38 @@ struct FormState {
     test_result: Option<String>,
 }
 
+/// A host key the server presented that the user is deciding whether to trust.
+#[derive(Clone, Debug)]
+struct PendingTrust {
+    origin: Origin,
+    target: TestTarget,
+    key: PresentedKey,
+    /// The mode to return to once the prompt is answered.
+    previous: Mode,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum UiAction {
     None,
     Quit,
-    Connect { alias: String, new_terminal: bool },
+    Connect {
+        alias: String,
+        new_terminal: bool,
+    },
     Add(Host),
-    Edit { alias: String, changes: HostChanges },
+    Edit {
+        alias: String,
+        changes: HostChanges,
+    },
     Remove(String),
     Refresh,
-    Test { origin: Origin, target: TestTarget },
+    Test {
+        origin: Origin,
+        target: TestTarget,
+    },
     CancelTest,
+    /// The answer to the trust prompt; on `true` the key to trust is in `UiState::trust`.
+    Trust(bool),
 }
 
 impl UiState {
@@ -1140,6 +1176,7 @@ impl UiState {
             ctrl_enter,
             testing: None,
             results: TestResults::default(),
+            trust: None,
         }
     }
 
@@ -1224,6 +1261,7 @@ impl UiState {
             Mode::Filter => self.handle_filter_key(key),
             Mode::AddForm | Mode::EditForm => self.handle_form_key(key),
             Mode::ConfirmRemove => self.handle_remove_key(key),
+            Mode::ConfirmTrust => self.handle_trust_key(key),
         }
     }
 
@@ -1239,7 +1277,7 @@ impl UiState {
                 self.form.error = None;
                 self.form.test_result = None;
             }
-            Mode::Browse | Mode::ConfirmRemove => {}
+            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
     }
 
@@ -1386,15 +1424,59 @@ impl UiState {
     /// Shows a finished test: a saved host's result marks it in the list and the details pane
     /// and goes to the status line; a form's result goes to the form, if it is still open.
     fn record_test(&mut self, finished: Finished, finished_at: String) {
-        let (passed, line) = match &finished.outcome {
-            Ok(TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. }) => {
-                (report.passed(), report.summary())
+        let Finished {
+            origin,
+            target,
+            outcome,
+        } = finished;
+        let (passed, line, hint) = match &outcome {
+            Ok(TestOutcome::UnknownHostKey { key, .. }) if self.can_show(&origin) => {
+                self.trust = Some(PendingTrust {
+                    origin,
+                    target,
+                    key: key.clone(),
+                    previous: self.mode.clone(),
+                });
+                self.mode = Mode::ConfirmTrust;
+                return;
             }
-            Err(error) => (false, format!("failed \u{2014} {error}")),
+            Ok(TestOutcome::Done(report) | TestOutcome::UnknownHostKey { report, .. }) => {
+                let hint = match &report.result {
+                    ProbeResult::Failed(failure) => report
+                        .key_fetch_failure
+                        .as_ref()
+                        .map(|fetch| format!("could not fetch the host key: {fetch}"))
+                        .or_else(|| failure.hint().map(str::to_owned)),
+                    ProbeResult::Authenticated(_) => None,
+                };
+                (report.passed(), report.summary(), hint)
+            }
+            Err(error) => (false, format!("failed \u{2014} {error}"), None),
         };
-        match finished.origin {
+        let status = match (&origin, hint) {
+            (Origin::Host(_), Some(hint)) => format!("{}: {line} ({hint})", target.alias()),
+            (Origin::Host(_), None) => format!("{}: {line}", target.alias()),
+            (Origin::Form, _) => String::new(),
+        };
+        self.show_result(origin, passed, line, finished_at);
+        if !status.is_empty() {
+            self.status = Some(status);
+        }
+    }
+
+    /// Whether a result from `origin` still has somewhere to be shown.
+    fn can_show(&self, origin: &Origin) -> bool {
+        match origin {
+            Origin::Host(_) => true,
+            Origin::Form => self.in_form(),
+        }
+    }
+
+    /// Records a result: a saved host's marks it in the list and the details pane; a form's goes
+    /// to the form, if it is still open.
+    fn show_result(&mut self, origin: Origin, passed: bool, line: String, finished_at: String) {
+        match origin {
             Origin::Host(host) => {
-                self.status = Some(format!("{}: {line}", finished.target.alias()));
                 self.results.insert(
                     host,
                     TestMark {
@@ -1410,6 +1492,29 @@ impl UiState {
                 }
             }
         }
+    }
+
+    fn handle_trust_key(&mut self, key: KeyEvent) -> UiAction {
+        let trusted = match key.code {
+            KeyCode::Char('y') => true,
+            KeyCode::Char('n') | KeyCode::Esc => false,
+            _ => return UiAction::None,
+        };
+        let Some(pending) = &self.trust else {
+            self.mode = Mode::Browse;
+            return UiAction::None;
+        };
+        self.mode = pending.previous.clone();
+        if !trusted && let Some(pending) = self.trust.take() {
+            self.show_result(
+                pending.origin,
+                false,
+                "failed \u{2014} host key not trusted".into(),
+                local_time(),
+            );
+            self.status = Some("Host key not trusted".into());
+        }
+        UiAction::Trust(trusted)
     }
 
     /// The status line: the last message, otherwise the test in flight.
@@ -1694,6 +1799,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                 state.selected_alias().unwrap_or("selected host")
             ))],
         ),
+        Mode::ConfirmTrust => ("Trust host key", trust_lines(state.trust.as_ref())),
         _ => (
             "Details",
             details_text(state)
@@ -1718,6 +1824,25 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
     frame.render_widget(Paragraph::new(warnings), areas[1]);
     frame.render_widget(Paragraph::new(status.unwrap_or_default()), areas[2]);
     frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), areas[3]);
+}
+
+fn trust_lines(pending: Option<&PendingTrust>) -> Vec<Line<'static>> {
+    let Some(pending) = pending else {
+        return Vec::new();
+    };
+    let alias = pending.target.alias();
+    let mut lines = pending
+        .key
+        .fingerprints
+        .iter()
+        .map(|fingerprint| Line::raw(fingerprint.describe(alias)))
+        .collect::<Vec<_>>();
+    lines.push(Line::raw(
+        "Compare it with the fingerprint from the server's administrator or console.",
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("Trust it and test again? y/N"));
+    lines
 }
 
 fn footer_text(state: &UiState) -> String {
@@ -1761,6 +1886,7 @@ fn footer_text(state: &UiState) -> String {
             "↑↓ field  ←→ move  Enter save  Ctrl+T test  Esc cancel".into()
         }
         Mode::ConfirmRemove => "Enter remove  Esc cancel".into(),
+        Mode::ConfirmTrust => "y trust and test again  n/Esc keep it untrusted".into(),
     }
 }
 
@@ -3639,12 +3765,14 @@ mod tests {
             },
         };
         state.record_test(host_finished(prod.clone(), Ok(unknown_key)), "12:35".into());
+        assert_eq!(state.mode, Mode::ConfirmTrust);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('n')),
+            UiAction::Trust(false)
+        );
         let text = rendered(&state);
         assert!(text.contains("✗ prod  managed"), "{text}");
-        assert!(
-            text.contains("prod: failed — host key not trusted"),
-            "{text}"
-        );
+        assert!(text.contains("Host key not trusted"), "{text}");
 
         state.record_test(
             host_finished(prod, Err("unknown host: prod".into())),
@@ -3747,6 +3875,136 @@ mod tests {
         let text = rendered(&state);
         assert!(text.contains("Saved prod"), "{text}");
         assert!(!text.contains("Testing dev"), "{text}");
+    }
+
+    fn unknown_key(alias: &str, host: &str) -> TestOutcome {
+        TestOutcome::UnknownHostKey {
+            report: report(
+                alias,
+                ProbeResult::Failed(crate::probe::Failure::HostKeyUnknown),
+            ),
+            key: crate::openssh::PresentedKey {
+                lines: b"h ssh-ed25519 AAAA\n".to_vec(),
+                fingerprints: vec![crate::openssh::KeyFingerprint {
+                    host: host.into(),
+                    fingerprint: "SHA256:abc".into(),
+                    key_type: "ED25519".into(),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_opens_the_trust_prompt_with_the_fingerprint() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+
+        state.record_test(
+            host_finished(dev.clone(), Ok(unknown_key("dev", "|1|salt|hash"))),
+            "12:34".into(),
+        );
+
+        assert_eq!(state.mode, Mode::ConfirmTrust);
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Trust host key"), "{text}");
+        assert!(
+            text.contains("dev presents an ED25519 key with fingerprint SHA256:abc"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Compare it with the fingerprint from the server's administrator or console."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Trust it and test again? y/N"), "{text}");
+        assert!(
+            text.contains("y trust and test again  n/Esc keep it untrusted"),
+            "{text}"
+        );
+        assert!(state.results.get(&dev).is_none(), "nothing recorded yet");
+    }
+
+    #[test]
+    fn y_trusts_and_retests_and_returns_to_the_previous_mode() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        press(&mut state, KeyCode::Char('a'));
+        state.mode = Mode::EditForm;
+        let finished = Finished {
+            origin: Origin::Form,
+            target: TestTarget::Saved("dev".into()),
+            outcome: Ok(unknown_key("dev", "dev.example")),
+        };
+        state.record_test(finished, "12:34".into());
+        assert_eq!(state.mode, Mode::ConfirmTrust);
+
+        assert_eq!(press(&mut state, KeyCode::Char('x')), UiAction::None);
+        assert_eq!(state.mode, Mode::ConfirmTrust);
+        assert_eq!(press(&mut state, KeyCode::Char('y')), UiAction::Trust(true));
+
+        assert_eq!(state.mode, Mode::EditForm);
+        let pending = state.trust.take().expect("the key to trust");
+        assert_eq!(pending.origin, Origin::Form);
+        assert_eq!(pending.target, TestTarget::Saved("dev".into()));
+        assert_eq!(pending.key.lines, b"h ssh-ed25519 AAAA\n");
+        assert!(state.form.test_result.is_none(), "nothing recorded on y");
+    }
+
+    #[test]
+    fn n_and_esc_decline_and_mark_the_host_untrusted() {
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let dev = summary("dev", Ownership::Managed);
+            let mut state = test_state(vec![dev.clone()]);
+            state.record_test(
+                host_finished(dev.clone(), Ok(unknown_key("dev", "dev.example"))),
+                "12:34".into(),
+            );
+
+            assert_eq!(press(&mut state, code), UiAction::Trust(false));
+
+            assert_eq!(state.mode, Mode::Browse);
+            assert!(state.trust.is_none());
+            assert_eq!(state.status.as_deref(), Some("Host key not trusted"));
+            let mark = state.results.get(&dev).expect("a recorded result");
+            assert!(!mark.passed);
+            assert_eq!(mark.line, "failed \u{2014} host key not trusted");
+        }
+    }
+
+    #[test]
+    fn a_changed_key_shows_its_warning_without_a_prompt() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        let changed = TestOutcome::Done(report(
+            "dev",
+            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged),
+        ));
+
+        state.record_test(host_finished(dev.clone(), Ok(changed)), "12:34".into());
+
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(state.trust.is_none());
+        assert!(!state.results.get(&dev).unwrap().passed);
+        let status = state.status.unwrap();
+        assert!(status.starts_with("dev: failed"), "{status}");
+        assert!(status.contains("can mean an attack"), "{status}");
+    }
+
+    #[test]
+    fn a_form_result_for_a_closed_form_opens_no_prompt() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let finished = Finished {
+            origin: Origin::Form,
+            target: TestTarget::Saved("dev".into()),
+            outcome: Ok(unknown_key("dev", "dev.example")),
+        };
+        state.record_test(finished, "12:34".into());
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(state.trust.is_none());
     }
 
     #[test]

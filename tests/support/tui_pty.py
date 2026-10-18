@@ -62,7 +62,7 @@ class Screen:
         return "\n".join("".join(row) for row in self.rows)
 
 
-binary, home, fake_bin = sys.argv[1:]
+binary, home, fake_bin, *requested = sys.argv[1:]
 environment = dict(os.environ, HOME=home, PATH=fake_bin + os.pathsep + os.environ["PATH"])
 
 
@@ -252,6 +252,12 @@ def check_terminal(scenario):
             managed.chmod(0o600)
             os.write(master, b"r")
             read_screen("Refreshed: ")
+        elif scenario == "connection_test":
+            # The fake ssh answers after a second, so the test is visibly in flight first.
+            os.write(master, b"t")
+            read_screen("Testing dev\u2026 (Esc to cancel)")
+            read_screen("\u2713 dev")
+            assert "Testing dev" not in screen.text()
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")
@@ -352,5 +358,6 @@ def check_terminal(scenario):
         os.close(slave)
 
 
-for scenario in ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "refresh", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+scenarios = requested or ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "refresh", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
+for scenario in scenarios:
     check_terminal(scenario)

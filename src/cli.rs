@@ -306,16 +306,8 @@ fn print_untrusted_key(
 ) -> Result<(), String> {
     let mut text = format!("{alias}: host key not trusted\n");
     for presented in &key.fingerprints {
-        // A hashed known-hosts name is unreadable, so name the alias instead.
-        let host = if presented.host.starts_with("|1|") {
-            alias
-        } else {
-            &presented.host
-        };
-        text.push_str(&format!(
-            "{host} presents an {} key with fingerprint {}\n",
-            presented.key_type, presented.fingerprint
-        ));
+        text.push_str(&presented.describe(alias));
+        text.push('\n');
     }
     text.push_str("Compare it with the fingerprint from the server's administrator or console.\n");
     write!(output, "{text}").map_err(|error| error.to_string())

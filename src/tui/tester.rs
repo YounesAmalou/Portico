@@ -9,7 +9,10 @@ use std::{
     thread,
 };
 
-use crate::app::{App, HostSummary, TestOutcome, TestTarget};
+use crate::{
+    app::{App, HostSummary, TestOutcome, TestTarget},
+    openssh::PresentedKey,
+};
 
 /// Where a test was started, which decides where its result is shown.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +26,11 @@ pub(super) enum Origin {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Job {
     Test(TestTarget),
+    /// Trusts the host key that was shown, then tests again.
+    Trust {
+        target: TestTarget,
+        key: PresentedKey,
+    },
 }
 
 #[derive(Debug)]
@@ -84,7 +92,7 @@ impl Tester {
         self.generation += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         let alias = match &job {
-            Job::Test(target) => target.alias().to_owned(),
+            Job::Test(target) | Job::Trust { target, .. } => target.alias().to_owned(),
         };
         let request = Request {
             generation: self.generation,
@@ -148,10 +156,17 @@ fn test_worker(app: &App, requests: &mpsc::Receiver<Request>, results: &mpsc::Se
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
         }
-        let Job::Test(target) = request.job;
-        let outcome = app
-            .test_cancellable(&target, &request.cancelled)
-            .map_err(|error| error.to_string());
+        let (target, outcome) = match request.job {
+            Job::Test(target) => {
+                let outcome = app.test_cancellable(&target, &request.cancelled);
+                (target, outcome)
+            }
+            Job::Trust { target, key } => {
+                let outcome = app.trust_and_retest_cancellable(&target, &key, &request.cancelled);
+                (target, outcome)
+            }
+        };
+        let outcome = outcome.map_err(|error| error.to_string());
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
         }

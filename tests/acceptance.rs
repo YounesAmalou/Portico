@@ -272,6 +272,46 @@ exit 23
 }
 
 #[test]
+fn tui_connection_test_runs_on_a_real_pty() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    env.install_program(
+        "ssh",
+        r#"#!/bin/sh
+if [ "$1" = '-G' ]; then
+  printf 'hostname dev.example\nport 22\n'
+  exit 0
+fi
+sleep 1
+printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using "publickey".\n' >&2
+"#,
+    );
+
+    let output = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/tui_pty.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_portico"))
+        .arg(env.home())
+        .arg(env.bin())
+        .arg("connection_test")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "PTY harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
 fn concurrent_adds_do_not_lose_completed_updates() {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();

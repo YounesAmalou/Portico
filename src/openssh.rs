@@ -51,6 +51,22 @@ pub struct KeyFingerprint {
     pub key_type: String,
 }
 
+impl KeyFingerprint {
+    /// The line that shows this key to the user. A hashed known-hosts name is unreadable, so the
+    /// tested `alias` is named in its place.
+    pub fn describe(&self, alias: &str) -> String {
+        let host = if self.host.starts_with("|1|") {
+            alias
+        } else {
+            &self.host
+        };
+        format!(
+            "{host} presents an {} key with fingerprint {}",
+            self.key_type, self.fingerprint
+        )
+    }
+}
+
 /// The known-hosts lines a server presented, with their fingerprints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentedKey {
