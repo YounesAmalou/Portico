@@ -2201,7 +2201,10 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             .map_or(("Migrate", Vec::new()), |migrate| {
                 (
                     migrate.title(),
-                    migrate.lines(usize::from(columns[1].width.saturating_sub(2))),
+                    migrate.lines(
+                        usize::from(columns[1].width.saturating_sub(2)),
+                        usize::from(columns[1].height.saturating_sub(2)),
+                    ),
                 )
             }),
         _ => (

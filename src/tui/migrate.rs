@@ -1,6 +1,7 @@
 //! The migrate screen: a checklist of hosts to adopt or export, then the exact preview.
 
 use std::{
+    cell::Cell,
     collections::BTreeSet,
     path::{Path, PathBuf},
 };
@@ -11,6 +12,7 @@ use ratatui::{
     text::Line,
 };
 
+use super::{display_width, keep_start};
 use crate::adopt::{Candidate, Direction, MigrationPlan};
 
 /// Lines PageUp and PageDown scroll the preview by.
@@ -22,6 +24,8 @@ pub(super) struct MigrateState {
     /// Indexes of the checked candidates.
     selected: BTreeSet<usize>,
     cursor: usize,
+    /// The first checklist row shown, moved by rendering only as far as keeps the cursor visible.
+    offset: Cell<usize>,
     /// The rendered preview of the checked hosts and its first visible line, while it is shown.
     preview: Option<(String, usize)>,
     /// Shown as `~` in file paths.
@@ -53,6 +57,7 @@ impl MigrateState {
             plan,
             selected,
             cursor: found.unwrap_or(0),
+            offset: Cell::new(0),
             preview: None,
             home: None,
         }
@@ -119,9 +124,10 @@ impl MigrateState {
             .collect()
     }
 
-    /// The pane's lines for `width` columns inside its border: the checklist with the cursor
-    /// row reversed across the pane, or the preview from its scroll offset.
-    pub(super) fn lines(&self, width: usize) -> Vec<Line<'static>> {
+    /// The pane's lines for `width` columns and `height` rows inside its border: the rows of
+    /// the checklist that fit, each cut to the width and the cursor row reversed across the
+    /// pane, or the preview from its scroll offset.
+    pub(super) fn lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
         if let Some((preview, scroll)) = &self.preview {
             return preview
                 .lines()
@@ -142,10 +148,21 @@ impl MigrateState {
             .map(|candidate| candidate.alias.chars().count())
             .max()
             .unwrap_or(0);
+        let count = self.plan.candidates.len();
+        let height = height.max(1);
+        let offset = self
+            .offset
+            .get()
+            .min(self.cursor)
+            .max((self.cursor + 1).saturating_sub(height))
+            .min(count.saturating_sub(height));
+        self.offset.set(offset);
         self.plan
             .candidates
             .iter()
             .enumerate()
+            .skip(offset)
+            .take(height)
             .map(|(index, candidate)| {
                 let alias = &candidate.alias;
                 let (text, mut style) = match &candidate.reason {
@@ -166,9 +183,11 @@ impl MigrateState {
                         Style::default(),
                     ),
                 };
+                // Rows never wrap, so each takes exactly one line of the pane.
+                let text = keep_start(&text, width);
                 if index == self.cursor {
                     style = style.add_modifier(Modifier::REVERSED);
-                    let padding = width.saturating_sub(text.chars().count());
+                    let padding = width.saturating_sub(display_width(&text));
                     return Line::styled(format!("{text}{}", " ".repeat(padding)), style);
                 }
                 Line::styled(text, style)
@@ -250,7 +269,7 @@ mod tests {
 
     fn text(state: &MigrateState) -> Vec<String> {
         state
-            .lines(60)
+            .lines(60, usize::MAX)
             .iter()
             .map(|line| line.to_string().trim_end().to_owned())
             .collect()
@@ -261,7 +280,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(64, 14)).unwrap();
         terminal
             .draw(|frame| {
-                let paragraph = Paragraph::new(state.lines(62))
+                let paragraph = Paragraph::new(state.lines(62, 12))
                     .block(Block::default().borders(Borders::ALL).title(state.title()));
                 frame.render_widget(paragraph, frame.area());
             })
@@ -289,7 +308,7 @@ mod tests {
         press(&mut state, KeyCode::Char(' '));
         assert_eq!(text(&state)[0], "[ ] web   ~/.ssh/config");
 
-        let lines = state.lines(60);
+        let lines = state.lines(60, usize::MAX);
         assert!(lines[1].style.add_modifier.contains(Modifier::DIM));
         assert!(lines[0].style.add_modifier.contains(Modifier::REVERSED));
         assert!(!lines[2].style.add_modifier.contains(Modifier::REVERSED));
@@ -380,7 +399,7 @@ mod tests {
         let state = adoption(Some("DB"));
         assert_eq!(text(&state)[2], "[x] db    ~/.ssh/config");
         assert!(
-            state.lines(60)[2]
+            state.lines(60, usize::MAX)[2]
                 .style
                 .add_modifier
                 .contains(Modifier::REVERSED)
@@ -389,7 +408,7 @@ mod tests {
         let state = adoption(Some("wild"));
         assert!(text(&state).iter().all(|line| !line.starts_with("[x]")));
         assert!(
-            state.lines(60)[1]
+            state.lines(60, usize::MAX)[1]
                 .style
                 .add_modifier
                 .contains(Modifier::REVERSED)
@@ -429,6 +448,47 @@ mod tests {
             state.footer(),
             "↑↓ move  Space toggle  a all  Enter preview  Esc cancel"
         );
+    }
+
+    #[test]
+    fn checklist_scrolls_to_keep_the_cursor_visible() {
+        let mut candidates = (0..30)
+            .map(|index| candidate(&format!("host{index:02}"), None))
+            .collect::<Vec<_>>();
+        candidates[29].reason = Some("its Host line has a wildcard, so it cannot move".into());
+        let plan = MigrationPlan::for_tests(Direction::Adopt, candidates);
+        let mut state = MigrateState::new(plan, Some("host27")).with_home(Path::new("/home/test"));
+        let window = |state: &MigrateState| {
+            let lines = state.lines(30, 10);
+            assert_eq!(lines.len(), 10);
+            assert!(lines.iter().all(|line| line.width() <= 30), "{lines:?}");
+            let cursor = lines
+                .iter()
+                .position(|line| line.style.add_modifier.contains(Modifier::REVERSED))
+                .expect("the cursor row is visible");
+            let text = lines
+                .iter()
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect::<Vec<_>>();
+            (text, cursor)
+        };
+
+        let (rows, cursor) = window(&state);
+        assert_eq!(rows[cursor], "[x] host27  ~/.ssh/config");
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        let (rows, cursor) = window(&state);
+        assert_eq!(rows[cursor], "    host29  its Host line has…");
+        assert_eq!(cursor, 9);
+        // Moving up keeps the window until the cursor reaches its top.
+        press(&mut state, KeyCode::Up);
+        let (rows, cursor) = window(&state);
+        assert_eq!((rows[0].as_str(), cursor), ("[ ] host20  ~/.ssh/config", 8));
+        for _ in 0..30 {
+            press(&mut state, KeyCode::Up);
+        }
+        let (rows, cursor) = window(&state);
+        assert_eq!((rows[0].as_str(), cursor), ("[ ] host00  ~/.ssh/config", 0));
     }
 
     #[test]
