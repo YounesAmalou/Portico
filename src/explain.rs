@@ -76,6 +76,8 @@ pub struct Context<'a> {
     /// Whether the host is being added and does not exist yet, so a rejected field is corrected
     /// in the form rather than with `portico edit`.
     pub adding: bool,
+    /// Whether the explanation is shown in the TUI, where a test is a key press, not a command.
+    pub in_tui: bool,
 }
 
 struct Parts {
@@ -143,11 +145,12 @@ fn describe(failure: &Failure, context: &Context<'_>, key_entry: Option<String>)
             unusable,
         } => refusal(methods, offered, unusable, context),
         Failure::NameUnresolved { host } => {
+            // ssh -G reports the alias both when HostName is unset and when it names the alias.
             let note = if context
                 .hostname
                 .is_some_and(|name| name.eq_ignore_ascii_case(alias))
             {
-                " (no HostName is set, so ssh looked up the alias)"
+                " (ssh looked up the alias itself)"
             } else {
                 ""
             };
@@ -224,6 +227,8 @@ fn describe(failure: &Failure, context: &Context<'_>, key_entry: Option<String>)
             let parts = Parts::new("the host key is not trusted");
             if testing {
                 parts
+            } else if context.in_tui {
+                parts.next("the key was declined; press t to review it")
             } else {
                 parts.next(format!(
                     "the key was declined; review it with `portico test {alias}`"
@@ -285,13 +290,17 @@ fn refusal(
         .split(',')
         .any(|method| method.trim() == "publickey")
     {
-        let parts = Parts::new("the server accepts only a password")
-            .fact(Label::Methods, methods.replace(',', ", "));
+        let methods = methods.replace(',', ", ");
+        // A connection could type a password, so its refusal means the password was wrong.
         return match context.operation {
-            Operation::Connect => parts,
-            _ => parts.next(format!(
-                "the test cannot type a password; `portico connect {alias}` will ask for it"
-            )),
+            Operation::Connect => Parts::new("the server refused the password")
+                .fact(Label::Methods, methods)
+                .next("check the password, and User for the host"),
+            _ => Parts::new("the server accepts only a password")
+                .fact(Label::Methods, methods)
+                .next(format!(
+                    "the test cannot type a password; `portico connect {alias}` will ask for it"
+                )),
         };
     }
     let connecting = context.operation == Operation::Connect;
@@ -524,6 +533,7 @@ mod tests {
             home,
             managed_file: None,
             adding: false,
+            in_tui: false,
         }
     }
 
@@ -620,8 +630,9 @@ mod tests {
         assert_eq!(
             render("password-only", Operation::Connect),
             [
-                "dev: failed \u{2014} the server accepts only a password",
+                "dev: failed \u{2014} the server refused the password",
                 "  methods: password",
+                "  next:    check the password, and User for the host",
             ]
         );
     }
@@ -658,7 +669,7 @@ mod tests {
             explain(&diagnosis, &context).render("dev", false),
             [
                 "dev: failed \u{2014} the host name does not resolve",
-                "  name: probe.invalid (no HostName is set, so ssh looked up the alias)",
+                "  name: probe.invalid (ssh looked up the alias itself)",
                 "  next: check HostName for dev",
             ]
         );
@@ -779,6 +790,13 @@ mod tests {
                 "dev: failed \u{2014} the host key is not trusted",
                 "  next: the key was declined; review it with `portico test dev`",
             ]
+        );
+        let home = home();
+        let mut tui = context(&home, Operation::Connect, &[]);
+        tui.in_tui = true;
+        assert_eq!(
+            explained(Failure::HostKeyUnknown, &[], &tui)[1],
+            "  next: the key was declined; press t to review it"
         );
         assert_eq!(
             render("host-key-changed", Operation::Test),
@@ -1084,6 +1102,6 @@ mod tests {
             &[],
             &context,
         );
-        assert!(lines[1].contains("no HostName is set"), "{lines:?}");
+        assert!(lines[1].contains("looked up the alias"), "{lines:?}");
     }
 }

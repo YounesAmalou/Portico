@@ -352,16 +352,17 @@ impl App {
         if new_terminal {
             return Ok(self.openssh.launch_in_new_terminal(&alias)?);
         }
-        self.connect_here(&alias, None)
+        self.connect_here(&alias, None, false)
     }
 
+    /// Connects from the TUI, whose explanations name its keys rather than commands.
     pub(crate) fn connect_cancellable(
         &self,
         alias: &str,
         cancelled: &AtomicBool,
     ) -> Result<ConnectionOutcome, AppError> {
         let alias = self.connectable_alias(alias)?;
-        self.connect_here(&alias, Some(cancelled))
+        self.connect_here(&alias, Some(cancelled), true)
     }
 
     /// The alias as the inventory spells it.
@@ -379,13 +380,14 @@ impl App {
         &self,
         alias: &str,
         cancelled: Option<&AtomicBool>,
+        in_tui: bool,
     ) -> Result<ConnectionOutcome, AppError> {
         let mirrored = self
             .openssh
             .connect_mirrored(alias, Box::new(io::stderr()), cancelled)?;
         // Only 255 is ssh's own failure; any other code is the remote command's or a logout.
         let explanation = if mirrored.status.code() == Some(255) {
-            self.explain_connection(alias, &mirrored.tail)
+            self.explain_connection(alias, &mirrored.tail, in_tui)
         } else {
             None
         };
@@ -398,14 +400,14 @@ impl App {
 
     /// Explains a failed connection from the end of what ssh wrote to stderr, or `None` when
     /// the cause is not recognised: ssh's own output is then already on screen.
-    fn explain_connection(&self, alias: &str, tail: &[u8]) -> Option<Explanation> {
+    fn explain_connection(&self, alias: &str, tail: &[u8], in_tui: bool) -> Option<Explanation> {
         match self.openssh.resolve_with(None, alias, None) {
             Ok(resolved) => {
                 let diagnosis = diagnose(&String::from_utf8_lossy(tail), false, resolved.route());
                 if matches!(diagnosis.failure, Failure::Other(_)) {
                     return None;
                 }
-                Some(self.explain_failure(diagnosis, alias, &resolved, Operation::Connect))
+                Some(self.explain_failure(diagnosis, alias, &resolved, Operation::Connect, in_tui))
             }
             Err(OpenSshError::Failed { stderr, .. }) => {
                 let managed = &self.store.paths().managed;
@@ -583,6 +585,7 @@ impl App {
                 alias,
                 &resolved,
                 Operation::Test,
+                false,
             )),
             ProbeResult::Authenticated(_) => None,
         };
@@ -659,6 +662,7 @@ impl App {
             home: self.home(),
             managed_file: Some(&self.store.paths().managed),
             adding,
+            in_tui: false,
         };
         explain(diagnosis, &context)
     }
@@ -669,6 +673,7 @@ impl App {
         alias: &str,
         resolved: &ResolvedConfig,
         operation: Operation,
+        in_tui: bool,
     ) -> Explanation {
         let home = self.home();
         let identity_files: Vec<(String, bool)> = resolved
@@ -704,6 +709,7 @@ impl App {
                 home,
                 managed_file: Some(&self.store.paths().managed),
                 adding: false,
+                in_tui,
             },
         )
     }

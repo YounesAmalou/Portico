@@ -584,6 +584,13 @@ fn connect_explains_a_refused_login() {
 }
 
 #[test]
+fn connect_exits_as_a_shell_would_when_a_signal_kills_ssh() {
+    let env = env_with_x();
+    install_connecting_ssh(&env, RESOLVES, "kill -TERM $$");
+    env.run(["connect", "x"]).assert_exit_code(128 + 15);
+}
+
+#[test]
 fn connect_adds_nothing_for_other_exit_codes_or_unknown_output() {
     let env = env_with_x();
     install_connecting_ssh(

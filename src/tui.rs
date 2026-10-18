@@ -1306,6 +1306,7 @@ impl UiState {
                 let edited = input.as_str() != before;
                 self.form.error = None;
                 self.form.test_result = None;
+                self.show_raw = false;
                 if edited {
                     return UiAction::FormEdited;
                 }
@@ -1421,6 +1422,7 @@ impl UiState {
                     let edited = input.as_str() != before;
                     self.form.error = None;
                     self.form.test_result = None;
+                    self.show_raw = false;
                     if edited {
                         return UiAction::FormEdited;
                     }
@@ -1606,6 +1608,10 @@ impl UiState {
     ) {
         match origin {
             Origin::Host(host) => {
+                // Output unfolded for the old result is not a request to see the new one's.
+                if self.selected_summary() == Some(&host) {
+                    self.show_raw = false;
+                }
                 self.results.insert(
                     host,
                     TestMark {
@@ -1618,6 +1624,7 @@ impl UiState {
             }
             Origin::Form => {
                 if self.in_form() {
+                    self.show_raw = false;
                     self.form.test_result = Some(FormTestResult { line, explanation });
                 }
             }
@@ -4219,7 +4226,31 @@ mod tests {
         let dev = summary("dev", Ownership::Managed);
         let mut state = test_state(vec![dev.clone()]);
         resolve(&mut state, details("dev", Ownership::Managed));
-        let changed = explained("dev", "the host key has changed", &[], false);
+        let home = std::path::PathBuf::from("/home/me");
+        let mut changed = report(
+            "dev",
+            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged { known_hosts: None }),
+        );
+        changed.explanation = Some(crate::explain::explain(
+            &crate::probe::Diagnosis {
+                failure: crate::probe::Failure::HostKeyChanged { known_hosts: None },
+                raw: Vec::new(),
+            },
+            &crate::explain::Context {
+                alias: "dev",
+                operation: crate::explain::Operation::Test,
+                user: None,
+                hostname: Some("dev.example"),
+                port: None,
+                identity_files: &[],
+                jump_is_known: false,
+                home: &home,
+                managed_file: None,
+                adding: false,
+                in_tui: true,
+            },
+        ));
+        let changed = TestOutcome::Done(changed);
 
         state.record_test(host_finished(dev.clone(), Ok(changed)), "12:34".into());
 
@@ -4228,10 +4259,10 @@ mod tests {
         assert!(!state.results.get(&dev).unwrap().passed);
         assert_eq!(
             state.status.as_deref(),
-            Some("dev: failed \u{2014} the host key has changed")
+            Some("dev: failed \u{2014} the host key changed, which can mean an attack")
         );
         let text = details_text(&state);
-        assert!(text.contains("  next: try this"), "{text}");
+        assert!(text.contains("`ssh-keygen -R dev.example`"), "{text}");
     }
 
     #[test]
@@ -4505,6 +4536,42 @@ mod tests {
         assert!(!state.show_raw);
         press(&mut state, KeyCode::Esc);
         assert!(!state.show_raw);
+    }
+
+    #[test]
+    fn a_new_result_or_a_form_edit_folds_the_output_again() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        resolve(&mut state, details("dev", Ownership::Managed));
+        let failed = || Ok(explained("dev", "refused", &["Permission denied"], false));
+
+        state.record_test(host_finished(dev.clone(), failed()), "12:34".into());
+        press(&mut state, KeyCode::Char('o'));
+        assert!(state.show_raw);
+        state.record_test(host_finished(dev, failed()), "12:35".into());
+        assert!(!state.show_raw, "a new result of the selected host");
+
+        press(&mut state, KeyCode::Char('a'));
+        let form_finished = || Finished {
+            origin: Origin::Form,
+            target: TestTarget::Add(Host::new("new", "h", None, None, None, None).unwrap()),
+            outcome: failed(),
+        };
+        state.record_test(form_finished(), "12:36".into());
+        state.handle_key(ctrl('o'));
+        assert!(state.show_raw);
+        state.record_test(form_finished(), "12:37".into());
+        assert!(!state.show_raw, "a new result of the form");
+
+        state.handle_key(ctrl('o'));
+        assert!(state.show_raw);
+        press(&mut state, KeyCode::Char('x'));
+        assert!(!state.show_raw, "typing in a field");
+
+        state.record_test(form_finished(), "12:38".into());
+        state.handle_key(ctrl('o'));
+        state.handle_paste("y");
+        assert!(!state.show_raw, "pasting into a field");
     }
 
     #[test]
