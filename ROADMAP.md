@@ -20,54 +20,48 @@ Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/s
 
 Everything here works in the terminal and adds no long-running state.
 
-1. **Connection test edge cases.** Three rare configurations the first version of `portico test` does not handle:
-   - A multi-hop `ProxyJump a,b` whose intermediate hop logs at `VERBOSE` prints its own `(via proxy)` login before the target's, which can be taken for the target's success.
-   - A `ProxyCommand` with `ProxyUseFdpass yes` makes OpenSSH log the direct-socket form of the login line, which the test does not accept for a proxied host, so it reports a timeout.
-   - A signal that arrives just after the first test finishes leaves the cancel flag set, so trusting a key and testing again reports "cancelled" although the key was trusted.
-2. **Container shells (Docker and Compose).** List the running containers on the local machine or on a host Portico knows, and open a shell in one. Requirements:
+1. **Container shells (Docker and Compose).** List the running containers on the local machine or on a host Portico knows, and open a shell in one. Requirements:
    - Listing runs `docker ps` locally, or over `ssh` on the chosen host, each time it is asked for; nothing is stored. Compose projects and services (from the `com.docker.compose.*` labels) group and name the containers.
    - Connecting runs `docker exec -it` (never `docker attach`) as the chosen user, defaulting to the image's own user, and starts `bash` when the container has it and `sh` otherwise. On a host it runs through `ssh -t <alias>`, so it reuses the current-terminal and new-terminal connect paths and their error explanations, jump hosts included.
    - Reached from both the CLI and the TUI (a container picker for a host, plus the local machine).
    - Scope stops at listing and a shell: container logs, restarts and Compose lifecycle (`up`, `down`) are not planned.
    - Open design questions, settled when the slice starts: hosts where the user cannot run `docker` without a password, Podman, and whether the last user chosen per service is remembered.
-3. **Safe adoption:** losslessly migrate a concrete external block only after showing an exact preview, creating a backup, and providing rollback.
 
 ### v3: long-running work and the desktop
 
 Tunnels outlive the command that starts them, and the desktop surface reads everything through one CLI contract, so these ship together.
 
-4. **Tunnels (saved forwards, run on demand).** Model local, remote and dynamic forwards, save them, and start and stop them on demand. Requirements:
+2. **Tunnels (saved forwards, run on demand).** Model local, remote and dynamic forwards, save them, and start and stop them on demand. Requirements:
    - Saved tunnels live in Portico-owned configuration, are listed, edited, added and removed from both the CLI and the TUI, and the TUI treats them as a first-class screen: obvious add and edit forms with field validation, one key to start or stop, and a status column (stopped, running, failed, port in use).
    - Local conflicts are detected before starting (the local port is already bound, or two saved tunnels collide).
    - A started tunnel is an `ssh` process Portico can find again after Portico exits, without a resident Portico process. Where its state lives, and how it is stopped, are the central design questions.
    - Explicitly started only: nothing starts automatically.
-5. **Machine-readable output.** The smallest `--json` contract (hosts, one host's details, their containers, and tunnels and their status) that the desktop surface needs, defined by that consumer's requirements and carrying no credentials.
-6. **Desktop surface (Quickshell).** A Quickshell component for quick connection and tunnel control: a short list of hosts (and their containers) to connect to, and the saved tunnels with their status and a start or stop action. It reads from the CLI contract above and does not duplicate management: adding, editing and adopting stay in the TUI and CLI.
+3. **Machine-readable output.** The smallest `--json` contract (hosts, one host's details, their containers, and tunnels and their status) that the desktop surface needs, defined by that consumer's requirements and carrying no credentials.
+4. **Desktop surface (Quickshell).** A Quickshell component for quick connection and tunnel control: a short list of hosts (and their containers) to connect to, and the saved tunnels with their status and a start or stop action. It reads from the CLI contract above and does not duplicate management: adding, editing and adopting stay in the TUI and CLI.
    - **Quickshell first, Omarchy second.** Omarchy's shell is a Quickshell configuration, so one Quickshell component can serve both. On a plain Quickshell setup it runs as its own panel; on Omarchy it can additionally be packaged as an Omarchy plugin (a `plugin.json` with a bar widget and a panel entry point, as other plugins in `~/.config/omarchy/plugins` do) and offered through the Omarchy menu. The shared part is the panel; only the thin entry points differ.
    - Open design questions: bar widget versus launcher-style popup, how connecting opens a terminal (reuse the `xdg-terminal-exec` path), and how the panel learns of status changes without a daemon (poll the CLI on open).
-7. **Identity awareness:** discover file references and agent/provider identities, including 1Password, while keeping private keys with their provider. Identity knowledge must remain separate from credential possession. Discovery and display only: Portico does not generate keys.
+5. **Identity awareness:** discover file references and agent/provider identities, including 1Password, while keeping private keys with their provider. Identity knowledge must remain separate from credential possession. Discovery and display only: Portico does not generate keys.
 
 ### v4: more places to open a shell
 
-8. **Proxmox container shells.** The same list-and-shell flow for LXC containers on a Proxmox VE node Portico knows: list them with `pct list` over `ssh`, and open a shell with `pct exec <vmid>` as the chosen user, `bash` first and `sh` otherwise. It is a second backend behind the container shells picker, not a separate feature.
+6. **Proxmox container shells.** The same list-and-shell flow for LXC containers on a Proxmox VE node Portico knows: list them with `pct list` over `ssh`, and open a shell with `pct exec <vmid>` as the chosen user, `bash` first and `sh` otherwise. It is a second backend behind the container shells picker, not a separate feature.
    - Open design questions, settled when the slice starts: `pct` needs root on the node, and whether stopped containers are listed.
 
 ### Unscheduled
 
-9. **More OpenSSH directives (optional, undecided).** Managed hosts support only host, user, port, identity file and ProxyJump today. Supporting more directives is wanted but must not overload the tool. Whether this ships as a curated set added one directive at a time, as a free-form "custom directive" field validated by OpenSSH, or both, is an open design question; the answer decides the slice's size. It stays optional: the default form does not grow.
+7. **More OpenSSH directives (optional, undecided).** Managed hosts support only host, user, port, identity file and ProxyJump today. Supporting more directives is wanted but must not overload the tool. Whether this ships as a curated set added one directive at a time, as a free-form "custom directive" field validated by OpenSSH, or both, is an open design question; the answer decides the slice's size. It stays optional: the default form does not grow.
 
 ## Production readiness
 
 | Item | Prerequisite |
 |---|---|
 | Project website and documentation: a static site that presents Portico (what it is, install, a short tour) and holds the user documentation now living in the README, kept in this repository and published from CI | A choice of generator (a docs-oriented static site tool) and hosting (GitHub Pages is the default candidate); the README stays the short entry point. Whatever is built is verified on GitHub, not only locally |
-| Automated end-to-end tests with a real OpenSSH and a real terminal in CI | Its own design |
 | Leaner CI and CD, remainder: merge small jobs (for example `fmt` into `clippy`) so they share the setup each job pays (about 30 s: starting the container, installing packages and the toolchain) | Measured and left out: it saves runner time but no wall-clock time, because the jobs run in parallel and the slowest one sets the pace, and it renames checks that pull requests must pass. Revisit if runner time starts to matter |
 | AUR package `portico` (source build) | Built and merged; publishing is suspended until an AUR account and key exist. Then set the `aur` environment secret and re-run the failed job |
 | AUR package `portico-bin` (prebuilt binary) | Demand for faster installs; the source package ships first |
 | Live inventory reload when the config changes | Its own design: watch `~/.ssh/config` and every included file (or poll modification times), debounce editors that save by renaming, and never reshuffle the list while a form is open; the manual refresh key already ships |
 | Linux release artifacts, ready to use without installing Rust: prebuilt tarballs (a static x86_64 musl build that runs on any distribution including Arch Linux, and an aarch64 build) and distribution packages (`.deb`, `.rpm` and an Arch Linux `.pkg.tar.zst`), each checksummed and attached to the GitHub Release | Its own design: the final target list, whether the aarch64 build needs native ARM runners in CI, how each package is built and verified in a clean container of its distribution, and how this fits the release-plz workflow; first check what the build and distribution channels already support natively |
-| macOS support, distributed through Homebrew | The end-to-end tests, and a portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher |
+| macOS support, distributed through Homebrew | A portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher, with the end-to-end tests running on macOS |
 | Windows support, distributed through winget | The same portability work, plus a Windows terminal launcher |
 | Signed releases and SBOM/provenance attestations | A decision on signing keys and attestation format |
 | Trusted Publishing on crates.io | Configure the trust relationship on crates.io, then switch the publish job to OIDC and delete the stored token |

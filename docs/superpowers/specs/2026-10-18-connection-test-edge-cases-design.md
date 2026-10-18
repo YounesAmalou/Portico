@@ -1,6 +1,6 @@
 # Connection Test Edge Cases Design
 
-**Status:** Approved
+**Status:** Approved; implemented
 
 ## Purpose
 

@@ -43,8 +43,8 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
     // Every bolded slice title still pending in the spec must survive in the roadmap.
     let pending = titles(pending);
     assert!(
-        pending.len() >= 4,
-        "expected four slices, found {pending:?}"
+        pending.len() >= 3,
+        "expected three slices, found {pending:?}"
     );
     for title in pending {
         assert!(roadmap.contains(title), "roadmap dropped slice {title:?}");
@@ -60,14 +60,7 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
         );
     }
 
-    for planned in [
-        "aarch64",
-        "macOS",
-        "Windows",
-        "AUR",
-        "Homebrew",
-        "end-to-end",
-    ] {
+    for planned in ["aarch64", "macOS", "Windows", "AUR", "Homebrew"] {
         assert!(roadmap.contains(planned), "roadmap lacks {planned}");
     }
 }
