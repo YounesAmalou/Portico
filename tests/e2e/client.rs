@@ -47,15 +47,19 @@ impl Client {
 for arg do
   [ "$arg" = -F ] && exec /usr/bin/ssh "$@"
 done
+# Portico runs several ssh processes at once: each writes its own copy and
+# renames it into place, so none reads a copy another one is writing.
 flat="$HOME/.ssh/e2e-flat-config"
+partial="$flat.$$"
 mkdir -p "$HOME/.ssh"
 if [ -f "$HOME/.ssh/config" ]; then
-  sed "s|~/|$HOME/|g" "$HOME/.ssh/config" > "$flat"
+  sed "s|~/|$HOME/|g" "$HOME/.ssh/config" > "$partial"
 else
-  : > "$flat"
+  : > "$partial"
 fi
 printf '\nHost *\n  UserKnownHostsFile %s\n  GlobalKnownHostsFile /dev/null\n  IdentityAgent none\n  IdentitiesOnly yes\n' \
-  "$HOME/.ssh/known_hosts" >> "$flat"
+  "$HOME/.ssh/known_hosts" >> "$partial"
+mv -f "$partial" "$flat"
 exec /usr/bin/ssh -F "$flat" "$@"
 "#,
         );

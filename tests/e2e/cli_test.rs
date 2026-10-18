@@ -123,3 +123,37 @@ fn parallel_servers_get_distinct_ports() {
     ports.dedup();
     assert_eq!(ports.len(), servers.len(), "two servers share a port");
 }
+
+/// Portico runs `ssh` processes concurrently (resolving details while a test
+/// runs); each must see the whole configuration, never a half-written copy.
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn concurrent_ssh_calls_see_the_whole_config() {
+    let sshd = Sshd::start();
+    let client = Client::new();
+    client.init();
+    client.add_host("box", &sshd, &sshd.client_key());
+    let ssh = client.home().parent().unwrap().join("bin/ssh");
+    let handles: Vec<_> = (0..32)
+        .map(|_| {
+            let ssh = ssh.clone();
+            let env = client.env();
+            thread::spawn(move || {
+                std::process::Command::new(ssh)
+                    .args(["-G", "box"])
+                    .envs(env)
+                    .output()
+                    .unwrap()
+            })
+        })
+        .collect();
+    for handle in handles {
+        let output = handle.join().unwrap();
+        let resolved = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            resolved.contains("hostname 127.0.0.1"),
+            "an ssh saw a partial config:\n{resolved}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
