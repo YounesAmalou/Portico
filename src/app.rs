@@ -6,6 +6,12 @@ use std::{
 
 use thiserror::Error;
 
+mod containers;
+
+pub use containers::{
+    ContainerError, ContainerList, ContainerPrograms, DockerIssue, Offer, Target,
+};
+
 use crate::{
     config_error::{ConfigFiles, ConfigRejection, interpret},
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
@@ -24,6 +30,7 @@ use crate::{
 pub struct App {
     store: ManagedStore,
     openssh: OpenSsh,
+    container_programs: ContainerPrograms,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,7 +166,17 @@ pub enum AppError {
 
 impl App {
     pub fn new(store: ManagedStore, openssh: OpenSsh) -> Self {
-        Self { store, openssh }
+        Self {
+            store,
+            openssh,
+            container_programs: ContainerPrograms::default(),
+        }
+    }
+
+    /// Replaces the programs container commands run on this machine.
+    pub fn with_container_programs(mut self, programs: ContainerPrograms) -> Self {
+        self.container_programs = programs;
+        self
     }
 
     pub fn init_plan(&self) -> Result<InitPlan, AppError> {

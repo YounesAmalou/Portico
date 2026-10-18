@@ -611,10 +611,6 @@ impl OpenSsh {
     /// With `batch`, ssh never prompts (`BatchMode=yes`, stdin closed) and `cancelled` stops it
     /// and everything it started. Without, stdin is inherited and ssh stays in Portico's
     /// process group so it can prompt on the terminal; `cancelled` is ignored then.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the container commands that follow")
-    )]
     pub(crate) fn run_remote(
         &self,
         alias: &str,
@@ -682,7 +678,9 @@ impl OpenSsh {
         }
     }
 
-    fn cancellable_output(
+    /// Runs `command` in its own process group with stdout and stderr captured; setting
+    /// `cancelled` stops it and everything it started.
+    pub(crate) fn cancellable_output(
         &self,
         command: &mut Command,
         cancelled: &AtomicBool,
