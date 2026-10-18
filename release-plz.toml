@@ -14,9 +14,10 @@ semver_check = false
 release_commits = "^(feat|fix|security|perf|refactor|changed)"
 # Before 1.0, a feature raises the minor version (0.2.6 -> 0.3.0) and a fix the patch.
 features_always_increment_minor = true
-# release-plz's default body without its credit footer.
+# release-plz's default body (as of the release-plz version release-plz.yml pins) without
+# its credit footer. Tera 1 has no block `set`, hence the macro.
 pr_body = """
-{% set changes %}
+{% macro get_changes(releases, type="text") %}
 {%- for release in releases %}
 {%- if release.changelog %}{% if releases | length > 1 %}
 ## `{{ release.package }}`
@@ -28,7 +29,9 @@ pr_body = """
 {{ release.changelog }}
 </blockquote>{% endif %}
 {% endfor %}
-{% endset %}
+{% endmacro -%}
+
+{% set changes = self::get_changes(releases=releases) %}
 
 ## New release
 {% for release in releases %}
