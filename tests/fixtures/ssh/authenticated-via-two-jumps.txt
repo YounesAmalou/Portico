@@ -1,0 +1,9 @@
+Authenticated to 127.0.0.1 ([127.0.0.1]:22999) using "publickey".
+Authenticated to 127.0.0.2 (via proxy) using "publickey".
+Authenticated to 127.0.0.3 (via proxy) using "publickey".
+Transferred: sent 3596, received 3668 bytes, in 3.8 seconds
+Bytes per second: sent 948.0, received 967.0
+Transferred: sent 7520, received 7692 bytes, in 3.8 seconds
+Bytes per second: sent 1961.3, received 2006.2
+Transferred: sent 11776, received 12056 bytes, in 3.9 seconds
+Bytes per second: sent 3041.0, received 3113.3
