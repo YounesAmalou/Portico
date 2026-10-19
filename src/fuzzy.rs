@@ -129,7 +129,20 @@ fn align(term: &[char], text: &[Folded]) -> Option<(i64, Vec<usize>)> {
     let mut best = vec![vec![None::<i64>; columns]; rows];
     let mut from = vec![vec![0usize; columns]; rows];
     for (j, &wanted) in term.iter().enumerate() {
+        // A gap from k to i costs GAP_START + (i - k - 2) * GAP_EXTEND, so the best gapped
+        // predecessor is the best of best[j - 1][k] - k * GAP_EXTEND, kept as i moves right.
+        // The earliest k wins a tie.
+        let mut gapped: Option<(i64, usize)> = None;
         for i in 0..columns {
+            if j > 0
+                && let Some(k) = i.checked_sub(2)
+                && let Some(before) = best[j - 1][k]
+            {
+                let value = before - k as i64 * GAP_EXTEND;
+                if gapped.is_none_or(|(kept, _)| value > kept) {
+                    gapped = Some((value, k));
+                }
+            }
             if text[i].character != wanted {
                 continue;
             }
@@ -138,18 +151,15 @@ fn align(term: &[char], text: &[Folded]) -> Option<(i64, Vec<usize>)> {
                 best[j][i] = Some(here);
                 continue;
             }
-            let previous = (0..i)
-                .filter_map(|k| {
-                    let before = best[j - 1][k]?;
-                    let gap = i - k - 1;
-                    let joined = if gap == 0 {
-                        CONSECUTIVE
-                    } else {
-                        GAP_START + (gap as i64 - 1) * GAP_EXTEND
-                    };
-                    Some((before + joined, k))
-                })
-                .max_by_key(|&(score, k)| (score, std::cmp::Reverse(k)));
+            let gap = gapped.map(|(value, k)| (value + GAP_START + (i as i64 - 2) * GAP_EXTEND, k));
+            let consecutive = i
+                .checked_sub(1)
+                .and_then(|k| Some((best[j - 1][k]? + CONSECUTIVE, k)));
+            let previous = match (gap, consecutive) {
+                (Some(gap), Some(consecutive)) if consecutive.0 > gap.0 => Some(consecutive),
+                (Some(gap), _) => Some(gap),
+                (None, consecutive) => consecutive,
+            };
             if let Some((score, k)) = previous {
                 best[j][i] = Some(score + here);
                 from[j][i] = k;
@@ -257,6 +267,90 @@ mod tests {
             .map(|(index, _)| index)
             .collect();
         assert_eq!(order, vec![0, 1]);
+    }
+
+    /// `align` as first written: for each match, every earlier match of the previous character.
+    fn naive_align(term: &[char], text: &[Folded]) -> Option<(i64, Vec<usize>)> {
+        let (rows, columns) = (term.len(), text.len());
+        if rows == 0 || rows > columns {
+            return (rows == 0).then(|| (0, Vec::new()));
+        }
+        let mut best = vec![vec![None::<i64>; columns]; rows];
+        let mut from = vec![vec![0usize; columns]; rows];
+        for (j, &wanted) in term.iter().enumerate() {
+            for i in 0..columns {
+                if text[i].character != wanted {
+                    continue;
+                }
+                let here = MATCH + text[i].bonus;
+                if j == 0 {
+                    best[j][i] = Some(here);
+                    continue;
+                }
+                let previous = (0..i)
+                    .filter_map(|k| {
+                        let before = best[j - 1][k]?;
+                        let gap = i - k - 1;
+                        let joined = if gap == 0 {
+                            CONSECUTIVE
+                        } else {
+                            GAP_START + (gap as i64 - 1) * GAP_EXTEND
+                        };
+                        Some((before + joined, k))
+                    })
+                    .max_by_key(|&(score, k)| (score, std::cmp::Reverse(k)));
+                if let Some((score, k)) = previous {
+                    best[j][i] = Some(score + here);
+                    from[j][i] = k;
+                }
+            }
+        }
+        let (score, mut at) = (0..columns)
+            .filter_map(|i| best[rows - 1][i].map(|score| (score, i)))
+            .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))?;
+        let mut positions = vec![0; rows];
+        for j in (0..rows).rev() {
+            positions[j] = text[at].original;
+            at = from[j][at];
+        }
+        Some((score, positions))
+    }
+
+    #[test]
+    fn align_agrees_with_the_naive_alignment() {
+        // The last field ties two gapped predecessors of its `b`: `a` after `-`, and `a` 8 later.
+        let fields = [
+            "ab-ab",
+            "aab-bba",
+            "a-b-a-b-a",
+            "abba-ab",
+            "baab",
+            "Ab-aB",
+            "a--b--ab",
+            "x-axxxxxxxaxb",
+        ];
+        // Every term of up to four characters of `a`, `b`, `-` and `x`.
+        let mut terms: Vec<Vec<char>> = vec![Vec::new()];
+        let mut level = terms.clone();
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|term| {
+                    ['a', 'b', '-', 'x'].map(|character| [term.as_slice(), &[character]].concat())
+                })
+                .collect();
+            terms.extend(level.iter().cloned());
+        }
+        for field in fields {
+            let text = fold_field(field);
+            for term in &terms {
+                assert_eq!(
+                    align(term, &text),
+                    naive_align(term, &text),
+                    "{term:?} in {field}"
+                );
+            }
+        }
     }
 
     #[test]
