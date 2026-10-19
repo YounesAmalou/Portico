@@ -241,4 +241,16 @@ TestCase {
         compare(Portico.tunnelRows({ schema: 1, tunnels: [null] })[0].stateText, "Unknown")
         compare(Portico.actionResult({ schema: 1, results: [null] }, "db").outcome, "failed")
     }
+
+    function test_version_banner() {
+        compare(Portico.versionBanner("0.6.0+0123456789abcdef\n", "portico 0.6.0\n"), "")
+        compare(Portico.versionBanner("0.5.1+0123456789abcdef\n", "portico 0.6.0\n"),
+                "This panel is from Portico 0.5.1 and portico is 0.6.0. Run portico desktop install to update it.")
+        compare(Portico.versionBanner("", "portico 0.6.0\n"), "")
+        compare(Portico.versionBanner(undefined, "portico 0.6.0"), "")
+        compare(Portico.versionBanner("0.5.1+abc", ""), "")
+        compare(Portico.versionBanner("0.5.1+abc", "something else"), "")
+        compare(Portico.localPath("file:///home/me/my%20panel/VERSION"), "/home/me/my panel/VERSION")
+        compare(Portico.localPath("/plain"), "/plain")
+    }
 }

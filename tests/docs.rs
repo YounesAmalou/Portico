@@ -254,6 +254,8 @@ fn aur_package_builds_the_tagged_source_and_installs_the_binary() {
         "cargo build --frozen --release",
         "install -Dm755 target/release/portico \"$pkgdir/usr/bin/portico\"",
         "LICENSE-MIT LICENSE-APACHE",
+        "packaging/desktop/portico.desktop \"$pkgdir/usr/share/applications/portico.desktop\"",
+        "packaging/desktop/portico.svg \"$pkgdir/usr/share/icons/hicolor/scalable/apps/portico.svg\"",
     ] {
         assert!(pkgbuild.contains(expected), "PKGBUILD lacks {expected}");
     }
@@ -508,6 +510,9 @@ fn readme_documents_the_desktop_panel() {
         "omarchy plugin enable portico",
         "omarchy-shell shell toggle portico",
         "PORTICO_BIN",
+        "portico desktop install",
+        "portico desktop uninstall",
+        "portico desktop status",
     ] {
         assert!(
             section.contains(needle),

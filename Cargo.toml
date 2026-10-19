@@ -16,8 +16,9 @@ exclude = [
     ".worktrees/",
     "docs/superpowers/",
     ".github/",
-    "packaging/",
-    "desktop/",
+    "packaging/aur/",
+    "desktop/quickshell/tests/",
+    "desktop/quickshell/preview.png",
     "tests/docs.rs",
     "tests/package.rs",
 ]

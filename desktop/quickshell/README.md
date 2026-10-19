@@ -14,4 +14,6 @@ Installing and using it: the "Desktop panel" section of the [README](../../READM
 | `tests/fake-portico` | Answers the panel from the golden files, to run it without real hosts |
 | `preview.png` | The panel with the fake, for the README and Omarchy's plugin listing |
 
+The `portico` binary embeds these files, except `tests/` and `preview.png`, and `portico desktop install` writes them with a `VERSION` stamp, which the panel compares with `portico --version` to show a banner when they differ.
+
 Check it with `scripts/ci-checks.sh desktop` from the repository root.

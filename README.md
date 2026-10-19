@@ -21,7 +21,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
-Portico owns only `~/.ssh/portico/config` and, for saved tunnels, `~/.ssh/portico/tunnels`, which OpenSSH never reads. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
+Portico owns only `~/.ssh/portico/config` and, for saved tunnels, `~/.ssh/portico/tunnels`, which OpenSSH never reads. `portico desktop install` adds, only with your confirmation, the desktop panel's directory `~/.local/share/portico/panel` (which any `portico` command keeps in step with the binary), links to it in your desktop shell's configuration, a launcher entry and icon under `~/.local/share` marked as Portico's, and one keybinding line between marker comments; `portico desktop uninstall` removes exactly those. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents. To show identities it only checks that key files exist, reads public key files with `ssh-keygen -l`, and asks agents for their public key list with `ssh-add -l`; it never generates keys, loads them into an agent, or asks an agent to sign.
 
@@ -327,9 +327,19 @@ Use `portico <command> --help` for the authoritative options for a command.
 
 `desktop/quickshell/` is a small Quickshell panel: the saved tunnels with their status and a Start or Stop button, and the hosts to connect to in a new terminal, each expandable to its running containers to open a shell in. It runs `portico` with `--json` when it opens and lists the tunnels again every 5 seconds while it stays open; nothing runs while it is closed. Containers are listed only when you expand a host (`→`), and the panel never runs `portico show`. It manages nothing: hosts and tunnels are added, edited and removed in the CLI and the TUI. Typing filters, `↑` / `↓` move, `Enter` connects, opens the shell or starts or stops the tunnel, `←` collapses, `F5` lists again and `Esc` closes.
 
-The panel runs from a checkout of this repository; nothing installs it for you. It finds `portico` through `$PORTICO_BIN`, then `PATH`, then `~/.cargo/bin/portico`. A session started by the compositor often lacks `~/.cargo/bin` on its `PATH`; in Hyprland, set `env = PORTICO_BIN,/path/to/portico`. The panel needs a Portico with `--json` and says so when the one it finds is older or newer than it reads.
+**Install it with `portico desktop install`.** The panel is built into the `portico` binary, so it needs no checkout. The command shows its whole plan first (every file and link it will create or edit, and every command it will run), then asks about each of three parts:
 
-**Plain Quickshell.** Try it from the checkout, then open it:
+- **The panel.** Portico writes it to `~/.local/share/portico/panel` (under `$XDG_DATA_HOME` when set) and links it into your desktop shell. On Omarchy (found by `omarchy-shell` and `~/.config/omarchy/plugins`) it links `~/.config/omarchy/plugins/portico`, then runs `omarchy-shell shell rescanPlugins` and `omarchy plugin enable portico`, and the panel appears as a bar icon. With plain Quickshell (`qs` on `PATH`) it links `~/.config/quickshell/portico`, starts it with `qs -c portico -n -d`, and prints the line that starts it with your session. `--omarchy` or `--quickshell` chooses the target yourself.
+- **A launcher entry,** so application launchers list Portico (it opens the TUI in a terminal): `~/.local/share/applications/portico.desktop` and an icon. A package that already ships one (the AUR package does) makes this unnecessary, and the command says so.
+- **A keybinding** that toggles the panel, `SUPER + ALT + P` unless you type another combination (`--bind "<combo>"` proposes one). Portico checks that the combination is free (with `hyprctl binds` on Hyprland, including Omarchy, or in the Sway configuration), shows the exact line and file, keeps a backup, and writes the line between two marker comments: Omarchy's `~/.config/hypr/bindings.lua` gets `o.bind("SUPER + ALT + P", "Portico", "omarchy-shell shell toggle portico")`, other Hyprland setups get `bind = SUPER ALT, P, exec, qs -c portico ipc call portico toggle` (or `hl.bind(…)` in a Lua configuration), and Sway gets a `bindsym` line. With another compositor it prints the command to bind and changes nothing.
+
+`--yes` accepts every proposal without asking (a taken combination is still refused), and `--no-bind`, `--no-launcher` and `--no-panel` leave a part out. `portico desktop status` shows what is installed and the panel's version, and `portico desktop uninstall` removes exactly what `install` created, after a preview; the keybinding file's backups stay.
+
+The panel follows Portico: any `portico` command notices when the installed panel was written by an older version and quietly rewrites Portico's copy (only inside its own directory; a panel from a newer Portico, or a `portico` run from a cargo build directory, leaves it alone), and running `portico desktop install` again repairs or updates everything. If the panel still finds itself out of step with `portico`, it says so in a banner.
+
+The panel finds `portico` through `$PORTICO_BIN`, then `PATH`, then `~/.cargo/bin/portico`. A session started by the compositor often lacks `~/.cargo/bin` on its `PATH`; in Hyprland, set `env = PORTICO_BIN,/path/to/portico`. The panel needs a Portico with `--json` and says so when the one it finds is older or newer than it reads.
+
+**Manual setup, from a checkout.** The panel's source is `desktop/quickshell/`, and it also runs straight from a checkout, which is handy when changing it. With plain Quickshell, try it, then open it:
 
 ```sh
 qs -p desktop/quickshell
@@ -344,7 +354,7 @@ qs -c portico
 qs -c portico ipc call portico toggle
 ```
 
-**Omarchy.** The same directory is an Omarchy plugin with a bar icon and a popup. Link it (a `git pull` then updates it) or copy it into the plugins directory, then enable it:
+On Omarchy, the same directory is an Omarchy plugin with a bar icon and a popup. Link it (a `git pull` then updates it), then enable it:
 
 ```sh
 ln -s "$PWD/desktop/quickshell" ~/.config/omarchy/plugins/portico
@@ -352,7 +362,7 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable portico
 ```
 
-The icon opens the panel under it; for a keybinding, bind `omarchy-shell shell toggle portico '{}'`. `omarchy plugin add` does not apply, because the plugin is a directory of this repository rather than a repository of its own. To remove it, `omarchy plugin disable portico` and delete the link.
+For a keybinding, bind `omarchy-shell shell toggle portico`. `omarchy plugin add` does not apply, because the plugin is a directory of this repository rather than a repository of its own. To remove it, `omarchy plugin disable portico` and delete the link. `portico desktop install` replaces such a link with its own copy, after saying so.
 
 Connecting runs `portico connect --new-terminal`, so the terminal is the one `xdg-terminal-exec` opens, and a failure is explained there or under the row. Start and stop run in the background (a start can take as long as the host's `ConnectTimeout`) under `setsid`, so a reload of the panel never interrupts one.
 

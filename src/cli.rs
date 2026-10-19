@@ -25,6 +25,7 @@ use crate::{
     picker::{Picker, Row},
 };
 
+mod desktop;
 mod json;
 mod tunnels;
 
@@ -161,6 +162,41 @@ enum Command {
         #[command(subcommand)]
         command: tunnels::TunnelCommand,
     },
+    /// Install the desktop panel, a launcher entry and a keybinding, or show or remove them.
+    Desktop {
+        #[command(subcommand)]
+        command: desktop::DesktopCommand,
+    },
+}
+
+impl Cli {
+    /// Whether this is a `portico desktop` command, which `main` runs with the desktop
+    /// environment and which must not refresh the panel first.
+    pub fn is_desktop(&self) -> bool {
+        matches!(self.command, Some(Command::Desktop { .. }))
+    }
+}
+
+/// Runs a `portico desktop` command.
+pub fn run_desktop(
+    cli: Cli,
+    env: &crate::desktop::DesktopEnv,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    error: &mut dyn Write,
+    interactive: bool,
+) -> ExitCode {
+    let Some(Command::Desktop { command }) = cli.command else {
+        return ExitCode::FAILURE;
+    };
+    match desktop::run(command, env, input, output, interactive) {
+        Ok(exit) => exit,
+        Err(message) => {
+            let _ = output.flush();
+            let _ = writeln!(error, "error: {message}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `--via`: the tool that runs docker inside the docker group.
@@ -576,6 +612,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
         Some(Command::Tunnels { .. }) => tunnels::list(app, output),
         Some(Command::Tunnel { command }) => {
             tunnels::run(command, app, picker, input, output, error, interactive)
+        }
+        // `main` runs these through `run_desktop`, with the desktop environment.
+        Some(Command::Desktop { .. }) => {
+            Err("portico desktop needs the desktop environment".into())
         }
         Some(Command::Adopt { aliases, all, yes }) => {
             let interrupts = Interrupts::install(handle_signals)
