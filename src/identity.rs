@@ -522,6 +522,9 @@ pub fn assemble(
 
 /// `path` with a leading `home` shown as `~`.
 pub fn tilde(path: &Path, home: &Path) -> String {
+    if home.as_os_str().is_empty() {
+        return path.display().to_string();
+    }
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
         Ok(rest) => format!("~/{}", rest.display()),
@@ -897,6 +900,8 @@ mod tests {
         assert_eq!(tilde_text("/home/me/.ssh/a", home), "~/.ssh/a");
         assert_eq!(tilde_text("/home/meow/a", home), "/home/meow/a");
         assert_eq!(tilde_text("~/.ssh/a", home), "~/.ssh/a");
+        assert_eq!(tilde(Path::new("/a/b"), Path::new("")), "/a/b");
+        assert_eq!(tilde_text("/a/b", Path::new("")), "/a/b");
         assert_eq!(
             short_fingerprint("SHA256:NQlIU/kfZu3WkN47"),
             "SHA256:NQlIU/kf…"

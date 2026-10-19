@@ -1,5 +1,6 @@
 use std::{
     io, panic,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -243,6 +244,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
+    state.home = app.home().to_owned();
     sync_details(&mut state, &mut resolver, false);
     lister.list(&mut state.containers, Target::Local);
     let mut redraw = true;
@@ -1229,6 +1231,9 @@ struct UiState {
     /// Every identity Portico knows of, for the IdentityFile suggestions; built once a form
     /// opens and dropped on refresh.
     identity_inventory: Option<IdentityInventory>,
+    /// The home whose `~/.ssh` the IdentityFile suggestions scan and whose paths show as `~`;
+    /// empty (nothing scanned) until the session sets it from the app.
+    home: PathBuf,
 }
 
 /// The left-column panel that receives keys while browsing.
@@ -1436,6 +1441,7 @@ impl UiState {
             focus: Focus::Hosts,
             migrate: None,
             identity_inventory: None,
+            home: PathBuf::new(),
         }
     }
 
@@ -1761,10 +1767,7 @@ impl UiState {
         let previous = form.suggestions.take();
         let forced = on_demand || previous.as_ref().is_some_and(|list| list.forced);
         if form.active == IDENTITY_FILE {
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default();
-            let candidates = identities::candidates(self.identity_inventory.as_ref(), &home);
+            let candidates = identities::candidates(self.identity_inventory.as_ref(), &self.home);
             let query = form.values[IDENTITY_FILE].as_str();
             let items = identities::missing_last(suggest::rank(query, &candidates, &[]));
             let exact = items.iter().any(|item| item.alias == query);
@@ -2770,7 +2773,7 @@ fn details_text(state: &UiState) -> String {
         return "No host selected".into();
     };
     let text = match state.details.get(selected) {
-        Some(Ok(details)) => detail_text(details),
+        Some(Ok(details)) => detail_text(details, &state.home),
         Some(Err(error)) => format!("Could not load details: {error}"),
         None => "Resolving…".into(),
     };
@@ -2873,7 +2876,7 @@ fn declared_rows(host: &Host) -> [DetailRow; 5] {
 
 /// Describes a host with each field shown once, as OpenSSH resolves it. Portico's own
 /// declaration only appears where it does not take effect, or while resolution is unavailable.
-fn detail_text(details: &HostDetails) -> String {
+fn detail_text(details: &HostDetails, home: &Path) -> String {
     let mut text = format!(
         "Ownership: {}\nSource: {}\n\n",
         ownership(details.summary.ownership),
@@ -2891,11 +2894,8 @@ fn detail_text(details: &HostDetails) -> String {
                 push_rows(&mut text, std::slice::from_ref(row));
             }
             if let Some(identities) = &details.identities {
-                let home = std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default();
                 text.push('\n');
-                text.push_str(&identities::detail_lines(identities, &home));
+                text.push_str(&identities::detail_lines(identities, home));
             }
             let overridden = declared
                 .iter()
@@ -3032,7 +3032,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Instant};
+    use std::time::Instant;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -5549,6 +5549,14 @@ mod tests {
     }
 
     #[test]
+    fn identity_suggestions_never_scan_without_a_home() {
+        let mut state = identity_form(None);
+        assert_eq!(state.home, PathBuf::new());
+        state.handle_key(ctrl(' '));
+        assert!(state.form.suggestions.is_none());
+    }
+
+    #[test]
     fn identity_file_ctrl_space_lists_everything_and_moving_away_closes_it() {
         let mut state = identity_form(Some(identity_inventory()));
         state.handle_key(ctrl(' '));
@@ -5564,11 +5572,15 @@ mod tests {
 
     #[test]
     fn identity_suggestions_follow_the_inventory_when_it_arrives() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh/scanned.pub"), "").unwrap();
         let mut state = identity_form(None);
+        state.home = home.path().to_owned();
         state.handle_key(ctrl(' '));
-        let before = listed(&state).len();
+        assert_eq!(listed(&state), ["~/.ssh/scanned.pub"]);
         state.finish_identities(Ok(identity_inventory()));
-        assert_eq!(listed(&state).len(), 3, "before: {before}");
+        assert_eq!(listed(&state).len(), 3);
         state.finish_identities(Err("boom".into()));
         assert_eq!(
             state.status.as_deref(),
@@ -5579,7 +5591,7 @@ mod tests {
     #[test]
     fn identities_replace_the_identity_file_row_in_the_details() {
         let mut details = details("web", Ownership::Managed);
-        let plain = detail_text(&details);
+        let plain = detail_text(&details, Path::new("/home/test"));
         assert!(plain.contains("IdentityFile ~/.ssh/id_ed25519"), "{plain}");
         details.identities = Some(crate::identity::HostIdentities {
             agent: crate::identity::Agent::Disabled,
@@ -5596,7 +5608,7 @@ mod tests {
             also_offered: Vec::new(),
             pkcs11_provider: None,
         });
-        let text = detail_text(&details);
+        let text = detail_text(&details, Path::new("/home/test"));
         assert_eq!(text.matches("~/.ssh/id_ed25519").count(), 1, "{text}");
         assert!(
             text.contains(

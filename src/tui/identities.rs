@@ -218,6 +218,9 @@ fn key_label(key: &PublicKey) -> String {
 /// files in `~/.ssh`. Missing files come last.
 pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> Vec<Candidate> {
     let Some(inventory) = inventory else {
+        if home.as_os_str().is_empty() {
+            return Vec::new();
+        }
         return key_files_in(&home.join(".ssh"))
             .into_iter()
             .map(|path| Candidate {
