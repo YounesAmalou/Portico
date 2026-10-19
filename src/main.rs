@@ -8,7 +8,7 @@ use clap::Parser;
 use portico::{
     app::App,
     cli::{Cli, fail, run, run_desktop},
-    desktop::{DesktopEnv, panel},
+    desktop::{DesktopEnv, is_development_binary, panel},
     managed::{ConfigPaths, ManagedStore},
     openssh::OpenSsh,
     picker::TerminalPicker,
@@ -45,8 +45,11 @@ fn main() -> ExitCode {
             interactive,
         );
     }
-    // Keep an installed panel in step with this binary; silent, and a no-op without a panel.
-    panel::refresh(&desktop.panel_dir());
+    // Bring an installed panel up to this binary; silent, a no-op without a panel, and never
+    // from a cargo build, which would rewrite the installed panel on every run.
+    panel::refresh(&desktop.panel_dir(), || {
+        std::env::current_exe().is_ok_and(|exe| is_development_binary(&exe))
+    });
     let runtime = RuntimeDir::locate(
         home.as_ref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),

@@ -1,6 +1,7 @@
 //! `portico desktop install | uninstall | status`: plans, questions and reports.
 
 use std::{
+    fs,
     io::{BufRead, Write},
     path::PathBuf,
     process::ExitCode,
@@ -232,6 +233,11 @@ fn install(
     };
     let panel_ready = panel_present || panel_steps.is_some();
     if matches!(binding, Binding::Ready(..) | Binding::Taken { .. }) && !panel_ready {
+        writeln!(
+            output,
+            "Skipping the keybinding: it toggles the panel, which is not installed."
+        )
+        .map_err(w)?;
         binding = Binding::Unavailable("it toggles the panel, which is not installed".into());
     }
     let binding_steps = match target {
@@ -350,6 +356,12 @@ fn plan_panel(env: &DesktopEnv, target: Target) -> Part {
     let link = target.link(env);
     let mut steps = Vec::new();
     let state = panel::state(&dir);
+    if state == panel::State::Blocked {
+        return Part::Unavailable(format!(
+            "{} is a link or a file, not a directory Portico created; move it away to install the panel",
+            env.show(&dir)
+        ));
+    }
     if state != panel::State::Current {
         steps.push(Step::WritePanel);
     }
@@ -403,6 +415,15 @@ fn plan_panel(env: &DesktopEnv, target: Target) -> Part {
 fn plan_launcher(env: &DesktopEnv) -> (Part, Vec<String>) {
     let (desktop_path, icon_path) = launcher::paths(env);
     for path in [&desktop_path, &icon_path] {
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return (
+                Part::Unavailable(format!(
+                    "{} is a link, not Portico's; move it away to install the launcher entry",
+                    env.show(path)
+                )),
+                Vec::new(),
+            );
+        }
         if path.exists() && !launcher::is_marked(path) {
             return (
                 Part::Unavailable(format!(
@@ -413,7 +434,7 @@ fn plan_launcher(env: &DesktopEnv) -> (Part, Vec<String>) {
             );
         }
     }
-    if !desktop_path.exists()
+    if fs::symlink_metadata(&desktop_path).is_err()
         && let Some(system) = launcher::system_entry(env)
     {
         return (
@@ -740,7 +761,12 @@ fn report(env: &DesktopEnv, output: Out, step: &Step, said: Option<String>) -> R
             } else {
                 "Added the keybinding to"
             };
-            writeln!(output, "{verb} {} (backup {}).", show(file), show(backup))
+            writeln!(
+                output,
+                "{verb} {} (backup {}).",
+                show(file),
+                said.unwrap_or_else(|| show(backup))
+            )
         }
         Step::Remove(path) => writeln!(output, "Removed {}.", show(path)),
         Step::RemovePanel => writeln!(output, "Removed {}.", show(&env.panel_dir())),
@@ -759,6 +785,7 @@ fn uninstall(
     let run = |args: &[&str]| Step::Run(args.iter().map(|arg| arg.to_string()).collect());
     let mut steps = Vec::new();
     let mut problems = Vec::new();
+    let mut notes = Vec::new();
 
     let omarchy_link = Target::Omarchy.link(env);
     if desktop::link_state(&omarchy_link, &dir) == Link::Ours {
@@ -791,14 +818,14 @@ fn uninstall(
                     .map(str::to_string)
                     .collect();
                 sway |= setup == keybinding::Setup::Sway;
+                let (file, shown) = desktop::edit_target(env, &file);
                 steps.push(Step::Edit {
                     text: keybinding::replace_block(&original, &block, None),
                     backup: desktop::backup_path(&file),
                     action: format!(
-                        "remove   lines {}-{} of {}",
+                        "remove   lines {}-{} of {shown}",
                         block.first + 1,
                         block.last + 1,
-                        env.show(&file)
                     ),
                     file,
                     original,
@@ -820,12 +847,17 @@ fn uninstall(
             steps.push(Step::Remove(path));
         }
     }
-    if dir.exists() {
+    if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
         steps.push(Step::RemovePanel);
+    } else if panel::is_blocked(&dir) {
+        notes.push(format!(
+            "{} is a link or a file, not Portico's directory; it is left alone",
+            env.show(&dir)
+        ));
     }
 
-    for problem in &problems {
-        writeln!(output, "note: {problem}").map_err(w)?;
+    for note in problems.iter().chain(&notes) {
+        writeln!(output, "note: {note}").map_err(w)?;
     }
     if steps.is_empty() {
         writeln!(output, "Portico's desktop integration is not installed.").map_err(w)?;
@@ -861,6 +893,10 @@ fn status(env: &DesktopEnv, output: Out) -> Result<(), String> {
     let dir = env.panel_dir();
     let version = env!("CARGO_PKG_VERSION");
     let panel = match panel::state(&dir) {
+        panel::State::Blocked => format!(
+            "blocked: {} is a link or a file, not Portico's directory",
+            env.show(&dir)
+        ),
         panel::State::Missing => "not installed".to_string(),
         panel::State::Current => format!(
             "installed in {}, {version} (matches this portico)",
@@ -1056,6 +1092,10 @@ mod tests {
         let (result, out) = install(&env, "n\ny\n");
         assert!(result.is_ok(), "{out}");
         assert!(!out.contains("Add the keybinding"), "{out}");
+        assert!(
+            out.contains("Skipping the keybinding: it toggles the panel, which is not installed."),
+            "{out}"
+        );
         assert!(!env.panel_dir().exists());
         assert!(launcher::paths(&env).0.exists());
         assert_eq!(bindings(&env), BINDINGS);

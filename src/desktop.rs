@@ -73,6 +73,12 @@ impl DesktopEnv {
         }
     }
 
+    /// Omarchy's configuration directory: always `~/.config`, since Omarchy's shell, its plugin
+    /// commands and its Hyprland bootstrap ignore `XDG_CONFIG_HOME`.
+    pub fn omarchy_config(&self) -> PathBuf {
+        self.home.join(".config")
+    }
+
     /// Portico's panel directory.
     pub fn panel_dir(&self) -> PathBuf {
         self.data_home.join("portico/panel")
@@ -122,15 +128,22 @@ impl DesktopEnv {
         ))
     }
 
-    /// Whether the running binary is a cargo build's (`…/target/debug/portico`).
+    /// Whether the running binary is a cargo build's (see `is_development_binary`).
     pub fn is_development_build(&self) -> bool {
-        self.exe.as_deref().is_some_and(|exe| {
-            exe.parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "target")
-        })
+        self.exe.as_deref().is_some_and(is_development_binary)
     }
+}
+
+/// Whether `exe` is a cargo build's: under a directory holding the `CACHEDIR.TAG` cargo writes at
+/// a target directory's root, or under a `target` directory next to a `Cargo.toml`.
+pub fn is_development_binary(exe: &Path) -> bool {
+    exe.ancestors().skip(1).any(|dir| {
+        dir.join("CACHEDIR.TAG").is_file()
+            || (dir.file_name().is_some_and(|name| name == "target")
+                && dir
+                    .parent()
+                    .is_some_and(|parent| parent.join("Cargo.toml").is_file()))
+    })
 }
 
 /// Where the panel is installed.
@@ -151,7 +164,7 @@ impl Target {
     /// The link to the panel directory in the target's configuration.
     pub fn link(self, env: &DesktopEnv) -> PathBuf {
         match self {
-            Target::Omarchy => env.config_home.join("omarchy/plugins/portico"),
+            Target::Omarchy => env.omarchy_config().join("omarchy/plugins/portico"),
             Target::Quickshell => env.config_home.join("quickshell/portico"),
         }
     }
@@ -159,7 +172,7 @@ impl Target {
 
 /// The target found or forced, and why; or what is missing, with the flags to use.
 pub fn detect(env: &DesktopEnv, forced: Option<Target>) -> Result<(Target, String), String> {
-    let plugins = env.config_home.join("omarchy/plugins");
+    let plugins = env.omarchy_config().join("omarchy/plugins");
     let omarchy_shell = env.find("omarchy-shell").is_some();
     let qs = env.find("qs").is_some();
     match forced {
@@ -329,7 +342,10 @@ pub fn apply(env: &DesktopEnv, step: &Step) -> Result<Option<String>, String> {
                     show(file)
                 ));
             }
-            fs::copy(file, backup).map_err(io(format!("could not back up {}", show(file))))?;
+            let backup = create_backup(file, backup)
+                .map_err(io(format!("could not back up {}", show(file))))?;
+            // `file` is the resolved path, so a configuration file that is a link into a
+            // dotfiles repository keeps its link and the repository's copy gets the change.
             let mut temporary = file.clone();
             temporary
                 .as_mut_os_string()
@@ -344,6 +360,7 @@ pub fn apply(env: &DesktopEnv, step: &Step) -> Result<Option<String>, String> {
                     let _ = fs::remove_file(&temporary);
                     format!("could not write {}: {error}", show(file))
                 })?;
+            return Ok(Some(show(&backup)));
         }
         Step::Remove(path) => {
             fs::remove_file(path).map_err(io(format!("could not remove {}", show(path))))?;
@@ -359,15 +376,64 @@ pub fn apply(env: &DesktopEnv, step: &Step) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// A backup path next to `file`: `<file>.portico-bak.<unix seconds>`.
+/// A free backup path next to `file`: `<file>.portico-bak.<unix seconds>`, then `-1`, `-2`…
 pub fn backup_path(file: &Path) -> PathBuf {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let mut path = file.to_path_buf();
-    path.as_mut_os_string()
+    let mut base = file.to_path_buf();
+    base.as_mut_os_string()
         .push(format!(".portico-bak.{seconds}"));
-    path
+    next_free(&base, 0)
+}
+
+fn next_free(base: &Path, from: u32) -> PathBuf {
+    (from..)
+        .map(|n| {
+            let mut path = base.to_path_buf();
+            if n > 0 {
+                path.as_mut_os_string().push(format!("-{n}"));
+            }
+            path
+        })
+        .find(|path| fs::symlink_metadata(path).is_err())
+        .expect("some counter is free")
+}
+
+/// Copies `file` to `planned`, or to the next free name when another backup took it: an
+/// existing backup is never overwritten. The path written.
+fn create_backup(file: &Path, planned: &Path) -> io::Result<PathBuf> {
+    let contents = fs::read(file)?;
+    let mut path = planned.to_path_buf();
+    for n in 1.. {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut out) => {
+                io::Write::write_all(&mut out, &contents)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                path = next_free(planned, n);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the counter is unbounded")
+}
+
+/// The file an edit of `file` writes: the link's target when `file` is a link, so the link
+/// survives. How the plan names it: the target, and the link it was reached through.
+pub fn edit_target(env: &DesktopEnv, file: &Path) -> (PathBuf, String) {
+    let resolved = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let shown = if resolved == file {
+        env.show(file)
+    } else {
+        format!("{} (linked from {})", env.show(&resolved), env.show(file))
+    };
+    (resolved, shown)
 }
 
 /// The keybinding for one combination, worked out.
@@ -442,21 +508,20 @@ pub fn plan_binding(env: &DesktopEnv, target: Target, combo: &Combo) -> BindingP
         };
     }
     let block = keybinding::block_lines(location.setup, &line);
+    let (file, shown) = edit_target(env, &location.file);
     let (text, action) = match &existing {
         Some(old) => (
             keybinding::replace_block(&original, old, Some(&block)),
             format!(
-                "replace  lines {}-{} of {}",
+                "replace  lines {}-{} of {shown}",
                 old.first + 1,
                 old.last + 1,
-                env.show(&location.file)
             ),
         ),
         None => (
             keybinding::append_block(&original, &block),
             format!(
-                "append   to {}{}, after line {}",
-                env.show(&location.file),
+                "append   to {shown}{}, after line {}",
                 location
                     .note
                     .as_ref()
@@ -469,8 +534,8 @@ pub fn plan_binding(env: &DesktopEnv, target: Target, combo: &Combo) -> BindingP
     BindingPlan::Ready {
         combo: combo.clone(),
         step: Step::Edit {
-            file: location.file.clone(),
-            backup: backup_path(&location.file),
+            backup: backup_path(&file),
+            file,
             original,
             text,
             action,
@@ -584,10 +649,30 @@ mod tests {
 
     #[test]
     fn recognises_a_development_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let mut env = env(&[]);
-        assert!(!env.is_development_build());
-        env.exe = Some("/src/portico/target/debug/portico".into());
-        assert!(env.is_development_build());
+        let installed = root.join("home/.cargo/bin");
+        let tagged = root.join("build/release");
+        let project = root.join("project/target/x86_64-unknown-linux-gnu/debug");
+        for path in [&installed, &tagged, &project] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            root.join("build/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        fs::write(root.join("project/Cargo.toml"), "").unwrap();
+        for (exe, development) in [(&installed, false), (&tagged, true), (&project, true)] {
+            env.exe = Some(exe.join("portico"));
+            assert_eq!(env.is_development_build(), development, "{}", exe.display());
+        }
+        env.exe = std::env::current_exe().ok();
+        assert!(
+            env.is_development_build(),
+            "this test binary is a cargo build's"
+        );
     }
 
     #[test]

@@ -335,7 +335,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 
 `--yes` accepts every proposal without asking (a taken combination is still refused), and `--no-bind`, `--no-launcher` and `--no-panel` leave a part out. `portico desktop status` shows what is installed and the panel's version, and `portico desktop uninstall` removes exactly what `install` created, after a preview; the keybinding file's backups stay.
 
-The panel follows Portico: any `portico` command notices when the installed panel was written by another version and quietly rewrites Portico's copy (only inside its own directory), and running `portico desktop install` again repairs or updates everything. If the panel still finds itself out of step with `portico`, it says so in a banner.
+The panel follows Portico: any `portico` command notices when the installed panel was written by an older version and quietly rewrites Portico's copy (only inside its own directory; a panel from a newer Portico, or a `portico` run from a cargo build directory, leaves it alone), and running `portico desktop install` again repairs or updates everything. If the panel still finds itself out of step with `portico`, it says so in a banner.
 
 The panel finds `portico` through `$PORTICO_BIN`, then `PATH`, then `~/.cargo/bin/portico`. A session started by the compositor often lacks `~/.cargo/bin` on its `PATH`; in Hyprland, set `env = PORTICO_BIN,/path/to/portico`. The panel needs a Portico with `--json` and says so when the one it finds is older or newer than it reads.
 

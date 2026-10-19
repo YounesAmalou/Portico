@@ -49,8 +49,9 @@ pub fn icon_file() -> String {
 
 /// Whether a file at a launcher path is one Portico wrote.
 pub fn is_marked(path: &Path) -> bool {
-    fs::read_to_string(path)
-        .is_ok_and(|text| text.lines().take(3).any(|line| line.contains(MARKER)))
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+        && fs::read_to_string(path)
+            .is_ok_and(|text| text.lines().take(3).any(|line| line.contains(MARKER)))
 }
 
 /// The program a marked `.desktop` file runs.

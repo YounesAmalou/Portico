@@ -76,7 +76,7 @@ pub fn locate(env: &DesktopEnv, target: Target) -> Result<Location, Unavailable>
     if env.hyprland {
         let (setup, file, note) = match target {
             Target::Omarchy => {
-                let file = hypr.join("bindings.lua");
+                let file = env.omarchy_config().join("hypr/bindings.lua");
                 if !file.is_file() {
                     return Err(Unavailable::Reason(format!(
                         "{} does not exist",
@@ -343,6 +343,7 @@ pub fn sway_clash(file: &Path, home: &Path, combo: &Combo) -> Option<String> {
     for text in &texts {
         let ours = find_block(text).ok().flatten();
         let mut depth = 0usize;
+        let mut in_bindsym_block = false;
         for (index, line) in text.lines().enumerate() {
             let trimmed = line.trim();
             if ours
@@ -351,12 +352,32 @@ pub fn sway_clash(file: &Path, home: &Path, combo: &Combo) -> Option<String> {
             {
                 continue;
             }
+            let first_keys = |words: &mut std::str::SplitWhitespace<'_>| {
+                words
+                    .find(|word| !word.starts_with("--"))
+                    .map(str::to_string)
+            };
+            if in_bindsym_block {
+                // `bindsym { <keys> <command> … }`: each inner line starts with its keys.
+                if trimmed == "}" {
+                    in_bindsym_block = false;
+                } else if first_keys(&mut trimmed.split_whitespace())
+                    .is_some_and(|keys| sway_keys_match(&keys, &variables, combo))
+                {
+                    return Some(trimmed.to_string());
+                }
+                continue;
+            }
             if depth == 0 && trimmed.starts_with("bindsym") {
-                let keys = trimmed
-                    .split_whitespace()
-                    .skip(1)
-                    .find(|word| !word.starts_with("--"));
-                if keys.is_some_and(|keys| sway_keys_match(keys, &variables, combo)) {
+                if trimmed.ends_with('{') {
+                    in_bindsym_block = true;
+                    continue;
+                }
+                let mut words = trimmed.split_whitespace();
+                words.next();
+                if first_keys(&mut words)
+                    .is_some_and(|keys| sway_keys_match(&keys, &variables, combo))
+                {
                     return Some(trimmed.to_string());
                 }
             }
@@ -441,7 +462,10 @@ fn expand(value: &str, home: &Path) -> String {
 pub fn candidate_files(env: &DesktopEnv) -> Vec<(Setup, PathBuf)> {
     let hypr = env.config_home.join("hypr");
     let mut files = vec![
-        (Setup::Omarchy, hypr.join("bindings.lua")),
+        (
+            Setup::Omarchy,
+            env.omarchy_config().join("hypr/bindings.lua"),
+        ),
         (Setup::HyprlandLua, hypr.join("hyprland.lua")),
         (Setup::HyprlandConf, hypr.join("hyprland.conf")),
     ];
@@ -454,7 +478,8 @@ pub fn candidate_files(env: &DesktopEnv) -> Vec<(Setup, PathBuf)> {
         files.push((Setup::Sway, file));
     }
     files.retain(|(_, file)| file.is_file());
-    files.dedup_by(|a, b| a.1 == b.1);
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|(_, file)| seen.insert(file.clone()));
     files
 }
 
@@ -576,7 +601,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "set $mod Mod4\nbindsym $mod+p exec x\nmode \"resize\" {{\n  bindsym $mod+Ctrl+p exec y\n}}\ninclude config.d/*\n{block}\n"
+                "set $mod Mod4\nbindsym $mod+p exec x\nmode \"resize\" {{\n  bindsym $mod+Ctrl+p exec y\n  bindsym {{\n    $mod+Alt+Ctrl+p exec z\n  }}\n}}\nbindsym --to-code {{\n  $mod+Alt+Shift+p exec grim\n  $mod+Alt+q kill\n}}\ninclude config.d/*\n{block}\n"
             ),
         )
         .unwrap();
@@ -588,6 +613,17 @@ mod tests {
             Some("bindsym --to-code $mod+Shift+p exec grim")
         );
         assert_eq!(clash("SUPER + ALT + T"), None, "Portico's own block");
+        assert_eq!(
+            clash("SUPER + ALT + SHIFT + P").as_deref(),
+            Some("$mod+Alt+Shift+p exec grim"),
+            "a block-form bindsym"
+        );
+        assert_eq!(clash("SUPER + ALT + Q").as_deref(), Some("$mod+Alt+q kill"));
+        assert_eq!(
+            clash("SUPER + CTRL + ALT + P"),
+            None,
+            "a block inside a mode"
+        );
         assert_eq!(clash("SUPER + ALT + P"), None);
     }
 

@@ -126,7 +126,41 @@ impl Desktop {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_portico"));
+        self.command_with(Path::new(env!("CARGO_BIN_EXE_portico")), args)
+    }
+
+    /// A copy of `portico` outside cargo's target directory, as `cargo install` leaves it: only
+    /// such a binary refreshes an installed panel.
+    fn installed_binary(&self) -> PathBuf {
+        let dir = self.root.join("installed");
+        let program = dir.join("portico");
+        if !program.exists() {
+            fs::create_dir_all(&dir).unwrap();
+            fs::copy(env!("CARGO_BIN_EXE_portico"), &program).unwrap();
+        }
+        program
+    }
+
+    /// Runs the installed copy, retrying while another test's fork still holds it open.
+    fn run_installed(&self, args: &[&str]) -> Output {
+        let program = self.installed_binary();
+        for _ in 0..100 {
+            match self
+                .command_with(&program, args)
+                .stdin(Stdio::null())
+                .output()
+            {
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result.unwrap(),
+            }
+        }
+        panic!("{} stayed busy", program.display());
+    }
+
+    fn command_with(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .args(args)
             .env_clear()
@@ -537,9 +571,9 @@ fn uninstall_leaves_a_link_to_elsewhere() {
 }
 
 #[test]
-fn ordinary_commands_refresh_a_stale_panel_silently() {
+fn ordinary_commands_refresh_a_panel_from_an_older_portico_silently() {
     let desktop = Desktop::omarchy();
-    let clean = desktop.run(&["hosts", "--json"], "");
+    let clean = desktop.run_installed(&["hosts", "--json"]);
 
     desktop.run(
         &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
@@ -550,30 +584,176 @@ fn ordinary_commands_refresh_a_stale_panel_silently() {
     fs::write(panel.join("shell.qml"), "old").unwrap();
     fs::write(panel.join("Gone.qml"), "old").unwrap();
 
-    let refreshed = desktop.run(&["hosts", "--json"], "");
+    // A cargo build never refreshes: it would rewrite the panel on every run.
+    desktop.run(&["hosts", "--json"], "");
+    assert_eq!(read(&panel.join("VERSION")), "0.0.1+0000000000000000\n");
+
+    let refreshed = desktop.run_installed(&["hosts", "--json"]);
     assert_eq!(refreshed.stdout, clean.stdout, "the document is unchanged");
     assert_eq!(refreshed.stderr, clean.stderr);
     assert_eq!(refreshed.status.code(), clean.status.code());
     assert!(read(&panel.join("VERSION")).starts_with(env!("CARGO_PKG_VERSION")));
     assert_ne!(read(&panel.join("shell.qml")), "old");
     assert!(!panel.join("Gone.qml").exists());
+
+    // A panel from a newer Portico is left alone, so two binaries never take turns.
+    fs::write(panel.join("VERSION"), "999.0.0+0000000000000000\n").unwrap();
+    desktop.run_installed(&["hosts", "--json"]);
+    assert_eq!(read(&panel.join("VERSION")), "999.0.0+0000000000000000\n");
 }
 
 #[test]
 fn a_failed_refresh_changes_nothing_about_the_command() {
     use std::os::unix::fs::PermissionsExt;
     let desktop = Desktop::omarchy();
-    let clean = desktop.run(&["hosts", "--json"], "");
+    let clean = desktop.run_installed(&["hosts", "--json"]);
     let panel = desktop.panel();
     fs::create_dir_all(&panel).unwrap();
     fs::write(panel.join("VERSION"), "0.0.1+0000000000000000\n").unwrap();
     fs::set_permissions(&panel, fs::Permissions::from_mode(0o555)).unwrap();
-    let output = desktop.run(&["hosts", "--json"], "");
+    let output = desktop.run_installed(&["hosts", "--json"]);
     fs::set_permissions(&panel, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(output.stdout, clean.stdout);
     assert_eq!(output.stderr, clean.stderr);
     assert_eq!(output.status.code(), clean.status.code());
     assert_eq!(read(&panel.join("VERSION")), "0.0.1+0000000000000000\n");
+}
+
+#[test]
+fn a_linked_panel_directory_is_never_written_or_removed() {
+    let desktop = Desktop::omarchy();
+    let checkout = desktop.root.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("preview.png"), "image").unwrap();
+    fs::write(checkout.join("VERSION"), "0.0.1+0000000000000000\n").unwrap();
+    fs::create_dir_all(desktop.panel().parent().unwrap()).unwrap();
+    symlink(&checkout, desktop.panel()).unwrap();
+
+    desktop.run_installed(&["hosts", "--json"]);
+    let install = desktop.run(&["desktop", "install", "--yes"], "");
+    let out = text(&install);
+    assert!(
+        out.contains("Panel: unavailable, ~/.local/share/portico/panel is a link or a file"),
+        "{out}"
+    );
+    let status = text(&desktop.run(&["desktop", "status"], ""));
+    assert!(
+        status.contains("Panel        blocked: ~/.local/share/portico/panel is a link or a file"),
+        "{status}"
+    );
+    let uninstall = text(&desktop.run(&["desktop", "uninstall", "--yes"], ""));
+    assert!(
+        uninstall.contains("is a link or a file, not Portico's directory; it is left alone"),
+        "{uninstall}"
+    );
+
+    assert!(checkout.join("preview.png").exists());
+    assert!(!checkout.join("shell.qml").exists());
+    assert_eq!(read(&checkout.join("VERSION")), "0.0.1+0000000000000000\n");
+    assert!(
+        fs::symlink_metadata(desktop.panel())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn a_linked_bindings_file_keeps_its_link() {
+    let desktop = Desktop::omarchy();
+    let dotfiles = desktop.root.join("dotfiles/hypr");
+    fs::create_dir_all(&dotfiles).unwrap();
+    let bindings = desktop.path(".config/hypr/bindings.lua");
+    fs::rename(&bindings, dotfiles.join("bindings.lua")).unwrap();
+    symlink(dotfiles.join("bindings.lua"), &bindings).unwrap();
+
+    let install = desktop.run(&["desktop", "install", "--yes"], "");
+    let out = text(&install);
+    assert!(install.status.success(), "{out}");
+    assert!(
+        out.contains("(linked from ~/.config/hypr/bindings.lua)"),
+        "{out}"
+    );
+    assert!(
+        fs::symlink_metadata(&bindings)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(read(&dotfiles.join("bindings.lua")).contains("portico desktop install: begin"));
+    assert!(
+        fs::read_dir(&dotfiles).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("bindings.lua.portico-bak.")),
+        "the backup sits next to the file it copies"
+    );
+
+    let uninstall = desktop.run(&["desktop", "uninstall", "--yes"], "");
+    assert!(uninstall.status.success(), "{}", text(&uninstall));
+    assert!(
+        fs::symlink_metadata(&bindings)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(read(&dotfiles.join("bindings.lua")), BINDINGS_LUA);
+}
+
+#[test]
+fn backups_in_the_same_second_never_overwrite_each_other() {
+    let desktop = Desktop::omarchy();
+    for _ in 0..3 {
+        desktop.run(&["desktop", "install", "--yes"], "");
+        desktop.run(&["desktop", "uninstall", "--yes"], "");
+    }
+    let backups: Vec<String> = fs::read_dir(desktop.path(".config/hypr"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("bindings.lua.portico-bak."))
+        .collect();
+    assert_eq!(backups.len(), 6, "{backups:?}");
+}
+
+#[test]
+fn a_link_at_a_launcher_path_is_not_portico_s() {
+    let desktop = Desktop::omarchy();
+    let entry = desktop.path(".local/share/applications/portico.desktop");
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    let outside = desktop.root.join("outside.desktop");
+    symlink(&outside, &entry).unwrap();
+    let output = desktop.run(&["desktop", "install", "--yes"], "");
+    let out = text(&output);
+    assert!(
+        out.contains("Launcher entry: unavailable, ~/.local/share/applications/portico.desktop is a link, not Portico's"),
+        "{out}"
+    );
+    assert!(!outside.exists(), "nothing written through the link");
+    desktop.run(&["desktop", "uninstall", "--yes"], "");
+    assert!(
+        fs::symlink_metadata(&entry).is_ok(),
+        "the user's link stays"
+    );
+}
+
+#[test]
+fn omarchy_lives_in_home_config_whatever_xdg_config_home_says() {
+    let desktop = Desktop::omarchy();
+    let elsewhere = desktop.root.join("xdg-config");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let output = desktop
+        .command(&["desktop", "install", "--yes"])
+        .env("XDG_CONFIG_HOME", &elsewhere)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(fs::symlink_metadata(desktop.path(".config/omarchy/plugins/portico")).is_ok());
+    assert!(
+        read(&desktop.path(".config/hypr/bindings.lua")).contains("portico desktop install: begin")
+    );
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
 }
 
 #[test]
