@@ -6,7 +6,7 @@ use std::{
 use clap::Parser;
 use portico::{
     app::App,
-    cli::{Cli, run},
+    cli::{Cli, fail, run},
     managed::{ConfigPaths, ManagedStore},
     openssh::OpenSsh,
     picker::TerminalPicker,
@@ -14,9 +14,15 @@ use portico::{
 };
 
 fn main() -> ExitCode {
+    // Parsed first, so a `--json` command reports even this as a document.
+    let cli = Cli::parse();
     let Some(home) = std::env::var_os("HOME") else {
-        eprintln!("error: HOME is not set");
-        return ExitCode::FAILURE;
+        return fail(
+            &cli,
+            "HOME is not set",
+            &mut io::stdout().lock(),
+            &mut io::stderr(),
+        );
     };
     let runtime = RuntimeDir::locate(
         home.as_ref(),
@@ -27,7 +33,6 @@ fn main() -> ExitCode {
         OpenSsh::system(),
     )
     .with_runtime_dir(runtime);
-    let cli = Cli::parse();
     let stdin = io::stdin();
     let interactive = stdin.is_terminal();
     run(

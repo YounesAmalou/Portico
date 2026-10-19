@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use super::{CANCELLED, confirm, host_argument};
+use super::{CANCELLED, confirm, host_argument, json::JsonCommand};
 use crate::{
     app::{App, StartOutcome, StopOutcome, TunnelChanges},
     picker::{Picker, Row},
@@ -15,7 +15,12 @@ use crate::{
 #[derive(clap::Subcommand, Debug)]
 pub(super) enum TunnelCommand {
     /// Show one tunnel, its command line and its status.
-    Show { name: Option<String> },
+    Show {
+        name: Option<String>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
+    },
     /// Save a tunnel: one forward through a host.
     Add {
         name: String,
@@ -42,13 +47,38 @@ pub(super) enum TunnelCommand {
         force: bool,
     },
     /// Start saved tunnels in the background.
-    Start { names: Vec<String> },
+    Start {
+        names: Vec<String>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop running tunnels.
     Stop {
         names: Vec<String>,
         #[arg(short = 'A', long, conflicts_with = "names")]
         all: bool,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
     },
+}
+
+/// The command as a `--json` one, when it was given `--json`.
+pub(super) fn json_command(command: &TunnelCommand) -> Option<JsonCommand> {
+    Some(match command {
+        TunnelCommand::Show { name, json: true } => JsonCommand::TunnelShow(name.clone()),
+        TunnelCommand::Start { names, json: true } => JsonCommand::TunnelStart(names.clone()),
+        TunnelCommand::Stop {
+            names,
+            all,
+            json: true,
+        } => JsonCommand::TunnelStop {
+            names: names.clone(),
+            all: *all,
+        },
+        _ => return None,
+    })
 }
 
 /// The forward, in ssh's own syntax.
@@ -225,7 +255,7 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
     interactive: bool,
 ) -> Result<ExitCode, String> {
     match command {
-        TunnelCommand::Show { name } => {
+        TunnelCommand::Show { name, .. } => {
             let Some(name) = pick_tunnel(
                 name,
                 app,
@@ -340,7 +370,7 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             writeln!(output, "Removed {}.", report.tunnel.name).map_err(text)?;
             Ok(ExitCode::SUCCESS)
         }
-        TunnelCommand::Start { names } => {
+        TunnelCommand::Start { names, .. } => {
             let names = if names.is_empty() {
                 match pick_tunnel(
                     None,
@@ -397,7 +427,7 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
                 ExitCode::SUCCESS
             })
         }
-        TunnelCommand::Stop { names, all } => {
+        TunnelCommand::Stop { names, all, .. } => {
             let names = if all {
                 let running = app.running_tunnels().map_err(text)?;
                 if running.is_empty() {

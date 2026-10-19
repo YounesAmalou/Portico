@@ -1,0 +1,8 @@
+{
+  "error": {
+    "kind": "usage",
+    "message": "give the name: portico show <alias> --json",
+    "next": []
+  },
+  "schema": 1
+}

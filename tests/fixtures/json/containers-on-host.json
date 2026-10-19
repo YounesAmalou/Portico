@@ -1,0 +1,30 @@
+{
+  "containers": [
+    {
+      "display_name": "web",
+      "id": "4f1c2a9b7d3e",
+      "image": "nginx:1.27",
+      "name": "shop-web-1",
+      "project": "shop",
+      "service": "web",
+      "status": "Up 3 hours"
+    },
+    {
+      "display_name": "cache",
+      "id": "9a8b7c6d5e4f",
+      "image": "redis:7",
+      "name": "cache",
+      "project": null,
+      "service": null,
+      "status": "Up 5 minutes"
+    }
+  ],
+  "note": null,
+  "schema": 1,
+  "skipped": 0,
+  "target": {
+    "alias": "prod",
+    "kind": "host"
+  },
+  "via": null
+}

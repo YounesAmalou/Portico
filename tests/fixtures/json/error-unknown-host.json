@@ -1,0 +1,8 @@
+{
+  "error": {
+    "kind": "unknown-host",
+    "message": "unknown host: nope",
+    "next": []
+  },
+  "schema": 1
+}
