@@ -12,8 +12,8 @@ use std::{
 use crate::{
     adopt::{Candidate, Direction},
     app::{
-        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, Offer, Ownership,
-        Target, TestOutcome, TestReport, TestTarget,
+        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, HostSummary, Offer,
+        Ownership, Target, TestOutcome, TestReport, TestTarget,
     },
     container::{GroupTool, ResolveError, display_name, group, remote_command, resolve},
     discovery::DiscoveryWarning,
@@ -39,7 +39,7 @@ enum Command {
     },
     Hosts,
     Show {
-        alias: String,
+        alias: Option<String>,
     },
     Add {
         alias: String,
@@ -55,7 +55,7 @@ enum Command {
         jump: Option<String>,
     },
     Edit {
-        alias: String,
+        alias: Option<String>,
         #[arg(short = 'a', long = "alias")]
         new_alias: Option<String>,
         #[arg(short = 'H', long)]
@@ -72,12 +72,12 @@ enum Command {
         unset: Vec<ClearField>,
     },
     Remove {
-        alias: String,
+        alias: Option<String>,
         #[arg(short = 'f', long)]
         force: bool,
     },
     Connect {
-        alias: String,
+        alias: Option<String>,
         #[arg(short = 'n', long = "new-terminal")]
         new_terminal: bool,
         /// Wait for Enter after an explained failure; used in a new terminal.
@@ -101,7 +101,7 @@ enum Command {
         yes: bool,
     },
     Test {
-        alias: String,
+        alias: Option<String>,
         #[arg(long = "accept-host-key", value_name = "FINGERPRINT")]
         accept_host_key: Option<String>,
         /// Show what ssh itself said, below the explanation.
@@ -109,13 +109,15 @@ enum Command {
         raw: bool,
     },
     Containers {
-        #[arg(long = "on", value_name = "ALIAS")]
-        on: Option<String>,
+        /// List on this host; without an alias, choose one.
+        #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
+        on: Option<Option<String>>,
     },
     Shell {
         container: Option<String>,
-        #[arg(long = "on", value_name = "ALIAS")]
-        on: Option<String>,
+        /// Open the shell on this host; without an alias, choose one.
+        #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
+        on: Option<Option<String>>,
         #[arg(short = 'u', long)]
         user: Option<String>,
         #[arg(short = 'n', long = "new-terminal")]
@@ -332,6 +334,9 @@ fn execute<I: BufRead, O: Write, E: Write>(
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Show { alias }) => {
+            let Some(alias) = host_argument(alias, app, picker, interactive, "show", false)? else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
             let details = app.show(&alias).map_err(|error| error.to_string())?;
             print_details(output, &details)?;
             Ok(ExitCode::SUCCESS)
@@ -361,6 +366,9 @@ fn execute<I: BufRead, O: Write, E: Write>(
             jump,
             unset,
         }) => {
+            let Some(alias) = host_argument(alias, app, picker, interactive, "edit", true)? else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
             let updated_alias = new_alias.as_deref().unwrap_or(&alias).to_owned();
             let changes = HostChanges {
                 alias: new_alias.map_or(Change::Keep, Change::Set),
@@ -376,6 +384,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Remove { alias, force }) => {
+            let Some(alias) = host_argument(alias, app, picker, interactive, "remove", true)?
+            else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
             let inventory = app.hosts().map_err(|error| error.to_string())?;
             match inventory
                 .hosts
@@ -406,6 +418,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
             new_terminal,
             hold,
         }) => {
+            let Some(alias) = host_argument(alias, app, picker, interactive, "connect", false)?
+            else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
             // A held connection already runs in the terminal it was opened in.
             let outcome = app
                 .connect(&alias, new_terminal && !hold)
@@ -413,7 +429,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
             finish_connection(outcome, hold, input, error)
         }
         Some(Command::Containers { on }) => {
-            let list = list_with_offers(app, &target(on), input, output, error, interactive)?;
+            let Some(target) = on_argument(on, app, picker, interactive, "containers")? else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
+            let list = list_with_offers(app, &target, input, output, error, interactive)?;
             print_listing(output, &list)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -425,7 +444,9 @@ fn execute<I: BufRead, O: Write, E: Write>(
             hold,
             via,
         }) => {
-            let target = target(on);
+            let Some(target) = on_argument(on, app, picker, interactive, "shell")? else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
             // A held shell was resolved before its terminal was opened.
             let (id, via) = match container {
                 Some(id) if hold => (id, via.map(GroupTool::from)),
@@ -512,6 +533,9 @@ fn execute<I: BufRead, O: Write, E: Write>(
             accept_host_key,
             raw,
         }) => {
+            let Some(alias) = host_argument(alias, app, picker, interactive, "test", false)? else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
             let interrupts = Interrupts::install(handle_signals)
                 .map_err(|error| format!("cannot handle signals: {error}"))?;
             test_command(
@@ -669,9 +693,75 @@ fn container_rows(list: &ContainerList) -> Vec<(String, Row)> {
         .collect()
 }
 
-/// This machine without `--on`, otherwise the host it names.
-fn target(on: Option<String>) -> Target {
-    on.map_or(Target::Local, Target::Host)
+/// The host `alias` names, otherwise one chosen in the picker; `None` when the choice is
+/// cancelled. `managed_only` offers only the hosts Portico manages, for commands that change one.
+fn host_argument(
+    alias: Option<String>,
+    app: &App,
+    picker: &mut dyn Picker,
+    interactive: bool,
+    usage: &str,
+    managed_only: bool,
+) -> Result<Option<String>, String> {
+    if let Some(alias) = alias {
+        return Ok(Some(alias));
+    }
+    if !interactive {
+        return Err(format!(
+            "choose a host: portico {usage} <alias> (no terminal for the picker)"
+        ));
+    }
+    let hosts: Vec<HostSummary> = app
+        .hosts()
+        .map_err(|error| error.to_string())?
+        .hosts
+        .into_iter()
+        .filter(|host| !managed_only || host.ownership == Ownership::Managed)
+        .collect();
+    if hosts.is_empty() {
+        return Err(if managed_only {
+            "No managed hosts."
+        } else {
+            "No hosts."
+        }
+        .into());
+    }
+    let rows = hosts
+        .iter()
+        .map(|host| Row {
+            fields: vec![host.alias.clone()],
+            extra: vec![
+                ownership(host.ownership).into(),
+                host.source.display().to_string(),
+            ],
+        })
+        .collect();
+    Ok(picker
+        .pick_one("host", rows)?
+        .map(|index| hosts[index].alias.clone()))
+}
+
+/// This machine without `--on`, the host it names, or one chosen in the picker for a bare
+/// `--on`; `None` when the choice is cancelled.
+fn on_argument(
+    on: Option<Option<String>>,
+    app: &App,
+    picker: &mut dyn Picker,
+    interactive: bool,
+    command: &str,
+) -> Result<Option<Target>, String> {
+    match on {
+        None => Ok(Some(Target::Local)),
+        Some(alias) => Ok(host_argument(
+            alias,
+            app,
+            picker,
+            interactive,
+            &format!("{command} --on"),
+            false,
+        )?
+        .map(Target::Host)),
+    }
 }
 
 /// Lists the containers of `target`. When docker refuses with a fix Portico can run, an
@@ -1469,7 +1559,7 @@ mod tests {
     /// sources `<name>.behaviour` when it exists.
     fn container_app() -> (TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["docker", "sudo", "sg", "sh"] {
+        for name in ["docker", "sudo", "sg", "sh", "ssh"] {
             let base = dir.path().join(name);
             write_executable(
                 &base,
@@ -1690,6 +1780,22 @@ fi
             self.seen.push((prompt.into(), rows));
             picked
         }
+
+        fn prompts(&self) -> Vec<&str> {
+            self.seen
+                .iter()
+                .map(|(prompt, _)| prompt.as_str())
+                .collect()
+        }
+
+        /// The first field of each row shown by the `pick`th call.
+        fn labels(&self, pick: usize) -> Vec<&str> {
+            self.seen[pick]
+                .1
+                .iter()
+                .map(|row| row.fields[0].as_str())
+                .collect()
+        }
     }
 
     impl Picker for Scripted {
@@ -1780,6 +1886,181 @@ fi
         );
     }
 
+    /// A managed `dev` and an external `legacy`.
+    fn two_hosts() -> (TempDir, App) {
+        let (dir, app) = adoption_app("Host legacy\n  HostName legacy.example\n");
+        let (exit, _, error) = run_command(&app, &["add", "dev", "-H", "dev.example"], "", false);
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        (dir, app)
+    }
+
+    #[test]
+    fn parses_optional_aliases_and_bare_on() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied()))
+                .unwrap()
+                .command
+        };
+        assert!(matches!(
+            parse(&["connect"]),
+            Some(Command::Connect { alias: None, .. })
+        ));
+        assert!(matches!(
+            parse(&["shell", "--on"]),
+            Some(Command::Shell { on: Some(None), .. })
+        ));
+        assert!(matches!(
+            parse(&["shell", "--on", "box"]),
+            Some(Command::Shell { on: Some(Some(alias)), .. }) if alias == "box"
+        ));
+        assert!(matches!(
+            parse(&["containers"]),
+            Some(Command::Containers { on: None })
+        ));
+    }
+
+    #[test]
+    fn connect_test_show_list_every_host() {
+        let (_dir, app) = two_hosts();
+        let mut picker = Scripted::new(&[Some("legacy")]);
+
+        let (exit, output, error) = run_picking(&app, &["show"], "", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        assert!(output.starts_with("Alias: legacy\n"), "{output}");
+        assert_eq!(picker.prompts(), ["host"]);
+        assert_eq!(picker.labels(0), ["dev", "legacy"]);
+        let extra: Vec<&str> = picker.seen[0]
+            .1
+            .iter()
+            .map(|row| row.extra[0].as_str())
+            .collect();
+        assert_eq!(extra, ["managed", "external"]);
+        assert!(picker.seen[0].1[1].extra[1].ends_with(".ssh/config"));
+    }
+
+    #[test]
+    fn edit_and_remove_list_managed_hosts_only() {
+        let (_dir, app) = two_hosts();
+        for args in [&["edit", "-u", "x"][..], &["remove"]] {
+            let mut picker = Scripted::new(&[None]);
+            run_picking(&app, args, "", true, &mut picker);
+            assert_eq!(picker.labels(0), ["dev"], "{args:?}");
+        }
+    }
+
+    #[test]
+    fn edit_without_alias_applies_flags_to_the_pick() {
+        let (_dir, app) = two_hosts();
+        let mut picker = Scripted::new(&[Some("dev")]);
+
+        let (exit, output, error) =
+            run_picking(&app, &["edit", "-u", "root"], "", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        assert_eq!(output, "Updated dev.\n");
+        let details = app.show("dev").unwrap();
+        assert_eq!(details.declared.unwrap().user(), Some("root"));
+    }
+
+    #[test]
+    fn remove_without_alias_still_confirms() {
+        let (_dir, app) = two_hosts();
+        let mut picker = Scripted::new(&[Some("dev")]);
+
+        let (exit, output, _) = run_picking(&app, &["remove"], "n\n", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(output, "Remove dev? [y/N] Removal cancelled.\n");
+        assert_eq!(aliases_of(&app, Ownership::Managed), ["dev"]);
+    }
+
+    #[test]
+    fn cancelled_host_pick_exits_130_and_changes_nothing() {
+        let (_dir, app) = two_hosts();
+        let mut picker = Scripted::new(&[None]);
+
+        let (exit, output, _) = run_picking(&app, &["remove", "-f"], "", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::from(130));
+        assert!(output.is_empty(), "{output}");
+        assert_eq!(aliases_of(&app, Ownership::Managed), ["dev"]);
+    }
+
+    #[test]
+    fn no_hosts_and_no_managed_hosts() {
+        let (_dir, app) = adoption_app("");
+        let (exit, _, error) = run_command(&app, &["show"], "", true);
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(error, "error: No hosts.\n");
+
+        let (_dir, app) = adoption_app("Host legacy\n  HostName legacy.example\n");
+        let (exit, _, error) = run_command(&app, &["edit", "-u", "x"], "", true);
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(error, "error: No managed hosts.\n");
+    }
+
+    #[test]
+    fn single_host_still_opens_the_picker() {
+        let (_dir, app) = adoption_app("Host legacy\n  HostName legacy.example\n");
+        let mut picker = Scripted::new(&[None]);
+
+        let (exit, _, _) = run_picking(&app, &["show"], "", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::from(130));
+        assert_eq!(picker.labels(0), ["legacy"]);
+    }
+
+    #[test]
+    fn without_terminal_the_alias_is_required() {
+        let (_dir, app) = two_hosts();
+        for (args, message) in [
+            (
+                &["connect"][..],
+                "choose a host: portico connect <alias> (no terminal for the picker)",
+            ),
+            (
+                &["edit", "-u", "x"],
+                "choose a host: portico edit <alias> (no terminal for the picker)",
+            ),
+            (
+                &["shell", "--on"],
+                "choose a host: portico shell --on <alias> (no terminal for the picker)",
+            ),
+            (
+                &["containers", "--on"],
+                "choose a host: portico containers --on <alias> (no terminal for the picker)",
+            ),
+        ] {
+            let (exit, _, error) = run_command(&app, args, "", false);
+            assert_eq!(exit, ExitCode::FAILURE, "{args:?}");
+            assert_eq!(error, format!("error: {message}\n"));
+        }
+    }
+
+    #[test]
+    fn bare_on_picks_the_host_then_the_container() {
+        let (dir, app) = container_app();
+        app.initialize(true).unwrap();
+        let (exit, _, error) = run_command(&app, &["add", "box", "-H", "box.example"], "", false);
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        behave(
+            &dir,
+            "ssh",
+            &format!("case \"$*\" in *' ps '*) echo '{LISTING}' ;; esac\n"),
+        );
+        let mut picker = Scripted::new(&[Some("box"), Some("web")]);
+
+        let (exit, _, error) = run_picking(&app, &["shell", "--on"], "", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        assert_eq!(picker.prompts(), ["host", "container"]);
+        let ssh = calls(&dir, "ssh");
+        let last = ssh.lines().last().unwrap();
+        assert!(last.contains("[box]") && last.contains("aaaa1111"), "{ssh}");
+        assert!(calls(&dir, "docker").is_empty());
+    }
+
     #[test]
     fn parses_shell_arguments() {
         let cli = Cli::try_parse_from([
@@ -1795,7 +2076,7 @@ fi
                 new_terminal: false,
                 hold: true,
                 via: Some(Via::Sg),
-            }) if container == "abcd" && on == "dev" && user == "root"
+            }) if container == "abcd" && on.as_deref() == Some("dev") && user == "root"
         ));
     }
 
@@ -1835,11 +2116,21 @@ fi
         input: &str,
         interactive: bool,
     ) -> (std::process::ExitCode, String, String) {
+        run_picking(app, args, input, interactive, &mut Scripted::default())
+    }
+
+    fn run_picking(
+        app: &App,
+        args: &[&str],
+        input: &str,
+        interactive: bool,
+        picker: &mut Scripted,
+    ) -> (std::process::ExitCode, String, String) {
         let (mut output, mut error) = (Vec::new(), Vec::new());
         let exit = run(
             Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied())).unwrap(),
             app,
-            &mut Scripted::default(),
+            picker,
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
             &mut error,
