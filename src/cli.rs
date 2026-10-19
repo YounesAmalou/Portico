@@ -366,10 +366,8 @@ fn execute<I: BufRead, O: Write, E: Write>(
             jump,
             unset,
         }) => {
-            let Some(alias) = host_argument(alias, app, picker, interactive, "edit", true)? else {
-                return Ok(ExitCode::from(CANCELLED));
-            };
-            let updated_alias = new_alias.as_deref().unwrap_or(&alias).to_owned();
+            // The flags are checked before a host is picked, so a mistake does not cost a pick.
+            let renamed = new_alias.clone();
             let changes = HostChanges {
                 alias: new_alias.map_or(Change::Keep, Change::Set),
                 hostname: hostname.map_or(Change::Keep, Change::Set),
@@ -378,6 +376,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 identity_file: field_change(identity, "identity", ClearField::Identity, &unset)?,
                 proxy_jump: field_change(jump, "jump", ClearField::Jump, &unset)?,
             };
+            let Some(alias) = host_argument(alias, app, picker, interactive, "edit", true)? else {
+                return Ok(ExitCode::from(CANCELLED));
+            };
+            let updated_alias = renamed.unwrap_or_else(|| alias.clone());
             app.edit(&alias, changes)
                 .map_err(|error| error.to_string())?;
             writeln!(output, "Updated {updated_alias}.").map_err(|error| error.to_string())?;
@@ -1940,6 +1942,24 @@ fi
         assert_eq!(output, "Updated dev.\n");
         let details = app.show("dev").unwrap();
         assert_eq!(details.declared.unwrap().user(), Some("root"));
+    }
+
+    #[test]
+    fn edit_without_alias_rejects_conflicting_flags_before_picking() {
+        let (_dir, app) = two_hosts();
+        let mut picker = Scripted::new(&[]);
+
+        let (exit, _, error) = run_picking(
+            &app,
+            &["edit", "-u", "x", "--unset", "user"],
+            "",
+            true,
+            &mut picker,
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(error, "error: --unset user conflicts with --user\n");
+        assert!(picker.prompts().is_empty());
     }
 
     #[test]
