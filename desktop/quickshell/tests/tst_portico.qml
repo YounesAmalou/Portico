@@ -190,6 +190,32 @@ TestCase {
         compare(Portico.filterRows([{ name: "db", host: "prod" }], "prod", ["name", "host"]).length, 1)
     }
 
+    function test_filter_finds_loaded_containers() {
+        var rows = Portico.containerRows(doc("containers-on-host.json"), "prod")
+        compare(rows[0].dockerName, "shop-web-1")
+        var loaded = { state: "loaded", rows: rows }
+        // No query: as before, containers only when expanded.
+        compare(Portico.hostView(false, loaded, "", false), { show: true, containers: null, filtered: false })
+        compare(Portico.hostView(false, loaded, "", true).containers.length, 2)
+        // The host matches: shown as usual, all its containers when expanded.
+        compare(Portico.hostView(true, loaded, "prod", true).containers.length, 2)
+        compare(Portico.hostView(true, loaded, "prod", false).containers, null)
+        // The host does not match, a loaded container does: only that one, even collapsed.
+        var byName = Portico.hostView(false, loaded, "CACHE", false)
+        compare(byName.show, true)
+        compare(byName.filtered, true)
+        compare(byName.containers.length, 1)
+        compare(byName.containers[0].id, "9a8b7c6d5e4f")
+        compare(Portico.hostView(false, loaded, "shop-web", false).containers[0].name, "web")
+        compare(Portico.hostView(false, loaded, "redis", false).containers[0].name, "cache")
+        compare(Portico.hostView(false, loaded, "4f1c2a", false).containers.length, 1)
+        // Nothing matches, or the containers are not loaded: hidden.
+        compare(Portico.hostView(false, loaded, "nope", true).show, false)
+        compare(Portico.hostView(false, undefined, "web", false).show, false)
+        compare(Portico.hostView(false, { state: "loading" }, "web", true).show, false)
+        compare(Portico.hostView(false, { state: "failed", error: {} }, "web", true).show, false)
+    }
+
     function test_launch_failure() {
         compare(Portico.launchFailure(1, "error: unknown host: nope\n\n"), "error: unknown host: nope")
         compare(Portico.launchFailure(3, ""), "Portico could not open a terminal (exit status 3).")
