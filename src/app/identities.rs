@@ -555,7 +555,7 @@ mod tests {
         Fixture { dir, app }
     }
 
-/// What a public key file starts with.
+    /// What a public key file starts with.
     const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test\n";
 
     fn resolved(text: &str) -> ResolvedConfig {
@@ -781,7 +781,11 @@ mod tests {
             "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n",
         )
         .unwrap();
-        fs::write(ssh_dir.join("linked"), "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        fs::write(
+            ssh_dir.join("linked"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(ssh_dir.join("linked"), ssh_dir.join("linked.pub")).unwrap();
         let identities = fixture.app.host_identities(
             "h",

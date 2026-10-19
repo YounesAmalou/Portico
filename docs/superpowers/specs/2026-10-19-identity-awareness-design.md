@@ -27,7 +27,7 @@ It implements v3 item 4 of `ROADMAP.md`, "Identity awareness", and the first fol
 | A host's effective configuration | `ssh -G <alias>`, already run for host details; the parser also keeps `identityagent`, `identitiesonly` and `pkcs11provider` | The IdentityFile list in order, the agent socket, whether only listed identities are offered, a PKCS#11 provider path |
 | OpenSSH's built-in defaults | `ssh -G -F none portico-defaults`, once per process | The identity files OpenSSH tries when none is configured, for this OpenSSH version |
 | The agent | `ssh-add -l -E sha256` with `SSH_AUTH_SOCK` set to the socket, stdin null, a 3 s deadline | Each key's type, size, SHA-256 fingerprint and comment |
-| Public key files | `ssh-keygen -l -E sha256 -f <file.pub>`, same deadline | The fingerprint, type and comment of the key the file pairs with |
+| Public key files | `ssh-keygen -l -E sha256 -f <file.pub>`, same deadline, only for a regular `.pub` file whose first word is a public key type (`ssh-…`, `ecdsa-…`, `sk-…`). That word is read one byte at a time and reading stops at a leading `-`, so a private key misnamed `.pub` or linked to as one never reaches `ssh-keygen` and only its first byte is read | The fingerprint, type and comment of the key the file pairs with |
 | Private key files | `stat` only (`std::fs::metadata`): never opened | Whether the file exists as a regular file |
 | `~/.ssh/*.pub` | A non-recursive directory listing of `~/.ssh` (not `~/.ssh/portico`), names ending in `.pub` but not `-cert.pub` | Key pairs and agent-backed public keys that no host references yet, for `portico identities` and the form suggestions |
 
@@ -37,13 +37,14 @@ It implements v3 item 4 of `ROADMAP.md`, "Identity awareness", and the first fol
 
 ### Resolving the agent
 
-`ssh -G` prints `identityagent` already expanded (`~` and environment variables). Portico maps it to a socket:
+`ssh -G` prints `identityagent` already expanded (`~`, `%` tokens and `${VAR}`; `%%` is printed as `%`), except the `$NAME` form, which it prints as written. Portico therefore never expands it again, and maps it to a socket:
 
 | `identityagent` | Socket |
 |---|---|
-| absent, or `SSH_AUTH_SOCK` | Portico's own `SSH_AUTH_SOCK`; none when unset or empty |
-| `none` | No agent: shown as "disabled by IdentityAgent none" |
-| any other value | That path |
+| absent, or `SSH_AUTH_SOCK` | Portico's own `SSH_AUTH_SOCK`; when unset or empty, "none (SSH_AUTH_SOCK is not set)" |
+| `$NAME` | The variable `NAME` in Portico's environment; when unset or empty, "none (NAME is not set)" |
+| `none` | No agent: shown as "none (IdentityAgent none)" |
+| any other value | That path, as printed |
 
 A socket path that does not exist, or is not a socket, is reported without running `ssh-add`. A listing that times out is reported as "did not answer" with the hint that the agent may be waiting to be unlocked; Portico never retries on its own.
 
@@ -110,10 +111,17 @@ pub struct PublicKey {          // one line of ssh-add -l or ssh-keygen -l
 
 pub enum Provider { OnePassword, GpgAgent, GnomeKeyring, Generic }
 
+pub enum AgentProblem {
+    NoSuchSocket,
+    NotASocket,
+    Refused(String),   // ssh-add's message
+    NoAnswer,          // the 3 s deadline passed
+}
+
 pub enum Agent {
     Disabled,                                  // IdentityAgent none
-    NotConfigured,                             // no SSH_AUTH_SOCK
-    Unavailable { socket: PathBuf, reason: AgentProblem },  // missing, not a socket, refused, no answer
+    NotConfigured { variable: String },        // SSH_AUTH_SOCK (or $NAME's variable) is not set
+    Unavailable { socket: PathBuf, provider: Provider, reason: AgentProblem },
     Listed { socket: PathBuf, provider: Provider, keys: Vec<PublicKey> },
 }
 
@@ -163,7 +171,7 @@ Resolving every host costs one `ssh -G` per host (a few milliseconds each). It r
 
 ```
 Agent: 1Password, ~/.1password/agent.sock, 3 keys
-Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:3/9rWBEc… "GitHub")
+Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:3/9rWBEcW/rifhH7XvLTSnlsXPJpccrkcu/8GpD/85o "GitHub")
 Identity: ~/.ssh/id_work: missing (no such file)
 IdentitiesOnly: yes
 ```
@@ -258,5 +266,5 @@ Only listed  yes
 
 Settled during review, under the maintainer's delegation:
 
-1. **Saving an agent key as a `.pub` file** (to pin a host to one 1Password key): not in this slice. It is recorded in `ROADMAP.md` as an unscheduled item, because it would be the first file Portico writes outside its own directory.
+1. **Saving an agent key as a `.pub` file** (to pin a host to one 1Password key): not in this slice. It is recorded in `ROADMAP.md` as an unscheduled item, because it would be the first key-related file Portico writes.
 2. **An identity indicator in the host list:** not in this slice and not planned. The details pane and `portico identities` cover it on demand, and the list never runs `ssh -G` for every host.

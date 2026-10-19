@@ -64,6 +64,8 @@ class Screen:
 
 binary, home, fake_bin, *requested = sys.argv[1:]
 environment = dict(os.environ, HOME=home, PATH=fake_bin + os.pathsep + os.environ["PATH"])
+# The developer's own agent must never be asked (a locked 1Password would prompt).
+environment.pop("SSH_AUTH_SOCK", None)
 
 
 def is_running(pid):

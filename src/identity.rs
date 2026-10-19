@@ -348,7 +348,9 @@ pub fn expand(value: &str, context: &Expansion<'_>) -> Result<PathBuf, String> {
 pub enum Socket {
     Disabled,
     /// The environment variable that should name the socket is not set.
-    NotConfigured { variable: String },
+    NotConfigured {
+        variable: String,
+    },
     Path(PathBuf),
 }
 
@@ -358,14 +360,12 @@ pub enum Socket {
 /// expanded (`~`, `%` tokens and `${VAR}`), except `$NAME`, so the value is never expanded again.
 pub fn agent_socket(identity_agent: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Socket {
     let from_env = |name: &str| {
-        env(name)
-            .filter(|value| !value.is_empty())
-            .map_or_else(
-                || Socket::NotConfigured {
-                    variable: name.into(),
-                },
-                |value| Socket::Path(value.into()),
-            )
+        env(name).filter(|value| !value.is_empty()).map_or_else(
+            || Socket::NotConfigured {
+                variable: name.into(),
+            },
+            |value| Socket::Path(value.into()),
+        )
     };
     match identity_agent {
         None | Some("SSH_AUTH_SOCK") => from_env("SSH_AUTH_SOCK"),

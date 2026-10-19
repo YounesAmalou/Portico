@@ -1306,8 +1306,11 @@ struct FormState {
     error: Option<String>,
     /// The last connection test of the typed values, shown until the form is edited.
     test_result: Option<FormTestResult>,
-    /// The jump host dropdown under ProxyJump, while it is open.
+    /// The dropdown under ProxyJump or IdentityFile, while it is open.
     suggestions: Option<Suggestions>,
+    /// Ctrl+Space asked for IdentityFile suggestions before there were any: the dropdown opens
+    /// when the identity inventory arrives, unless the focus left the field meanwhile.
+    identity_pending: bool,
 }
 
 /// The index of IdentityFile in `FORM_FIELDS`.
@@ -1737,6 +1740,9 @@ impl UiState {
         {
             self.form.suggestions = None;
         }
+        if self.form.active != IDENTITY_FILE || key.code == KeyCode::Esc {
+            self.form.identity_pending = false;
+        }
         UiAction::None
     }
 
@@ -1771,9 +1777,13 @@ impl UiState {
             let query = form.values[IDENTITY_FILE].as_str();
             let items = identities::missing_last(suggest::rank(query, &candidates, &[]));
             let exact = items.iter().any(|item| item.alias == query);
+            if items.is_empty() && on_demand && self.identity_inventory.is_none() {
+                form.identity_pending = true;
+            }
             if items.is_empty() || (!forced && query.is_empty()) || (!on_demand && exact) {
                 return;
             }
+            form.identity_pending = false;
             form.suggestions = Some(Suggestions::reopened(
                 previous,
                 items,
@@ -2133,24 +2143,21 @@ impl UiState {
         }
     }
 
-    /// Opens the migrate screen on the plan the worker built, unless it was closed meanwhile.
-    /// Keeps the built identity inventory and recomputes an open IdentityFile dropdown. A failed
+    /// Keeps the built identity inventory and, while IdentityFile has the focus, recomputes its
+    /// dropdown: what was typed, or an earlier Ctrl+Space, can now find candidates. A failed
     /// build leaves the suggestions to the key files in `~/.ssh`.
     fn finish_identities(&mut self, built: Result<IdentityInventory, String>) {
         match built {
             Ok(inventory) => self.identity_inventory = Some(inventory),
             Err(error) => self.status = Some(format!("Could not list identities: {error}")),
         }
-        if self
-            .form
-            .suggestions
-            .as_ref()
-            .is_some_and(|list| list.field == IDENTITY_FILE)
-        {
-            self.suggest(false);
+        if self.in_form() && self.form.active == IDENTITY_FILE {
+            let pending = std::mem::take(&mut self.form.identity_pending);
+            self.suggest(pending);
         }
     }
 
+    /// Opens the migrate screen on the plan the worker built, unless it was closed meanwhile.
     fn finish_plan(
         &mut self,
         planned: Result<adopt::MigrationPlan, AppError>,
@@ -2228,6 +2235,7 @@ impl Default for FormState {
             error: None,
             test_result: None,
             suggestions: None,
+            identity_pending: false,
         }
     }
 }
@@ -2254,6 +2262,7 @@ impl FormState {
             error: None,
             test_result: None,
             suggestions: None,
+            identity_pending: false,
         }
     }
 
@@ -5546,6 +5555,40 @@ mod tests {
         assert_eq!(state.form.active, IDENTITY_FILE);
         assert!(state.form.suggestions.is_none());
         assert_eq!(state.mode, Mode::AddForm);
+    }
+
+    #[test]
+    fn identity_suggestions_open_when_the_inventory_arrives_for_an_empty_home() {
+        let home = tempfile::tempdir().unwrap();
+        // Ctrl+Space before the inventory, with no key files to scan, opens it once it arrives.
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        state.handle_key(ctrl(' '));
+        assert!(state.form.suggestions.is_none());
+        state.finish_identities(Ok(identity_inventory()));
+        assert_eq!(listed(&state).len(), 3);
+
+        // So does what was typed meanwhile.
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        type_text(&mut state, "hub");
+        assert!(state.form.suggestions.is_none());
+        state.finish_identities(Ok(identity_inventory()));
+        assert_eq!(listed(&state), ["~/.ssh/github.pub"]);
+
+        // A Ctrl+Space whose field lost the focus is forgotten.
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        state.handle_key(ctrl(' '));
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::BackTab);
+        state.finish_identities(Ok(identity_inventory()));
+        assert!(state.form.suggestions.is_none());
+
+        // Nothing opens outside a form.
+        let mut state = test_state(Vec::new());
+        state.finish_identities(Ok(identity_inventory()));
+        assert!(state.form.suggestions.is_none());
     }
 
     #[test]

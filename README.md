@@ -207,7 +207,7 @@ The first time a host is tested its key is usually unknown. In a terminal, Porti
 
 ```text
 Agent: 1Password, ~/.1password/agent.sock, 3 keys
-Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:3/9rWBEc… "GitHub")
+Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:3/9rWBEcW/rifhH7XvLTSnlsXPJpccrkcu/8GpD/85o "GitHub")
 Identity: ~/.ssh/id_work: missing (no such file)
 IdentitiesOnly: yes
 ```
@@ -297,7 +297,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 In the filter and the host form, type normally: `Backspace` and `Delete` erase text, `←` / `→` / `Home` / `End` move the cursor, `Enter` applies the filter or saves the form, and `Esc` cancels.
 Form errors appear next to the field they belong to. `ProxyJump` takes `[user@]host[:port]` or an existing alias, with commas between several hops and no spaces.
 While you type a ProxyJump hop, a dropdown lists the known hosts whose alias contains what you typed, ignoring case and accents: `↑` / `↓` choose, `Enter` or `Tab` fills in the hop, and `Esc` closes the list (a second `Esc` cancels the form). In the ProxyJump field, `Ctrl+Space` opens the list even before you type.
-The IdentityFile field suggests the same way: key files in `~/.ssh` and every identity file a host uses, each with whether it is in an agent, a key file or missing (missing files last), and `Ctrl+Space` opens the list.
+The IdentityFile field suggests the same way: key files in `~/.ssh` and every identity file a host uses, and `Ctrl+Space` opens the list. Opening a form starts checking every host's identities in the background; until that is done, rows read `key file` or `public key` from `~/.ssh` alone, and then each says whether it is in an agent, a key file or missing (missing files last). A list asked for with `Ctrl+Space` before then opens when the check is done.
 Form fields only accept characters they can hold, whether typed or pasted: alias, hostname, user, port (digits only), and ProxyJump never take whitespace, and IdentityFile takes spaces inside a path but not at its start or end. Saving still validates everything.
 
 `Ctrl+Enter` needs a terminal that reports modified keys, such as kitty, WezTerm, Ghostty, or foot, and is only shown in the footer when Portico detects one. `n` works everywhere.
