@@ -1506,7 +1506,12 @@ impl UiState {
                 return self.form_input_changed(&before, cursor);
             }
             Mode::Browse if self.focus == Focus::Containers => self.containers.paste(text),
-            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust | Mode::Migrate => {}
+            Mode::Migrate => {
+                if let Some(migrate) = &mut self.migrate {
+                    migrate.paste(text);
+                }
+            }
+            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
         UiAction::None
     }
@@ -2347,11 +2352,11 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
 
     let (right_title, detail_lines) = match state.mode {
         Mode::AddForm | Mode::EditForm => (
-            if state.mode == Mode::AddForm {
+            Line::from(if state.mode == Mode::AddForm {
                 "Add host"
             } else {
                 "Edit host"
-            },
+            }),
             form_lines(
                 &state.form,
                 state.show_raw,
@@ -2360,16 +2365,19 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             ),
         ),
         Mode::ConfirmRemove => (
-            "Remove host",
+            Line::from("Remove host"),
             vec![Line::raw(format!(
                 "Remove {}?",
                 state.selected_alias().unwrap_or("selected host")
             ))],
         ),
-        Mode::ConfirmTrust => ("Trust host key", trust_lines(state.trust.as_ref())),
+        Mode::ConfirmTrust => (
+            Line::from("Trust host key"),
+            trust_lines(state.trust.as_ref()),
+        ),
         Mode::Migrate => state.migrate.as_ref().map_or(
             (
-                "Migrate",
+                Line::from("Migrate"),
                 vec![Line::raw("Checking each host with OpenSSH…")],
             ),
             |migrate| {
@@ -2391,7 +2399,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             };
             let text = container.unwrap_or_else(|| details_text(state));
             (
-                title,
+                Line::from(title),
                 text.lines()
                     .map(|line| Line::raw(line.to_owned()))
                     .collect(),
@@ -2503,8 +2511,7 @@ fn footer_text(state: &UiState) -> String {
         Mode::Migrate => state
             .migrate
             .as_ref()
-            .map_or("Esc cancel", MigrateState::footer)
-            .into(),
+            .map_or_else(|| "Esc cancel".into(), MigrateState::footer),
     }
 }
 
