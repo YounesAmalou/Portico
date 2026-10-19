@@ -130,6 +130,7 @@ function containerRows(doc, target) {
             target: target,
             id: id,
             name: text(c.display_name) || text(c.name) || id,
+            dockerName: text(c.name),
             image: text(c.image),
             status: text(c.status)
         }
@@ -179,6 +180,26 @@ function matches(row, query, fields) {
 
 function filterRows(rows, query, fields) {
     return list(rows).filter(function (row) { return matches(row, query, fields) })
+}
+
+// The fields a container row is searched on.
+var CONTAINER_FIELDS = ["name", "dockerName", "image", "id"]
+
+// How a host shows under the filter. `hostMatches` says whether the host's own
+// name matches; `entry` is its containers entry (absent until listed). A host
+// that matches shows as usual: its containers when expanded. A host that does
+// not match is kept when its loaded containers match, showing only those, even
+// when collapsed, so a container can be found by name; otherwise it is hidden.
+// containers is null when no container rows are to be shown (collapsed, or the
+// entry is loading or failed and drawn by the caller).
+function hostView(hostMatches, entry, query, expanded) {
+    var loaded = entry && entry.state === "loaded" ? list(entry.rows) : null
+    if (text(query).trim() === "" || hostMatches)
+        return { show: true, containers: expanded && loaded ? loaded : null, filtered: false }
+    var found = loaded ? filterRows(loaded, query, CONTAINER_FIELDS) : []
+    if (found.length === 0)
+        return { show: false, containers: null, filtered: false }
+    return { show: true, containers: found, filtered: true }
 }
 
 // The last non-empty line of human text, as one plain line.

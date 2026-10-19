@@ -42,26 +42,35 @@ FocusScope {
         return { type: "message", lines: Portico.errorLines(error) }
     }
 
-    function containerItems(target) {
+    function containerItems(target, rows) {
         let entry = model.containers[target]
-        if (!entry || entry.state === "loading")
-            return [hint("Listing containers…")]
-        if (entry.state === "failed")
-            return [message(entry.error)]
-        if (entry.rows.length === 0)
+        if (!rows) {
+            if (!entry || entry.state === "loading")
+                return [hint("Listing containers…")]
+            if (entry.state === "failed")
+                return [message(entry.error)]
+            rows = entry.rows
+        }
+        if (rows.length === 0)
             return [hint("No running containers.")]
-        return entry.rows.map(function (row) {
+        return rows.map(function (row) {
             return { type: "container", key: row.key, row: row, target: target,
                      busy: !!model.launching[row.key], error: model.rowErrors[row.key] || null }
         })
     }
 
-    function hostItem(key, target, title, external) {
+    // A host row and the container rows under it, or nothing when the filter hides it.
+    function hostItem(key, target, title, external, hostMatches, query) {
         let open = !!model.expanded[target]
+        let shown = Portico.hostView(hostMatches, model.containers[target], query, open)
+        if (!shown.show)
+            return []
         let item = { type: "host", key: key, target: target, title: title, external: external,
-                     local: target === "" && key === "local:", expanded: open,
+                     local: target === "" && key === "local:", expanded: open || shown.filtered,
                      busy: !!model.launching[key], error: model.rowErrors[key] || null }
-        return [item].concat(open ? containerItems(target) : [])
+        if (shown.containers)
+            return [item].concat(containerItems(target, shown.containers))
+        return [item].concat(open ? containerItems(target, null) : [])
     }
 
     function buildItems() {
@@ -85,19 +94,23 @@ FocusScope {
         }
 
         list.push({ type: "section", text: "Hosts" })
-        if (Portico.matches({ name: "this machine local" }, query, ["name"]))
-            list = list.concat(hostItem("local:", "", "This machine", false))
+        list = list.concat(hostItem("local:", "", "This machine", false,
+                                    Portico.matches({ name: "this machine local" }, query, ["name"]), query))
         if (model.hostsError) {
             list.push(message(model.hostsError))
         } else if (!model.hostsLoaded) {
             list.push(hint("Reading hosts…"))
         } else {
-            let hosts = Portico.filterRows(model.hosts, query, ["alias"])
-            if (hosts.length === 0)
-                list.push(hint(model.hosts.length === 0 ? "No hosts: add one with portico add or the TUI." : "No host matches."))
-            hosts.forEach(function (row) {
-                list = list.concat(hostItem(row.key, row.alias, row.alias, row.external))
+            let shown = 0
+            model.hosts.forEach(function (row) {
+                let rows = hostItem(row.key, row.alias, row.alias, row.external,
+                                    Portico.matches(row, query, ["alias"]), query)
+                if (rows.length > 0)
+                    shown++
+                list = list.concat(rows)
             })
+            if (shown === 0)
+                list.push(hint(model.hosts.length === 0 ? "No hosts: add one with portico add or the TUI." : "No host or loaded container matches."))
             model.hostWarnings.forEach(function (warning) { list.push(hint("Warning: " + warning)) })
         }
         return list
