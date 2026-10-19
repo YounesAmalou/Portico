@@ -136,7 +136,11 @@ impl TestEnv {
         paths.extend(std::env::split_paths(&inherited));
         let path = std::env::join_paths(paths).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_portico"));
-        command.args(args).env("HOME", &self.home).env("PATH", path);
+        command
+            .args(args)
+            .env("HOME", &self.home)
+            .env("PATH", path)
+            .env_remove("SSH_AUTH_SOCK");
         command
     }
 

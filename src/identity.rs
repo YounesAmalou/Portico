@@ -149,10 +149,14 @@ pub enum Availability {
     /// The host's agent holds the key.
     InAgent,
     /// The private key file exists. Without its public key file the agent was not checked.
-    KeyFile { public_key_found: bool },
+    KeyFile {
+        public_key_found: bool,
+    },
     Missing(MissingReason),
     /// The path uses a token Portico does not expand.
-    Unchecked { token: String },
+    Unchecked {
+        token: String,
+    },
 }
 
 impl Availability {
@@ -177,7 +181,10 @@ impl Availability {
     /// Why, when the word alone does not say.
     pub fn reason(&self) -> Option<String> {
         match self {
-            Availability::InAgent | Availability::KeyFile { public_key_found: true } => None,
+            Availability::InAgent
+            | Availability::KeyFile {
+                public_key_found: true,
+            } => None,
             Availability::KeyFile {
                 public_key_found: false,
             } => Some("agent not checked: no public key file".into()),
@@ -534,9 +541,7 @@ pub fn tilde_text(value: &str, home: &Path) -> String {
 
 /// `SHA256:` and the first 8 characters of the hash, then `…`.
 pub fn short_fingerprint(fingerprint: &str) -> String {
-    let (prefix, hash) = fingerprint
-        .split_once(':')
-        .unwrap_or(("", fingerprint));
+    let (prefix, hash) = fingerprint.split_once(':').unwrap_or(("", fingerprint));
     if hash.chars().count() <= 8 {
         return fingerprint.into();
     }
@@ -634,8 +639,14 @@ mod tests {
         );
         assert_eq!(agent_socket(Some("none"), &context), Socket::Disabled);
         assert_eq!(agent_socket(Some("$KEYS"), &context), path("/keys"));
-        assert_eq!(agent_socket(Some("$EMPTY"), &context), Socket::NotConfigured);
-        assert_eq!(agent_socket(Some("$UNSET"), &context), Socket::NotConfigured);
+        assert_eq!(
+            agent_socket(Some("$EMPTY"), &context),
+            Socket::NotConfigured
+        );
+        assert_eq!(
+            agent_socket(Some("$UNSET"), &context),
+            Socket::NotConfigured
+        );
         assert_eq!(
             agent_socket(Some("~/.1password/agent.sock"), &context),
             path("/home/me/.1password/agent.sock")
@@ -703,10 +714,7 @@ mod tests {
 
     #[test]
     fn pairs_public_key_paths() {
-        assert_eq!(
-            public_key_path(Path::new("/k/id")),
-            Path::new("/k/id.pub")
-        );
+        assert_eq!(public_key_path(Path::new("/k/id")), Path::new("/k/id.pub"));
         assert_eq!(
             public_key_path(Path::new("/k/gh.pub")),
             Path::new("/k/gh.pub")
@@ -857,14 +865,7 @@ mod tests {
             "key file (ED25519 SHA256:a \"c\")"
         );
         assert_eq!(
-            identity(
-                "x",
-                Availability::Unchecked {
-                    token: "%C".into()
-                },
-                None
-            )
-            .describe(),
+            identity("x", Availability::Unchecked { token: "%C".into() }, None).describe(),
             "unchecked (Portico does not expand %C)"
         );
         assert_eq!(

@@ -221,7 +221,11 @@ impl App {
             }
             Socket::Path(path) => path,
         };
-        let slot = Arc::clone(lock(&self.identities.agents).entry(path.clone()).or_default());
+        let slot = Arc::clone(
+            lock(&self.identities.agents)
+                .entry(path.clone())
+                .or_default(),
+        );
         let mut slot = lock(&slot);
         slot.get_or_insert_with(|| list_agent(&self.openssh, &path, self.identities.deadline()))
             .clone()
@@ -605,7 +609,10 @@ mod tests {
         let log = tempfile::NamedTempFile::new().unwrap();
         let fixture = fixture(
             "",
-            &format!("echo asked >> '{}'\necho 'The agent has no identities.'\nexit 1", log.path().display()),
+            &format!(
+                "echo asked >> '{}'\necho 'The agent has no identities.'\nexit 1",
+                log.path().display()
+            ),
         );
         let (sock, _listener) = socket(&fixture);
         let config = resolved(&format!("identityagent {}", sock.display()));
@@ -622,7 +629,10 @@ mod tests {
     #[test]
     fn a_listing_past_the_deadline_is_killed() {
         let pid = tempfile::NamedTempFile::new().unwrap();
-        let fixture = fixture("", &format!("echo $$ > '{}'\nexec sleep 30", pid.path().display()));
+        let fixture = fixture(
+            "",
+            &format!("echo $$ > '{}'\nexec sleep 30", pid.path().display()),
+        );
         let (sock, _listener) = socket(&fixture);
         let started = Instant::now();
         let identities = fixture
@@ -636,7 +646,11 @@ mod tests {
                 ..
             }
         ));
-        let pid: i32 = fs::read_to_string(pid.path()).unwrap().trim().parse().unwrap();
+        let pid: i32 = fs::read_to_string(pid.path())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         // SAFETY: signal 0 only checks whether the process exists.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "ssh-add {pid} is still running");
@@ -647,7 +661,10 @@ mod tests {
         let log = tempfile::NamedTempFile::new().unwrap();
         let fixture = fixture(
             "",
-            &format!("echo asked >> '{}'\necho 'Error connecting to agent: refused' >&2\nexit 2", log.path().display()),
+            &format!(
+                "echo asked >> '{}'\necho 'Error connecting to agent: refused' >&2\nexit 2",
+                log.path().display()
+            ),
         );
         let missing = fixture
             .app
@@ -662,7 +679,10 @@ mod tests {
         fs::write(fixture.path("plain"), "").unwrap();
         let plain = fixture.app.host_identities(
             "h",
-            &resolved(&format!("identityagent {}", fixture.path("plain").display())),
+            &resolved(&format!(
+                "identityagent {}",
+                fixture.path("plain").display()
+            )),
         );
         assert!(matches!(
             plain.agent,
@@ -684,7 +704,9 @@ mod tests {
                 problem: AgentProblem::Refused("Error connecting to agent: refused".into()),
             }
         );
-        let disabled = fixture.app.host_identities("h", &resolved("identityagent none"));
+        let disabled = fixture
+            .app
+            .host_identities("h", &resolved("identityagent none"));
         assert_eq!(disabled.agent, Agent::Disabled);
     }
 
@@ -694,7 +716,9 @@ mod tests {
         fs::write(fixture.app.home().join(".ssh/id_ed25519"), "").unwrap();
         let identities = fixture.app.host_identities(
             "h",
-            &resolved("identityagent none\nidentityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/id_ed25519"),
+            &resolved(
+                "identityagent none\nidentityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/id_ed25519",
+            ),
         );
         assert!(identities.defaults);
         assert_eq!(identities.identities.len(), 1);
@@ -722,7 +746,9 @@ mod tests {
         fs::write(ssh_dir.join("pair.pub"), "").unwrap();
         fixture.app.host_identities(
             "h",
-            &resolved("identityagent none\nidentityfile ~/.ssh/only_private\nidentityfile ~/.ssh/pair"),
+            &resolved(
+                "identityagent none\nidentityfile ~/.ssh/only_private\nidentityfile ~/.ssh/pair",
+            ),
         );
         assert_eq!(
             fs::read_to_string(log.path()).unwrap(),
@@ -768,7 +794,11 @@ mod tests {
         assert_eq!(
             files,
             [
-                ("~/.ssh/held.pub", "in agent", vec!["one".into(), "two".into()]),
+                (
+                    "~/.ssh/held.pub",
+                    "in agent",
+                    vec!["one".into(), "two".into()]
+                ),
                 ("~/.ssh/spare", "key file", vec![]),
                 ("~/.ssh/used", "key file", vec!["one".into(), "two".into()]),
             ]
