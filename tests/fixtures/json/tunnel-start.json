@@ -1,0 +1,47 @@
+{
+  "results": [
+    {
+      "error": {
+        "kind": "ssh",
+        "message": "the server refused the remote forward on port 8080",
+        "next": [
+          "the port is in use on the server, or its sshd does not allow remote forwards"
+        ]
+      },
+      "name": "preview",
+      "outcome": "failed",
+      "pid": null,
+      "tunnel": {
+        "forward": {
+          "bind_address": null,
+          "bind_port": 8080,
+          "description": "remote 8080 → localhost:3000",
+          "kind": "remote",
+          "spec": "8080:localhost:3000",
+          "target_host": "localhost",
+          "target_port": 3000
+        },
+        "host": "prod",
+        "name": "preview",
+        "status": {
+          "finished": 1781861043,
+          "reason": "the server refused the remote forward on port 8080",
+          "state": "failed"
+        },
+        "warnings": []
+      }
+    },
+    {
+      "error": {
+        "kind": "unknown-tunnel",
+        "message": "no tunnel named nope",
+        "next": []
+      },
+      "name": "nope",
+      "outcome": "failed",
+      "pid": null,
+      "tunnel": null
+    }
+  ],
+  "schema": 1
+}

@@ -1,0 +1,47 @@
+{
+  "command": [
+    "ssh",
+    "-f",
+    "-N",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+    "-o",
+    "RemoteCommand=none",
+    "-E",
+    "/home/me/.ssh/portico/run/tunnels/preview.log",
+    "-R",
+    "8080:localhost:3000",
+    "--",
+    "prod"
+  ],
+  "log": [
+    "Warning: remote port forwarding failed for listen port 8080",
+    "Error: remote port forwarding failed for listen port 8080"
+  ],
+  "schema": 1,
+  "tunnel": {
+    "forward": {
+      "bind_address": null,
+      "bind_port": 8080,
+      "description": "remote 8080 → localhost:3000",
+      "kind": "remote",
+      "spec": "8080:localhost:3000",
+      "target_host": "localhost",
+      "target_port": 3000
+    },
+    "host": "prod",
+    "name": "preview",
+    "status": {
+      "finished": 1781861043,
+      "reason": "Error: remote port forwarding failed for listen port 8080",
+      "state": "failed"
+    },
+    "warnings": []
+  }
+}

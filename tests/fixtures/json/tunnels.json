@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "tunnels": [
+    {
+      "forward": {
+        "bind_address": "127.0.0.1",
+        "bind_port": 5433,
+        "description": "127.0.0.1:5433 → localhost:80",
+        "kind": "local",
+        "spec": "127.0.0.1:5433:localhost:80",
+        "target_host": "localhost",
+        "target_port": 80
+      },
+      "host": "prod",
+      "name": "busy",
+      "status": {
+        "address": "127.0.0.1:5433",
+        "by": null,
+        "state": "port-in-use"
+      },
+      "warnings": []
+    },
+    {
+      "forward": {
+        "bind_address": "127.0.0.1",
+        "bind_port": 1,
+        "description": "127.0.0.1:1 → localhost:5432",
+        "kind": "local",
+        "spec": "127.0.0.1:1:localhost:5432",
+        "target_host": "localhost",
+        "target_port": 5432
+      },
+      "host": "prod",
+      "name": "db",
+      "status": {
+        "state": "stopped"
+      },
+      "warnings": [
+        {
+          "kind": "collides-with",
+          "message": "uses the same port as tunnel socks; only one of them can run at a time",
+          "tunnel": "socks"
+        }
+      ]
+    },
+    {
+      "forward": {
+        "bind_address": null,
+        "bind_port": 8080,
+        "description": "remote 8080 → localhost:3000",
+        "kind": "remote",
+        "spec": "8080:localhost:3000",
+        "target_host": "localhost",
+        "target_port": 3000
+      },
+      "host": "prod",
+      "name": "preview",
+      "status": {
+        "finished": 1781861043,
+        "reason": "Error: remote port forwarding failed for listen port 8080",
+        "state": "failed"
+      },
+      "warnings": []
+    },
+    {
+      "forward": {
+        "bind_address": "127.0.0.1",
+        "bind_port": 1,
+        "description": "socks 127.0.0.1:1",
+        "kind": "dynamic",
+        "spec": "127.0.0.1:1",
+        "target_host": null,
+        "target_port": null
+      },
+      "host": "prod",
+      "name": "socks",
+      "status": {
+        "state": "stopped"
+      },
+      "warnings": [
+        {
+          "kind": "collides-with",
+          "message": "uses the same port as tunnel db; only one of them can run at a time",
+          "tunnel": "db"
+        }
+      ]
+    }
+  ]
+}

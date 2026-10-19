@@ -198,10 +198,7 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
                 return Err(Failure::usage("tunnel start <name>..."));
             }
             Ok(results(
-                names
-                    .iter()
-                    .map(|name| start_result(app, name))
-                    .collect(),
+                names.iter().map(|name| start_result(app, name)).collect(),
             ))
         }
         JsonCommand::TunnelStop { names, all } => {
@@ -586,12 +583,18 @@ mod tests {
 
     #[test]
     fn documents_carry_the_schema_and_end_with_a_newline() {
-        assert_eq!(text(json!({ "x": [] })), "{\n  \"schema\": 1,\n  \"x\": []\n}\n");
+        assert_eq!(
+            text(json!({ "x": [] })),
+            "{\n  \"schema\": 1,\n  \"x\": []\n}\n"
+        );
     }
 
     #[test]
     fn every_status_has_its_keys() {
-        assert_eq!(status(&TunnelStatus::Stopped), json!({ "state": "stopped" }));
+        assert_eq!(
+            status(&TunnelStatus::Stopped),
+            json!({ "state": "stopped" })
+        );
         assert_eq!(
             status(&TunnelStatus::Running {
                 pid: 7,
@@ -722,9 +725,7 @@ mod tests {
                 Some("no such file"),
             ),
             (
-                Availability::Unchecked {
-                    token: "%C".into(),
-                },
+                Availability::Unchecked { token: "%C".into() },
                 "unchecked",
                 Some("Portico does not expand %C"),
             ),

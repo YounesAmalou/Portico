@@ -1,0 +1,12 @@
+{
+  "error": {
+    "kind": "docker",
+    "message": "The Docker daemon is not running on this machine.",
+    "next": [
+      "Start it with: sudo systemctl start docker",
+      "Run portico containers in a terminal to be offered this fix."
+    ],
+    "problem": "daemon-down"
+  },
+  "schema": 1
+}

@@ -1,0 +1,60 @@
+{
+  "agents": [
+    {
+      "environment": false,
+      "keys": [
+        {
+          "bits": 256,
+          "comment": "deploy@prod",
+          "fingerprint": "SHA256:YmF6cXV4Zm9vYmFycXV1eGNvcmdlZ3JhdWx0Z2FycGx5",
+          "type": "ED25519"
+        },
+        {
+          "bits": 256,
+          "comment": "work laptop",
+          "fingerprint": "SHA256:Zm9vYmFyYmF6cXV4cXV1eGNvcmdlZ3JhdWx0Z2FycGx5",
+          "type": "ED25519"
+        }
+      ],
+      "provider": "1password",
+      "socket": "/home/me/.1password/agent.sock",
+      "state": "listed",
+      "used_by": [
+        "prod"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "availability": "in-agent",
+      "configured": "~/.ssh/id_ed25519",
+      "path": "/home/me/.ssh/id_ed25519",
+      "public_key": {
+        "bits": 256,
+        "comment": "deploy@prod",
+        "fingerprint": "SHA256:YmF6cXV4Zm9vYmFycXV1eGNvcmdlZ3JhdWx0Z2FycGx5",
+        "type": "ED25519"
+      },
+      "reason": null,
+      "used_by": [
+        "prod"
+      ]
+    },
+    {
+      "availability": "missing",
+      "configured": "~/.ssh/old_rsa",
+      "path": "/home/me/.ssh/old_rsa",
+      "public_key": null,
+      "reason": "no such file",
+      "used_by": [
+        "prod"
+      ]
+    }
+  ],
+  "schema": 1,
+  "warnings": [
+    {
+      "message": "legacy: could not resolve: ssh exited with exit status: 255: legacy: line 9: Bad configuration option: frobnicate"
+    }
+  ]
+}

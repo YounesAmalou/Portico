@@ -1,0 +1,30 @@
+{
+  "hosts": [
+    {
+      "alias": "bastion",
+      "ownership": "external",
+      "source": "/home/me/.ssh/config"
+    },
+    {
+      "alias": "bastion",
+      "ownership": "external",
+      "source": "/home/me/.ssh/config"
+    },
+    {
+      "alias": "legacy",
+      "ownership": "external",
+      "source": "/home/me/.ssh/config"
+    },
+    {
+      "alias": "prod",
+      "ownership": "managed",
+      "source": "/home/me/.ssh/portico/config"
+    }
+  ],
+  "schema": 1,
+  "warnings": [
+    {
+      "message": "duplicate alias bastion: /home/me/.ssh/config, /home/me/.ssh/config"
+    }
+  ]
+}

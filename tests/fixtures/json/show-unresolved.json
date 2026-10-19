@@ -1,0 +1,17 @@
+{
+  "host": {
+    "alias": "legacy",
+    "declared": null,
+    "identities": null,
+    "ownership": "external",
+    "resolution_error": "ssh exited with exit status: 255: legacy: line 9: Bad configuration option: frobnicate",
+    "resolved": null,
+    "source": "/home/me/.ssh/config"
+  },
+  "schema": 1,
+  "warnings": [
+    {
+      "message": "duplicate alias bastion: /home/me/.ssh/config, /home/me/.ssh/config"
+    }
+  ]
+}
