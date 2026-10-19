@@ -1,6 +1,6 @@
 # Identity Awareness Design
 
-**Status:** Approved
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -172,21 +172,21 @@ and, for a host on OpenSSH defaults with an ordinary agent:
 
 ```
 Agent: SSH agent, /run/user/1000/ssh-agent.socket, 1 key
-Identity: ~/.ssh/id_ed25519 (OpenSSH default): key file, in agent (ED25519 SHA256:… "me@laptop")
+Identity: ~/.ssh/id_ed25519 (OpenSSH default): in agent (ED25519 SHA256:… "me@laptop")
 Identity: other OpenSSH defaults: none present
 Also offered by the agent: 0
 ```
 
-Every line `show` prints today stays byte-for-byte unchanged (`Resolved IdentityFile` included), so scripts reading `show` keep working; the identities block is only appended after them, before the warnings. Fingerprints are printed in full; the TUI shortens them.
+Every line `show` prints today stays byte-for-byte unchanged (`Resolved IdentityFile` included), so scripts reading `show` keep working; the identities block is only appended after them, before the warnings. Fingerprints are printed in full, here and in `portico identities`; the TUI shortens the ones it shows without a comment. A host with no identity at all shows `Identity: none`, and one on OpenSSH defaults with none present `Identity: OpenSSH defaults: none present`.
 
 **`portico identities`** (new) prints the inventory, agents first:
 
 ```
 Agents
-  1Password  ~/.1password/agent.sock  3 keys  (SSH_AUTH_SOCK)
-    ED25519  SHA256:NQlIU/kf…  VPS
-    ED25519  SHA256:3/9rWBEc…  GitHub          ~/.ssh/github.pub
-    ED25519  SHA256:9K4JN0kK…  codex-work
+  1Password  ~/.1password/agent.sock  3 keys  (SSH_AUTH_SOCK, used by 2 hosts)
+    ED25519  SHA256:NQlIU/kfZu3WkN47wF0BtGzX80pA/enhVbzMcSR/mtA  VPS
+    ED25519  SHA256:3/9rWBEcW/rifhH7XvLTSnlsXPJpccrkcu/8GpD/85o  GitHub      ~/.ssh/github.pub
+    ED25519  SHA256:9K4JN0kKozQ/OwJyNyk2DKrPia8Ufj1GmKB7ALBq/lc  codex-work
 
 Identity files
   ~/.ssh/github.pub    in agent   used by: github.com, gist
@@ -204,14 +204,14 @@ Identity files
 **Host details.** Under the resolved fields, the details pane shows an **Identities** section in the same wording as `show`, condensed:
 
 ```
-Agent        1Password · 3 keys
-Identity     ~/.ssh/github.pub    ✓ in agent  GitHub
-             ~/.ssh/id_work       ✗ missing
+Agent        1Password · 3 keys  ~/.1password/agent.sock
+IdentityFile ~/.ssh/github.pub  ✓ in agent  GitHub
+             ~/.ssh/id_work  ✗ missing (no such file)
 Only listed  yes
 ```
 
-- `✓` (green) for in agent or key file, `✗` (red) for missing, `?` (yellow) for unchecked; the words are always present, so colour is never the only signal.
-- Fingerprints are shortened to `SHA256:` plus 8 characters with `…`; the comment is shown when it fits.
+- `✓` for in agent or key file, `✗` for missing, `?` for unchecked, always followed by the word. The details pane is plain text, as it is for every other field, so no colour is needed or used.
+- A key is named by its comment, or by its fingerprint shortened to `SHA256:` plus 8 characters and `…` when it has none. `Also offered` lists the agent's other keys without IdentitiesOnly; `PKCS#11` shows a provider.
 - The IdentityFile row of the resolved fields is replaced by this section (it showed the same paths without status). The "Declared by Portico but overridden" note keeps comparing paths as today.
 - The identities are computed by the existing details worker, right after `ssh -G`, so the UI never waits for an agent: the details pane reads `Resolving…` as it does today until both are done. Because each socket is asked once per session, only the first host shown with a given agent can wait for it (at most the 3 s deadline); every later host reuses the listing.
 - An agent listing is not interrupted when the selection moves on (the host's `ssh -G` still is): it runs to its result or its deadline and fills the cache, so moving the cursor can never cause the same agent to be asked twice.

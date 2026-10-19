@@ -40,11 +40,13 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
             .collect()
     }
 
-    // Every bolded slice title still pending in the spec must survive in the roadmap.
+    // Every bolded slice title still pending in the spec must survive in the roadmap. A slice
+    // that ships leaves the pending list, so the three slices are counted across both lists.
     let pending = titles(pending);
+    let shipped = titles(delivered);
     assert!(
-        pending.len() >= 3,
-        "expected three slices, found {pending:?}"
+        pending.len() + shipped.len() >= 3,
+        "expected three slices, found {pending:?} and {shipped:?}"
     );
     for title in pending {
         assert!(roadmap.contains(title), "roadmap dropped slice {title:?}");
