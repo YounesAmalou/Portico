@@ -67,6 +67,10 @@ exec /usr/bin/ssh -F "$flat" "$@"
             bin.join("ssh-keygen"),
             "#!/bin/sh\nexec /usr/bin/ssh-keygen \"$@\"\n",
         );
+        write_executable(
+            bin.join("ssh-add"),
+            "#!/bin/sh\nexec /usr/bin/ssh-add \"$@\"\n",
+        );
         Self {
             _dir: dir,
             home,
@@ -104,7 +108,12 @@ exec /usr/bin/ssh -F "$flat" "$@"
 
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(Self::binary());
-        command.args(args).envs(self.env()).stdin(Stdio::null());
+        // The developer's own agent never shows up in a test's results.
+        command
+            .args(args)
+            .envs(self.env())
+            .env_remove("SSH_AUTH_SOCK")
+            .stdin(Stdio::null());
         command
     }
 
