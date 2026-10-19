@@ -28,8 +28,12 @@ pub fn match_fields(query: &str, fields: &[&str]) -> Option<Match> {
         score: 0,
         positions: vec![Vec::new(); fields.len()],
     };
-    for term in fold(query).split_whitespace() {
-        let term: Vec<char> = term.chars().collect();
+    for term in query.split_whitespace() {
+        // One character at a time, like the fields, so lowercasing does not depend on the word.
+        let term: Vec<char> = term
+            .chars()
+            .flat_map(|character| fold(&character.to_string()).chars().collect::<Vec<_>>())
+            .collect();
         let (field, score, positions) = folded
             .iter()
             .enumerate()
@@ -202,6 +206,12 @@ mod tests {
         assert!(match_fields("PROD", &["prod"]).is_some());
         assert!(match_fields("pröd", &["prod"]).is_some());
         assert_eq!(positions("e", &["Émile"]), vec![vec![0]]);
+    }
+
+    #[test]
+    fn query_folds_like_the_fields() {
+        // Lowercasing a whole word turns its last Σ into ς; one character at a time gives σ.
+        assert_eq!(positions("ΟΔΟΣ", &["ΟΔΟΣ-1"]), vec![vec![0, 1, 2, 3]]);
     }
 
     #[test]
