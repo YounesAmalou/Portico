@@ -7,6 +7,12 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-19
+
+### Fixed
+
+- Tighten the fuzzy pickers' edge cases ([#44](https://github.com/YounesAmalou/Portico/pull/44))
+
 ## [0.5.0] - 2026-10-19
 
 ### Added
