@@ -7,6 +7,27 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
+### Added
+
+- Install the desktop panel, launcher entry and shortcut with portico desktop install ([#54](https://github.com/YounesAmalou/Portico/pull/54))
+- Switch between hosts, tunnels and containers with tabs ([#53](https://github.com/YounesAmalou/Portico/pull/53))
+- Control hosts and tunnels from a Quickshell panel ([#50](https://github.com/YounesAmalou/Portico/pull/50))
+- Print hosts, containers and tunnels as JSON ([#49](https://github.com/YounesAmalou/Portico/pull/49))
+- Save tunnels and start or stop them on demand ([#47](https://github.com/YounesAmalou/Portico/pull/47))
+- Show which identities each host uses and whether they are available ([#46](https://github.com/YounesAmalou/Portico/pull/46))
+
+### Changed
+
+- Share one home-path helper ([#52](https://github.com/YounesAmalou/Portico/pull/52))
+
+### Fixed
+
+- Make Omarchy reload the panel after Portico updates it ([#57](https://github.com/YounesAmalou/Portico/pull/57))
+- Find loaded containers with the panel's search ([#56](https://github.com/YounesAmalou/Portico/pull/56))
+- Wait for Omarchy to register the panel before enabling it ([#55](https://github.com/YounesAmalou/Portico/pull/55))
+
 ## [0.5.1] - 2026-10-19
 
 ### Fixed
