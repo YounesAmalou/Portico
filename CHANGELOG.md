@@ -7,6 +7,16 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-19
+
+### Added
+
+- Pick hosts and containers with a built-in fuzzy picker ([#42](https://github.com/YounesAmalou/Portico/pull/42))
+
+### Fixed
+
+- Exit when the terminal closes instead of spinning ([#41](https://github.com/YounesAmalou/Portico/pull/41))
+
 ## [0.4.0] - 2026-10-19
 
 ### Added
