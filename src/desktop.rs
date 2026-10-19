@@ -250,6 +250,41 @@ pub fn omarchy_enabled(env: &DesktopEnv) -> Option<bool> {
     }))
 }
 
+/// How long `install` waits for Omarchy's shell to list the plugin after a rescan, which returns
+/// before the shell has registered it: Omarchy's own `omarchy-plugin-add` polls the same way.
+pub const OMARCHY_DISCOVERY_ATTEMPTS: u32 = 40;
+pub const OMARCHY_DISCOVERY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Polls `omarchy plugin list --json` until it lists the `portico` plugin, up to `attempts`
+/// times `pause` apart. Whether it appeared.
+pub fn wait_for_omarchy_plugin(
+    env: &DesktopEnv,
+    attempts: u32,
+    pause: std::time::Duration,
+) -> bool {
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(pause);
+        }
+        let known = env
+            .run("omarchy", &["plugin", "list", "--json"])
+            .ok()
+            .and_then(|listing| serde_json::from_str::<serde_json::Value>(&listing).ok())
+            .and_then(|plugins| {
+                plugins.as_array().map(|plugins| {
+                    plugins.iter().any(|plugin| {
+                        plugin.get("id").and_then(serde_json::Value::as_str) == Some("portico")
+                    })
+                })
+            })
+            .unwrap_or(false);
+        if known {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a `qs -c portico` instance runs.
 pub fn quickshell_running(env: &DesktopEnv) -> bool {
     env.run("qs", &["list", "-c", "portico", "-j"])
@@ -271,6 +306,8 @@ pub enum Step {
     },
     /// Run a program found on `PATH`.
     Run(Vec<String>),
+    /// Wait until Omarchy's running shell lists the plugin, then `omarchy plugin enable portico`.
+    EnableOmarchyPlugin,
     /// Write a launcher file.
     WriteFile { path: PathBuf, contents: String },
     /// Back up `file` and replace its text, as planned from `original`.
@@ -320,6 +357,18 @@ pub fn apply(env: &DesktopEnv, step: &Step) -> Result<Option<String>, String> {
                 .map_err(io(format!("could not link {}", show(path))))?;
         }
         Step::Run(args) => return run_step(env, args),
+        Step::EnableOmarchyPlugin => {
+            if !wait_for_omarchy_plugin(env, OMARCHY_DISCOVERY_ATTEMPTS, OMARCHY_DISCOVERY_PAUSE) {
+                return Err(format!(
+                    "Omarchy did not list the portico plugin within {} seconds of the rescan; \
+                     enable it with: omarchy plugin enable portico",
+                    OMARCHY_DISCOVERY_PAUSE.as_millis() * u128::from(OMARCHY_DISCOVERY_ATTEMPTS)
+                        / 1000
+                ));
+            }
+            let args = ["omarchy", "plugin", "enable", "portico"].map(String::from);
+            return run_step(env, &args);
+        }
         Step::WriteFile { path, contents } => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
