@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     io::{self, BufRead, Write},
     path::Path,
-    process::{ExitCode, Stdio},
+    process::ExitCode,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,6 +21,7 @@ use crate::{
     host::{Change, ClearField, Host, HostChanges},
     managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
+    picker::{Picker, Row},
 };
 
 #[derive(clap::Parser, Debug)]
@@ -238,9 +239,11 @@ impl Interrupts {
 /// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets
 /// `portico test` catch SIGINT, SIGTERM and SIGHUP to stop its `ssh`; only the real program sets
 /// it, so tests never install process-wide handlers.
+#[allow(clippy::too_many_arguments)]
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,
+    picker: &mut dyn Picker,
     input: &mut I,
     output: &mut O,
     error: &mut E,
@@ -252,7 +255,16 @@ where
     O: Write,
     E: Write,
 {
-    match execute(cli, app, input, output, error, interactive, handle_signals) {
+    match execute(
+        cli,
+        app,
+        picker,
+        input,
+        output,
+        error,
+        interactive,
+        handle_signals,
+    ) {
         Ok(exit) => exit,
         Err(message) if message.is_empty() => ExitCode::FAILURE,
         Err(message) => {
@@ -262,9 +274,11 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute<I: BufRead, O: Write, E: Write>(
     cli: Cli,
     app: &App,
+    picker: &mut dyn Picker,
     input: &mut I,
     output: &mut O,
     error: &mut E,
@@ -443,8 +457,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
                             }
                         },
                         None if interactive => {
-                            match pick(&app.container_programs().fzf, &list, input, output)? {
-                                Some(id) => id,
+                            let (ids, rows): (Vec<String>, Vec<Row>) =
+                                container_rows(&list).into_iter().unzip();
+                            match picker.pick_one("container", rows)? {
+                                Some(index) => ids[index].clone(),
                                 None => return Ok(ExitCode::from(CANCELLED)),
                             }
                         }
@@ -629,91 +645,28 @@ fn finish_connection<I: BufRead, E: Write>(
     Ok(exit_code(status))
 }
 
-/// Asks which container to open: through `fzf` when it runs, otherwise from a numbered menu
-/// read from `input`. `None` when the choice is cancelled.
-fn pick<I: BufRead, O: Write>(
-    fzf: &Path,
-    list: &ContainerList,
-    input: &mut I,
-    output: &mut O,
-) -> Result<Option<String>, String> {
+/// The picker's rows for the containers of `list`, grouped and ordered as they are listed.
+fn container_rows(list: &ContainerList) -> Vec<(String, Row)> {
     let containers = &list.listing.containers;
-    let rows: Vec<[String; 6]> = group(containers)
+    group(containers)
         .into_iter()
         .flat_map(|group| {
             let project = group.project.unwrap_or("Other");
             group.containers.into_iter().map(move |container| {
-                [
-                    container.id.clone(),
-                    project.to_string(),
-                    display_name(container, containers),
-                    container.name.clone(),
-                    container.image.clone(),
-                    container.status.clone(),
-                ]
+                let row = Row {
+                    fields: vec![
+                        display_name(container, containers),
+                        container.name.clone(),
+                        container.project.clone().unwrap_or_default(),
+                        container.service.clone().unwrap_or_default(),
+                        container.image.clone(),
+                    ],
+                    extra: vec![project.to_owned(), container.status.clone()],
+                };
+                (container.id.clone(), row)
             })
         })
-        .collect();
-    let spawned = std::process::Command::new(fzf)
-        .args([
-            "--delimiter",
-            "\t",
-            "--with-nth",
-            "2..",
-            "--prompt",
-            "container> ",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // fzf draws on the terminal through /dev/tty and its stderr.
-        .stderr(Stdio::inherit())
-        .spawn();
-    match spawned {
-        Ok(mut child) => {
-            let lines: String = rows.iter().map(|row| row.join("\t") + "\n").collect();
-            if let Some(mut stdin) = child.stdin.take() {
-                // fzf may exit before reading everything, as when it is cancelled.
-                let _ = stdin.write_all(lines.as_bytes());
-            }
-            let result = child
-                .wait_with_output()
-                .map_err(|error| format!("cannot run {}: {error}", fzf.display()))?;
-            match result.status.code() {
-                Some(0) => Ok(String::from_utf8_lossy(&result.stdout)
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split('\t').next())
-                    .filter(|id| !id.is_empty())
-                    .map(String::from)),
-                Some(1 | 130) => Ok(None),
-                _ => Err(format!("{} exited with {}", fzf.display(), result.status)),
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut menu = String::new();
-            for (number, [_, rest @ ..]) in rows.iter().enumerate() {
-                menu.push_str(&format!("{}) {}\n", number + 1, rest.join("  ")));
-            }
-            menu.push_str("Container number: ");
-            write!(output, "{menu}").map_err(|error| error.to_string())?;
-            output.flush().map_err(|error| error.to_string())?;
-            let mut answer = String::new();
-            input
-                .read_line(&mut answer)
-                .map_err(|error| error.to_string())?;
-            let answer = answer.trim();
-            if answer.is_empty() {
-                return Ok(None);
-            }
-            answer
-                .parse::<usize>()
-                .ok()
-                .and_then(|number| rows.get(number.checked_sub(1)?))
-                .map(|row| Some(row[0].clone()))
-                .ok_or_else(|| format!("no container numbered {answer}"))
-        }
-        Err(error) => Err(format!("cannot run {}: {error}", fzf.display())),
-    }
+        .collect()
 }
 
 /// This machine without `--on`, otherwise the host it names.
@@ -1301,6 +1254,7 @@ mod tests {
         host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
+        picker::Row,
     };
 
     #[test]
@@ -1356,6 +1310,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "init"]).unwrap(),
             &app,
+            &mut Scripted::default(),
             &mut Cursor::new(b"y\n"),
             &mut output,
             &mut error,
@@ -1369,6 +1324,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
+            &mut Scripted::default(),
             &mut Cursor::new(b"n\n"),
             &mut output,
             &mut error,
@@ -1381,6 +1337,7 @@ mod tests {
         run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
+            &mut Scripted::default(),
             &mut Cursor::new(b"y\n"),
             &mut output,
             &mut error,
@@ -1406,6 +1363,7 @@ mod tests {
             let exit = run(
                 Cli::try_parse_from(["portico", "remove", alias]).unwrap(),
                 &app,
+                &mut Scripted::default(),
                 &mut Cursor::new(b"y\n"),
                 &mut output,
                 &mut error,
@@ -1468,6 +1426,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "test", "dev"]).unwrap(),
             app,
+            &mut Scripted::default(),
             &mut Cursor::new(answer),
             &mut output,
             &mut Vec::new(),
@@ -1510,7 +1469,7 @@ mod tests {
     /// sources `<name>.behaviour` when it exists.
     fn container_app() -> (TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["docker", "sudo", "sg", "sh", "fzf"] {
+        for name in ["docker", "sudo", "sg", "sh"] {
             let base = dir.path().join(name);
             write_executable(
                 &base,
@@ -1530,7 +1489,6 @@ mod tests {
             sudo: program("sudo"),
             sg: program("sg"),
             sh: program("sh"),
-            fzf: program("fzf"),
         });
         (dir, app)
     }
@@ -1566,6 +1524,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "containers"]).unwrap(),
             app,
+            &mut Scripted::default(),
             &mut Cursor::new(answer),
             &mut output,
             &mut error,
@@ -1681,15 +1640,16 @@ fi
         );
     }
 
-    fn run_shell(app: &App, answer: &[u8]) -> (ExitCode, String) {
+    fn run_shell(app: &App, picker: &mut Scripted, interactive: bool) -> (ExitCode, String) {
         let mut output = Vec::new();
         let exit = run(
             Cli::try_parse_from(["portico", "shell"]).unwrap(),
             app,
-            &mut Cursor::new(answer),
+            picker,
+            &mut Cursor::new(b""),
             &mut output,
             &mut Vec::new(),
-            true,
+            interactive,
             false,
         );
         (exit, String::from_utf8(output).unwrap())
@@ -1699,108 +1659,125 @@ fi
         format!("[exec][-it][{id}][sh][-c][{SHELL_SCRIPT}]\n")
     }
 
+    /// A picker that answers from a script, by the first field of a row, and records what it
+    /// was shown. `None` cancels; `pick_many` takes a comma-separated list.
+    #[derive(Default)]
+    struct Scripted {
+        answers: std::collections::VecDeque<Option<&'static str>>,
+        seen: Vec<(String, Vec<Row>)>,
+    }
+
+    impl Scripted {
+        fn new(answers: &[Option<&'static str>]) -> Self {
+            Self {
+                answers: answers.iter().copied().collect(),
+                seen: Vec::new(),
+            }
+        }
+
+        fn answer(&mut self, prompt: &str, rows: Vec<Row>) -> Option<Vec<usize>> {
+            let answer = self.answers.pop_front().expect("an unexpected pick");
+            let picked = answer.map(|labels| {
+                labels
+                    .split(',')
+                    .map(|label| {
+                        rows.iter()
+                            .position(|row| row.fields[0] == label)
+                            .unwrap_or_else(|| panic!("no row {label}"))
+                    })
+                    .collect()
+            });
+            self.seen.push((prompt.into(), rows));
+            picked
+        }
+    }
+
+    impl Picker for Scripted {
+        fn pick_one(&mut self, prompt: &str, rows: Vec<Row>) -> Result<Option<usize>, String> {
+            Ok(self.answer(prompt, rows).map(|picked| picked[0]))
+        }
+
+        fn pick_many(&mut self, title: &str, rows: Vec<Row>) -> Result<Option<Vec<usize>>, String> {
+            Ok(self.answer(title, rows))
+        }
+    }
+
+    fn row(fields: &[&str], extra: &[&str]) -> Row {
+        Row {
+            fields: fields.iter().map(|field| (*field).into()).collect(),
+            extra: extra.iter().map(|extra| (*extra).into()).collect(),
+        }
+    }
+
     #[test]
-    fn numbered_picker_selects_second() {
+    fn shell_picks_a_container_through_the_picker() {
         let (dir, app) = container_app();
         two_containers(&dir);
-        fs::remove_file(dir.path().join("fzf")).unwrap();
+        let mut picker = Scripted::new(&[Some("beta")]);
 
-        let (exit, output) = run_shell(&app, b"2\n");
+        let (exit, output) = run_shell(&app, &mut picker, true);
 
         assert_eq!(exit, ExitCode::SUCCESS);
-        assert_eq!(
-            output,
-            "1) Other  alpha  alpha  nginx  Up 2 hours\n2) Other  beta  beta  redis  Up 1 hour\nContainer number: "
-        );
+        assert!(output.is_empty(), "{output}");
         assert!(calls(&dir, "docker").ends_with(&exec_call("bbbb2222")));
     }
 
     #[test]
-    fn numbered_picker_cancelled_runs_nothing() {
+    fn shell_container_rows_search_names_project_and_image() {
         let (dir, app) = container_app();
         two_containers(&dir);
-        fs::remove_file(dir.path().join("fzf")).unwrap();
+        let mut picker = Scripted::new(&[None]);
 
-        for answer in [&b""[..], b"\n"] {
-            let (exit, _) = run_shell(&app, answer);
-            assert_eq!(exit, ExitCode::from(130));
-        }
+        run_shell(&app, &mut picker, true);
+
+        assert_eq!(
+            picker.seen,
+            vec![(
+                "container".to_owned(),
+                vec![
+                    row(
+                        &["alpha", "alpha", "", "", "nginx"],
+                        &["Other", "Up 2 hours"]
+                    ),
+                    row(&["beta", "beta", "", "", "redis"], &["Other", "Up 1 hour"]),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn shell_picker_cancelled_exits_130_and_runs_nothing() {
+        let (dir, app) = container_app();
+        two_containers(&dir);
+
+        let (exit, _) = run_shell(&app, &mut Scripted::new(&[None]), true);
+
+        assert_eq!(exit, ExitCode::from(130));
         assert!(!calls(&dir, "docker").contains("[exec]"));
     }
 
     #[test]
-    fn numbered_picker_rejects_a_bad_number() {
+    fn shell_without_terminal_still_needs_a_container() {
         let (dir, app) = container_app();
         two_containers(&dir);
-        fs::remove_file(dir.path().join("fzf")).unwrap();
         let mut error = Vec::new();
 
         let exit = run(
             Cli::try_parse_from(["portico", "shell"]).unwrap(),
             &app,
-            &mut Cursor::new(b"3\n"),
+            &mut Scripted::default(),
+            &mut Cursor::new(b""),
             &mut Vec::new(),
             &mut error,
-            true,
+            false,
             false,
         );
 
         assert_eq!(exit, ExitCode::FAILURE);
         assert_eq!(
             String::from_utf8(error).unwrap(),
-            "error: no container numbered 3\n"
+            "error: choose a container: portico shell <container> (no terminal for the picker)\n"
         );
-        assert!(!calls(&dir, "docker").contains("[exec]"));
-    }
-
-    #[test]
-    fn fzf_picker_used_when_present() {
-        let (dir, app) = container_app();
-        two_containers(&dir);
-        behave(&dir, "fzf", "sed -n 2p\n");
-
-        let (exit, output) = run_shell(&app, b"");
-
-        assert_eq!(exit, ExitCode::SUCCESS);
-        assert!(output.is_empty(), "{output}");
-        assert_eq!(
-            calls(&dir, "fzf"),
-            "[--delimiter][\t][--with-nth][2..][--prompt][container> ]\n"
-        );
-        assert!(calls(&dir, "docker").ends_with(&exec_call("bbbb2222")));
-    }
-
-    #[test]
-    fn fzf_lines_carry_the_id_and_project() {
-        let (dir, app) = container_app();
-        two_containers(&dir);
-        let lines = dir.path().join("lines");
-        behave(
-            &dir,
-            "fzf",
-            &format!("cat > '{}'\nexit 130\n", lines.display()),
-        );
-
-        let (exit, _) = run_shell(&app, b"");
-
-        assert_eq!(exit, ExitCode::from(130));
-        assert_eq!(
-            fs::read_to_string(lines).unwrap(),
-            "aaaa1111\tOther\talpha\talpha\tnginx\tUp 2 hours\nbbbb2222\tOther\tbeta\tbeta\tredis\tUp 1 hour\n"
-        );
-        assert!(!calls(&dir, "docker").contains("[exec]"));
-    }
-
-    #[test]
-    fn fzf_with_no_match_cancels() {
-        let (dir, app) = container_app();
-        two_containers(&dir);
-        behave(&dir, "fzf", "exit 1\n");
-
-        let (exit, _) = run_shell(&app, b"");
-
-        assert_eq!(exit, ExitCode::from(130));
-        assert!(!calls(&dir, "docker").contains("[exec]"));
     }
 
     #[test]
@@ -1862,6 +1839,7 @@ fi
         let exit = run(
             Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied())).unwrap(),
             app,
+            &mut Scripted::default(),
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
             &mut error,

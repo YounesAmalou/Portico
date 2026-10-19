@@ -2,11 +2,23 @@
 //! given: a single select that ranks rows as the user types, and a multi select with the TUI
 //! checklist's keys.
 
-use std::{cell::Cell, collections::BTreeSet};
+use std::{
+    cell::Cell,
+    collections::BTreeSet,
+    io::{self, Stderr},
+};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::{
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use ratatui::{
-    Frame,
+    Frame, Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
@@ -25,6 +37,88 @@ const PAGE: usize = MAX_HEIGHT as usize - 1;
 /// How matched characters are shown, in the pickers and the TUI filters.
 pub(crate) const HIT: Style = Style::new().add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+
+/// Asks the user to choose among rows.
+pub trait Picker {
+    /// The chosen row, or `None` when cancelled.
+    fn pick_one(&mut self, prompt: &str, rows: Vec<Row>) -> Result<Option<usize>, String>;
+    /// The marked rows in input order, or `None` when cancelled.
+    fn pick_many(&mut self, title: &str, rows: Vec<Row>) -> Result<Option<Vec<usize>>, String>;
+}
+
+/// The pickers drawn inline on the terminal, under the prompt, through stderr.
+pub struct TerminalPicker;
+
+impl Picker for TerminalPicker {
+    fn pick_one(&mut self, prompt: &str, rows: Vec<Row>) -> Result<Option<usize>, String> {
+        Ok(interact(&mut Single::new(prompt, rows))?.map(|picked| picked[0]))
+    }
+
+    fn pick_many(&mut self, title: &str, rows: Vec<Row>) -> Result<Option<Vec<usize>>, String> {
+        interact(&mut Multi::new(title, rows))
+    }
+}
+
+/// What the terminal loop needs of a picker.
+trait State {
+    fn handle_key(&mut self, key: KeyEvent) -> Outcome;
+    fn paste(&mut self, text: &str);
+    fn height(&self, max: u16) -> u16;
+    fn render(&self, frame: &mut Frame, area: Rect);
+}
+
+/// Raw mode and bracketed paste for as long as it lives, so an error or a panic restores them.
+struct RawMode;
+
+impl RawMode {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let guard = Self;
+        execute!(io::stderr(), EnableBracketedPaste)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = execute!(io::stderr(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Runs `state` in an inline viewport until a pick or a cancel, then erases the viewport.
+fn interact(state: &mut impl State) -> Result<Option<Vec<usize>>, String> {
+    let failed = |error: io::Error| format!("cannot open the picker: {error}");
+    let (_, lines) = crossterm::terminal::size().map_err(failed)?;
+    let raw = RawMode::enter().map_err(failed)?;
+    let mut terminal: Terminal<CrosstermBackend<Stderr>> = Terminal::with_options(
+        CrosstermBackend::new(io::stderr()),
+        TerminalOptions {
+            viewport: Viewport::Inline(state.height(lines)),
+        },
+    )
+    .map_err(failed)?;
+    let picker_failed = |error: io::Error| format!("the picker failed: {error}");
+    let outcome = loop {
+        terminal
+            .draw(|frame| state.render(frame, frame.area()))
+            .map_err(picker_failed)?;
+        match event::read().map_err(picker_failed)? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match state.handle_key(key) {
+                Outcome::Continue => {}
+                Outcome::Picked(picked) => break Some(picked),
+                Outcome::Cancelled => break None,
+            },
+            Event::Paste(text) => state.paste(&text),
+            Event::Resize(..) => terminal.autoresize().map_err(picker_failed)?,
+            _ => {}
+        }
+    };
+    terminal.clear().map_err(picker_failed)?;
+    drop(terminal);
+    drop(raw);
+    Ok(outcome)
+}
 
 /// One choice: `fields` are searched and the first is shown, `extra` is shown dimmed after it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,8 +226,10 @@ impl Single {
         self.ranked = rank(self.query.as_str(), fields.iter().map(Vec::as_slice));
         self.cursor = 0;
     }
+}
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+impl State for Single {
+    fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         if is_ctrl_c(key) {
             return Outcome::Cancelled;
         }
@@ -159,16 +255,16 @@ impl Single {
         }
     }
 
-    pub(crate) fn paste(&mut self, text: &str) {
+    fn paste(&mut self, text: &str) {
         self.query.paste(text);
         self.rerank();
     }
 
-    pub(crate) fn height(&self, max: u16) -> u16 {
+    fn height(&self, max: u16) -> u16 {
         height(self.rows.len(), max)
     }
 
-    pub(crate) fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect) {
         let prompt = format!("{}> ", self.prompt);
         let mut lines = vec![Line::from(vec![
             Span::raw(prompt.clone()),
@@ -239,8 +335,10 @@ impl Multi {
             .and_then(|selected| self.visible.iter().position(|&index| index == selected))
             .unwrap_or(0);
     }
+}
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+impl State for Multi {
+    fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         if is_ctrl_c(key) {
             return Outcome::Cancelled;
         }
@@ -301,7 +399,7 @@ impl Multi {
         Outcome::Continue
     }
 
-    pub(crate) fn paste(&mut self, text: &str) {
+    fn paste(&mut self, text: &str) {
         if self.editing {
             let mut filter = self.filter.clone();
             filter.paste(text);
@@ -309,11 +407,11 @@ impl Multi {
         }
     }
 
-    pub(crate) fn height(&self, max: u16) -> u16 {
+    fn height(&self, max: u16) -> u16 {
         height(self.rows.len(), max)
     }
 
-    pub(crate) fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect) {
         let mut title = vec![Span::raw(format!("{}  ", self.title))];
         let filtered = self.editing || !self.filter.is_empty();
         let cursor_column = title[0].content.chars().count() + 1 + self.filter.cursor_offset();

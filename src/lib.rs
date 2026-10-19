@@ -9,8 +9,6 @@ pub mod fuzzy;
 pub mod host;
 pub mod managed;
 pub mod openssh;
-// Used by the CLI from the next commit on.
-#[allow(dead_code)]
 pub mod picker;
 pub mod probe;
 pub mod suggest;
