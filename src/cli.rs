@@ -25,6 +25,7 @@ use crate::{
     picker::{Picker, Row},
 };
 
+mod json;
 mod tunnels;
 
 #[derive(clap::Parser, Debug)]
@@ -40,9 +41,16 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    Hosts,
+    Hosts {
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
+    },
     Show {
         alias: Option<String>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
     },
     Add {
         alias: String,
@@ -112,11 +120,18 @@ enum Command {
         raw: bool,
     },
     /// List the agents and identity files Portico knows of, and whether each key is available.
-    Identities,
+    Identities {
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
+    },
     Containers {
         /// List on this host; without an alias, choose one.
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
     },
     Shell {
         container: Option<String>,
@@ -136,7 +151,11 @@ enum Command {
         via: Option<Via>,
     },
     /// List saved tunnels and their status.
-    Tunnels,
+    Tunnels {
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
+    },
     /// Save, start and stop tunnels.
     Tunnel {
         #[command(subcommand)]
@@ -269,6 +288,9 @@ where
     O: Write,
     E: Write,
 {
+    if let Some(command) = cli.command.as_ref().and_then(json_command) {
+        return json::run(command, app, output);
+    }
     match execute(
         cli,
         app,
@@ -286,6 +308,20 @@ where
             ExitCode::FAILURE
         }
     }
+}
+
+/// The command as a `--json` one, when it was given `--json`.
+fn json_command(command: &Command) -> Option<json::JsonCommand> {
+    use json::JsonCommand;
+    Some(match command {
+        Command::Hosts { json: true } => JsonCommand::Hosts,
+        Command::Show { alias, json: true } => JsonCommand::Show(alias.clone()),
+        Command::Identities { json: true } => JsonCommand::Identities,
+        Command::Containers { on, json: true } => JsonCommand::Containers(on.clone()),
+        Command::Tunnels { json: true } => JsonCommand::Tunnels,
+        Command::Tunnel { command } => return tunnels::json_command(command),
+        _ => return None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -327,7 +363,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
             .map_err(|error| error.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Hosts) => {
+        Some(Command::Hosts { .. }) => {
             let inventory = app.hosts().map_err(|error| error.to_string())?;
             for host in inventory.hosts {
                 writeln!(
@@ -345,7 +381,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Show { alias }) => {
+        Some(Command::Show { alias, .. }) => {
             let Some(alias) = host_argument(alias, app, picker, interactive, "show", false)? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
@@ -353,7 +389,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
             print_details(output, &details, app.home())?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Identities) => {
+        Some(Command::Identities { .. }) => {
             let inventory = app
                 .identity_inventory()
                 .map_err(|error| error.to_string())?;
@@ -449,7 +485,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 .map_err(|error| error.to_string())?;
             finish_connection(outcome, hold, input, error)
         }
-        Some(Command::Containers { on }) => {
+        Some(Command::Containers { on, .. }) => {
             let Some(target) = on_argument(on, app, picker, interactive, "containers")? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
@@ -527,7 +563,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
             };
             finish_connection(outcome, hold, input, error)
         }
-        Some(Command::Tunnels) => tunnels::list(app, output),
+        Some(Command::Tunnels { .. }) => tunnels::list(app, output),
         Some(Command::Tunnel { command }) => {
             tunnels::run(command, app, picker, input, output, error, interactive)
         }
@@ -2094,7 +2130,7 @@ fi
         ));
         assert!(matches!(
             parse(&["containers"]),
-            Some(Command::Containers { on: None })
+            Some(Command::Containers { on: None, .. })
         ));
     }
 
@@ -2571,6 +2607,59 @@ fi
 
         assert_eq!(exit, ExitCode::SUCCESS, "{output}");
         assert!(output.contains("authenticated"), "{output}");
+    }
+
+    /// A picker that fails the test when it is asked anything.
+    struct Forbidden;
+
+    impl Picker for Forbidden {
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn pick_one(&mut self, prompt: &str, _: Vec<Row>) -> Result<Option<usize>, String> {
+            panic!("--json opened the {prompt} picker")
+        }
+
+        fn pick_many(&mut self, title: &str, _: Vec<Row>) -> Result<Option<Vec<usize>>, String> {
+            panic!("--json opened the {title} checklist")
+        }
+    }
+
+    #[test]
+    fn json_commands_never_pick_or_prompt_even_on_a_terminal() {
+        let (_dir, app) = test_app();
+        app.initialize(true).unwrap();
+        app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
+            .unwrap();
+        for args in [
+            &["show", "--json"][..],
+            &["containers", "--on", "--json"],
+            &["tunnel", "show", "--json"],
+            &["tunnel", "start", "--json"],
+            &["tunnel", "stop", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied()))
+                .unwrap();
+            let mut output = Vec::new();
+            let mut error = Vec::new();
+            let exit = run(
+                cli,
+                &app,
+                &mut Forbidden,
+                // A confirmation would read this.
+                &mut Cursor::new(b"y\n"),
+                &mut output,
+                &mut error,
+                true,
+                false,
+            );
+            assert_eq!(exit, ExitCode::FAILURE, "{args:?}");
+            assert!(error.is_empty(), "{args:?}");
+            let document: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(document["schema"], 1, "{args:?}");
+            assert_eq!(document["error"]["kind"], "usage", "{args:?}");
+        }
     }
 
     fn test_app() -> (TempDir, App) {
