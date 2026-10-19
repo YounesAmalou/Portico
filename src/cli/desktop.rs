@@ -384,8 +384,13 @@ fn plan_panel(env: &DesktopEnv, target: Target) -> Part {
         }),
     }
     let run = |args: &[&str]| Step::Run(args.iter().map(|arg| arg.to_string()).collect());
+    let rewrites = state != panel::State::Current;
     match target {
         Target::Omarchy => {
+            // A new link is itself a change Omarchy sees; an existing one is re-created.
+            if rewrites && link_state == Link::Ours {
+                steps.push(Step::ReloadOmarchyPanel);
+            }
             let enabled = desktop::omarchy_enabled(env);
             if link_state != Link::Ours || enabled != Some(true) {
                 steps.push(run(&["omarchy-shell", "shell", "rescanPlugins"]));
@@ -395,7 +400,13 @@ fn plan_panel(env: &DesktopEnv, target: Target) -> Part {
             }
         }
         Target::Quickshell => {
-            if link_state != Link::Ours || !desktop::quickshell_running(env) {
+            let running = desktop::quickshell_running(env);
+            // Quickshell does not reload a configuration whose files change, so a running
+            // panel is restarted to load the rewritten files.
+            if rewrites && link_state == Link::Ours && running {
+                steps.push(run(&["qs", "kill", "-c", "portico"]));
+                steps.push(run(&["qs", "-c", "portico", "-n", "-d"]));
+            } else if link_state != Link::Ours || !running {
                 steps.push(run(&["qs", "-c", "portico", "-n", "-d"]));
             }
         }
@@ -580,6 +591,11 @@ fn print_step(env: &DesktopEnv, output: Out, step: &Step) -> Result<(), String> 
             output,
             "  run      omarchy plugin enable portico   (once Omarchy lists the plugin)"
         ),
+        Step::ReloadOmarchyPanel => writeln!(
+            output,
+            "  relink   {}   (so Omarchy reloads the panel)",
+            show(&Target::Omarchy.link(env))
+        ),
         Step::WriteFile { path, contents } => match launcher::exec_of_text(contents) {
             Some(exec) if path.extension().is_some_and(|ext| ext == "desktop") => {
                 writeln!(output, "  write    {} (runs {exec})", show(path))
@@ -757,6 +773,7 @@ fn report(env: &DesktopEnv, output: Out, step: &Step, said: Option<String>) -> R
             Some(said) => writeln!(output, "Ran {}: {said}", args.join(" ")),
             None => writeln!(output, "Ran {}.", args.join(" ")),
         },
+        Step::ReloadOmarchyPanel => writeln!(output, "Asked Omarchy to reload the panel."),
         Step::EnableOmarchyPlugin => match said {
             Some(said) => writeln!(output, "Ran omarchy plugin enable portico: {said}"),
             None => writeln!(output, "Ran omarchy plugin enable portico."),

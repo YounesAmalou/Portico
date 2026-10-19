@@ -119,14 +119,16 @@ pub fn write(dir: &Path) -> io::Result<()> {
 /// command's output and status stay its own. A panel from a newer Portico is left alone, so two
 /// installed binaries never take turns rewriting it; `portico desktop status` and the panel's
 /// banner report a stamp that differs.
-pub fn refresh(dir: &Path, is_development_build: impl FnOnce() -> bool) {
+/// Whether it rewrote the panel.
+pub fn refresh(dir: &Path, is_development_build: impl FnOnce() -> bool) -> bool {
     if let Ok(written) = fs::read_to_string(dir.join(VERSION_FILE))
         && should_refresh(written.trim())
         && !is_blocked(dir)
         && !is_development_build()
     {
-        let _ = write(dir);
+        return write(dir).is_ok();
     }
+    false
 }
 
 /// Whether a panel stamped `written` is behind this binary.
