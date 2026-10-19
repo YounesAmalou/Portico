@@ -68,7 +68,7 @@ The rules of `ROADMAP.md` hold: no daemon (updates happen when `portico` runs), 
 
   The icon is a simple monochrome-friendly SVG of a portico (pediment over columns), drawn for this slice.
   - **The AUR package** installs them to `/usr/share/applications/portico.desktop` and `/usr/share/icons/hicolor/scalable/apps/portico.svg`.
-  - **The user install** writes them to `$XDG_DATA_HOME/applications/portico.desktop` and `$XDG_DATA_HOME/icons/hicolor/scalable/apps/portico.svg` (default `~/.local/share`), from copies embedded in the binary, with two changes: a first comment line `# Installed by portico desktop install; portico desktop uninstall removes it.` (an XML comment in the SVG, after its declaration), which is how `uninstall` and `status` recognise them, and `Exec=` set to the absolute path of the running binary (`std::env::current_exe`). The session that starts a launcher often lacks `~/.cargo/bin` on `PATH`, the same problem the panel solves with its lookup; `status` reports an `Exec=` path that no longer exists.
+  - **The user install** writes them to `$XDG_DATA_HOME/applications/portico.desktop` and `$XDG_DATA_HOME/icons/hicolor/scalable/apps/portico.svg` (default `~/.local/share`), from copies embedded in the binary, with two changes: a first comment line `# Installed by portico desktop install; portico desktop uninstall removes it.` (an XML comment in the SVG, after its declaration), which is how `uninstall` and `status` recognise them, and `Exec=` set to the absolute path of the running binary (`std::env::current_exe`). The session that starts a launcher often lacks `~/.cargo/bin` on `PATH`, the same problem the panel solves with its lookup; `status` reports an `Exec=` path that no longer exists, and when the running binary lies under a cargo `target/` directory (a development run), the plan warns that the entry would run a build directory's binary.
   - **When a system entry exists** (`applications/portico.desktop` in any directory of `XDG_DATA_DIRS`, default `/usr/local/share:/usr/share`), the launcher component is shown as "provided by /usr/share/applications/portico.desktop" and not offered: a user copy would only shadow it.
   - A file at the user location without the marker is the user's own: the component is unavailable, and the plan says so.
   - No cache is updated: `update-desktop-database` only matters for MIME associations, and launchers scan `hicolor` without `gtk-update-icon-cache`.
@@ -256,7 +256,7 @@ Removed ~/.local/share/portico/panel.
 
 - A TUI for any of this: a "TUI settings panel" (desktop integration and other preferences from the TUI) is added to `ROADMAP.md` as an unscheduled item.
 - `--json` for `desktop status`.
-- Writing the session autostart for plain Quickshell (printed, not written; see the question below).
+- Writing the session autostart for plain Quickshell (printed, not written; see "Decided in review").
 - Compositors other than Hyprland and Sway for the keybinding, and Omarchy versions before its Quickshell shell (without `omarchy-shell`, which are treated as plain Hyprland when `qs` is present).
 - System-wide installs: `install` writes only under the user's home; packages ship the launcher entry, and the panel needs nothing outside the binary.
 - Changing the panel's behaviour beyond the version banner.
@@ -270,6 +270,11 @@ Removed ~/.local/share/portico/panel.
 - **Docs guard** (`tests/docs.rs`): the README's desktop section names `portico desktop install`; `packaging/aur/PKGBUILD` installs both launcher files.
 - **Manual, on the maintainer's machine, read-only:** Omarchy's launcher lists entries from Quickshell's `DesktopEntries` (`/usr/share/omarchy/shell/services/AppLibrary.qml`), which scans `$XDG_DATA_HOME/applications`, and indexes icons under `~/.local/share/icons/**/apps/`. That `portico.desktop` parses and is listed is checked by running a throwaway Quickshell configuration that prints `DesktopEntries.applications` with `XDG_DATA_HOME` pointing at a temporary directory holding the generated files, without writing to the maintainer's `~/.local/share`. That Omarchy's own launcher then shows it needs the files in the real location, which this slice must not write; it goes in the pull request's manual check list, with the full `portico desktop install` on Omarchy.
 
-## Questions for the maintainer
+## Decided in review
 
-1. **Autostart for plain Quickshell.** `install` starts `qs -c portico` now and prints the line that starts it with the session, as decided. Should it instead offer to write that line too, as a fourth confirmed component with the same markers and backup as the keybinding? The recommendation is to keep it printed for this slice: autostart files vary more than binding files (Hyprland Lua, `exec-once`, Sway `exec`, systemd user units, desktop autostart entries), and the keybinding already proves the marked-edit mechanism.
+1. **The plain-Quickshell autostart line stays printed, not written,** in this slice.
+2. **Omarchy's `o` helper is in scope in `bindings.lua`:** `o` is a global that `default.hypr.helpers` defines, and Omarchy's configuration requires it before `hypr.bindings`, so the written block needs no `require` or `local`.
+3. **The Hyprland Lua names are the installed API:** `hl.bind(keys, dispatcher, { description = … })`, `hl.dsp.exec_cmd(cmd)` and `hl.on("hyprland.start", fn)` are declared in Hyprland 0.56's stubs (`/usr/share/hypr/stubs/hl.meta.lua`) and used by its default `hyprland.lua` and by Omarchy, so a Lua-configured plain Hyprland gets the `hl.bind` line.
+4. **The auto-refresh never runs for `desktop` commands,** runs before the command writes anything, and costs one failed `open` when no panel is installed; a test proves `portico hosts --json` with no panel creates nothing under `XDG_DATA_HOME`.
+5. **A development binary is flagged:** when the running binary lies under a `target/` directory of a cargo build, the plan warns that the launcher entry would run a build directory's binary.
+6. **The manual Omarchy check list** (full install, the launcher shows Portico, SUPER + ALT + P toggles the panel, `uninstall` restores `bindings.lua` byte for byte) is in the pull request description, for the maintainer.
