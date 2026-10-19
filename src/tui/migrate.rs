@@ -157,11 +157,20 @@ impl MigrateState {
             }
             KeyCode::Char('a') => {
                 let candidates = &self.plan.candidates;
-                self.selected.extend(
-                    self.visible
-                        .iter()
-                        .filter(|&&index| candidates[index].reason.is_none()),
-                );
+                let eligible: Vec<usize> = self
+                    .visible
+                    .iter()
+                    .copied()
+                    .filter(|&index| candidates[index].reason.is_none())
+                    .collect();
+                // Like the CLI checklist: unmark them when every one is already marked.
+                if eligible.iter().all(|index| self.selected.contains(index)) {
+                    for index in &eligible {
+                        self.selected.remove(index);
+                    }
+                } else {
+                    self.selected.extend(eligible);
+                }
             }
             KeyCode::Char('/') => {
                 self.filter_before_edit = self.filter.as_str().to_owned();
@@ -583,6 +592,20 @@ mod tests {
         assert_eq!(
             press(&mut state, KeyCode::Char('y')),
             MigrateAction::Apply(vec!["web".into(), "db".into()])
+        );
+    }
+
+    #[test]
+    fn a_again_unmarks_the_visible_hosts() {
+        let mut state = adoption(None);
+        press(&mut state, KeyCode::Char(' '));
+        filter(&mut state, "d");
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('y')),
+            MigrateAction::Apply(vec!["web".into()])
         );
     }
 

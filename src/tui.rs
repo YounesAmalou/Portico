@@ -1046,9 +1046,9 @@ impl TextInput {
         self.field.is_none_or(|field| field.accepts(text))
     }
 
-    /// The characters before the cursor, so a terminal cursor can be placed after them.
+    /// The columns the text before the cursor takes, so a terminal cursor can be placed after it.
     pub(crate) fn cursor_offset(&self) -> usize {
-        self.text[..self.cursor].chars().count()
+        display_width(&self.text[..self.cursor])
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -2646,7 +2646,7 @@ fn suggestion_lines(
 }
 
 /// The terminal columns `text` takes.
-fn display_width(text: &str) -> usize {
+pub(crate) fn display_width(text: &str) -> usize {
     Span::raw(text).width()
 }
 

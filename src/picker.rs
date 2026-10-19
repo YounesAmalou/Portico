@@ -5,6 +5,7 @@
 use std::{
     cell::Cell,
     collections::BTreeSet,
+    fmt::Display,
     io::{self, IsTerminal, Stderr},
 };
 
@@ -18,7 +19,7 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
@@ -27,7 +28,7 @@ use ratatui::{
 
 use crate::{
     fuzzy::{Match, highlight, match_fields, rank},
-    tui::TextInput,
+    tui::{TextInput, display_width},
 };
 
 /// The most lines a picker takes, its prompt line included.
@@ -106,30 +107,45 @@ fn interact(state: &mut impl State) -> Result<Option<Vec<usize>>, String> {
         },
     )
     .map_err(failed)?;
-    let picker_failed = |error: io::Error| format!("the picker failed: {error}");
+    let outcome = run(&mut terminal, state, event::read);
+    drop(terminal);
+    drop(raw);
+    outcome
+}
+
+/// Draws `state` and feeds it events from `next_event` until a pick or a cancel, then erases it.
+fn run<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut impl State,
+    mut next_event: impl FnMut() -> io::Result<Event>,
+) -> Result<Option<Vec<usize>>, String> {
+    let failed = |error: &dyn Display| format!("the picker failed: {error}");
+    // Drawing resizes the viewport to the terminal first, so a resize event needs no handling.
     let outcome = loop {
-        terminal
-            .draw(|frame| state.render(frame, frame.area()))
-            .map_err(picker_failed)?;
-        match event::read().map_err(picker_failed)? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match state.handle_key(key) {
-                Outcome::Continue => {}
-                Outcome::Picked(picked) => break Some(picked),
-                Outcome::Cancelled => break None,
-            },
-            Event::Paste(text) => state.paste(&text),
-            Event::Resize(..) => terminal.autoresize().map_err(picker_failed)?,
-            _ => {}
+        if let Err(error) = terminal.draw(|frame| state.render(frame, frame.area())) {
+            break Err(failed(&error));
+        }
+        match next_event() {
+            Err(error) => break Err(failed(&error)),
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                match state.handle_key(key) {
+                    Outcome::Continue => {}
+                    Outcome::Picked(picked) => break Ok(Some(picked)),
+                    Outcome::Cancelled => break Ok(None),
+                }
+            }
+            Ok(Event::Paste(text)) => state.paste(&text),
+            Ok(_) => {}
         }
     };
     // Clearing puts the cursor back where it was drawn; output continues where the picker began.
+    // After a failure it is still tried, so the error is not printed over a stale picker.
     let top = terminal.get_frame().area().y;
-    terminal.clear().map_err(picker_failed)?;
-    terminal
-        .set_cursor_position((0, top))
-        .map_err(picker_failed)?;
-    drop(terminal);
-    drop(raw);
+    let cleared = terminal
+        .clear()
+        .and_then(|()| terminal.set_cursor_position((0, top)));
+    let outcome = outcome?;
+    cleared.map_err(|error| failed(&error))?;
     Ok(outcome)
 }
 
@@ -296,7 +312,7 @@ impl State for Single {
             }
         }
         frame.render_widget(Paragraph::new(lines), area);
-        let column = prompt.chars().count() + self.query.cursor_offset();
+        let column = display_width(&prompt) + self.query.cursor_offset();
         frame.set_cursor_position((
             area.x
                 + u16::try_from(column)
@@ -427,7 +443,7 @@ impl State for Multi {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let mut title = vec![Span::raw(format!("{}  ", self.title))];
         let filtered = self.editing || !self.filter.is_empty();
-        let cursor_column = title[0].content.chars().count() + 1 + self.filter.cursor_offset();
+        let cursor_column = display_width(&title[0].content) + 1 + self.filter.cursor_offset();
         if filtered {
             title.push(Span::raw(format!("/{}  ", self.filter.as_str())));
         }
@@ -697,6 +713,51 @@ mod tests {
         assert_eq!(
             multi_lines(&state, 5)[1..4],
             ["[ ] sandbox", "[ ] prod-db", "[ ] db-main"]
+        );
+    }
+
+    #[test]
+    fn a_failed_read_erases_the_picker() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(40, 6),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        let mut state = Single::new("host", rows(&["prod", "db"]));
+        let mut events = vec![
+            Err(io::Error::other("gone")),
+            Ok(Event::Key(key(KeyCode::Char('p')))),
+        ];
+
+        let outcome = run(&mut terminal, &mut state, || events.pop().unwrap());
+
+        assert_eq!(outcome, Err("the picker failed: gone".into()));
+        assert!(
+            lines(&terminal).iter().all(String::is_empty),
+            "{:?}",
+            lines(&terminal)
+        );
+    }
+
+    #[test]
+    fn cursor_follows_wide_characters() {
+        let mut single = Single::new("host", rows(&["東京-db"]));
+        type_text(&mut |event| single.handle_key(event), "東京");
+        let mut terminal = draw(40, 3, |frame| single.render(frame, frame.area()));
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            (u16::try_from("host> ".len() + 4).unwrap(), 0).into()
+        );
+
+        let mut multi = Multi::new("adopt", rows(&["東京-db"]));
+        multi.handle_key(key(KeyCode::Char('/')));
+        type_text(&mut |event| multi.handle_key(event), "東京");
+        let mut terminal = draw(40, 3, |frame| multi.render(frame, frame.area()));
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            (u16::try_from("adopt  /".len() + 4).unwrap(), 0).into()
         );
     }
 

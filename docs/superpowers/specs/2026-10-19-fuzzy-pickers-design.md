@@ -83,7 +83,7 @@ The `m` checklist's keys, for `adopt` and `export`.
 - **Hosts filter.** Matches the alias with the fuzzy matcher instead of a substring, and highlights the matched characters. Keys, title, selection rules and order are unchanged.
 - **Containers filter.** Matches the same fields as today with the fuzzy matcher instead of a substring, and highlights the matched characters in the name shown. Keys, headers, selection rules and order are unchanged.
 - **Checklist filter.** The `m` checklist gets a filter with the hosts filter's keys: `/` edits it, typing narrows the rows at once, `Enter` applies, `Esc` while editing restores the previous filter, and `Esc` with an applied filter clears it (otherwise it closes the checklist, as today). Rows that are not eligible are filtered like the others.
-  - Marks survive filter changes; `a` acts on the visible rows; `Enter` previews every marked host, also hidden ones.
+  - Marks survive filter changes; `a` marks the visible eligible rows, or unmarks them when all are marked, as in the CLI checklist; `Enter` previews every marked host, also hidden ones.
   - The cursor stays on the same row when it still matches, otherwise it moves to the first match; `j` `k` move through matching rows only.
   - The title shows `/<filter>` and the number of marked hosts. No matches shows `No hosts match "<filter>".`
   - The footer offers `/ filter` and, with an applied filter, `Esc clear filter`; while editing it shows the filter-editing footer.
