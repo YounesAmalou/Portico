@@ -228,7 +228,7 @@ Later work retains these requirements without constraining their implementation 
 
 1. Identity awareness: delivered (see below).
 2. Tunnels: delivered (see below).
-3. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
+3. Desktop surface: delivered (see below).
 
 _(The former fifth slice, herdr tool integration, was dropped on 2026-10-13. The machine-readable output it called for shipped as its own slice, listed below.)_
 
@@ -247,3 +247,4 @@ Each slice requires its own design review before implementation.
 - **Identity awareness:** `portico show`, the TUI details and the new `portico identities` show which identities each host offers (IdentityFile references, the agent from `IdentityAgent` or `SSH_AUTH_SOCK`, including 1Password's SSH agent) and whether each is in the agent, a key file, missing or unchecked, and the IdentityFile form field suggests known identities. Portico only stats private key files and reads public ones with `ssh-keygen -l` and agents with `ssh-add -l`. Designed in `2026-10-19-identity-awareness-design.md`.
 - **Tunnels:** `portico tunnels` and `portico tunnel add|edit|remove|show|start|stop`, and the TUI tunnels screen (`T`), save local, remote and dynamic forwards in `~/.ssh/portico/tunnels` and start them on demand as background `ssh` processes that outlive Portico. Conflicts with busy ports and with running saved tunnels are detected before starting, and a started tunnel is found again and stopped only after its PID, start time, boot and command line are verified. Designed in `2026-10-19-tunnels-design.md`.
 - **Machine-readable output:** `--json` on `hosts`, `show`, `identities`, `containers`, `tunnels` and `tunnel show|start|stop` prints one versioned JSON document on stdout, success or failure, never prompting and carrying no credentials, for the desktop surface and other consumers. The contract is `docs/json-output.md`, pinned by golden files. Designed in `2026-10-19-json-output-design.md`.
+- **Desktop panel:** a Quickshell panel in `desktop/quickshell/`, also an Omarchy plugin (bar icon and popup), lists the saved tunnels with their status and a start or stop action, and the hosts to connect to in a new terminal, each expandable to its running containers. It reads only the `--json` contract, runs nothing while closed, lists containers only when a host is expanded, and manages nothing. Designed in `2026-10-19-desktop-panel-design.md`.

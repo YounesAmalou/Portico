@@ -38,6 +38,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       docs: ${{ steps.filter.outputs.docs }}
       deps: ${{ steps.filter.outputs.deps }}
+      desktop: ${{ steps.filter.outputs.desktop }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,7 +52,9 @@ jobs:
           # rust: anything but documentation changed; docs: documentation changed (the
           # doc guards in tests/docs.rs read it); deps: the dependencies or their checks
           # changed. Without a diff to inspect (a release, a new branch), run everything.
-          rust=true docs=true deps=true
+          # desktop: the desktop panel or what it is tested against changed; it is only
+          # ever set by a diff, so the optional desktop check never runs for a release.
+          rust=true docs=true deps=true desktop=false
           case "$GITHUB_EVENT_NAME" in
             pull_request) base=HEAD^1 ;;
             push) base=$BEFORE ;;
@@ -67,15 +70,20 @@ jobs:
               case "$file" in
                 "") ;;
                 *.md | docs/*) docs=true ;;
+                # The doc guards read the panel's files.
+                desktop/*) docs=true ;;
                 *) rust=true ;;
+              esac
+              case "$file" in
+                desktop/* | tests/fixtures/json/* | docs/json-output.md | scripts/ci-checks.sh) desktop=true ;;
               esac
               case "$file" in
                 Cargo.toml | Cargo.lock | deny.toml | .github/workflows/ci.yml | scripts/ci-*.sh) deps=true ;;
               esac
             done <<< "$files"
           fi
-          echo "rust=$rust docs=$docs deps=$deps"
-          { echo "rust=$rust"; echo "docs=$docs"; echo "deps=$deps"; } >> "$GITHUB_OUTPUT"
+          echo "rust=$rust docs=$docs deps=$deps desktop=$desktop"
+          { echo "rust=$rust"; echo "docs=$docs"; echo "deps=$deps"; echo "desktop=$desktop"; } >> "$GITHUB_OUTPUT"
 
   fmt:
     needs: changes
@@ -181,3 +189,22 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/ci-container.sh package
+
+  # Optional: not a required check, and no job depends on it. It lints the desktop panel
+  # and tests its JSON parsing against the golden files. The job always runs, and its
+  # steps only when the panel or what it reads changed, because a skipped job would keep
+  # the release workflow from reusing this run; continue-on-error keeps a failure from
+  # failing the workflow.
+  desktop:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ needs.changes.outputs.desktop == 'true' }}
+      - name: Lint the panel and test portico.js
+        if: ${{ needs.changes.outputs.desktop == 'true' }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work archlinux:base-devel bash -c \
+            'pacman -Syu --noconfirm qt6-declarative quickshell && scripts/ci-checks.sh desktop'

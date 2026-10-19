@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "portico",
+  "name": "Portico",
+  "version": "1.0.0",
+  "author": "Younes Amalou",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/YounesAmalou/Portico",
+  "description": "Connect to your SSH hosts and their Docker containers in a new terminal, and start or stop your saved Portico tunnels, from the bar or a keybinding. Reads the portico CLI's JSON output; hosts and tunnels are managed in the portico CLI and TUI.",
+  "kinds": ["bar-widget", "panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "OmarchyBarWidget.qml",
+    "panel": "OmarchyPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "Portico",
+    "description": "SSH hosts, container shells and saved tunnels.",
+    "category": "Network",
+    "aliases": ["ssh", "tunnel", "portico", "hosts"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

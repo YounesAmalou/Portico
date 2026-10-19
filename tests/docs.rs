@@ -440,3 +440,78 @@ fn readme_points_consumers_at_the_json_contract() {
     assert!(readme.contains("docs/json-output.md"));
     assert!(readme.contains("--json"));
 }
+
+/// The desktop panel reads one schema; a schema bump must not leave it behind unnoticed.
+#[test]
+fn the_desktop_panel_reads_the_schema_portico_prints() {
+    let library = read("desktop/quickshell/portico.js");
+    let schema = library
+        .lines()
+        .find_map(|line| line.strip_prefix("var SCHEMA = "))
+        .expect("portico.js declares SCHEMA");
+    let tests = read("desktop/quickshell/tests/tst_portico.qml");
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/json");
+    let mut files = 0;
+    for entry in fs::read_dir(golden).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let document: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            document["schema"].to_string(),
+            schema.trim(),
+            "{name} has another schema than the desktop panel reads"
+        );
+        assert!(
+            tests.contains(&format!("\"{name}\"")),
+            "{name} is not checked by desktop/quickshell/tests/tst_portico.qml"
+        );
+        files += 1;
+    }
+    assert!(files > 0);
+}
+
+#[test]
+fn the_desktop_panel_manifest_names_files_that_exist() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(&read("desktop/quickshell/manifest.json")).unwrap();
+    assert_eq!(manifest["schemaVersion"], 1);
+    assert_eq!(manifest["id"], "portico");
+    let entry_points = manifest["entryPoints"].as_object().unwrap();
+    assert_eq!(
+        entry_points.keys().collect::<Vec<_>>(),
+        ["barWidget", "panel"]
+    );
+    for file in entry_points.values() {
+        let file = file.as_str().unwrap();
+        assert!(!file.contains(".."), "{file} leaves the plugin directory");
+        assert!(
+            !read(&format!("desktop/quickshell/{file}")).is_empty(),
+            "{file} is empty"
+        );
+    }
+    assert!(!read("desktop/quickshell/shell.qml").is_empty());
+}
+
+#[test]
+fn readme_documents_the_desktop_panel() {
+    let readme = read("README.md");
+    let section = readme
+        .split("## Desktop panel")
+        .nth(1)
+        .expect("README has a Desktop panel section");
+    for needle in [
+        "desktop/quickshell",
+        "qs -p",
+        "ipc call portico toggle",
+        "~/.config/omarchy/plugins/portico",
+        "omarchy plugin enable portico",
+        "omarchy-shell shell toggle portico",
+        "PORTICO_BIN",
+    ] {
+        assert!(
+            section.contains(needle),
+            "README's Desktop panel section lacks {needle}"
+        );
+    }
+}
