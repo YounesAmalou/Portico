@@ -50,8 +50,6 @@ pub enum AgentProblem {
     Refused(String),
     /// The listing did not finish before the deadline; the agent may be waiting to be unlocked.
     NoAnswer,
-    /// The configured socket uses a token Portico does not expand.
-    Unexpandable(String),
 }
 
 /// The agent a host uses, and what it holds.
@@ -59,12 +57,13 @@ pub enum AgentProblem {
 pub enum Agent {
     /// `IdentityAgent none`.
     Disabled,
-    /// The host uses `SSH_AUTH_SOCK`, which is not set.
-    NotConfigured,
+    /// The host takes its socket from an environment variable (`SSH_AUTH_SOCK`, or another
+    /// one named by `IdentityAgent $NAME`) that is not set.
+    NotConfigured { variable: String },
     Unavailable {
         socket: PathBuf,
         provider: Provider,
-        problem: AgentProblem,
+        reason: AgentProblem,
     },
     Listed {
         socket: PathBuf,
@@ -93,16 +92,16 @@ impl Agent {
     pub fn describe(&self, home: &Path) -> String {
         match self {
             Agent::Disabled => "none (IdentityAgent none)".into(),
-            Agent::NotConfigured => "none (SSH_AUTH_SOCK is not set)".into(),
+            Agent::NotConfigured { variable } => format!("none ({variable} is not set)"),
             Agent::Unavailable {
                 socket,
                 provider,
-                problem,
+                reason,
             } => format!(
                 "{}, {}, unavailable: {}",
                 provider.name(),
                 tilde(socket, home),
-                problem.describe()
+                reason.describe()
             ),
             Agent::Listed {
                 socket,
@@ -127,7 +126,6 @@ impl AgentProblem {
             AgentProblem::NoAnswer => {
                 "did not answer in time (it may be waiting to be unlocked)".into()
             }
-            AgentProblem::Unexpandable(token) => format!("Portico does not expand {token}"),
         }
     }
 }
@@ -349,31 +347,31 @@ pub fn expand(value: &str, context: &Expansion<'_>) -> Result<PathBuf, String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Socket {
     Disabled,
-    NotConfigured,
+    /// The environment variable that should name the socket is not set.
+    NotConfigured { variable: String },
     Path(PathBuf),
-    Unexpandable { configured: String, token: String },
 }
 
 /// The socket `identity_agent` (as `ssh -G` printed it, or `None` when absent) names: the
 /// environment's `SSH_AUTH_SOCK` when absent or `SSH_AUTH_SOCK`, another variable for `$NAME`,
-/// nothing for `none`, and otherwise the expanded path.
-pub fn agent_socket(identity_agent: Option<&str>, context: &Expansion<'_>) -> Socket {
+/// nothing for `none`, and otherwise the value itself. `ssh -G` prints IdentityAgent already
+/// expanded (`~`, `%` tokens and `${VAR}`), except `$NAME`, so the value is never expanded again.
+pub fn agent_socket(identity_agent: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Socket {
     let from_env = |name: &str| {
-        (context.env)(name)
+        env(name)
             .filter(|value| !value.is_empty())
-            .map_or(Socket::NotConfigured, |value| Socket::Path(value.into()))
+            .map_or_else(
+                || Socket::NotConfigured {
+                    variable: name.into(),
+                },
+                |value| Socket::Path(value.into()),
+            )
     };
     match identity_agent {
         None | Some("SSH_AUTH_SOCK") => from_env("SSH_AUTH_SOCK"),
         Some(value) if value.eq_ignore_ascii_case("none") => Socket::Disabled,
         Some(value) if value.starts_with('$') && !value.starts_with("${") => from_env(&value[1..]),
-        Some(value) => match expand(value, context) {
-            Ok(path) => Socket::Path(path),
-            Err(token) => Socket::Unexpandable {
-                configured: value.into(),
-                token,
-            },
-        },
+        Some(value) => Socket::Path(value.into()),
     }
 }
 
@@ -419,6 +417,20 @@ fn parse_key_line(line: &str) -> Option<PublicKey> {
         fingerprint: fingerprint.into(),
         comment: rest[..open].trim_end().into(),
     })
+}
+
+/// Whether `line`, the first line of a file, starts like an OpenSSH public key: its first word
+/// is a key type such as `ssh-ed25519`, `ecdsa-sha2-nistp256` or `sk-ssh-ed25519@openssh.com`.
+/// A private key's `-----BEGIN` header never does.
+pub fn looks_like_public_key(line: &[u8]) -> bool {
+    let word = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    ["ssh-", "ecdsa-", "sk-", "webauthn-"]
+        .iter()
+        .any(|prefix| word.starts_with(prefix.as_bytes()) && word.len() > prefix.len())
+        && line.iter().any(|byte| byte.is_ascii_whitespace())
 }
 
 /// Whether an IdentityFile names a public key, which selects an agent key and cannot sign.
@@ -633,40 +645,30 @@ mod tests {
 
     #[test]
     fn resolves_the_agent_socket() {
-        let context = context();
         let path = |value: &str| Socket::Path(value.into());
-        assert_eq!(agent_socket(None, &context), path("/run/agent.sock"));
+        let unset = |variable: &str| Socket::NotConfigured {
+            variable: variable.into(),
+        };
+        assert_eq!(agent_socket(None, &env), path("/run/agent.sock"));
         assert_eq!(
-            agent_socket(Some("SSH_AUTH_SOCK"), &context),
+            agent_socket(Some("SSH_AUTH_SOCK"), &env),
             path("/run/agent.sock")
         );
-        assert_eq!(agent_socket(Some("none"), &context), Socket::Disabled);
-        assert_eq!(agent_socket(Some("$KEYS"), &context), path("/keys"));
+        assert_eq!(agent_socket(Some("none"), &env), Socket::Disabled);
+        assert_eq!(agent_socket(Some("$KEYS"), &env), path("/keys"));
+        assert_eq!(agent_socket(Some("$EMPTY"), &env), unset("EMPTY"));
+        assert_eq!(agent_socket(Some("$UNSET"), &env), unset("UNSET"));
+        // ssh -G has already expanded everything else: `%%` printed as `%` stays as it is.
         assert_eq!(
-            agent_socket(Some("$EMPTY"), &context),
-            Socket::NotConfigured
+            agent_socket(Some("/run/a%b.sock"), &env),
+            path("/run/a%b.sock")
         );
         assert_eq!(
-            agent_socket(Some("$UNSET"), &context),
-            Socket::NotConfigured
-        );
-        assert_eq!(
-            agent_socket(Some("~/.1password/agent.sock"), &context),
+            agent_socket(Some("/home/me/.1password/agent.sock"), &env),
             path("/home/me/.1password/agent.sock")
         );
-        assert_eq!(
-            agent_socket(Some("/run/%C"), &context),
-            Socket::Unexpandable {
-                configured: "/run/%C".into(),
-                token: "%C".into()
-            }
-        );
-        let unset = |_: &str| None;
-        let without = Expansion {
-            env: &unset,
-            ..context
-        };
-        assert_eq!(agent_socket(None, &without), Socket::NotConfigured);
+        let nothing = |_: &str| None;
+        assert_eq!(agent_socket(None, &nothing), unset("SSH_AUTH_SOCK"));
     }
 
     #[test]
@@ -713,6 +715,29 @@ mod tests {
         assert_eq!(keys[2].key_type, "ED25519-SK");
         assert_eq!(keys[3].key_type, "MLDSA44-ED25519");
         assert!(parse_listing("The agent has no identities.\n").is_empty());
+    }
+
+    #[test]
+    fn recognises_public_key_lines() {
+        for line in [
+            "ssh-ed25519 AAAAC3Nz me@host",
+            "ssh-rsa AAAAB3",
+            "ecdsa-sha2-nistp256 AAAAE2",
+            "sk-ssh-ed25519@openssh.com AAAA",
+            "ssh-mldsa44-ed25519 AAAA",
+        ] {
+            assert!(looks_like_public_key(line.as_bytes()), "{line}");
+        }
+        for line in [
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "",
+            "ssh-",
+            "ssh-ed25519",
+            "garbage",
+        ] {
+            assert!(!looks_like_public_key(line.as_bytes()), "{line}");
+        }
     }
 
     #[test]
@@ -884,12 +909,19 @@ mod tests {
             Agent::Unavailable {
                 socket: "/run/a".into(),
                 provider: Provider::Generic,
-                problem: AgentProblem::NoSuchSocket,
+                reason: AgentProblem::NoSuchSocket,
             }
             .describe(home),
             "SSH agent, /run/a, unavailable: no such socket"
         );
         assert_eq!(Agent::Disabled.describe(home), "none (IdentityAgent none)");
+        assert_eq!(
+            Agent::NotConfigured {
+                variable: "FOO".into()
+            }
+            .describe(home),
+            "none (FOO is not set)"
+        );
     }
 
     #[test]

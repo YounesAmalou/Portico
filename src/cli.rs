@@ -1371,12 +1371,12 @@ fn print_inventory(
                 (provider.name(), identity::count(keys.len(), "key"))
             }
             Agent::Unavailable {
-                provider, problem, ..
+                provider, reason, ..
             } => (
                 provider.name(),
-                format!("unavailable: {}", problem.describe()),
+                format!("unavailable: {}", reason.describe()),
             ),
-            Agent::Disabled | Agent::NotConfigured => continue,
+            Agent::Disabled | Agent::NotConfigured { .. } => continue,
         };
         let mut uses = Vec::new();
         if known.environment {
@@ -2700,7 +2700,7 @@ fi
                     agent: Agent::Unavailable {
                         socket: "/run/gone".into(),
                         provider: identity::Provider::Generic,
-                        problem: identity::AgentProblem::NoSuchSocket,
+                        reason: identity::AgentProblem::NoSuchSocket,
                     },
                     environment: false,
                     used_by: vec!["c".into()],

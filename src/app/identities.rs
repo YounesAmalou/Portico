@@ -118,10 +118,10 @@ fn run_with_deadline(openssh: &OpenSsh, command: &mut Command, deadline: Duratio
 /// never ask for anything.
 fn list_agent(openssh: &OpenSsh, socket: &Path, deadline: Duration) -> Agent {
     let provider = identity::provider(socket);
-    let unavailable = |problem| Agent::Unavailable {
+    let unavailable = |reason| Agent::Unavailable {
         socket: socket.to_owned(),
         provider,
-        problem,
+        reason,
     };
     match fs::metadata(socket) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -159,9 +159,10 @@ fn list_agent(openssh: &OpenSsh, socket: &Path, deadline: Duration) -> Agent {
 }
 
 /// The key in the public key file at `path`, read by `ssh-keygen -l`. Only a regular file named
-/// `*.pub` is ever passed on.
+/// `*.pub` whose first line reads as a public key is ever passed on, so a private key that is
+/// misnamed, or linked to as `.pub`, never reaches `ssh-keygen`.
 fn fingerprint(openssh: &OpenSsh, path: &Path, deadline: Duration) -> Option<PublicKey> {
-    if !identity::is_public(path) || !is_file(path) {
+    if !identity::is_public(path) || !is_file(path) || !starts_like_a_public_key(path) {
         return None;
     }
     let mut command = Command::new(openssh.keygen_program());
@@ -174,6 +175,30 @@ fn fingerprint(openssh: &OpenSsh, path: &Path, deadline: Duration) -> Option<Pub
         }
         _ => None,
     }
+}
+
+/// Whether the file at `path`, which claims to be a public key, starts with a public key type.
+/// Only its first word is read, one byte at a time and at most 64 bytes, and reading stops at a
+/// leading `-`: of a private key file (`-----BEGIN …`), only that first byte is ever read.
+fn starts_like_a_public_key(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut start = Vec::new();
+    let mut byte = [0];
+    while start.len() < 64 {
+        match file.read(&mut byte) {
+            Ok(1) => {
+                start.push(byte[0]);
+                if byte[0].is_ascii_whitespace() || start == b"-" {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    identity::looks_like_public_key(&start)
 }
 
 /// Whether a regular file exists at `path`, by `stat` alone.
@@ -211,14 +236,7 @@ impl App {
     fn agent(&self, socket: Socket) -> Agent {
         let path = match socket {
             Socket::Disabled => return Agent::Disabled,
-            Socket::NotConfigured => return Agent::NotConfigured,
-            Socket::Unexpandable { configured, token } => {
-                return Agent::Unavailable {
-                    provider: identity::provider(Path::new(&configured)),
-                    socket: configured.into(),
-                    problem: AgentProblem::Unexpandable(token),
-                };
-            }
+            Socket::NotConfigured { variable } => return Agent::NotConfigured { variable },
             Socket::Path(path) => path,
         };
         let slot = Arc::clone(
@@ -265,7 +283,7 @@ impl App {
         };
         let agent = self.agent(identity::agent_socket(
             resolved.identity_agent.as_deref(),
-            &context,
+            &|name| self.identities.env(name),
         ));
         let defaults = !resolved.identity_files.is_empty()
             && self.defaults() == Some(&resolved.identity_files);
@@ -396,10 +414,13 @@ impl App {
         }
         for path in key_files_in(&home.join(".ssh")) {
             let public_path = identity::public_key_path(&path);
+            // A host may name the key, its private file or its public file.
             let known = files.iter().any(|(known, _, _)| {
-                known
-                    .as_ref()
-                    .is_some_and(|known| *known == path || *known == public_path)
+                known.as_ref().is_some_and(|known| {
+                    *known == path
+                        || *known == public_path
+                        || identity::public_key_path(known) == path
+                })
             });
             if known {
                 continue;
@@ -534,6 +555,9 @@ mod tests {
         Fixture { dir, app }
     }
 
+/// What a public key file starts with.
+    const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test\n";
+
     fn resolved(text: &str) -> ResolvedConfig {
         let mut config = ResolvedConfig {
             hostname: "h".into(),
@@ -578,10 +602,10 @@ mod tests {
         );
         let (sock, _listener) = socket(&fixture);
         let ssh_dir = fixture.app.home().join(".ssh");
-        fs::write(ssh_dir.join("held.pub"), "").unwrap();
+        fs::write(ssh_dir.join("held.pub"), PUBLIC).unwrap();
         fs::write(ssh_dir.join("file"), "").unwrap();
-        fs::write(ssh_dir.join("file.pub"), "").unwrap();
-        fs::write(ssh_dir.join("lonely.pub"), "").unwrap();
+        fs::write(ssh_dir.join("file.pub"), PUBLIC).unwrap();
+        fs::write(ssh_dir.join("lonely.pub"), PUBLIC).unwrap();
         let config = resolved(&format!(
             "identityagent {}\nidentityfile ~/.ssh/held.pub\nidentityfile ~/.ssh/file\nidentityfile ~/.ssh/lonely.pub\nidentityfile ~/.ssh/gone\nidentityfile ~/.ssh/%C",
             sock.display()
@@ -649,7 +673,7 @@ mod tests {
         assert!(matches!(
             identities.agent,
             Agent::Unavailable {
-                problem: AgentProblem::NoAnswer,
+                reason: AgentProblem::NoAnswer,
                 ..
             }
         ));
@@ -679,7 +703,7 @@ mod tests {
         assert!(matches!(
             missing.agent,
             Agent::Unavailable {
-                problem: AgentProblem::NoSuchSocket,
+                reason: AgentProblem::NoSuchSocket,
                 ..
             }
         ));
@@ -694,7 +718,7 @@ mod tests {
         assert!(matches!(
             plain.agent,
             Agent::Unavailable {
-                problem: AgentProblem::NotASocket,
+                reason: AgentProblem::NotASocket,
                 ..
             }
         ));
@@ -708,7 +732,7 @@ mod tests {
             Agent::Unavailable {
                 socket: sock,
                 provider: identity::Provider::Generic,
-                problem: AgentProblem::Refused("Error connecting to agent: refused".into()),
+                reason: AgentProblem::Refused("Error connecting to agent: refused".into()),
             }
         );
         let disabled = fixture
@@ -750,12 +774,31 @@ mod tests {
         let ssh_dir = fixture.app.home().join(".ssh");
         fs::write(ssh_dir.join("only_private"), "").unwrap();
         fs::write(ssh_dir.join("pair"), "").unwrap();
-        fs::write(ssh_dir.join("pair.pub"), "").unwrap();
-        fixture.app.host_identities(
+        fs::write(ssh_dir.join("pair.pub"), PUBLIC).unwrap();
+        // A private key misnamed `.pub`, and a `.pub` link to a private key, are not public keys.
+        fs::write(
+            ssh_dir.join("misnamed.pub"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n",
+        )
+        .unwrap();
+        fs::write(ssh_dir.join("linked"), "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        std::os::unix::fs::symlink(ssh_dir.join("linked"), ssh_dir.join("linked.pub")).unwrap();
+        let identities = fixture.app.host_identities(
             "h",
             &resolved(
-                "identityagent none\nidentityfile ~/.ssh/only_private\nidentityfile ~/.ssh/pair",
+                "identityagent none\nidentityfile ~/.ssh/only_private\nidentityfile ~/.ssh/pair\n\
+                 identityfile ~/.ssh/misnamed.pub\nidentityfile ~/.ssh/linked",
             ),
+        );
+        assert_eq!(
+            identities.identities[2].availability,
+            Availability::Missing(MissingReason::NoSuchFile)
+        );
+        assert_eq!(
+            identities.identities[3].availability,
+            Availability::KeyFile {
+                public_key_found: false
+            }
         );
         assert_eq!(
             fs::read_to_string(log.path()).unwrap(),
@@ -766,7 +809,7 @@ mod tests {
     #[test]
     fn inventory_merges_hosts_ssh_keys_and_agents() {
         let fixture = fixture(
-            "hostname h\nidentityfile ~/.ssh/used\nidentityfile ~/.ssh/held.pub\n",
+            "hostname h\nidentityfile ~/.ssh/used\nidentityfile ~/.ssh/held.pub\nidentityfile ~/.ssh/vault\n",
             "echo '256 SHA256:held held (ED25519)'",
         );
         let (sock, _listener) = socket(&fixture);
@@ -777,10 +820,12 @@ mod tests {
         fs::write(&entry, config).unwrap();
         let ssh_dir = fixture.app.home().join(".ssh");
         fs::write(ssh_dir.join("used"), "").unwrap();
-        fs::write(ssh_dir.join("held.pub"), "").unwrap();
+        fs::write(ssh_dir.join("held.pub"), PUBLIC).unwrap();
         fs::write(ssh_dir.join("spare"), "").unwrap();
-        fs::write(ssh_dir.join("spare.pub"), "").unwrap();
+        fs::write(ssh_dir.join("spare.pub"), PUBLIC).unwrap();
         fs::write(ssh_dir.join("spare-cert.pub"), "").unwrap();
+        // `vault` is named by a host, but only its public half is on disk.
+        fs::write(ssh_dir.join("vault.pub"), PUBLIC).unwrap();
         let Fixture { dir: _dir, app } = fixture;
         let app = app.with_auth_sock(Some(sock));
         let inventory = app.identity_inventory().unwrap();
@@ -808,6 +853,7 @@ mod tests {
                 ),
                 ("~/.ssh/spare", "key file", vec![]),
                 ("~/.ssh/used", "key file", vec!["one".into(), "two".into()]),
+                ("~/.ssh/vault", "missing", vec!["one".into(), "two".into()]),
             ]
         );
     }
