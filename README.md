@@ -301,7 +301,7 @@ The containers panel sits under the hosts and shows this machine's containers, l
 
 The filter edits like the hosts filter: `Enter` applies it and `Esc` cancels the edit. The panel's title shows it, a Compose project's header stays only while one of its containers matches, and showing another target clears it.
 
-The `m` checklist shows every host, dimming those that cannot move with the reason. `Space` marks a host, `a` marks every shown host, and `/` filters with the hosts filter's keys; marks stay when the filter hides them, and `Enter` previews every marked host. `Esc` clears an applied filter, otherwise closes the checklist.
+The `m` checklist shows every host, dimming those that cannot move with the reason. `Space` marks a host, `a` marks every shown host that can move (again to unmark), and `/` filters with the hosts filter's keys; marks stay when the filter hides them, and `Enter` previews every marked host. `Esc` clears an applied filter, otherwise closes the checklist.
 
 External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
