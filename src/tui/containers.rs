@@ -12,8 +12,9 @@ use super::{TextInput, TuiError, display_width, explanation_lines};
 use crate::{
     app::{ContainerError, ContainerList, Offer, Target},
     container::{Container, GroupTool, display_name, group, remote_command},
+    fuzzy,
     openssh::ConnectionOutcome,
-    suggest::fold,
+    picker::HIT,
 };
 
 /// Why a target could not be listed, as the panel shows it.
@@ -217,18 +218,23 @@ impl Panel {
     /// Whether `container` matches the filter on the name the panel shows, its name, Compose
     /// project and service, or image, ignoring case and accents.
     fn matches(&self, container: &Container, all: &[Container]) -> bool {
-        let filter = fold(self.filter.as_str());
+        self.shown_match(container, all).is_some()
+    }
+
+    /// The match of the filter on `container`, with the matched characters of the name the
+    /// panel shows first among its positions.
+    fn shown_match(&self, container: &Container, all: &[Container]) -> Option<fuzzy::Match> {
         let shown = display_name(container, all);
-        [
-            Some(shown.as_str()),
-            Some(container.name.as_str()),
-            container.project.as_deref(),
-            container.service.as_deref(),
-            Some(container.image.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|field| fold(field).contains(&filter))
+        fuzzy::match_fields(
+            self.filter.as_str(),
+            &[
+                &shown,
+                &container.name,
+                container.project.as_deref().unwrap_or_default(),
+                container.service.as_deref().unwrap_or_default(),
+                &container.image,
+            ],
+        )
     }
 
     /// Shows that `target` could not be listed for a reason of Portico's own.
@@ -377,10 +383,20 @@ impl Panel {
                         } else {
                             " "
                         };
-                        lines.push(Line::from(vec![
-                            Span::raw(format!("{mark} {}  ", display_name(container, all))),
-                            Span::styled(container.status.clone(), dim),
-                        ]));
+                        let positions = self
+                            .shown_match(container, all)
+                            .and_then(|found| found.positions.into_iter().next())
+                            .unwrap_or_default();
+                        let mut spans = vec![Span::raw(format!("{mark} "))];
+                        spans.extend(fuzzy::highlight(
+                            &display_name(container, all),
+                            &positions,
+                            Style::default(),
+                            HIT,
+                        ));
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(container.status.clone(), dim));
+                        lines.push(Line::from(spans));
                         row += 1;
                     }
                 }
@@ -1367,6 +1383,37 @@ mod tests {
             "accents"
         );
         assert_eq!(shown("nope"), ["No containers match \"nope\"."]);
+    }
+
+    #[test]
+    fn containers_filter_is_fuzzy() {
+        let mut all = containers();
+        all[3].image = "redis:7".into();
+        let mut panel = Panel::default();
+        panel.finish(Target::Local, Ok(list(Target::Local, all)));
+        type_filter(&mut panel, "rds7");
+        assert_eq!(
+            texts(&panel.lines(false, 100, 200)),
+            ["Other", "> redis  Up 2 hours"]
+        );
+    }
+
+    #[test]
+    fn containers_filter_highlights_the_shown_name() {
+        let mut panel = listed_panel();
+        type_filter(&mut panel, "rds");
+        let lines = panel.lines(false, 100, 200);
+        let row = lines
+            .iter()
+            .find(|line| line.to_string().contains("redis"))
+            .unwrap();
+        let hits: Vec<&str> = row
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(hits, ["r", "d", "s"]);
     }
 
     #[test]

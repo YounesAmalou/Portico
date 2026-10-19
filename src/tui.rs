@@ -46,9 +46,11 @@ use crate::{
     config_error::ConfigRejection,
     discovery::DiscoveryWarning,
     explain::Explanation,
+    fuzzy,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
+    picker::HIT,
     suggest::{self, Candidate},
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
@@ -1387,12 +1389,12 @@ impl UiState {
 
     /// Recomputes the visible hosts from the filter, keeping the selection when it still matches.
     fn refilter(&mut self) {
-        let filter = self.filter.as_str().to_ascii_lowercase();
+        let filter = self.filter.as_str();
         self.visible = self
             .hosts
             .iter()
             .enumerate()
-            .filter(|(_, host)| host.alias.to_ascii_lowercase().contains(&filter))
+            .filter(|(_, host)| fuzzy::match_fields(filter, &[&host.alias]).is_some())
             .map(|(index, _)| index)
             .collect();
         if !self
@@ -2290,11 +2292,18 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                 Some(_) => "\u{2717} ",
                 None => "  ",
             };
-            ListItem::new(format!(
-                "{mark}{}  {}",
-                host.alias,
-                ownership(host.ownership)
-            ))
+            let positions = fuzzy::match_fields(state.filter.as_str(), &[&host.alias])
+                .and_then(|found| found.positions.into_iter().next())
+                .unwrap_or_default();
+            let mut spans = vec![Span::raw(mark)];
+            spans.extend(fuzzy::highlight(
+                &host.alias,
+                &positions,
+                Style::default(),
+                HIT,
+            ));
+            spans.push(Span::raw(format!("  {}", ownership(host.ownership))));
+            ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>();
     let mut list_state = ListState::default().with_selected(
@@ -3177,6 +3186,51 @@ mod tests {
             source: PathBuf::from(source),
             ..summary(alias, ownership)
         }
+    }
+
+    fn visible_aliases(state: &UiState) -> Vec<String> {
+        state
+            .visible
+            .iter()
+            .map(|&index| state.hosts[index].alias.clone())
+            .collect()
+    }
+
+    #[test]
+    fn hosts_filter_is_fuzzy_and_keeps_order() {
+        let mut state = test_state(vec![
+            summary("web-prod", Ownership::Managed),
+            summary("db-prod", Ownership::Managed),
+            summary("prod-db", Ownership::Managed),
+        ]);
+        let order = visible_aliases(&state);
+        state.set_filter("pdb");
+        assert_eq!(visible_aliases(&state), ["prod-db"]);
+        state.set_filter("PROD");
+        assert_eq!(visible_aliases(&state), order);
+    }
+
+    #[test]
+    fn hosts_filter_highlights_matches() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("prod-db", Ownership::Managed),
+        ]);
+        state.set_filter("pd");
+        let buffer = render_to_buffer(&state);
+        let (x, y) = (0..buffer.area.height)
+            .find_map(|y| {
+                let line: Vec<&str> = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                line.windows(7)
+                    .position(|cells| cells.concat() == "prod-db")
+                    .map(|x| (x as u16, y))
+            })
+            .unwrap();
+        let bold = |offset: u16| buffer[(x + offset, y)].modifier.contains(Modifier::BOLD);
+        assert!(bold(0) && bold(5), "p and the d after the dash");
+        assert!(!bold(1) && !bold(3));
     }
 
     #[test]
