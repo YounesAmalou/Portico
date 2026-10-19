@@ -40,7 +40,8 @@ mod tester;
 use crate::{
     adopt,
     app::{
-        App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
+        App, AppError, HostDetails, HostInventory, HostSummary, Ownership, Target, TestOutcome,
+        TestTarget,
     },
     config_error::ConfigRejection,
     discovery::DiscoveryWarning,
@@ -230,6 +231,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
     sync_details(&mut state, &mut resolver, false);
+    lister.list(&mut state.containers, Target::Local);
     let mut redraw = true;
 
     loop {
@@ -457,7 +459,6 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             tester.cancel_if(|origin, _| *origin == Origin::Form);
         }
 
-        state.follow_selection();
         sync_details(&mut state, &mut resolver, inventory_changed);
         redraw = true;
     }
@@ -1350,7 +1351,7 @@ impl UiState {
         let HostInventory { hosts, warnings } = inventory;
         let visible = (0..hosts.len()).collect::<Vec<_>>();
         let selected = visible.first().copied();
-        let mut state = Self {
+        Self {
             hosts,
             warnings,
             visible,
@@ -1371,15 +1372,7 @@ impl UiState {
             containers: Panel::default(),
             focus: Focus::Hosts,
             migrate: None,
-        };
-        state.follow_selection();
-        state
-    }
-
-    /// Points the containers panel at the selected host when the selection moved.
-    fn follow_selection(&mut self) {
-        let alias = self.selected.map(|index| self.hosts[index].alias.clone());
-        self.containers.follow_selection(alias.as_deref());
+        }
     }
 
     fn set_filter(&mut self, filter: &str) {
@@ -1470,7 +1463,7 @@ impl UiState {
         }
         if self.mode == Mode::Browse && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.focus = Focus::Containers;
-            return UiAction::Containers(self.containers.on_focus());
+            return UiAction::None;
         }
         if key.code == KeyCode::Esc && self.testing.is_some() {
             self.status = Some("Test cancelled".into());
@@ -1489,7 +1482,6 @@ impl UiState {
         if (selected, in_form) != (self.selected, self.in_form()) {
             self.show_raw = false;
         }
-        self.follow_selection();
         action
     }
 
@@ -1551,6 +1543,12 @@ impl UiState {
             KeyCode::Char('r') | KeyCode::F(5) => return UiAction::Refresh,
             KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.test_selected();
+            }
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(alias) = self.selected_alias() {
+                    let target = Target::Host(alias.to_owned());
+                    return UiAction::Containers(self.containers.show(target));
+                }
             }
             KeyCode::Char('o') if key.modifiers.is_empty() && self.selected_has_foldable_raw() => {
                 self.show_raw = !self.show_raw;
@@ -2425,7 +2423,7 @@ fn trust_lines(pending: Option<&PendingTrust>) -> Vec<Line<'static>> {
 
 fn footer_text(state: &UiState) -> String {
     if state.mode == Mode::Browse && state.focus == Focus::Containers {
-        return state.containers.footer().into();
+        return state.containers.footer();
     }
     match state.mode {
         Mode::Browse => {
@@ -2440,8 +2438,9 @@ fn footer_text(state: &UiState) -> String {
             } else {
                 ""
             };
-            let connect =
-                format!("{output}t test  Enter connect  {new_terminal}  Tab containers  q quit");
+            let connect = format!(
+                "{output}t test  Enter connect  {new_terminal}  c list containers  Tab containers  q quit"
+            );
             let clear_filter = if state.filter.is_empty() {
                 ""
             } else {
@@ -5686,33 +5685,55 @@ mod tests {
     }
 
     #[test]
-    fn tab_focuses_containers_and_lists() {
+    fn tab_only_moves_the_focus() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        assert_eq!(
-            press(&mut state, KeyCode::Tab),
-            UiAction::Containers(PanelAction::List(Target::Host("dev".into())))
-        );
+        assert_eq!(press(&mut state, KeyCode::Tab), UiAction::None);
         assert_eq!(state.focus, Focus::Containers);
+        assert_eq!(state.containers.target(), Target::Local);
         assert_eq!(
             press(&mut state, KeyCode::Tab),
             UiAction::Containers(PanelAction::Leave)
         );
         assert_eq!(state.focus, Focus::Hosts);
-        assert_eq!(
-            press(&mut state, KeyCode::BackTab),
-            UiAction::Containers(PanelAction::List(Target::Host("dev".into())))
-        );
+        assert_eq!(press(&mut state, KeyCode::BackTab), UiAction::None);
         assert_eq!(state.focus, Focus::Containers);
         assert_eq!(
             press(&mut state, KeyCode::BackTab),
             UiAction::Containers(PanelAction::Leave)
         );
         assert_eq!(state.focus, Focus::Hosts);
+        assert_eq!(state.containers.target(), Target::Local);
+    }
+
+    #[test]
+    fn c_lists_the_selected_host_and_keeps_the_focus() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("web", Ownership::External),
+        ]);
+        press(&mut state, KeyCode::Down);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('c')),
+            UiAction::Containers(PanelAction::List(Target::Host("web".into())))
+        );
+        assert_eq!(state.focus, Focus::Hosts);
+        assert_eq!(state.containers.target(), Target::Host("web".into()));
+        assert!(rendered(&state).contains("Containers: web /"));
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            UiAction::None,
+            "Ctrl+C is the main loop's"
+        );
+
+        let mut empty = test_state(Vec::new());
+        assert_eq!(press(&mut empty, KeyCode::Char('c')), UiAction::None);
+        assert_eq!(empty.containers.target(), Target::Local);
     }
 
     #[test]
     fn paste_goes_to_the_panel_user_while_editing() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('c'));
         press(&mut state, KeyCode::Tab);
         let dev = Target::Host("dev".into());
         state.containers.finish(dev.clone(), Ok(shop_list(dev)));
@@ -5733,6 +5754,7 @@ mod tests {
             summary("dev", Ownership::Managed),
             summary("web", Ownership::Managed),
         ]);
+        press(&mut state, KeyCode::Char('c'));
         press(&mut state, KeyCode::Tab);
         let dev = Target::Host("dev".into());
         state.containers.finish(dev.clone(), Ok(shop_list(dev)));
@@ -5747,30 +5769,63 @@ mod tests {
     }
 
     #[test]
-    fn moving_host_selection_follows() {
+    fn moving_host_selection_keeps_the_panel() {
         let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("web", Ownership::Managed),
         ]);
-        assert_eq!(state.containers.target(), Some(Target::Host("dev".into())));
+        assert_eq!(state.containers.target(), Target::Local);
+        press(&mut state, KeyCode::Char('c'));
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.containers.target(), Target::Host("dev".into()));
+        state.set_filter("w");
+        state.set_filter("");
+        assert_eq!(state.containers.target(), Target::Host("dev".into()));
+
         press(&mut state, KeyCode::Tab);
         assert_eq!(
             press(&mut state, KeyCode::Char('L')),
             UiAction::Containers(PanelAction::List(Target::Local))
         );
         press(&mut state, KeyCode::Esc);
+        assert_eq!(state.containers.target(), Target::Local, "kept on leaving");
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.containers.target(), Target::Local);
+    }
+
+    #[test]
+    fn panel_filter_keys_route_when_focused() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('c'));
+        press(&mut state, KeyCode::Tab);
+        let dev = Target::Host("dev".into());
+        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+        press(&mut state, KeyCode::Char('/'));
+        assert!(footer_text(&state).starts_with("type to filter"));
+        state.handle_paste("web");
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(state.filter.as_str(), "", "the hosts filter is untouched");
+        let text = rendered(&state);
+        assert!(text.contains("Containers: dev /web"), "{text}");
+        assert!(text.contains("> web"), "{text}");
+        assert!(!text.contains(" db "), "{text}");
+        assert!(footer_text(&state).contains("Esc clear filter"));
         assert_eq!(
-            state.containers.target(),
-            Some(Target::Local),
-            "kept on leaving"
+            press(&mut state, KeyCode::Esc),
+            UiAction::Containers(PanelAction::None)
         );
-        press(&mut state, KeyCode::Down);
-        assert_eq!(state.containers.target(), Some(Target::Host("web".into())));
+        assert_eq!(state.focus, Focus::Containers);
+        assert_eq!(
+            press(&mut state, KeyCode::Esc),
+            UiAction::Containers(PanelAction::Leave)
+        );
+        assert_eq!(state.focus, Focus::Hosts);
     }
 
     #[test]
     fn details_pane_shows_container_when_focused() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('c'));
         let dev = Target::Host("dev".into());
         state.containers.finish(dev.clone(), Ok(shop_list(dev)));
         let text = rendered(&state);
@@ -5789,14 +5844,16 @@ mod tests {
     #[test]
     fn browse_footer_mentions_tab_containers() {
         let state = test_state(vec![summary("dev", Ownership::Managed)]);
-        assert!(footer_text(&state).contains("Tab containers"));
+        assert!(footer_text(&state).contains("c list containers  Tab containers"));
         let state = test_state(Vec::new());
         assert!(footer_text(&state).contains("Tab containers"));
+        assert!(!footer_text(&state).contains("c list containers"));
     }
 
     #[test]
     fn a_narrow_panel_wraps_the_fix_command_in_full() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('c'));
         let offer = crate::app::Offer::JoinGroup {
             user: "deploy".into(),
             socket: "/var/run/docker.sock".into(),
