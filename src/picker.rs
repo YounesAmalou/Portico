@@ -27,7 +27,7 @@ use ratatui::{
 
 use crate::{
     fuzzy::{Match, highlight, match_fields, rank},
-    tui::TextInput,
+    tui::{TextInput, display_width},
 };
 
 /// The most lines a picker takes, its prompt line included.
@@ -296,7 +296,7 @@ impl State for Single {
             }
         }
         frame.render_widget(Paragraph::new(lines), area);
-        let column = prompt.chars().count() + self.query.cursor_offset();
+        let column = display_width(&prompt) + self.query.cursor_offset();
         frame.set_cursor_position((
             area.x
                 + u16::try_from(column)
@@ -427,7 +427,7 @@ impl State for Multi {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let mut title = vec![Span::raw(format!("{}  ", self.title))];
         let filtered = self.editing || !self.filter.is_empty();
-        let cursor_column = title[0].content.chars().count() + 1 + self.filter.cursor_offset();
+        let cursor_column = display_width(&title[0].content) + 1 + self.filter.cursor_offset();
         if filtered {
             title.push(Span::raw(format!("/{}  ", self.filter.as_str())));
         }
@@ -697,6 +697,26 @@ mod tests {
         assert_eq!(
             multi_lines(&state, 5)[1..4],
             ["[ ] sandbox", "[ ] prod-db", "[ ] db-main"]
+        );
+    }
+
+    #[test]
+    fn cursor_follows_wide_characters() {
+        let mut single = Single::new("host", rows(&["東京-db"]));
+        type_text(&mut |event| single.handle_key(event), "東京");
+        let mut terminal = draw(40, 3, |frame| single.render(frame, frame.area()));
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            (u16::try_from("host> ".len() + 4).unwrap(), 0).into()
+        );
+
+        let mut multi = Multi::new("adopt", rows(&["東京-db"]));
+        multi.handle_key(key(KeyCode::Char('/')));
+        type_text(&mut |event| multi.handle_key(event), "東京");
+        let mut terminal = draw(40, 3, |frame| multi.render(frame, frame.area()));
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            (u16::try_from("adopt  /".len() + 4).unwrap(), 0).into()
         );
     }
 
