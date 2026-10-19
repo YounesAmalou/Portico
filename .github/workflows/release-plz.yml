@@ -33,6 +33,9 @@ jobs:
       - uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
         with:
           command: release-pr
+          # Pinned so an update of the action cannot change the template engine pr_body
+          # needs (see release-plz.toml); bump it on purpose, with the tera dev-dependency.
+          version: 0.3.172
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
@@ -52,5 +55,6 @@ jobs:
       - uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
         with:
           command: release
+          version: 0.3.172
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
