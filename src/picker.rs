@@ -114,7 +114,12 @@ fn interact(state: &mut impl State) -> Result<Option<Vec<usize>>, String> {
             _ => {}
         }
     };
+    // Clearing puts the cursor back where it was drawn; output continues where the picker began.
+    let top = terminal.get_frame().area().y;
     terminal.clear().map_err(picker_failed)?;
+    terminal
+        .set_cursor_position((0, top))
+        .map_err(picker_failed)?;
     drop(terminal);
     drop(raw);
     Ok(outcome)

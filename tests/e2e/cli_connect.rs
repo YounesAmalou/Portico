@@ -108,3 +108,25 @@ fn cancelled_pick_exits_130() {
         terminal.screen()
     );
 }
+
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn output_after_a_pick_starts_at_column_zero() {
+    let sshd = Sshd::start();
+    let client = Client::new();
+    client.init();
+    client.add_host("box", &sshd, &sshd.client_key());
+
+    let mut terminal = Terminal::spawn(&client, &["show"]);
+    terminal.wait_for("host> ");
+    terminal.type_text("bo");
+    terminal.wait_for("1/1");
+    terminal.key(Key::Enter);
+    let status = terminal.wait_exit();
+    assert!(status.success(), "{status:?}\n{}", terminal.screen());
+    let screen = terminal.screen();
+    assert!(
+        screen.lines().any(|line| line.starts_with("Alias: box")),
+        "output does not start at column 0:\n{screen}"
+    );
+}
