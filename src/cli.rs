@@ -515,7 +515,15 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 all,
                 yes,
             };
-            run_migration(&migration, app, &interrupts, input, output, interactive)
+            run_migration(
+                &migration,
+                app,
+                picker,
+                &interrupts,
+                input,
+                output,
+                interactive,
+            )
         }
         Some(Command::Export { aliases, all, yes }) => {
             let interrupts = Interrupts::install(handle_signals)
@@ -526,7 +534,15 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 all,
                 yes,
             };
-            run_migration(&migration, app, &interrupts, input, output, interactive)
+            run_migration(
+                &migration,
+                app,
+                picker,
+                &interrupts,
+                input,
+                output,
+                interactive,
+            )
         }
         Some(Command::Test {
             alias,
@@ -966,6 +982,7 @@ impl Migration {
 fn run_migration<I: BufRead, O: Write>(
     migration: &Migration,
     app: &App,
+    picker: &mut dyn Picker,
     interrupts: &Interrupts,
     input: &mut I,
     output: &mut O,
@@ -1010,18 +1027,6 @@ fn run_migration<I: BufRead, O: Write>(
     } else {
         if eligible.is_empty() {
             writeln!(output, "No host can be {}.", migration.participle()).map_err(write_error)?;
-        } else {
-            writeln!(output, "Eligible hosts:").map_err(write_error)?;
-            for (index, candidate) in eligible.iter().enumerate() {
-                writeln!(
-                    output,
-                    "  {}. {}  {}",
-                    index + 1,
-                    candidate.alias,
-                    describe_source(migration.direction, candidate, home)
-                )
-                .map_err(write_error)?;
-            }
         }
         if !ineligible.is_empty() {
             writeln!(output, "Not eligible:").map_err(write_error)?;
@@ -1039,19 +1044,21 @@ fn run_migration<I: BufRead, O: Write>(
         if eligible.is_empty() {
             return Ok(ExitCode::SUCCESS);
         }
-        write!(
-            output,
-            "{} which hosts? (all, numbers like 1,3-4, or none) ",
-            capitalized(verb)
-        )
-        .map_err(write_error)?;
         output.flush().map_err(write_error)?;
-        let mut answer = String::new();
-        input.read_line(&mut answer).map_err(write_error)?;
-        parse_selection(&answer, eligible.len())?
-            .into_iter()
-            .map(|index| eligible[index].alias.clone())
-            .collect()
+        let rows = eligible
+            .iter()
+            .map(|candidate| Row {
+                fields: vec![candidate.alias.clone()],
+                extra: vec![describe_source(migration.direction, candidate, home)],
+            })
+            .collect();
+        match picker.pick_many(verb, rows)? {
+            Some(picked) => picked
+                .into_iter()
+                .map(|index| eligible[index].alias.clone())
+                .collect(),
+            None => return Ok(ExitCode::from(CANCELLED)),
+        }
     };
 
     if selection.is_empty() {
@@ -1098,40 +1105,6 @@ fn describe_source(direction: Direction, candidate: &Candidate, home: &Path) -> 
             Err(_) => candidate.source.display().to_string(),
         },
     }
-}
-
-/// The 0-based indexes an answer to the selection prompt picks out of `count` hosts: `all`,
-/// `none` or nothing, or comma-separated 1-based numbers and `a-b` ranges.
-fn parse_selection(answer: &str, count: usize) -> Result<Vec<usize>, String> {
-    let invalid = || format!("invalid selection: {}", answer.trim());
-    let compact = answer
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match compact.as_str() {
-        "" | "none" => return Ok(Vec::new()),
-        "all" => return Ok((0..count).collect()),
-        _ => {}
-    }
-    let number = |text: &str| {
-        text.parse::<usize>()
-            .ok()
-            .filter(|number| (1..=count).contains(number))
-            .ok_or_else(invalid)
-    };
-    let mut picked = BTreeSet::new();
-    for part in compact.split(',') {
-        let (first, last) = match part.split_once('-') {
-            Some((first, last)) => (number(first)?, number(last)?),
-            None => (number(part)?, number(part)?),
-        };
-        if first > last {
-            return Err(invalid());
-        }
-        picked.extend(first - 1..last);
-    }
-    Ok(picked.into_iter().collect())
 }
 
 fn capitalized(word: &str) -> String {
@@ -2080,22 +2053,6 @@ fi
         ));
     }
 
-    #[test]
-    fn parse_selection_accepts_all_none_numbers_and_ranges() {
-        assert_eq!(parse_selection("1,3-4", 5), Ok(vec![0, 2, 3]));
-        assert_eq!(parse_selection(" 2 , 4 - 5 ", 5), Ok(vec![1, 3, 4]));
-        assert_eq!(parse_selection("3,1,3", 5), Ok(vec![0, 2]));
-        assert_eq!(parse_selection("", 5), Ok(vec![]));
-        assert_eq!(parse_selection("none", 5), Ok(vec![]));
-        assert_eq!(parse_selection("all", 3), Ok(vec![0, 1, 2]));
-        for bad in ["0", "6", "2-1", "x", "1,,2", "1-", "-1"] {
-            assert_eq!(
-                parse_selection(bad, 5),
-                Err(format!("invalid selection: {bad}"))
-            );
-        }
-    }
-
     /// An initialized app whose entry config declares `hosts` below the Portico include.
     fn adoption_app(hosts: &str) -> (TempDir, App) {
         let (dir, app) = test_app();
@@ -2170,49 +2127,62 @@ fi
     }
 
     #[test]
-    fn interactive_adopt_moves_the_chosen_hosts() {
+    fn interactive_adopt_moves_the_picked_hosts() {
         let (_dir, app) = adoption_app(THREE_HOSTS);
-        let (exit, output, error) = run_command(&app, &["adopt"], "2\ny\n", true);
-        assert_eq!(exit, std::process::ExitCode::SUCCESS, "{error}");
-        assert!(output.starts_with(
-            "Eligible hosts:\n  1. one  ~/.ssh/config\n  2. two  ~/.ssh/config\n  3. three  ~/.ssh/config\n\
-             Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n\
-             Adopt which hosts? (all, numbers like 1,3-4, or none) "
-        ), "{output}");
-        assert!(output.contains("Adopt 1 host? [y/N] "));
-        assert!(output.ends_with("Adopted: two\n"));
-        assert_eq!(aliases_of(&app, Ownership::Managed), ["two"]);
+        let mut picker = Scripted::new(&[Some("one,three")]);
+
+        let (exit, output, error) = run_picking(&app, &["adopt"], "y\n", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        assert_eq!(picker.prompts(), ["adopt"]);
+        assert_eq!(
+            picker.seen[0].1,
+            vec![
+                row(&["one"], &["~/.ssh/config"]),
+                row(&["two"], &["~/.ssh/config"]),
+                row(&["three"], &["~/.ssh/config"]),
+            ]
+        );
+        assert!(output.contains("Adopt 2 hosts? [y/N] "), "{output}");
+        assert!(output.ends_with("Adopted: one, three\n"), "{output}");
+        assert_eq!(aliases_of(&app, Ownership::Managed), ["one", "three"]);
     }
 
     #[test]
-    fn interactive_adopt_accepts_ranges_and_all() {
+    fn ineligible_hosts_are_printed_before_the_picker() {
         let (_dir, app) = adoption_app(THREE_HOSTS);
-        let (_, output, _) = run_command(&app, &["adopt"], "1-2\ny\n", true);
-        assert!(output.contains("Adopt 2 hosts? [y/N] "));
-        assert!(output.ends_with("Adopted: one, two\n"));
-        let (_, output, _) = run_command(&app, &["adopt"], "all\ny\n", true);
-        assert!(output.ends_with("Adopted: three\n"), "{output}");
+        let mut picker = Scripted::new(&[None]);
+
+        let (_, output, _) = run_picking(&app, &["adopt"], "", true, &mut picker);
+
+        assert_eq!(
+            output,
+            "Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+        );
+        assert_eq!(picker.labels(0), ["one", "two", "three"]);
     }
 
     #[test]
-    fn interactive_adopt_changes_nothing_on_none_decline_or_invalid_answers() {
+    fn cancelled_adoption_exits_130_and_changes_nothing() {
         let (dir, app) = adoption_app(THREE_HOSTS);
         let entry = fs::read(dir.path().join(".ssh/config")).unwrap();
-        for (input, success, ending) in [
-            ("none\n", true, "Nothing to adopt.\n"),
-            ("\n", true, "Nothing to adopt.\n"),
-            ("", true, "Nothing to adopt.\n"),
-            ("1\nn\n", true, "Adoption cancelled.\n"),
-            ("1\n", true, "Adoption cancelled.\n"),
-        ] {
-            let (exit, output, _) = run_command(&app, &["adopt"], input, true);
-            assert_eq!(exit == std::process::ExitCode::SUCCESS, success, "{input}");
-            assert!(output.ends_with(ending), "{input}: {output}");
-        }
-        let (exit, _, error) = run_command(&app, &["adopt"], "9\n", true);
-        assert_eq!(exit, std::process::ExitCode::FAILURE);
-        assert_eq!(error, "error: invalid selection: 9\n");
+
+        let (exit, _, _) = run_picking(&app, &["adopt"], "", true, &mut Scripted::new(&[None]));
+
+        assert_eq!(exit, ExitCode::from(130));
         assert_eq!(fs::read(dir.path().join(".ssh/config")).unwrap(), entry);
+        assert!(aliases_of(&app, Ownership::Managed).is_empty());
+    }
+
+    #[test]
+    fn declined_preview_changes_nothing() {
+        let (_dir, app) = adoption_app(THREE_HOSTS);
+        let mut picker = Scripted::new(&[Some("one")]);
+
+        let (exit, output, _) = run_picking(&app, &["adopt"], "n\n", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert!(output.ends_with("Adoption cancelled.\n"), "{output}");
         assert!(aliases_of(&app, Ownership::Managed).is_empty());
     }
 
@@ -2252,18 +2222,18 @@ fi
     }
 
     #[test]
-    fn interactive_export_moves_managed_hosts_back() {
+    fn interactive_export_moves_picked_hosts_back() {
         let (_dir, app) = adoption_app("");
         app.add(Host::new("dev", "dev.example", None, None, None, None).unwrap())
             .unwrap();
-        let (exit, output, error) = run_command(&app, &["export"], "all\ny\n", true);
-        assert_eq!(exit, std::process::ExitCode::SUCCESS, "{error}");
-        assert!(
-            output.starts_with("Eligible hosts:\n  1. dev  managed\n"),
-            "{output}"
-        );
-        assert!(output.contains("Export which hosts?"));
-        assert!(output.contains("Export 1 host? [y/N] "));
+        let mut picker = Scripted::new(&[Some("dev")]);
+
+        let (exit, output, error) = run_picking(&app, &["export"], "y\n", true, &mut picker);
+
+        assert_eq!(exit, ExitCode::SUCCESS, "{error}");
+        assert_eq!(picker.prompts(), ["export"]);
+        assert_eq!(picker.seen[0].1, vec![row(&["dev"], &["managed"])]);
+        assert!(output.contains("Export 1 host? [y/N] "), "{output}");
         assert!(output.ends_with("Exported: dev\n"));
         assert_eq!(aliases_of(&app, Ownership::External), ["dev"]);
 
