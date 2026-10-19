@@ -100,7 +100,7 @@ impl Agent {
             } => format!(
                 "{}, {}, unavailable: {}",
                 provider.name(),
-                tilde(socket, home),
+                crate::home::tilde(socket, home),
                 reason.describe()
             ),
             Agent::Listed {
@@ -110,7 +110,7 @@ impl Agent {
             } => format!(
                 "{}, {}, {}",
                 provider.name(),
-                tilde(socket, home),
+                crate::home::tilde(socket, home),
                 count(keys.len(), "key")
             ),
         }
@@ -532,28 +532,6 @@ pub fn assemble(
     }
 }
 
-/// `path` with a leading `home` shown as `~`.
-pub fn tilde(path: &Path, home: &Path) -> String {
-    if home.as_os_str().is_empty() {
-        return path.display().to_string();
-    }
-    match path.strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
-    }
-}
-
-/// A configured value with a leading `home` shown as `~`; other spellings are kept.
-pub fn tilde_text(value: &str, home: &Path) -> String {
-    let home = home.to_string_lossy();
-    let home = home.trim_end_matches('/');
-    match value.strip_prefix(home) {
-        Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
-        _ => value.into(),
-    }
-}
-
 /// `SHA256:` and the first 8 characters of the hash, then `…`.
 pub fn short_fingerprint(fingerprint: &str) -> String {
     let (prefix, hash) = fingerprint.split_once(':').unwrap_or(("", fingerprint));
@@ -925,15 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn shortens_paths_and_fingerprints() {
-        let home = Path::new("/home/me");
-        assert_eq!(tilde(Path::new("/home/me/.ssh/a"), home), "~/.ssh/a");
-        assert_eq!(tilde(Path::new("/home/meow/a"), home), "/home/meow/a");
-        assert_eq!(tilde_text("/home/me/.ssh/a", home), "~/.ssh/a");
-        assert_eq!(tilde_text("/home/meow/a", home), "/home/meow/a");
-        assert_eq!(tilde_text("~/.ssh/a", home), "~/.ssh/a");
-        assert_eq!(tilde(Path::new("/a/b"), Path::new("")), "/a/b");
-        assert_eq!(tilde_text("/a/b", Path::new("")), "/a/b");
+    fn shortens_fingerprints() {
         assert_eq!(
             short_fingerprint("SHA256:NQlIU/kfZu3WkN47"),
             "SHA256:NQlIU/kf…"

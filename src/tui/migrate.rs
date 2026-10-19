@@ -302,12 +302,8 @@ impl MigrateState {
     fn source(&self, candidate: &Candidate) -> String {
         match self.plan.direction {
             Direction::Export => "managed".into(),
-            Direction::Adopt => match self
-                .home
-                .as_deref()
-                .and_then(|home| candidate.source.strip_prefix(home).ok())
-            {
-                Some(rest) => format!("~/{}", rest.display()),
+            Direction::Adopt => match self.home.as_deref() {
+                Some(home) => crate::home::tilde(&candidate.source, home),
                 None => candidate.source.display().to_string(),
             },
         }

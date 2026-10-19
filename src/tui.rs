@@ -2552,6 +2552,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             form_lines(
                 &state.form,
                 state.show_raw,
+                &state.home,
                 usize::from(columns[1].width.saturating_sub(2)),
                 usize::from(columns[1].height.saturating_sub(2)),
             ),
@@ -2711,8 +2712,14 @@ fn footer_text(state: &UiState) -> String {
 }
 
 /// The form's lines for a pane of `width` columns and `height` rows inside its border; only the
-/// jump host dropdown adapts to them.
-fn form_lines(form: &FormState, show_raw: bool, width: usize, height: usize) -> Vec<Line<'static>> {
+/// jump host dropdown adapts to them. Suggestions from files under `home` show it as `~`.
+fn form_lines(
+    form: &FormState,
+    show_raw: bool,
+    home: &Path,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = FORM_FIELDS
         .iter()
@@ -2737,7 +2744,7 @@ fn form_lines(form: &FormState, show_raw: bool, width: usize, height: usize) -> 
         let rows = height
             .saturating_sub(FORM_FIELDS.len() + 4)
             .clamp(1, SUGGESTION_ROWS);
-        let rows = suggestion_lines(list, FORM_FIELDS[list.field].label, width, rows);
+        let rows = suggestion_lines(list, FORM_FIELDS[list.field].label, home, width, rows);
         lines.splice(list.field + 1..list.field + 1, rows);
     }
     lines.push(Line::raw(""));
@@ -2777,6 +2784,7 @@ fn form_lines(form: &FormState, show_raw: bool, width: usize, height: usize) -> 
 fn suggestion_lines(
     list: &Suggestions,
     label: &str,
+    home: &Path,
     width: usize,
     rows: usize,
 ) -> Vec<Line<'static>> {
@@ -2796,7 +2804,6 @@ fn suggestion_lines(
     let indent =
         " ".repeat(display_width(&format!("> {label}: ")).min(width.saturating_sub(boxed)));
     let room = width.saturating_sub(indent.len() + boxed + 2);
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let border = "─".repeat(column + 3);
     let mut lines = vec![Line::raw(format!("{indent}┌{border}┐"))];
     lines.extend(visible.iter().enumerate().map(|(row, item)| {
@@ -2804,7 +2811,7 @@ fn suggestion_lines(
         let alias = keep_start(&item.alias, column);
         let padding = " ".repeat(column - display_width(&alias));
         let cell = format!("{} {alias}{padding} ", if selected { '>' } else { ' ' });
-        let origin = suggest::origin_label(&item.origin, home.as_deref());
+        let origin = suggest::origin_label(&item.origin, Some(home));
         let origin = if room >= 4 {
             keep_end(&origin, room)
         } else {
@@ -2999,7 +3006,7 @@ fn detail_text(details: &HostDetails, home: &Path) -> String {
                 .iter()
                 .flatten()
                 .zip(&rows)
-                .filter(|(declared, effective)| !declared_in_effect(declared, effective))
+                .filter(|(declared, effective)| !declared_in_effect(declared, effective, home))
                 .map(|(declared, _)| format!("  {}: {}\n", declared.label, declared.values[0]))
                 .collect::<String>();
             if !overridden.is_empty() {
@@ -3034,21 +3041,14 @@ fn push_rows(text: &mut String, rows: &[DetailRow]) {
 }
 
 /// Whether the value Portico declared is among those OpenSSH uses. An undeclared field never
-/// conflicts, and `ssh -G` reports `~` paths already expanded.
-fn declared_in_effect(declared: &DetailRow, effective: &DetailRow) -> bool {
+/// conflicts, and `ssh -G` reports `~` paths already expanded against `home`.
+fn declared_in_effect(declared: &DetailRow, effective: &DetailRow, home: &Path) -> bool {
     declared.values.iter().all(|value| {
         effective
             .values
             .iter()
-            .any(|used| used == value || *used == expand_home(value))
+            .any(|used| used == value || *used == crate::home::expand(value, home))
     })
-}
-
-fn expand_home(path: &str) -> String {
-    match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
-        _ => path.into(),
-    }
 }
 
 fn format_warning(warning: &DiscoveryWarning) -> String {
@@ -3945,17 +3945,19 @@ mod tests {
     #[test]
     fn declared_home_relative_paths_match_the_expanded_effective_path() {
         let declared = DetailRow::new("IdentityFile", ["~/.ssh/id".to_owned()]);
-        let home = std::env::var("HOME").unwrap();
-        let effective = DetailRow::new("IdentityFile", [format!("{home}/.ssh/id")]);
+        let home = Path::new("/home/test");
+        let effective = DetailRow::new("IdentityFile", ["/home/test/.ssh/id".to_owned()]);
 
-        assert!(declared_in_effect(&declared, &effective));
+        assert!(declared_in_effect(&declared, &effective, home));
         assert!(declared_in_effect(
             &DetailRow::new("IdentityFile", []),
-            &effective
+            &effective,
+            home
         ));
         assert!(!declared_in_effect(
             &DetailRow::new("IdentityFile", ["~/.ssh/other".to_owned()]),
-            &effective
+            &effective,
+            home
         ));
     }
 
@@ -5178,15 +5180,21 @@ mod tests {
             outcome: Ok(outcome),
         };
         let lines = |state: &UiState| -> Vec<String> {
-            form_lines(&state.form, state.show_raw, usize::MAX, usize::MAX)
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect()
-                })
-                .collect()
+            form_lines(
+                &state.form,
+                state.show_raw,
+                &state.home,
+                usize::MAX,
+                usize::MAX,
+            )
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
         };
 
         state.record_test(
@@ -6012,7 +6020,7 @@ mod tests {
     }
 
     fn form_text(state: &UiState, width: usize, height: usize) -> Vec<String> {
-        form_lines(&state.form, state.show_raw, width, height)
+        form_lines(&state.form, state.show_raw, &state.home, width, height)
             .iter()
             .map(|line| {
                 line.spans

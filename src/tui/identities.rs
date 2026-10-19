@@ -138,7 +138,7 @@ pub(super) fn detail_lines(identities: &HostIdentities, home: &Path) -> String {
         .map(|identity| {
             let mut value = format!(
                 "{}  {} {}",
-                identity::tilde_text(&identity.configured, home),
+                crate::home::tilde_text(&identity.configured, home),
                 identity.availability.symbol(),
                 identity.availability.word()
             );
@@ -198,7 +198,7 @@ fn agent_line(agent: &Agent, home: &Path) -> String {
             identity::count(keys.len(), "key"),
             agent
                 .socket()
-                .map(|socket| identity::tilde(socket, home))
+                .map(|socket| crate::home::tilde(socket, home))
                 .unwrap_or_default()
         ),
         _ => agent.describe(home),
@@ -229,7 +229,7 @@ pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> 
                 } else {
                     "key file".into()
                 }),
-                alias: identity::tilde(&path, home),
+                alias: crate::home::tilde(&path, home),
             })
             .collect();
     };
@@ -256,7 +256,7 @@ pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> 
                 ));
             }
             let alias = match &file.path {
-                Some(path) => identity::tilde(path, home),
+                Some(path) => crate::home::tilde(path, home),
                 None => file.configured.clone(),
             };
             (

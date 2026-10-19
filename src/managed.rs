@@ -106,6 +106,11 @@ impl ConfigPaths {
         }
     }
 
+    /// The home directory these paths were made from.
+    pub fn home(&self) -> &Path {
+        self.ssh_dir.parent().unwrap_or(&self.ssh_dir)
+    }
+
     pub fn init_backups(&self) -> Result<Vec<PathBuf>, io::Error> {
         let mut backups = Vec::new();
         for entry in fs::read_dir(&self.ssh_dir)? {
@@ -367,7 +372,12 @@ impl ManagedStore {
             // Existing hosts were validated when written; parsing the installed config is enough.
             validate(&self.paths.entry, &[]).map_err(|stderr| {
                 // The installed entry is the user's own file, not one Portico staged.
-                InitError::Validation(interpret_rejection(&stderr, &self.paths.managed, None))
+                InitError::Validation(interpret_rejection(
+                    &stderr,
+                    self.paths.home(),
+                    &self.paths.managed,
+                    None,
+                ))
             })
         };
         let preview = self.plan_init()?;
@@ -653,6 +663,7 @@ impl ManagedStore {
         validate(validation_file.path(), &changed_aliases).map_err(|stderr| {
             TransactionError::Validation(interpret_rejection(
                 &stderr,
+                self.paths.home(),
                 candidate.path(),
                 Some(StagedEntry {
                     path: validation_file.path(),
@@ -795,6 +806,7 @@ impl ManagedStore {
         drop(lock);
         let managed_text = read_lossy(candidate.path());
         let result = use_entry(ConfigFiles {
+            home: self.paths.home(),
             managed: candidate.path(),
             managed_text: &managed_text,
             entry: Some(StagedEntry {
@@ -1400,15 +1412,17 @@ pub(crate) fn read_lossy(path: &Path) -> String {
 }
 
 /// Interprets ssh's stderr against the managed config at `managed` and the entry Portico staged
-/// at `entry`, if any.
+/// at `entry`, if any, showing files under `home` with `~`.
 fn interpret_rejection(
     stderr: &str,
+    home: &Path,
     managed: &Path,
     entry: Option<StagedEntry<'_>>,
 ) -> ConfigRejection {
     interpret(
         stderr,
         &ConfigFiles {
+            home,
             managed,
             managed_text: &read_lossy(managed),
             entry,
@@ -2504,6 +2518,7 @@ mod tests {
                     path: paths.entry.clone(),
                     line: 3,
                     message: "Bad configuration option: bogus".into(),
+                    home: paths.home().to_owned(),
                 }
             ),
             other => panic!("{other:?}"),
