@@ -1567,6 +1567,8 @@ impl UiState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
+        // An `e` waiting for details is dropped by any other key, a tab switch included.
+        self.edit_pending = false;
         if let Some(action) = self.handle_tab_key(key) {
             return action;
         }
@@ -1655,7 +1657,6 @@ impl UiState {
 
     fn handle_hosts_key(&mut self, key: KeyEvent) -> UiAction {
         self.status = None;
-        self.edit_pending = false;
         if key.code == KeyCode::Esc && self.testing.is_some() {
             self.status = Some("Test cancelled".into());
             return UiAction::CancelTest;
@@ -1781,8 +1782,9 @@ impl UiState {
         }
     }
 
+    /// Opens the edit form `e` asked for, unless the Hosts tab has been left since.
     fn open_pending_edit(&mut self) {
-        if std::mem::take(&mut self.edit_pending) {
+        if std::mem::take(&mut self.edit_pending) && self.tab == Tab::Hosts {
             self.begin_edit();
         }
     }
@@ -4061,6 +4063,26 @@ mod tests {
 
         assert_eq!(state.mode, Mode::EditForm);
         assert_eq!(state.form.values[0].as_str(), "dev");
+    }
+
+    #[test]
+    fn a_tab_switch_drops_a_pending_edit() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('e'));
+        press(&mut state, KeyCode::Char('2'));
+        resolve(&mut state, details("dev", Ownership::Managed));
+        state.open_pending_edit();
+        assert_eq!(state.mode, Mode::Browse);
+        press(&mut state, KeyCode::Char('1'));
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(!state.in_form());
+        assert!(rendered(&state).contains("Details"));
+
+        // Even a pending edit left on a hidden tab never opens there.
+        press(&mut state, KeyCode::Char('2'));
+        state.edit_pending = true;
+        state.open_pending_edit();
+        assert_eq!(state.mode, Mode::Browse);
     }
 
     #[test]
