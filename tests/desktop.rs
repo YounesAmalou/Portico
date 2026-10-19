@@ -99,7 +99,7 @@ impl Desktop {
         self.program(
             "qs",
             &format!(
-                "case \"$1\" in\n  list) if [ -f '{0}/running' ]; then echo '[{{\"id\":\"x\"}}]'; else echo '[]'; fi ;;\n  kill) rm -f '{0}/running' ;;\n  *) : > '{0}/running' ;;\nesac",
+                "case \"$1\" in\n  list) if [ -f '{0}/running' ]; then echo '[{{\"id\":\"x\"}}]'; else echo '[]'; fi ;;\n  kill) /bin/rm -f '{0}/running' ;;\n  *) : > '{0}/running' ;;\nesac",
                 self.root.display()
             ),
         );
@@ -688,6 +688,89 @@ fn ordinary_commands_refresh_a_panel_from_an_older_portico_silently() {
     fs::write(panel.join("VERSION"), "999.0.0+0000000000000000\n").unwrap();
     desktop.run_installed(&["hosts", "--json"]);
     assert_eq!(read(&panel.join("VERSION")), "999.0.0+0000000000000000\n");
+}
+
+#[test]
+fn a_refresh_makes_omarchy_reload_the_panel() {
+    use std::os::unix::fs::MetadataExt;
+    let desktop = Desktop::omarchy();
+    desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    let plugins = desktop.path(".config/omarchy/plugins");
+    let link = plugins.join("portico");
+    let listing = || {
+        let mut names: Vec<_> = fs::read_dir(&plugins)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let names = listing();
+    let before = fs::symlink_metadata(&link).unwrap().ino();
+
+    // Up to date: nothing is rewritten, and the link is left alone.
+    desktop.run_installed(&["hosts", "--json"]);
+    assert_eq!(fs::symlink_metadata(&link).unwrap().ino(), before);
+
+    fs::write(desktop.panel().join("VERSION"), "0.0.1+0000000000000000\n").unwrap();
+    let output = desktop.run_installed(&["hosts", "--json"]);
+    assert!(output.stderr.is_empty(), "{}", text(&output));
+    assert_ne!(
+        fs::symlink_metadata(&link).unwrap().ino(),
+        before,
+        "the link was re-created"
+    );
+    assert_eq!(fs::read_link(&link).unwrap(), desktop.panel());
+    assert_eq!(
+        listing(),
+        names,
+        "nothing else in the plugins directory changed"
+    );
+}
+
+#[test]
+fn install_asks_omarchy_to_reload_a_rewritten_panel() {
+    let desktop = Desktop::omarchy();
+    desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    fs::write(desktop.panel().join("shell.qml"), "old").unwrap();
+    let output = desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(
+        out.contains("relink   ~/.config/omarchy/plugins/portico   (so Omarchy reloads the panel)"),
+        "{out}"
+    );
+    assert!(out.contains("Asked Omarchy to reload the panel."), "{out}");
+}
+
+#[test]
+fn install_restarts_a_running_quickshell_panel_it_rewrote() {
+    let desktop = Desktop::quickshell_hyprland();
+    desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    assert!(desktop.root.join("running").exists());
+    fs::remove_file(desktop.root.join("calls")).unwrap();
+    fs::write(desktop.panel().join("shell.qml"), "old").unwrap();
+    let output = desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        desktop.calls(),
+        ["qs kill -c portico", "qs -c portico -n -d"]
+    );
 }
 
 #[test]

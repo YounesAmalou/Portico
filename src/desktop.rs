@@ -216,6 +216,33 @@ pub fn detect(env: &DesktopEnv, forced: Option<Target>) -> Result<(Target, Strin
     ))
 }
 
+/// Makes Omarchy's running shell reload the panel after its files were rewritten.
+///
+/// Omarchy reloads a plugin on `inotifywait -r` events under `~/.config/omarchy/plugins`, and
+/// that watch does not follow the `portico` link into Portico's panel directory, so a rewrite
+/// there goes unseen. Re-creating the link fires it: a link with the same target is made at a
+/// hidden name (which Omarchy ignores) and renamed over `portico`, so the watch sees a move to
+/// `plugins/portico`. Only a link that points exactly at the panel directory is replaced; the
+/// result is `Ok(false)` when there is none.
+pub fn reload_omarchy_panel(env: &DesktopEnv) -> io::Result<bool> {
+    let link = Target::Omarchy.link(env);
+    let dir = env.panel_dir();
+    if link_state(&link, &dir) != Link::Ours {
+        return Ok(false);
+    }
+    let Some(plugins) = link.parent() else {
+        return Ok(false);
+    };
+    let temporary = plugins.join(format!(".portico.tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result =
+        std::os::unix::fs::symlink(&dir, &temporary).and_then(|()| fs::rename(&temporary, &link));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|()| true)
+}
+
 /// What is at a link location.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Link {
@@ -299,6 +326,8 @@ pub fn quickshell_running(env: &DesktopEnv) -> bool {
 pub enum Step {
     /// Write the panel files and stamp.
     WritePanel,
+    /// Re-create the Omarchy link so Omarchy's shell reloads the rewritten panel.
+    ReloadOmarchyPanel,
     /// Create the link at `path` to the panel directory, replacing a link elsewhere.
     Link {
         path: PathBuf,
@@ -355,6 +384,18 @@ pub fn apply(env: &DesktopEnv, step: &Step) -> Result<Option<String>, String> {
             }
             std::os::unix::fs::symlink(env.panel_dir(), path)
                 .map_err(io(format!("could not link {}", show(path))))?;
+        }
+        Step::ReloadOmarchyPanel => {
+            return match reload_omarchy_panel(env) {
+                Ok(true) => Ok(None),
+                Ok(false) => Err(format!(
+                    "{} no longer links to the panel, so Omarchy cannot be asked to reload it; restart its shell with: omarchy-restart-shell",
+                    env.show(&Target::Omarchy.link(env))
+                )),
+                Err(error) => Err(format!(
+                    "could not ask Omarchy to reload the panel ({error}); restart its shell with: omarchy-restart-shell"
+                )),
+            };
         }
         Step::Run(args) => return run_step(env, args),
         Step::EnableOmarchyPlugin => {
@@ -721,6 +762,52 @@ mod tests {
         assert!(
             env.is_development_build(),
             "this test binary is a cargo build's"
+        );
+    }
+
+    #[test]
+    fn reloads_omarchy_by_re_creating_only_portico_s_link() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let env = DesktopEnv::new(home.clone(), |_| None, None);
+        let plugins = home.join(".config/omarchy/plugins");
+        fs::create_dir_all(plugins.join("other")).unwrap();
+        fs::create_dir_all(env.panel_dir()).unwrap();
+        let link = plugins.join("portico");
+        let listing = || {
+            let mut names: Vec<_> = fs::read_dir(&plugins)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert!(
+            !reload_omarchy_panel(&env).unwrap(),
+            "no link, nothing to do"
+        );
+
+        std::os::unix::fs::symlink("/elsewhere", &link).unwrap();
+        assert!(!reload_omarchy_panel(&env).unwrap());
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("/elsewhere"));
+        fs::remove_file(&link).unwrap();
+
+        std::os::unix::fs::symlink(env.panel_dir(), &link).unwrap();
+        let before = fs::symlink_metadata(&link).unwrap().ino();
+        let names = listing();
+        assert!(reload_omarchy_panel(&env).unwrap());
+        assert_ne!(
+            fs::symlink_metadata(&link).unwrap().ino(),
+            before,
+            "a new link"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), env.panel_dir());
+        assert_eq!(
+            listing(),
+            names,
+            "nothing else in the plugins directory changed"
         );
     }
 
