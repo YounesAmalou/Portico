@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Portico
+GenericName=SSH Host Manager
+Comment=Browse, connect to and manage your OpenSSH hosts
+Exec=portico
+Icon=portico
+Terminal=true
+Categories=Network;System;
+Keywords=ssh;openssh;hosts;tunnels;containers;

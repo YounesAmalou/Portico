@@ -1,12 +1,14 @@
 use std::{
     io::{self, IsTerminal},
+    path::PathBuf,
     process::ExitCode,
 };
 
 use clap::Parser;
 use portico::{
     app::App,
-    cli::{Cli, fail, run},
+    cli::{Cli, fail, run, run_desktop},
+    desktop::{DesktopEnv, panel},
     managed::{ConfigPaths, ManagedStore},
     openssh::OpenSsh,
     picker::TerminalPicker,
@@ -24,6 +26,27 @@ fn main() -> ExitCode {
             &mut io::stderr(),
         );
     };
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal();
+    let desktop = DesktopEnv::new(
+        PathBuf::from(&home),
+        |name| std::env::var_os(name),
+        cli.is_desktop()
+            .then(|| std::env::current_exe().ok())
+            .flatten(),
+    );
+    if cli.is_desktop() {
+        return run_desktop(
+            cli,
+            &desktop,
+            &mut stdin.lock(),
+            &mut io::stdout().lock(),
+            &mut io::stderr(),
+            interactive,
+        );
+    }
+    // Keep an installed panel in step with this binary; silent, and a no-op without a panel.
+    panel::refresh(&desktop.panel_dir());
     let runtime = RuntimeDir::locate(
         home.as_ref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
@@ -33,8 +56,6 @@ fn main() -> ExitCode {
         OpenSsh::system(),
     )
     .with_runtime_dir(runtime);
-    let stdin = io::stdin();
-    let interactive = stdin.is_terminal();
     run(
         cli,
         &app,
