@@ -1,6 +1,6 @@
 # Fuzzy Pickers Design
 
-**Status:** Approved; not implemented
+**Status:** Approved; implemented
 
 ## Purpose
 

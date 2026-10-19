@@ -27,7 +27,6 @@ Private keys remain where they already live. Portico stores identity-file refere
 - OpenSSH client tools (`ssh`)
 - `xdg-terminal-exec` for the new-terminal option only
 - `docker`, only for container shells, on this machine or on the host (Docker only; Podman is not supported)
-- `fzf`, optional, for the `portico shell` picker (a numbered menu is used without it)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
 
@@ -116,19 +115,30 @@ Re-run `cargo install --path . --force` after rebuilding a version already insta
 portico                         Open the TUI
 portico init [-y|--yes]         Initialize the managed SSH fragment
 portico hosts                   List managed and external hosts
-portico show <alias>            Show declared and resolved configuration
+portico show [<alias>]          Show declared and resolved configuration
 portico add <alias> -H <host>   Add a managed host
-portico edit <alias> [options]  Change only the supplied fields
-portico remove <alias> [-f]     Remove a managed host
-portico connect <alias> [-n]    Connect using OpenSSH
-portico test <alias> [--raw]    Check that logging in works, without a shell
-portico containers [--on <alias>]
+portico edit [<alias>] [options]
+                                Change only the supplied fields
+portico remove [<alias>] [-f]   Remove a managed host
+portico connect [<alias>] [-n]  Connect using OpenSSH
+portico test [<alias>] [--raw]  Check that logging in works, without a shell
+portico containers [--on [<alias>]]
                                 List running containers, here or on a host
-portico shell [<container>] [--on <alias>] [-u <user>] [-n]
+portico shell [<container>] [--on [<alias>]] [-u <user>] [-n]
                                 Open a shell in a container
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
 ```
+
+### Picking a host
+
+Leave out the alias and Portico asks for it in the terminal: `show`, `connect` and `test` offer every host, `edit` and `remove` the managed ones. A bare `--on` does the same for `containers` and `shell`; without `--on` they use this machine. Because `--on` takes the next word as its alias, name a container before a bare `--on` (`portico shell web --on`).
+
+The picker opens under the prompt and ranks hosts as you type: the letters only need to appear in order (`prdb` finds `prod-db`), case and accents are ignored, and spaces separate words that must all match. `↑` / `↓` (or `Ctrl+P` / `Ctrl+N`, `PgUp` / `PgDn`) move, `Enter` picks, and `Esc` or `Ctrl+C` cancels with exit status 130. A single host is still offered, never chosen for you. `portico shell` picks its container the same way, matching the name, Compose project and service, and image.
+
+`portico adopt` and `portico export` without hosts open a checklist with the TUI's keys: `↑` / `↓` / `j` / `k` move, `Space` marks a host, `a` marks every shown host (again to unmark), `/` filters, `Enter` takes the marked hosts, also those the filter hides, and `Esc` clears the filter or cancels.
+
+Without a terminal, every command needs its alias.
 
 Host fields and their aliases:
 
@@ -200,7 +210,7 @@ portico shell myapp/api#2 -u root
 portico shell 3f9a1c -n
 ```
 
-`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in a terminal: `fzf` when it is installed, a numbered menu otherwise. Cancelling exits with 130.
+`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
 
 A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
 
@@ -231,7 +241,7 @@ portico remove development --force
 `portico adopt` moves a host from your own SSH configuration into Portico, comments included, so you can edit it there; `ssh <alias>` behaves exactly as before. Only a simple block qualifies: a single concrete alias, declared once, using only `HostName`, `User`, `Port`, `IdentityFile` and `ProxyJump`, in a file you own and can write, where OpenSSH reports the same effective configuration after the move. Every other host is listed with the reason it cannot be adopted.
 
 ```sh
-portico adopt                   # choose from a list
+portico adopt                   # choose in a checklist
 portico adopt dev-vps --yes
 portico adopt --all
 ```
@@ -247,7 +257,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move through hosts |
-| `/` | Filter hosts |
+| `/` | Filter hosts: the letters of an alias in order, ignoring case and accents (`prdb` finds `prod-db`) |
 | `a` | Add a host |
 | `e` | Edit the selected managed host |
 | `x` | Remove the selected managed host |
@@ -278,7 +288,7 @@ The containers panel sits under the hosts and shows this machine's containers, l
 | Key | Action |
 |---|---|
 | `↑` / `↓` / `j` / `k` | Move through containers |
-| `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, ignoring case and accents |
+| `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, as the hosts filter matches |
 | `Enter` | Open a shell in this terminal |
 | `n` | Open a shell in a new terminal |
 | `u` | Set the user for the next shell (empty means the image's user; not saved) |
@@ -290,6 +300,8 @@ The containers panel sits under the hosts and shows this machine's containers, l
 | `q` | Quit |
 
 The filter edits like the hosts filter: `Enter` applies it and `Esc` cancels the edit. The panel's title shows it, a Compose project's header stays only while one of its containers matches, and showing another target clears it.
+
+The `m` checklist shows every host, dimming those that cannot move with the reason. `Space` marks a host, `a` marks every shown host, and `/` filters with the hosts filter's keys; marks stay when the filter hides them, and `Enter` previews every marked host. `Esc` clears an applied filter, otherwise closes the checklist.
 
 External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
