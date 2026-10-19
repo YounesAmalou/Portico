@@ -5,6 +5,7 @@ pub mod config_error;
 pub mod container;
 pub mod discovery;
 pub mod explain;
+pub mod fuzzy;
 pub mod host;
 pub mod managed;
 pub mod openssh;
