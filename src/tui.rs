@@ -2996,7 +2996,11 @@ mod tests {
                 proxy_command: None,
                 proxy_use_fdpass: false,
                 known_hosts_files: vec!["~/.ssh/known_hosts".into()],
+                identity_agent: None,
+                identities_only: false,
+                pkcs11_provider: None,
             }),
+            identities: None,
             warnings: Vec::new(),
         }
     }
