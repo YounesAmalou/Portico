@@ -374,6 +374,22 @@ fn shell_new_terminal_passes_resolved_id() {
     );
 }
 
+/// The desktop panel (`desktop/quickshell/PorticoModel.qml`) opens a shell with exactly this form.
+#[test]
+fn the_desktop_panel_shell_form_opens_a_new_terminal() {
+    let env = env_with_dev(&shop_listing());
+
+    env.run(["shell", "--new-terminal", "--on", "dev", "--", "aaaa1111"])
+        .assert_success();
+    assert_eq!(
+        fs::read_to_string(env.connection_log()).unwrap(),
+        format!(
+            "{}\nshell\n--hold\n--on\ndev\n--\naaaa1111\n",
+            env!("CARGO_BIN_EXE_portico")
+        )
+    );
+}
+
 #[test]
 fn held_shell_runs_the_id_without_listing() {
     let env = TestEnv::new();

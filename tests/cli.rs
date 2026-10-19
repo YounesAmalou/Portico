@@ -222,6 +222,25 @@ fn new_terminal_detaches_launcher_streams() {
     result.assert_success_without_output("launcher-noise");
 }
 
+/// The desktop panel (`desktop/quickshell/PorticoModel.qml`) connects with exactly this form.
+#[test]
+fn the_desktop_panel_connect_form_opens_a_new_terminal() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+
+    env.run(["connect", "--new-terminal", "--", "dev"])
+        .assert_success();
+    assert_eq!(
+        std::fs::read_to_string(env.connection_log()).unwrap(),
+        format!(
+            "{}\nconnect\n--hold\n--\ndev\n",
+            env!("CARGO_BIN_EXE_portico")
+        )
+    );
+}
+
 #[test]
 fn prompt_terminal_launcher_failure_is_propagated() {
     let env = TestEnv::new();

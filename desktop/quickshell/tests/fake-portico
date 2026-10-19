@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""A stand-in for portico that answers the panel's commands from Portico's
+golden files (tests/fixtures/json), to run and screenshot the panel without
+real hosts:
+
+    PORTICO_BIN="$PWD/desktop/quickshell/tests/fake-portico" qs -p desktop/quickshell
+
+Started tunnels are remembered in FAKE_PORTICO_STATE (default: a file in
+$XDG_RUNTIME_DIR or /tmp), so a start shows as running on the next listing.
+FAKE_PORTICO_DELAY sets how long start and stop take (seconds, default 2).
+FAKE_PORTICO_MARKER, when set, names a file that each start and stop appends
+to once it finishes, to show that an action outlives a reloaded panel.
+"""
+import json
+import os
+import sys
+import time
+
+GOLDEN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "tests", "fixtures", "json")
+STATE = os.environ.get("FAKE_PORTICO_STATE") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "fake-portico-running")
+
+
+def golden(name):
+    with open(os.path.join(GOLDEN, name)) as f:
+        return json.load(f)
+
+
+def send(doc, status=0):
+    print(json.dumps(doc, indent=2, ensure_ascii=False, sort_keys=True))
+    sys.exit(status)
+
+
+def running():
+    try:
+        with open(STATE) as f:
+            return set(f.read().split())
+    except FileNotFoundError:
+        return set()
+
+
+def save(names):
+    with open(STATE, "w") as f:
+        f.write("\n".join(sorted(names)))
+
+
+def report(tunnel, names):
+    if tunnel["name"] in names:
+        tunnel["status"] = {"state": "running", "pid": 4242, "started": 1781861043}
+    elif tunnel["status"]["state"] == "running":
+        tunnel["status"] = {"state": "stopped"}
+    return tunnel
+
+
+def tunnels():
+    doc = golden("tunnels.json")
+    names = running()
+    doc["tunnels"] = [report(t, names) for t in doc["tunnels"]]
+    return doc
+
+
+def act(verb, name):
+    time.sleep(float(os.environ.get("FAKE_PORTICO_DELAY", "2")))
+    marker = os.environ.get("FAKE_PORTICO_MARKER")
+    if marker:
+        with open(marker, "a") as f:
+            f.write(f"{verb} {name}\n")
+    if verb == "start" and name == "preview":
+        send(golden("tunnel-start.json"), 1)
+    known = {t["name"]: t for t in golden("tunnels.json")["tunnels"]}
+    if name not in known:
+        send({"schema": 1, "results": [{"name": name, "outcome": "failed", "pid": None, "tunnel": None,
+                                        "error": {"kind": "unknown-tunnel", "message": f"no tunnel named {name}", "next": []}}]}, 1)
+    names = running()
+    if verb == "start":
+        outcome = "already-running" if name in names else "started"
+        names.add(name)
+    else:
+        outcome = "stopped" if name in names else "not-running"
+        names.discard(name)
+    save(names)
+    send({"schema": 1, "results": [{"name": name, "outcome": outcome, "error": None,
+                                    "pid": 4242 if verb == "start" else None,
+                                    "tunnel": report(known[name], names)}]})
+
+
+def main(argv):
+    args = [a for a in argv if a != "--"]
+    line = " ".join(args)
+    if line == "hosts --json":
+        send(golden("hosts.json"))
+    if line == "tunnels --json":
+        send(tunnels())
+    if line == "containers --json":
+        send(golden("containers.json"))
+    if line.startswith("containers --json --on "):
+        time.sleep(1)
+        if args[3] == "legacy":
+            send(golden("containers-docker-down.json"), 1)
+        doc = golden("containers-on-host.json")
+        doc["target"]["alias"] = args[3]
+        send(doc)
+    if args[:2] == ["tunnel", "start"] or args[:2] == ["tunnel", "stop"]:
+        act(args[1], args[-1])
+    if line == "connect --new-terminal legacy":
+        print("error: legacy: line 9: Bad configuration option: frobnicate", file=sys.stderr)
+        sys.exit(1)
+    if args[:2] in (["connect", "--new-terminal"], ["shell", "--new-terminal"]):
+        sys.exit(0)
+    print(f"fake-portico: unexpected arguments: {line}", file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -17,6 +17,7 @@ exclude = [
     "docs/superpowers/",
     ".github/",
     "packaging/",
+    "desktop/",
     "tests/docs.rs",
     "tests/package.rs",
 ]

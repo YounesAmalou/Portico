@@ -56,13 +56,15 @@ fn published_crate_contains_only_intended_files() {
             "{expected} missing from {files:?}"
         );
     }
-    // Repository-hygiene tests read files that are not published, so they must not ship either.
+    // Repository-hygiene tests read files that are not published, so they must not ship either,
+    // and the desktop panel is installed from a checkout, not from the crate.
     for forbidden in [
         ".superpowers",
         ".worktrees",
         "target/",
         "docs/superpowers",
         "packaging/",
+        "desktop/",
         "tests/docs.rs",
         "tests/package.rs",
     ] {

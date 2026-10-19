@@ -429,6 +429,34 @@ fn tunnel_stop_all_with_nothing_running() {
     );
 }
 
+/// The desktop panel (`desktop/quickshell/PorticoModel.qml`) lists containers, and starts and
+/// stops tunnels, with exactly these forms.
+#[test]
+fn the_desktop_panel_forms_print_documents() {
+    let fixture = setup();
+    let output = fixture.run(&["containers", "--json", "--on", "prod"]);
+    let document = check_golden(
+        &output,
+        0,
+        "containers-on-host.json",
+        fixture.env.home(),
+        None,
+    );
+    assert_eq!(document["target"]["alias"], "prod");
+
+    let output = fixture.run(&["tunnel", "start", "--json", "--", "preview"]);
+    assert_eq!(output.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["results"][0]["name"], "preview");
+    assert_eq!(document["results"][0]["outcome"], "failed");
+
+    let output = fixture.run(&["tunnel", "stop", "--json", "--", "db"]);
+    assert!(output.status.success());
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["results"][0]["name"], "db");
+    assert_eq!(document["results"][0]["outcome"], "not-running");
+}
+
 #[test]
 fn a_missing_name_is_a_usage_error() {
     let fixture = setup();
