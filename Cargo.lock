@@ -1110,6 +1110,7 @@ dependencies = [
  "ratatui",
  "signal-hook 0.4.5",
  "tempfile",
+ "tera",
  "thiserror 2.0.21",
  "vt100",
 ]
@@ -1582,6 +1583,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "tera"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61e0cadeeb54426080b4c5395d59769ce8293f542cc25511c167c742b2175809"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

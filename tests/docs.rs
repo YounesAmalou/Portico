@@ -363,3 +363,43 @@ fn readme_documents_adoption() {
         assert!(readme.contains(expected), "README lacks {expected}");
     }
 }
+
+#[test]
+fn the_release_pr_body_renders_with_the_pinned_release_plz() {
+    // release-plz 0.3.172 renders pr_body with Tera 2; a template it cannot parse stops
+    // the release pull request from updating.
+    let workflow = read(".github/workflows/release-plz.yml");
+    assert_eq!(
+        workflow.matches("version: 0.3.172").count(),
+        2,
+        "both release-plz steps pin the version this test renders for"
+    );
+    let config = read("release-plz.toml");
+    let template = config
+        .split("pr_body = \"\"\"\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\"\"\"").next())
+        .expect("release-plz.toml defines pr_body as a multi-line string");
+    assert!(
+        !template.contains('\\'),
+        "pr_body must not rely on TOML escapes"
+    );
+
+    let mut tera = tera::Tera::default();
+    tera.add_raw_template("pr_body", template)
+        .expect("pr_body parses");
+    let release = std::collections::BTreeMap::from([
+        ("package", "portico-ssh"),
+        ("previous_version", "0.3.0"),
+        ("next_version", "0.4.0"),
+        ("semver_check", "skipped"),
+        ("title", "[0.4.0] - 2026-10-19"),
+        ("changelog", "### Added\n\n- Filter the containers panel"),
+    ]);
+    let mut context = tera::Context::new();
+    context.insert("releases", &vec![release]);
+    let body = tera.render("pr_body", &context).expect("pr_body renders");
+    assert!(body.contains("`portico-ssh`: 0.3.0 -> 0.4.0"), "{body}");
+    assert!(body.contains("- Filter the containers panel"), "{body}");
+    assert!(!body.contains("release-plz"), "no credit footer: {body}");
+}

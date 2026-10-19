@@ -40,6 +40,8 @@ thiserror = "2"
 
 [dev-dependencies]
 portable-pty = "0.9"
+# Renders release-plz.toml's pr_body with the Tera major of the pinned release-plz.
+tera = { version = "2", default-features = false }
 tempfile = "3"
 vt100 = "0.17"
 
