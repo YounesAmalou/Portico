@@ -9,11 +9,15 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
 };
 
-use super::{display_width, keep_start};
-use crate::adopt::{Candidate, Direction, MigrationPlan};
+use super::{TextInput, display_width, keep_start};
+use crate::{
+    adopt::{Candidate, Direction, MigrationPlan},
+    fuzzy::{highlight, match_fields},
+    picker::HIT,
+};
 
 /// Lines PageUp and PageDown scroll the preview by.
 const PAGE: usize = 10;
@@ -30,6 +34,11 @@ pub(super) struct MigrateState {
     preview: Option<(String, usize)>,
     /// Shown as `~` in file paths.
     home: Option<PathBuf>,
+    filter: TextInput,
+    editing_filter: bool,
+    filter_before_edit: String,
+    /// Indexes of the candidates the filter keeps, in checklist order.
+    visible: Vec<usize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -54,12 +63,39 @@ impl MigrateState {
             .into_iter()
             .collect();
         Self {
-            plan,
             selected,
             cursor: found.unwrap_or(0),
             offset: Cell::new(0),
             preview: None,
             home: None,
+            visible: (0..plan.candidates.len()).collect(),
+            filter: TextInput::default(),
+            editing_filter: false,
+            filter_before_edit: String::new(),
+            plan,
+        }
+    }
+
+    /// Applies a new filter, keeping the cursor on its row when it still matches and otherwise
+    /// moving it to the first match.
+    fn set_filter(&mut self, filter: TextInput) {
+        self.filter = filter;
+        self.visible = (0..self.plan.candidates.len())
+            .filter(|&index| {
+                match_fields(self.filter.as_str(), &[&self.plan.candidates[index].alias]).is_some()
+            })
+            .collect();
+        if !self.visible.contains(&self.cursor) {
+            self.cursor = self.visible.first().copied().unwrap_or(0);
+        }
+    }
+
+    /// Pasted text goes into the filter while it is edited.
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.editing_filter {
+            let mut filter = self.filter.clone();
+            filter.paste(text);
+            self.set_filter(filter);
         }
     }
 
@@ -82,27 +118,55 @@ impl MigrateState {
             }
             return MigrateAction::None;
         }
-        let count = self.plan.candidates.len();
+        if self.editing_filter {
+            match key.code {
+                KeyCode::Enter => self.editing_filter = false,
+                KeyCode::Esc => {
+                    self.editing_filter = false;
+                    let before = std::mem::take(&mut self.filter_before_edit);
+                    self.set_filter(TextInput::new(&before));
+                }
+                _ => {
+                    let mut filter = self.filter.clone();
+                    if filter.handle_key(key) {
+                        self.set_filter(filter);
+                    }
+                }
+            }
+            return MigrateAction::None;
+        }
+        let place = self.visible.iter().position(|&index| index == self.cursor);
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(place) = place {
+                    self.cursor = self.visible[place.saturating_sub(1)];
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
+                if let Some(place) = place {
+                    self.cursor = self.visible[(place + 1).min(self.visible.len() - 1)];
+                }
             }
             KeyCode::Char(' ') => {
-                if self
-                    .plan
-                    .candidates
-                    .get(self.cursor)
-                    .is_some_and(|candidate| candidate.reason.is_none())
+                if place.is_some()
+                    && self.plan.candidates[self.cursor].reason.is_none()
                     && !self.selected.remove(&self.cursor)
                 {
                     self.selected.insert(self.cursor);
                 }
             }
             KeyCode::Char('a') => {
-                self.selected = (0..count)
-                    .filter(|&index| self.plan.candidates[index].reason.is_none())
-                    .collect();
+                let candidates = &self.plan.candidates;
+                self.selected.extend(
+                    self.visible
+                        .iter()
+                        .filter(|&&index| candidates[index].reason.is_none()),
+                );
+            }
+            KeyCode::Char('/') => {
+                self.filter_before_edit = self.filter.as_str().to_owned();
+                self.filter = TextInput::new(&self.filter_before_edit);
+                self.editing_filter = true;
             }
             KeyCode::Enter if !self.selected.is_empty() => {
                 match self.plan.preview(&self.selected_aliases()) {
@@ -110,6 +174,7 @@ impl MigrateState {
                     Err(error) => return MigrateAction::Error(error.to_string()),
                 }
             }
+            KeyCode::Esc if !self.filter.is_empty() => self.set_filter(TextInput::default()),
             KeyCode::Esc => return MigrateAction::Close,
             _ => {}
         }
@@ -141,6 +206,12 @@ impl MigrateState {
                 Direction::Export => "No host can be exported.",
             })];
         }
+        if self.visible.is_empty() {
+            return vec![Line::raw(format!(
+                "No hosts match \"{}\".",
+                self.filter.as_str()
+            ))];
+        }
         let alias_width = self
             .plan
             .candidates
@@ -148,22 +219,26 @@ impl MigrateState {
             .map(|candidate| candidate.alias.chars().count())
             .max()
             .unwrap_or(0);
-        let count = self.plan.candidates.len();
+        let count = self.visible.len();
+        let cursor = self
+            .visible
+            .iter()
+            .position(|&index| index == self.cursor)
+            .unwrap_or(0);
         let height = height.max(1);
         let offset = self
             .offset
             .get()
-            .min(self.cursor)
-            .max((self.cursor + 1).saturating_sub(height))
+            .min(cursor)
+            .max((cursor + 1).saturating_sub(height))
             .min(count.saturating_sub(height));
         self.offset.set(offset);
-        self.plan
-            .candidates
+        self.visible
             .iter()
-            .enumerate()
             .skip(offset)
             .take(height)
-            .map(|(index, candidate)| {
+            .map(|&index| {
+                let candidate = &self.plan.candidates[index];
                 let alias = &candidate.alias;
                 let (text, mut style) = match &candidate.reason {
                     Some(reason) => (
@@ -184,15 +259,34 @@ impl MigrateState {
                     ),
                 };
                 // Rows never wrap, so each takes exactly one line of the pane.
-                let text = keep_start(&text, width);
+                let cut = keep_start(&text, width);
+                let mut line = if cut == text {
+                    self.highlighted(&text, &candidate.alias)
+                } else {
+                    Line::raw(cut.clone())
+                };
                 if index == self.cursor {
                     style = style.add_modifier(Modifier::REVERSED);
-                    let padding = width.saturating_sub(display_width(&text));
-                    return Line::styled(format!("{text}{}", " ".repeat(padding)), style);
+                    let padding = width.saturating_sub(display_width(&cut));
+                    line.spans.push(Span::raw(" ".repeat(padding)));
                 }
-                Line::styled(text, style)
+                line.style(style)
             })
             .collect()
+    }
+
+    /// A checklist row's `text` with the filter's matches highlighted in its `alias`, which
+    /// starts at the fifth character.
+    fn highlighted(&self, text: &str, alias: &str) -> Line<'static> {
+        let positions = match_fields(self.filter.as_str(), &[alias])
+            .and_then(|found| found.positions.into_iter().next())
+            .unwrap_or_default();
+        let prefix: String = text.chars().take(4).collect();
+        let rest: String = text.chars().skip(4 + alias.chars().count()).collect();
+        let mut spans = vec![Span::raw(prefix)];
+        spans.extend(highlight(alias, &positions, Style::default(), HIT));
+        spans.push(Span::raw(rest));
+        Line::from(spans)
     }
 
     /// Where an eligible host is declared: its file for adoption, `managed` for export.
@@ -210,18 +304,25 @@ impl MigrateState {
         }
     }
 
-    pub(super) fn title(&self) -> &'static str {
-        match self.plan.direction {
-            Direction::Adopt => "Adopt hosts",
-            Direction::Export => "Export hosts",
-        }
+    pub(super) fn title(&self) -> Line<'static> {
+        let mut title = vec![Span::raw(match self.plan.direction {
+            Direction::Adopt => "Adopt hosts /",
+            Direction::Export => "Export hosts /",
+        })];
+        title.extend(self.filter.spans(self.editing_filter));
+        title.push(Span::raw(format!("  {} marked", self.selected.len())));
+        Line::from(title)
     }
 
-    pub(super) fn footer(&self) -> &'static str {
+    pub(super) fn footer(&self) -> String {
         if self.preview.is_some() {
-            "↑↓ scroll  y apply  Esc back"
+            "↑↓ scroll  y apply  Esc back".into()
+        } else if self.editing_filter {
+            "type to filter  ←→ move  Enter apply  Esc cancel".into()
+        } else if self.filter.is_empty() {
+            "↑↓ move  Space toggle  a all  / filter  Enter preview  Esc cancel".into()
         } else {
-            "↑↓ move  Space toggle  a all  Enter preview  Esc cancel"
+            "↑↓ move  Space toggle  a all  / filter  Enter preview  Esc clear filter".into()
         }
     }
 }
@@ -296,6 +397,158 @@ mod tests {
             .join("\n")
     }
 
+    fn type_text(state: &mut MigrateState, text: &str) {
+        for character in text.chars() {
+            assert_eq!(press(state, KeyCode::Char(character)), MigrateAction::None);
+        }
+    }
+
+    /// Applies `filter` with `/`, typing and Enter.
+    fn filter(state: &mut MigrateState, filter: &str) {
+        press(state, KeyCode::Char('/'));
+        type_text(state, filter);
+        press(state, KeyCode::Enter);
+    }
+
+    /// The aliases of the rows shown, in order.
+    fn shown(state: &MigrateState) -> Vec<String> {
+        text(state)
+            .iter()
+            .map(|line| {
+                line.trim_start_matches(['[', ']', 'x', ' '])
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The row the cursor is on, among the rows shown.
+    fn cursor_row(state: &MigrateState) -> usize {
+        state
+            .lines(60, usize::MAX)
+            .iter()
+            .position(|line| line.style.add_modifier.contains(Modifier::REVERSED))
+            .unwrap()
+    }
+
+    #[test]
+    fn slash_filters_the_checklist() {
+        let mut state = adoption(None);
+        filter(&mut state, "w");
+        assert_eq!(shown(&state), ["web", "wild"]);
+    }
+
+    #[test]
+    fn filter_edit_keys_match_the_hosts_filter() {
+        let mut state = adoption(None);
+        filter(&mut state, "d");
+        assert_eq!(shown(&state), ["wild", "db"]);
+        press(&mut state, KeyCode::Char('/'));
+        type_text(&mut state, "b");
+        assert_eq!(shown(&state), ["db"]);
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(shown(&state), ["wild", "db"]);
+    }
+
+    #[test]
+    fn esc_clears_filter_before_closing() {
+        let mut state = adoption(None);
+        filter(&mut state, "db");
+        assert_eq!(press(&mut state, KeyCode::Esc), MigrateAction::None);
+        assert_eq!(shown(&state), ["web", "wild", "db"]);
+        assert_eq!(press(&mut state, KeyCode::Esc), MigrateAction::Close);
+    }
+
+    #[test]
+    fn marks_survive_filter_changes() {
+        let mut state = adoption(None);
+        press(&mut state, KeyCode::Char(' '));
+        filter(&mut state, "db");
+        press(&mut state, KeyCode::Esc);
+        assert!(text(&state)[0].starts_with("[x] web"), "{:?}", text(&state));
+    }
+
+    #[test]
+    fn a_marks_only_visible_eligible_rows() {
+        let mut state = adoption(None);
+        filter(&mut state, "d");
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('y')),
+            MigrateAction::Apply(vec!["db".into()])
+        );
+    }
+
+    #[test]
+    fn enter_previews_hidden_marks() {
+        let mut state = adoption(None);
+        press(&mut state, KeyCode::Char(' '));
+        filter(&mut state, "db");
+        press(&mut state, KeyCode::Char(' '));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(
+            press(&mut state, KeyCode::Char('y')),
+            MigrateAction::Apply(vec!["web".into(), "db".into()])
+        );
+    }
+
+    #[test]
+    fn cursor_stays_or_moves_to_first_match() {
+        let mut state = adoption(None);
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        filter(&mut state, "d");
+        assert_eq!(shown(&state)[cursor_row(&state)], "db");
+        press(&mut state, KeyCode::Esc);
+        filter(&mut state, "web");
+        assert_eq!(shown(&state)[cursor_row(&state)], "web");
+    }
+
+    #[test]
+    fn jk_move_through_matches_only() {
+        let mut state = adoption(None);
+        filter(&mut state, "w");
+        press(&mut state, KeyCode::Char('j'));
+        press(&mut state, KeyCode::Char('j'));
+        assert_eq!(shown(&state)[cursor_row(&state)], "wild");
+        press(&mut state, KeyCode::Char('k'));
+        assert_eq!(shown(&state)[cursor_row(&state)], "web");
+    }
+
+    #[test]
+    fn no_match_message() {
+        let mut state = adoption(None);
+        filter(&mut state, "zzz");
+        assert_eq!(text(&state), ["No hosts match \"zzz\"."]);
+        assert_eq!(press(&mut state, KeyCode::Char(' ')), MigrateAction::None);
+    }
+
+    #[test]
+    fn title_and_footer_show_the_filter() {
+        let mut state = adoption(Some("web"));
+        assert_eq!(state.title().to_string(), "Adopt hosts /  1 marked");
+        assert!(state.footer().contains("/ filter"));
+        assert!(state.footer().ends_with("Esc cancel"));
+        filter(&mut state, "d");
+        assert_eq!(state.title().to_string(), "Adopt hosts /d  1 marked");
+        assert!(state.footer().ends_with("Esc clear filter"));
+        press(&mut state, KeyCode::Char('/'));
+        assert!(state.footer().starts_with("type to filter"));
+    }
+
+    #[test]
+    fn paste_goes_to_the_filter_while_editing() {
+        let mut state = adoption(None);
+        state.paste("db");
+        assert_eq!(shown(&state), ["web", "wild", "db"]);
+        press(&mut state, KeyCode::Char('/'));
+        state.paste("db\n");
+        assert_eq!(shown(&state), ["db"]);
+    }
+
     #[test]
     fn space_toggles_only_eligible_rows() {
         let mut state = adoption(None);
@@ -339,7 +592,7 @@ mod tests {
         assert_eq!(press(&mut state, KeyCode::Enter), MigrateAction::None);
         assert_eq!(
             state.footer(),
-            "↑↓ move  Space toggle  a all  Enter preview  Esc cancel"
+            "↑↓ move  Space toggle  a all  / filter  Enter preview  Esc cancel"
         );
         assert_eq!(press(&mut state, KeyCode::Char('y')), MigrateAction::None);
     }
@@ -352,7 +605,7 @@ mod tests {
         press(&mut state, KeyCode::Char(' '));
         press(&mut state, KeyCode::Enter);
         assert_eq!(state.footer(), "↑↓ scroll  y apply  Esc back");
-        assert_eq!(state.title(), "Adopt hosts");
+        assert!(state.title().to_string().starts_with("Adopt hosts /"));
         let preview = text(&state);
         assert!(preview.contains(&"~/.ssh/config".to_owned()), "{preview:?}");
         assert!(preview.contains(&"  -4: Host db".to_owned()), "{preview:?}");
@@ -426,7 +679,7 @@ mod tests {
             }],
         );
         let mut state = MigrateState::new(plan, Some("dev")).with_home(Path::new("/home/test"));
-        assert_eq!(state.title(), "Export hosts");
+        assert!(state.title().to_string().starts_with("Export hosts /"));
         assert_eq!(text(&state), ["[x] dev  managed"]);
         press(&mut state, KeyCode::Enter);
         let preview = text(&state);
@@ -446,7 +699,7 @@ mod tests {
         ));
         assert_eq!(
             state.footer(),
-            "↑↓ move  Space toggle  a all  Enter preview  Esc cancel"
+            "↑↓ move  Space toggle  a all  / filter  Enter preview  Esc cancel"
         );
     }
 

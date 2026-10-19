@@ -10,7 +10,7 @@ use std::{
 use crate::{
     client::{Client, RealHome},
     sshd::Sshd,
-    terminal::Terminal,
+    terminal::{Key, Terminal},
 };
 
 #[test]
@@ -59,4 +59,74 @@ fn dropping_a_terminal_reaps_its_child() {
         assert!(Instant::now() < deadline, "portico {pid} was not reaped");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn connect_without_alias_picks_a_host() {
+    let sshd = Sshd::start();
+    let client = Client::new();
+    client.init();
+    client.add_host("box", &sshd, &sshd.client_key());
+    client.add_host("other", &sshd, &sshd.client_key());
+    client.trust("box");
+
+    let mut terminal = Terminal::spawn(&client, &["connect"]);
+    terminal.wait_for("host> ");
+    terminal.wait_for("2/2");
+    terminal.type_text("bo");
+    terminal.wait_for("1/2");
+    terminal.key(Key::Enter);
+    terminal.wait_for("portico-e2e ready");
+    assert!(
+        !terminal.screen().contains("host> "),
+        "{}",
+        terminal.screen()
+    );
+    terminal.type_text("hello\r");
+    terminal.wait_for("portico-e2e got hello");
+    let status = terminal.wait_exit();
+    assert!(status.success(), "{status:?}\n{}", terminal.screen());
+}
+
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn cancelled_pick_exits_130() {
+    let sshd = Sshd::start();
+    let client = Client::new();
+    client.init();
+    client.add_host("box", &sshd, &sshd.client_key());
+
+    let mut terminal = Terminal::spawn(&client, &["connect"]);
+    terminal.wait_for("host> ");
+    terminal.key(Key::Esc);
+    let status = terminal.wait_exit();
+    assert_eq!(status.exit_code(), 130, "{}", terminal.screen());
+    assert!(
+        !terminal.screen().contains("host> "),
+        "{}",
+        terminal.screen()
+    );
+}
+
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn output_after_a_pick_starts_at_column_zero() {
+    let sshd = Sshd::start();
+    let client = Client::new();
+    client.init();
+    client.add_host("box", &sshd, &sshd.client_key());
+
+    let mut terminal = Terminal::spawn(&client, &["show"]);
+    terminal.wait_for("host> ");
+    terminal.type_text("bo");
+    terminal.wait_for("1/1");
+    terminal.key(Key::Enter);
+    let status = terminal.wait_exit();
+    assert!(status.success(), "{status:?}\n{}", terminal.screen());
+    let screen = terminal.screen();
+    assert!(
+        screen.lines().any(|line| line.starts_with("Alias: box")),
+        "output does not start at column 0:\n{screen}"
+    );
 }

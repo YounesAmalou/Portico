@@ -9,6 +9,7 @@ use portico::{
     cli::{Cli, run},
     managed::{ConfigPaths, ManagedStore},
     openssh::OpenSsh,
+    picker::TerminalPicker,
 };
 
 fn main() -> ExitCode {
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
     run(
         cli,
         &app,
+        &mut TerminalPicker,
         &mut stdin.lock(),
         &mut io::stdout().lock(),
         // Unlocked: `portico connect` mirrors ssh's stderr from another thread.

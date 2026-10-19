@@ -24,6 +24,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// crossterm asks for the kitty keyboard protocol, then for the device
 /// attributes that every terminal answers.
 const KEYBOARD_QUERY: &[u8] = b"\x1b[?u\x1b[c";
+/// A query for the cursor position, which a terminal answers with `ESC [ row ; column R`.
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 /// The answer of a terminal without the kitty protocol.
 const DEVICE_ATTRIBUTES: &[u8] = b"\x1b[?62;c";
 
@@ -32,6 +34,7 @@ pub enum Key {
     Enter,
     Tab,
     Backspace,
+    Esc,
 }
 
 impl Key {
@@ -40,6 +43,7 @@ impl Key {
             Key::Enter => b"\r",
             Key::Tab => b"\t",
             Key::Backspace => b"\x7f",
+            Key::Esc => b"\x1b",
         }
     }
 }
@@ -192,7 +196,19 @@ impl Terminal {
 
     fn feed(&mut self, data: &[u8]) {
         self.transcript.extend_from_slice(data);
-        self.parser.process(data);
+        // Answer each cursor position query, as the inline picker asks where it starts. The
+        // answer follows what came before the query.
+        let mut rest = data;
+        while let Some(at) = rest
+            .windows(CURSOR_QUERY.len())
+            .position(|window| window == CURSOR_QUERY)
+        {
+            self.parser.process(&rest[..at]);
+            let (row, column) = self.parser.screen().cursor_position();
+            self.write(format!("\x1b[{};{}R", row + 1, column + 1).as_bytes());
+            rest = &rest[at + CURSOR_QUERY.len()..];
+        }
+        self.parser.process(rest);
         if !self.answered
             && self
                 .transcript

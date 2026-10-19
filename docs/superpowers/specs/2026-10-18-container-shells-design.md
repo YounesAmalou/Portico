@@ -99,7 +99,7 @@ portico shell [<container>] [--on <alias>] [-u|--user <user>] [-n|--new-terminal
 
 - Without `--on`, both commands work on this machine.
 - **`portico containers`** prints the grouped list: a project header, then one indented row per container with the display name, container name, image and status. Columns are aligned, and "Other" comes last. When nothing is running it prints `No running containers on <target>.`
-- **`portico shell` without `<container>`** needs an interactive terminal. It opens a picker over the same rows: `fzf` when it is on PATH (one line per container, prefixed with its project, filtering as you type), otherwise a numbered menu read from stdin. Cancelling exits with status 130 and runs nothing. Non-interactive use without `<container>` is an error. `-u`, `-n` and `--on` apply to the chosen container.
+- **`portico shell` without `<container>`** needs an interactive terminal. It opens a picker over the same rows: `fzf` when it is on PATH (one line per container, prefixed with its project, filtering as you type), otherwise a numbered menu read from stdin. Cancelling exits with status 130 and runs nothing. Non-interactive use without `<container>` is an error. `-u`, `-n` and `--on` apply to the chosen container. The picker is replaced by the built-in one of `2026-10-19-fuzzy-pickers-design.md`.
 - `--hold` is hidden and used by the new-terminal launch, as for `connect`.
 - The exit status is the shell's, docker's or ssh's, mapped the way `portico connect` maps it.
 

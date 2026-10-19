@@ -126,8 +126,6 @@ pub struct ContainerPrograms {
     pub sudo: PathBuf,
     pub sg: PathBuf,
     pub sh: PathBuf,
-    /// The CLI's container picker.
-    pub fzf: PathBuf,
 }
 
 impl Default for ContainerPrograms {
@@ -137,7 +135,6 @@ impl Default for ContainerPrograms {
             sudo: "sudo".into(),
             sg: "sg".into(),
             sh: "sh".into(),
-            fzf: "fzf".into(),
         }
     }
 }
@@ -633,7 +630,6 @@ mod tests {
             sudo: program("sudo"),
             sg: program("sg"),
             sh: program("sh"),
-            fzf: program("fzf"),
         });
         app.initialize(true).unwrap();
         app.add(Host::new("dev", "h.example", None, None, None, None).unwrap())
