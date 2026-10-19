@@ -478,3 +478,65 @@ fn json_is_refused_where_it_is_not_offered() {
     let output = fixture.run(&["add", "x", "-H", "x", "--json"]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn an_unset_home_is_an_error_document() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_portico"))
+        .args(["hosts", "--json"])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document,
+        serde_json::json!({
+            "error": { "kind": "other", "message": "HOME is not set", "next": [] },
+            "schema": 1,
+        })
+    );
+    // Without --json it stays text on stderr.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_portico"))
+        .arg("hosts")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"error: HOME is not set\n");
+}
+
+#[test]
+fn start_and_stop_with_an_unreadable_tunnels_file_report_per_name() {
+    let fixture = setup();
+    let tunnels = fixture.env.home().join(".ssh/portico/tunnels");
+    fs::set_permissions(&tunnels, fs::Permissions::from_mode(0o000)).unwrap();
+    let start = fixture.run(&["tunnel", "start", "db", "--json"]);
+    let stop = fixture.run(&["tunnel", "stop", "db", "--json"]);
+    let stop_all = fixture.run(&["tunnel", "stop", "--all", "--json"]);
+    fs::set_permissions(&tunnels, fs::Permissions::from_mode(0o600)).unwrap();
+
+    for (output, name) in [(&start, "start"), (&stop, "stop")] {
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert!(output.stderr.is_empty(), "{name}");
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result = &document["results"][0];
+        assert_eq!(result["name"], "db", "{name}");
+        assert_eq!(result["outcome"], "failed", "{name}");
+        assert_eq!(result["error"]["kind"], "other", "{name}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tunnels"),
+            "{name}: {document}"
+        );
+        assert_eq!(result["tunnel"], Value::Null, "{name}");
+    }
+    // Recorded tunnels can still be stopped; with none running there is nothing to report.
+    assert_eq!(stop_all.status.code(), Some(0));
+    assert!(stop_all.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&stop_all.stdout).unwrap();
+    assert_eq!(document, serde_json::json!({ "results": [], "schema": 1 }));
+}

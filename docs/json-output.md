@@ -29,6 +29,7 @@ Other commands do not accept `--json`. To connect, a consumer runs `portico conn
 - **Paths** are absolute (never shortened with `~`), except where a value is shown as OpenSSH or the user wrote it (`configured`, `identity_file`, `identity_files`). A path that is not valid UTF-8 is converted lossily.
 - **Times** are Unix seconds.
 - **Warnings** are objects with a `message`, the line the human output prints after `Warning:`.
+- **Free text is one line.** Messages, next steps, reasons, warnings, key comments and docker's names, images and statuses never contain a newline, a terminal escape sequence or a control character, so any of them can go in a label as it is. Text from ssh, an agent or docker is cleaned the same way.
 
 ## Errors
 
@@ -46,7 +47,7 @@ A command that fails prints an error document and exits with status 1:
 }
 ```
 
-`message` is one line for people, and `next` the steps that may fix it, in order. `kind` says what failed:
+`message` is one line for people, and `next` the steps that may fix it, in order. When ssh fails in a way Portico has no explanation for, `message` ends with ssh's own last line (`ssh to prod failed: kex_exchange_identification: read: Connection reset`). `kind` says what failed:
 
 | `kind` | When |
 |---|---|
@@ -653,7 +654,7 @@ Containers' commands, mounts, ports and networks are not included. When docker f
 | `error` | An error object when `outcome` is `failed`, otherwise `null` |
 | `tunnel` | The tunnel's report after the action, or `null` when no tunnel has that name |
 
-The exit status is 1 when any result failed. Starting a running tunnel or stopping a stopped one succeeds. `stop --all` stops every running tunnel, and reports none when nothing runs:
+The exit status is 1 when any result failed. Once names are considered, every failure is a result, even an unreadable tunnels file: each name then fails with that message and `tunnel: null`, while `stop` still stops tunnels Portico has records of. The error document is only for a missing name and for failures before any name is considered. Starting a running tunnel or stopping a stopped one succeeds. `stop --all` stops every running tunnel, and reports none when nothing runs:
 
 <!-- golden: tunnel-stop-all.json -->
 ```json
@@ -667,7 +668,7 @@ The exit status is 1 when any result failed. Starting a running tunnel or stoppi
 
 ## What is never printed
 
-No key material and no credential: public keys appear only as type, size, fingerprint and comment. No environment variable's value, except the agent socket path. No command line Portico did not build (no `ProxyCommand`, no container command); the one command line printed is the tunnel's own `ssh` invocation. From logs and ssh's output, only what `portico` prints for people, with terminal control characters removed.
+No key material and no credential: public keys appear only as type, size, fingerprint and comment. No environment variable's value, except the agent socket path. No command line Portico did not build (no `ProxyCommand`, no container command); the one command line printed is the tunnel's own `ssh` invocation. From logs and the output of ssh, agents and docker, only what `portico` prints for people, as one line with terminal control characters removed.
 
 ## Versioning
 

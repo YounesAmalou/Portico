@@ -18,7 +18,7 @@ use crate::{
     identity::{
         Agent, Availability, HostIdentities, Identity, IdentityInventory, Provider, PublicKey,
     },
-    tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning},
+    tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
 };
 
 /// The contract's version: raised only by a breaking change.
@@ -74,8 +74,8 @@ impl Failure {
     fn value(&self) -> Value {
         let mut object = json!({
             "kind": self.kind,
-            "message": self.message,
-            "next": self.next,
+            "message": line(&self.message),
+            "next": self.next.iter().map(|next| line(next)).collect::<Vec<_>>(),
         });
         if let Some(problem) = self.problem {
             object["problem"] = json!(problem);
@@ -102,10 +102,19 @@ impl From<ContainerError> for Failure {
         match error {
             ContainerError::App(error) => error.into(),
             ContainerError::Ssh {
-                alias, explanation, ..
+                alias,
+                explanation,
+                stderr,
             } => match explanation {
                 Some(explanation) => Self::explained("ssh", &explanation),
-                None => Self::new("ssh", format!("ssh to {alias} failed")),
+                // Unexplained: ssh's own last word, as the human output shows its stderr.
+                None => Self::new(
+                    "ssh",
+                    match stderr.lines().map(line).rfind(|said| !said.is_empty()) {
+                        Some(said) => format!("ssh to {alias} failed: {said}"),
+                        None => format!("ssh to {alias} failed"),
+                    },
+                ),
             },
             ContainerError::Docker(issue) => docker_failure(&issue),
             error => Self::new("other", error.to_string()),
@@ -149,6 +158,15 @@ pub(super) fn run(command: JsonCommand, app: &App, output: &mut impl Write) -> E
     }
 }
 
+/// Prints an error document of kind `other` for a failure before any command ran.
+pub(super) fn fail(message: &str, output: &mut impl Write) -> ExitCode {
+    let _ = print(
+        output,
+        json!({ "error": Failure::new("other", message).value() }),
+    );
+    ExitCode::FAILURE
+}
+
 /// Writes `document` with the schema version, pretty-printed, with a final newline.
 fn print(output: &mut impl Write, mut document: Value) -> std::io::Result<()> {
     document["schema"] = json!(SCHEMA);
@@ -184,6 +202,9 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             let report = app.tunnel(&name)?;
             let log = if matches!(report.status, TunnelStatus::Failed { .. }) {
                 app.tunnel_log(&report.tunnel.name, LOG_LINES)
+                    .iter()
+                    .map(|logged| line(logged))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -275,6 +296,21 @@ fn stop_result(app: &App, name: &str) -> Value {
     }
 }
 
+/// Free text from Portico or a child program as one printable line: lines joined with a
+/// space, terminal escape sequences and control characters removed.
+fn line(text: &str) -> String {
+    text.lines()
+        .map(|part| printable(part).trim().to_owned())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An optional free text as one printable line.
+fn optional_line(text: Option<&str>) -> Value {
+    json!(text.map(line))
+}
+
 /// A path as a string; one that is not UTF-8 is converted lossily.
 fn path(path: &Path) -> Value {
     json!(path.to_string_lossy())
@@ -283,7 +319,7 @@ fn path(path: &Path) -> Value {
 fn warnings(warnings: &[DiscoveryWarning]) -> Value {
     warnings
         .iter()
-        .map(|warning| json!({ "message": format_warning(warning) }))
+        .map(|warning| json!({ "message": line(&format_warning(warning)) }))
         .collect()
 }
 
@@ -323,7 +359,7 @@ pub(super) fn details(details: &HostDetails) -> Value {
             }),
             Value::Null,
         ),
-        Err(error) => (Value::Null, json!(error)),
+        Err(error) => (Value::Null, json!(line(error))),
     };
     json!({
         "host": {
@@ -342,7 +378,7 @@ pub(super) fn details(details: &HostDetails) -> Value {
 fn public_key(key: &PublicKey) -> Value {
     json!({
         "bits": key.bits,
-        "comment": key.comment,
+        "comment": line(&key.comment),
         "fingerprint": key.fingerprint,
         "type": key.key_type,
     })
@@ -371,7 +407,7 @@ fn agent(agent: &Agent, list_keys: bool) -> Map<String, Value> {
         } => {
             let mut value = json!({
                 "provider": provider(*name),
-                "reason": reason.describe(),
+                "reason": line(&reason.describe()),
                 "socket": path(socket),
                 "state": "unavailable",
             });
@@ -419,7 +455,7 @@ fn identity(identity: &Identity) -> Value {
         "configured": identity.configured,
         "path": identity.path.as_deref().map(path),
         "public_key": identity.public_key.as_ref().map(public_key),
-        "reason": identity.availability.reason(),
+        "reason": optional_line(identity.availability.reason().as_deref()),
     })
 }
 
@@ -462,7 +498,7 @@ pub(super) fn inventory(inventory: &IdentityInventory) -> Value {
                 "configured": file.configured,
                 "path": file.path.as_deref().map(path),
                 "public_key": file.public_key.as_ref().map(public_key),
-                "reason": file.availability.reason(),
+                "reason": optional_line(file.availability.reason().as_deref()),
                 "used_by": file.used_by,
             })
         })
@@ -470,7 +506,7 @@ pub(super) fn inventory(inventory: &IdentityInventory) -> Value {
     let warnings: Vec<Value> = inventory
         .warnings
         .iter()
-        .map(|warning| json!({ "message": warning }))
+        .map(|warning| json!({ "message": line(warning) }))
         .collect();
     json!({ "agents": agents, "files": files, "warnings": warnings })
 }
@@ -483,13 +519,13 @@ pub(super) fn containers(list: &ContainerList) -> Value {
         .flat_map(|group| group.containers)
         .map(|container| {
             json!({
-                "display_name": display_name(container, all),
+                "display_name": line(&display_name(container, all)),
                 "id": container.id,
-                "image": container.image,
-                "name": container.name,
+                "image": line(&container.image),
+                "name": line(&container.name),
                 "project": container.project,
                 "service": container.service,
-                "status": container.status,
+                "status": line(&container.status),
             })
         })
         .collect();
@@ -499,7 +535,7 @@ pub(super) fn containers(list: &ContainerList) -> Value {
     };
     json!({
         "containers": containers,
-        "note": list.note,
+        "note": optional_line(list.note.as_deref()),
         "skipped": list.listing.skipped,
         "target": target,
         "via": list.via.map(|tool| match tool {
@@ -525,7 +561,7 @@ pub(super) fn status(status: &TunnelStatus) -> Value {
         TunnelStatus::Stopped => json!({}),
         TunnelStatus::Running { pid, started } => json!({ "pid": pid, "started": started }),
         TunnelStatus::Failed { reason, finished } => {
-            json!({ "finished": finished, "reason": reason })
+            json!({ "finished": finished, "reason": line(reason) })
         }
         TunnelStatus::PortInUse { address, by } => json!({ "address": address, "by": by }),
     };
@@ -540,7 +576,7 @@ fn tunnel_warning(warning: &TunnelWarning) -> Value {
             json!({ "kind": "collides-with", "tunnel": tunnel })
         }
     };
-    value["message"] = json!(warning.to_string());
+    value["message"] = json!(line(&warning.to_string()));
     value
 }
 
@@ -770,6 +806,64 @@ mod tests {
         let document = text(json!({ "reason": "\u{1b}[31mred\u{7}" }));
         assert!(document.contains(r#""\u001b[31mred\u0007""#), "{document}");
         assert!(!document.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn free_text_is_one_printable_line() {
+        let raw = "ssh: \u{1b}[31mConnection refused\u{1b}[0m\r\n\tby\u{7} 10.0.0.5\n\n";
+        assert_eq!(line(raw), "ssh: Connection refused by 10.0.0.5");
+        let failure = Failure::from(AppError::Tunnel(TunnelRefusal::Rejected {
+            name: "db".into(),
+            stderr: "Bad local forwarding\nspecification \u{1b}]0;title\u{7}'1:x'".into(),
+        }));
+        let message = failure.value()["message"].as_str().unwrap().to_owned();
+        assert_eq!(
+            message,
+            "OpenSSH rejected tunnel db: Bad local forwarding specification '1:x'"
+        );
+        let value = Value::Object(agent(
+            &Agent::Unavailable {
+                socket: PathBuf::from("/run/agent.sock"),
+                provider: Provider::Generic,
+                reason: crate::identity::AgentProblem::Refused(
+                    "error fetching identities:\n\u{1b}[1mcommunication\u{1b}[0m".into(),
+                ),
+            },
+            false,
+        ));
+        assert_eq!(value["reason"], "error fetching identities: communication");
+        let value = details(&HostDetails {
+            summary: HostSummary {
+                alias: "x".into(),
+                ownership: Ownership::External,
+                source: PathBuf::from("/c"),
+            },
+            declared: None,
+            resolution: Err("ssh exited\nline 2: \u{1b}[2Kbad".into()),
+            identities: None,
+            warnings: Vec::new(),
+        });
+        assert_eq!(value["host"]["resolution_error"], "ssh exited line 2: bad");
+    }
+
+    #[test]
+    fn an_unexplained_ssh_failure_keeps_ssh_s_last_word() {
+        let failure = Failure::from(ContainerError::Ssh {
+            alias: "dev".into(),
+            explanation: None,
+            stderr: "debug noise\n\u{1b}[31mkex_exchange_identification: read: Connection reset\u{1b}[0m\n\n"
+                .into(),
+        });
+        assert_eq!(
+            failure.value()["message"],
+            "ssh to dev failed: kex_exchange_identification: read: Connection reset"
+        );
+        let failure = Failure::from(ContainerError::Ssh {
+            alias: "dev".into(),
+            explanation: None,
+            stderr: String::new(),
+        });
+        assert_eq!(failure.value()["message"], "ssh to dev failed");
     }
 
     #[test]

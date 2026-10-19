@@ -310,6 +310,16 @@ where
     }
 }
 
+/// Reports `message` as the command's failure before anything ran: an error document on
+/// `output` for a `--json` command, otherwise `error: …` on `error`.
+pub fn fail(cli: &Cli, message: &str, output: &mut impl Write, error: &mut impl Write) -> ExitCode {
+    if cli.command.as_ref().and_then(json_command).is_some() {
+        return json::fail(message, output);
+    }
+    let _ = writeln!(error, "error: {message}");
+    ExitCode::FAILURE
+}
+
 /// The command as a `--json` one, when it was given `--json`.
 fn json_command(command: &Command) -> Option<json::JsonCommand> {
     use json::JsonCommand;
