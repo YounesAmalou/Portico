@@ -1006,14 +1006,14 @@ enum Mode {
 /// host field applies an edit only when the result is something that field accepts, so it never
 /// holds text the host model would reject for its characters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TextInput {
+pub(crate) struct TextInput {
     text: String,
     cursor: usize,
     field: Option<HostField>,
 }
 
 impl TextInput {
-    fn new(text: &str) -> Self {
+    pub(crate) fn new(text: &str) -> Self {
         Self {
             text: text.into(),
             cursor: text.len(),
@@ -1032,16 +1032,21 @@ impl TextInput {
         self.field.is_none_or(|field| field.accepts(text))
     }
 
-    fn as_str(&self) -> &str {
+    /// The characters before the cursor, so a terminal cursor can be placed after them.
+    pub(crate) fn cursor_offset(&self) -> usize {
+        self.text[..self.cursor].chars().count()
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
         &self.text
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
     /// Applies an editing key and reports whether the key was an editing key.
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char(character)
                 if !key
@@ -1078,7 +1083,7 @@ impl TextInput {
     /// Inserts pasted text at the cursor. Fields are single-line, so control characters (such as
     /// the newline that ends a copied line) are dropped, and so is whatever the field never
     /// permits. Text that would leave the field in a state it does not accept is refused whole.
-    fn paste(&mut self, text: &str) {
+    pub(crate) fn paste(&mut self, text: &str) {
         self.insert(text);
     }
 
@@ -1114,7 +1119,7 @@ impl TextInput {
     }
 
     /// The text as styled spans, with the character under the cursor reversed when `focused`.
-    fn spans(&self, focused: bool) -> Vec<Span<'static>> {
+    pub(crate) fn spans(&self, focused: bool) -> Vec<Span<'static>> {
         if !focused {
             return vec![Span::raw(self.text.clone())];
         }
