@@ -1,6 +1,6 @@
 # Identity Awareness Design
 
-**Status:** Draft; awaiting review
+**Status:** Approved
 
 ## Purpose
 
@@ -46,6 +46,12 @@ It implements v3 item 4 of `ROADMAP.md`, "Identity awareness", and the first fol
 | any other value | That path |
 
 A socket path that does not exist, or is not a socket, is reported without running `ssh-add`. A listing that times out is reported as "did not answer" with the hint that the agent may be waiting to be unlocked; Portico never retries on its own.
+
+**Locked and confirm-on-use agents.** A locked 1Password, or an agent that confirms each use, may show an unlock prompt for a list request or never answer. Portico therefore:
+
+- runs `ssh-add` with `SSH_AUTH_SOCK` set to the resolved socket, `SSH_ASKPASS` removed and `SSH_ASKPASS_REQUIRE=never`, and stdin null, so the listing itself can never start a prompt from Portico;
+- kills the `ssh-add` child when the 3 s deadline passes, and reaps it, so no listing outlives its request;
+- in the TUI, asks each socket at most once per session (and once more after each refresh), in the background, and never from the host list: moving the cursor reuses the listing once a socket has been asked. A socket whose listing failed or timed out is not asked again until refresh.
 
 **Provider label.** The socket path gives the agent a friendly name, for display only:
 
@@ -135,7 +141,7 @@ pub struct HostIdentities {
 }
 ```
 
-The fingerprint and comment of a public key are what `ssh-add -l` prints to anyone with the socket; they identify a key and grant nothing. The base64 public key blob is not kept. The JSON slice decides field names on the wire; these types are its source.
+The fingerprint and comment of a public key are what `ssh-add -l` prints to anyone with the socket; they identify a key and grant nothing. The base64 public key blob is not kept. The `--json` slice serializes `HostIdentities` and the inventory as they are, so the field and variant names above are chosen to be stable: they are part of that future contract, and renaming one later is a breaking change.
 
 `HostDetails` gains `identities: Option<HostIdentities>` (absent when resolution failed). The pure classification lives in `identity.rs` and is unit-tested against fake listings; the process calls live in `openssh.rs` beside `resolve`.
 
@@ -171,7 +177,7 @@ Identity: other OpenSSH defaults: none present
 Also offered by the agent: 0
 ```
 
-`Resolved IdentityFile` stays as it is, so scripts reading `show` keep working. Fingerprints are printed in full; the TUI shortens them.
+Every line `show` prints today stays byte-for-byte unchanged (`Resolved IdentityFile` included), so scripts reading `show` keep working; the identities block is only appended after them, before the warnings. Fingerprints are printed in full; the TUI shortens them.
 
 **`portico identities`** (new) prints the inventory, agents first:
 
@@ -207,7 +213,8 @@ Only listed  yes
 - `✓` (green) for in agent or key file, `✗` (red) for missing, `?` (yellow) for unchecked; the words are always present, so colour is never the only signal.
 - Fingerprints are shortened to `SHA256:` plus 8 characters with `…`; the comment is shown when it fits.
 - The IdentityFile row of the resolved fields is replaced by this section (it showed the same paths without status). The "Declared by Portico but overridden" note keeps comparing paths as today.
-- The identities are computed by the existing details worker, after `ssh -G`, so the UI never waits for an agent. A slow agent delays only the identities section, which reads `Checking identities…` meanwhile.
+- The identities are computed by the existing details worker, right after `ssh -G`, so the UI never waits for an agent: the details pane reads `Resolving…` as it does today until both are done. Because each socket is asked once per session, only the first host shown with a given agent can wait for it (at most the 3 s deadline); every later host reuses the listing.
+- An agent listing is not interrupted when the selection moves on (the host's `ssh -G` still is): it runs to its result or its deadline and fills the cache, so moving the cursor can never cause the same agent to be asked twice.
 - **Agent cache.** The first listing of a socket is kept for the session and shared by every host using it. `r` / `F5` (refresh) discards it with the other cached details, so loading a key into an agent and pressing `r` shows the change.
 
 **Host form suggestions.** The IdentityFile field of the add and edit forms gets the dropdown the ProxyJump field already has, with the same open, close and key rules (typing opens it when something matches, Ctrl+Space opens it on demand, Enter or Tab picks, Esc closes):
@@ -223,11 +230,11 @@ Only listed  yes
 ## Code layout
 
 - **`src/identity.rs` (new, pure):** the types above; `expand(path, context) -> Result<PathBuf, Token>`; `provider(socket)`; `parse_listing(text) -> Vec<PublicKey>` for both `ssh-add -l` and `ssh-keygen -l` lines (bits, fingerprint, comment with spaces, `(TYPE)`); `classify(...)` building `HostIdentities` from the resolved config, the defaults, file presence and listings; the inventory merge; candidate building for the form.
-- **`src/openssh.rs`:** `ResolvedConfig` gains `identity_agent`, `identities_only`, `pkcs11_provider`; `default_identity_files()`; `list_agent(socket, deadline)` and `fingerprint(pub_path, deadline)`, both run with `ssh-add`/`ssh-keygen` found next to `ssh` like the existing `keygen` path. Nothing here opens a file.
-- **`src/app.rs`:** `host_details` fills `identities`; `identity_inventory()`; an `AgentCache` (socket → listing) owned by the caller so the TUI can keep it per session.
+- **`src/openssh.rs`:** `ResolvedConfig` gains `identity_agent`, `identities_only`, `pkcs11_provider`; `OpenSsh` gains an `ssh-add` program path (`with_ssh_add`, like `with_keygen`) and `default_identity_files()`. Nothing here opens a file.
+- **`src/app/identities.rs` (new):** the process side: `list_agent(socket)` and `fingerprint(pub_path)` with the deadline and the `ssh-add` environment above, the `~/.ssh` scan, `App::identity_inventory()`, and the agent cache (socket → listing) that `App` owns, so a CLI command asks once per process and the TUI once per session; `App::forget_identities()` empties it on refresh. `src/app.rs` only fills `HostDetails::identities` in `show`.
 - **`src/cli.rs`:** the identities block in `show`, and the `identities` command. The new command is one enum variant and one function, to keep the merge with the tunnels slice's new subcommands trivial.
-- **`src/tui/identities.rs` (new):** the details section's rendering and the form's inventory worker. `src/tui.rs` gains only the hooks: the section call in `detail_text`, the IdentityFile field in the existing suggestion code (which becomes field-aware), and the cache reset on refresh.
-- **`src/suggest.rs`:** the `Candidate` origin gains an identity variant, or the ranking is made generic over a label; whichever keeps `rank` unchanged for jump hosts.
+- **`src/tui/identities.rs` (new):** the details section's lines and the form's inventory worker. `src/tui.rs` gains only the hooks: the section in `detail_text`, the IdentityFile field in the existing suggestion code (which becomes field-aware), and the cache reset on refresh.
+- **`src/suggest.rs`:** `Origin` gains `Note(String)`, a label shown as it is, so `rank` serves identity paths unchanged.
 - **`README.md`:** `portico identities`, the identities lines of `show`, the details section, the IdentityFile suggestions, and a short paragraph on what Portico does and does not touch (1Password included).
 
 ## Out of scope
@@ -243,11 +250,13 @@ Only listed  yes
 ## Testing
 
 - **Unit (`identity.rs`):** expansion of `~`, each supported token, `${VAR}` set and unset, unsupported tokens; provider labels for 1Password (Linux and macOS paths), gpg-agent, GNOME Keyring, others; listing parser with spaces in comments, empty comments, `sk` and hybrid types, `The agent has no identities.`; classification for every row of the availability order, including a `.pub` IdentityFile, a private file without `.pub`, defaults collapsed, `IdentitiesOnly` on and off, `IdentityFile none` and `IdentityAgent none`; inventory merge by expanded path with "used by".
-- **Unit (`openssh.rs`):** the extended `ssh -G` parser, against captured output; fake `ssh-add`/`ssh-keygen` scripts for exit statuses 0, 1 and 2 and a deadline overrun.
-- **TUI (unit):** the section's lines and symbols, the `Checking identities…` state, the cache reset on refresh, the IdentityFile dropdown (opens on typing, Ctrl+Space, pick inserts `~/` form, `.pub` vs private offering, recomputed when the worker returns), ProxyJump suggestions unchanged.
+- **Unit (`openssh.rs`):** the extended `ssh -G` parser, against captured output; fake `ssh-add`/`ssh-keygen` scripts for exit statuses 0, 1 and 2 and a deadline overrun: a fake `ssh-add` that sleeps past the deadline is killed, and the test asserts its process is gone; another fake records its environment to prove `SSH_AUTH_SOCK`, `SSH_ASKPASS_REQUIRE=never` and the absence of `SSH_ASKPASS`. `show` keeps every existing line byte-for-byte, asserted against the output before this slice.
+- **TUI (unit):** the section's lines and symbols, the cache reset on refresh, the IdentityFile dropdown (opens on typing, Ctrl+Space, pick inserts `~/` form, `.pub` vs private offering, recomputed when the worker returns), ProxyJump suggestions unchanged.
 - **End to end (`tests/e2e.rs`):** a real `ssh-agent -a <dir>/agent.sock` started for each test and killed afterwards (in a short temporary directory: a Unix socket path is limited to 108 bytes), keys created by the test with `ssh-keygen -N ''` (test set-up, not Portico) and loaded with `ssh-add`. With hosts whose IdentityAgent points at that socket, the tests prove: `show` reports in agent, key file and missing correctly; a `.pub`-only identity whose key is in the agent is "in agent" (the 1Password pattern); `IdentityAgent none` reports disabled; an agent socket that was removed reports unavailable; `portico identities` lists the agent keys and the files with "used by". A guard test proves Portico never opens a private key file: the private key is made unreadable (`chmod 000`) and every result stays the same.
 
-## Questions for the maintainer
+## Decided product questions
 
-1. **Saving an agent key as a `.pub` file.** With 1Password, pinning a host to one key means writing that key's public half to `~/.ssh/<name>.pub` and pointing IdentityFile at it. Portico could offer that from `portico identities` or the form. It writes no secret, but it creates a file outside Portico's own directory, which no slice has done. Recommended: not in this slice; reconsider if users ask.
-2. **An identity indicator in the host list** (for example a `✗` when a host's only identity is missing). It needs `ssh -G` for every host up front, which the list avoids today. Recommended: not in this slice; the details and `portico identities` cover it on demand.
+Settled during review, under the maintainer's delegation:
+
+1. **Saving an agent key as a `.pub` file** (to pin a host to one 1Password key): not in this slice. It is recorded in `ROADMAP.md` as an unscheduled item, because it would be the first file Portico writes outside its own directory.
+2. **An identity indicator in the host list:** not in this slice and not planned. The details pane and `portico identities` cover it on demand, and the list never runs `ssh -G` for every host.
