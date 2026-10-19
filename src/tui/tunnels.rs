@@ -1,7 +1,8 @@
-//! The tunnels screen: the saved tunnels with their status, their add and edit form, and the
+//! The Tunnels tab: the saved tunnels with their status, their add and edit form, and the
 //! worker that starts a tunnel while the interface keeps handling keys.
 
 use std::{
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,17 +15,21 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use super::TextInput;
+use super::{
+    TextInput,
+    dropdown::{SUGGESTION_ROWS, Suggestions, suggestion_lines},
+};
 use crate::{
-    app::{App, AppError, StartOutcome, TunnelChanges, TunnelRefusal},
+    app::{App, AppError, Ownership, StartOutcome, TunnelChanges, TunnelRefusal},
     fuzzy,
     picker::HIT,
+    suggest::{self, Candidate},
     tunnel::{
         Forward, Kind, Tunnel, TunnelError, TunnelField, TunnelReport, TunnelStatus, collisions,
     },
@@ -45,7 +50,7 @@ const FIELDS: [(TunnelField, &str, &str, &str); 7] = [
         TunnelField::Host,
         "Host",
         "prod-db",
-        "The host the tunnel goes through, as you would type it after ssh. Tab completes a known alias.",
+        "The host the tunnel goes through, as you would type it after ssh. Known aliases are suggested as you type; Ctrl+Space lists them.",
     ),
     (
         TunnelField::Kind,
@@ -90,6 +95,8 @@ struct TunnelForm {
     kind: Option<Kind>,
     active: usize,
     error: Option<(TunnelField, String)>,
+    /// The dropdown under Host, while it is open.
+    suggestions: Option<Suggestions>,
 }
 
 impl TunnelForm {
@@ -119,6 +126,7 @@ impl TunnelForm {
             kind: Some(forward.kind),
             active: 0,
             error: None,
+            suggestions: None,
         }
     }
 
@@ -176,8 +184,6 @@ enum Screen {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TunnelAction {
     None,
-    /// Back to the hosts screen.
-    Leave,
     Quit,
     Refresh,
     Start(String),
@@ -197,7 +203,10 @@ pub(super) struct TunnelsScreen {
     /// Each report's command line and log tail, in the same order.
     extras: Vec<(String, Vec<String>)>,
     load_error: Option<String>,
-    hosts: Vec<String>,
+    /// The known host aliases the form's Host field suggests.
+    hosts: Vec<Candidate>,
+    /// The home whose paths the suggestions show as `~`.
+    home: PathBuf,
     visible: Vec<usize>,
     selected: Option<usize>,
     filter: TextInput,
@@ -246,8 +255,19 @@ impl TunnelsScreen {
             }
         }
         if let Ok(inventory) = app.hosts() {
-            self.hosts = inventory.hosts.into_iter().map(|host| host.alias).collect();
+            self.hosts = inventory
+                .hosts
+                .into_iter()
+                .map(|host| Candidate {
+                    alias: host.alias,
+                    origin: match host.ownership {
+                        Ownership::Managed => suggest::Origin::Managed,
+                        Ownership::External => suggest::Origin::External(host.source),
+                    },
+                })
+                .collect();
         }
+        self.home = app.home().to_owned();
         self.refilter();
         if let Some(name) = selected {
             self.select(&name);
@@ -377,6 +397,11 @@ impl TunnelsScreen {
         self.show_log = false;
     }
 
+    /// Whether the table has the keys, rather than the filter, a form or a confirmation.
+    pub(super) fn is_browsing(&self) -> bool {
+        self.screen == Screen::Browse
+    }
+
     pub(super) fn any_running(&self) -> bool {
         self.reports.iter().any(|report| report.status.is_running())
     }
@@ -428,7 +453,11 @@ impl TunnelsScreen {
             Screen::Form if self.form.active != KIND => {
                 let field = FIELDS[self.form.active].0;
                 let text: String = text.chars().filter(|c| field.permits(*c)).collect();
+                let before = self.form.value(self.form.active).to_owned();
                 self.form.values[self.form.active].paste(&text);
+                if self.form.value(self.form.active) != before {
+                    self.suggest(false);
+                }
             }
             _ => {}
         }
@@ -448,10 +477,6 @@ impl TunnelsScreen {
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter = TextInput::new("");
                 self.refilter();
-            }
-            KeyCode::Esc => return TunnelAction::Leave,
-            KeyCode::Char('T') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return TunnelAction::Leave;
             }
             KeyCode::Char('q') => return TunnelAction::Quit,
             KeyCode::Char('r') | KeyCode::F(5) => return TunnelAction::Refresh,
@@ -496,20 +521,42 @@ impl TunnelsScreen {
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) -> TunnelAction {
+        if key.code == KeyCode::Char(' ') && key.modifiers == KeyModifiers::CONTROL {
+            if self.form.active == HOST {
+                self.suggest(true);
+            }
+            return TunnelAction::None;
+        }
+        if let Some(list) = &mut self.form.suggestions {
+            match key.code {
+                KeyCode::Up => {
+                    list.select(list.selected.saturating_sub(1));
+                    return TunnelAction::None;
+                }
+                KeyCode::Down => {
+                    list.select(list.selected + 1);
+                    return TunnelAction::None;
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    self.pick_suggestion();
+                    return TunnelAction::None;
+                }
+                KeyCode::Tab => {
+                    self.pick_suggestion();
+                    return TunnelAction::None;
+                }
+                KeyCode::Esc => {
+                    self.form.suggestions = None;
+                    return TunnelAction::None;
+                }
+                _ => {}
+            }
+        }
         let form = &mut self.form;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
             KeyCode::Up | KeyCode::BackTab => form.step(-1),
-            KeyCode::Down => form.step(1),
-            KeyCode::Tab if form.active == HOST => {
-                match host_matches(&self.hosts, form.value(HOST)).first() {
-                    Some(alias) if alias != form.value(HOST) => {
-                        form.values[HOST] = TextInput::new(alias);
-                    }
-                    _ => form.step(1),
-                }
-            }
-            KeyCode::Tab => form.step(1),
+            KeyCode::Down | KeyCode::Tab => form.step(1),
             KeyCode::Left if form.active == KIND => form.cycle_kind(-1),
             KeyCode::Right | KeyCode::Char(' ') if form.active == KIND => form.cycle_kind(1),
             KeyCode::Enter => {
@@ -543,11 +590,45 @@ impl TunnelsScreen {
                 // Typing never puts a character in a field that the field refuses.
                 if !input.as_str().chars().all(|c| field.permits(c)) {
                     *input = before;
+                } else if input.as_str() != before.as_str() {
+                    self.suggest(false);
                 }
             }
             _ => {}
         }
+        if self.form.active != HOST || self.screen != Screen::Form {
+            self.form.suggestions = None;
+        }
         TunnelAction::None
+    }
+
+    /// Opens, recomputes or closes the Host dropdown for what is typed. `on_demand` (Ctrl+Space)
+    /// opens it even for an empty field or an exact match; afterwards it stays open for an empty
+    /// field for as long as it stays open, but an exact match still closes it.
+    fn suggest(&mut self, on_demand: bool) {
+        let form = &mut self.form;
+        let previous = form.suggestions.take();
+        let forced = on_demand || previous.as_ref().is_some_and(|list| list.forced);
+        if form.active != HOST {
+            return;
+        }
+        let query = form.value(HOST);
+        let items = suggest::rank(query, &self.hosts, &[]);
+        let exact = items
+            .iter()
+            .any(|item| item.alias.eq_ignore_ascii_case(query));
+        if items.is_empty() || (!forced && query.is_empty()) || (!on_demand && exact) {
+            return;
+        }
+        form.suggestions = Some(Suggestions::reopened(previous, items, forced, HOST));
+    }
+
+    /// Fills Host with the selected suggestion and closes the dropdown.
+    fn pick_suggestion(&mut self) {
+        if let Some(list) = self.form.suggestions.take() {
+            self.form.values[HOST] = TextInput::new(&list.items[list.selected].alias);
+            self.form.error = None;
+        }
     }
 
     pub(super) fn footer(&self) -> String {
@@ -564,14 +645,17 @@ impl TunnelsScreen {
                     "o log  "
                 };
                 format!(
-                    "↑↓ move  / filter  {toggle}a add  e edit  x remove  r refresh  {log}T/Esc hosts  q quit"
+                    "↑↓ move  / filter  {toggle}a add  e edit  x remove  r refresh  {log}Tab/1-3 tabs  q quit"
                 )
             }
             Screen::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
+            Screen::Form if self.form.suggestions.is_some() => {
+                "↑↓ choose  Enter pick  Esc close".into()
+            }
             Screen::Form => {
                 let special = match self.form.active {
                     KIND => "  Space/←→ change kind",
-                    HOST => "  Tab complete host",
+                    HOST => "  Ctrl+Space suggest",
                     _ => "",
                 };
                 format!("↑↓ field{special}  Enter save  Esc cancel")
@@ -586,28 +670,22 @@ impl TunnelsScreen {
             .map_or(&[], |(_, log)| log.as_slice())
     }
 
-    pub(super) fn render(&self, frame: &mut Frame<'_>) {
-        let footer = self.footer();
-        let footer_height = (footer.chars().count() as u16)
-            .div_ceil(frame.area().width.max(1))
-            .max(1);
-        let status = self.status.clone().or_else(|| {
+    /// The status line: the last message, otherwise the start in flight.
+    pub(super) fn status_line(&self) -> Option<String> {
+        self.status.clone().or_else(|| {
             self.starting
                 .as_ref()
                 .map(|name| format!("Starting {name}\u{2026} (Esc to cancel)"))
-        });
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(u16::from(status.is_some())),
-                Constraint::Length(footer_height),
-            ])
-            .split(frame.area());
+        })
+    }
+
+    /// Draws the table and the details or form into `area`; the caller draws the status line and
+    /// the footer.
+    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(areas[0]);
+            .split(area);
 
         let mut title = vec![Span::raw("Tunnels /")];
         title.extend(self.filter.spans(self.screen == Screen::Filter));
@@ -639,7 +717,10 @@ impl TunnelsScreen {
                 } else {
                     "Add tunnel"
                 },
-                self.form_lines(),
+                self.form_lines(
+                    usize::from(columns[1].width.saturating_sub(2)),
+                    usize::from(columns[1].height.saturating_sub(2)),
+                ),
             ),
             Screen::ConfirmRemove => (
                 "Remove tunnel",
@@ -656,8 +737,6 @@ impl TunnelsScreen {
                 .block(Block::default().borders(Borders::ALL).title(right_title)),
             columns[1],
         );
-        frame.render_widget(Paragraph::new(status.unwrap_or_default()), areas[1]);
-        frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), areas[2]);
     }
 
     fn table_lines(&self) -> Vec<ListItem<'static>> {
@@ -767,7 +846,9 @@ impl TunnelsScreen {
         lines
     }
 
-    fn form_lines(&self) -> Vec<Line<'static>> {
+    /// The form's lines for a pane of `width` columns and `height` rows inside its border; only
+    /// the Host dropdown adapts to them.
+    fn form_lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
         let form = &self.form;
         let dim = Style::default().add_modifier(Modifier::DIM);
         let mut lines = Vec::new();
@@ -804,11 +885,15 @@ impl TunnelsScreen {
                     Style::default().fg(Color::Red),
                 ));
             }
-            if row == HOST && focused {
-                let matches = host_matches(&self.hosts, form.value(HOST));
-                if !matches.is_empty() && !matches.iter().any(|alias| alias == form.value(HOST)) {
-                    lines.push(Line::styled(format!("    {}", matches.join("  ")), dim));
-                }
+            if row == HOST
+                && let Some(list) = &form.suggestions
+            {
+                // Fields, the dropdown's borders, and the blank line and hint under it stay on
+                // screen.
+                let rows = height
+                    .saturating_sub(form.rows().len() + 4)
+                    .clamp(1, SUGGESTION_ROWS);
+                lines.extend(suggestion_lines(list, label, &self.home, width, rows));
             }
             if row == 4
                 && let Ok(forward) = form.forward()
@@ -850,19 +935,6 @@ impl TunnelsScreen {
         }
         lines
     }
-}
-
-/// The aliases matching what is typed, best first, at most six.
-fn host_matches(hosts: &[String], typed: &str) -> Vec<String> {
-    if typed.is_empty() {
-        return Vec::new();
-    }
-    let rows: Vec<[&str; 1]> = hosts.iter().map(|alias| [alias.as_str()]).collect();
-    fuzzy::rank(typed, rows.iter().map(|row| row.as_slice()))
-        .into_iter()
-        .take(6)
-        .map(|(index, _)| hosts[index].clone())
-        .collect()
 }
 
 fn status_span(status: &TunnelStatus) -> Span<'static> {
@@ -996,6 +1068,13 @@ pub(super) mod tests {
         }
     }
 
+    fn candidate(alias: &str, origin: suggest::Origin) -> Candidate {
+        Candidate {
+            alias: alias.into(),
+            origin,
+        }
+    }
+
     pub(in crate::tui) fn screen_with(reports: Vec<TunnelReport>) -> TunnelsScreen {
         let mut screen = TunnelsScreen {
             extras: reports
@@ -1003,7 +1082,15 @@ pub(super) mod tests {
                 .map(|_| ("ssh -f -N".to_owned(), Vec::new()))
                 .collect(),
             reports,
-            hosts: vec!["prod".into(), "prod-db".into(), "staging".into()],
+            hosts: vec![
+                candidate("prod", suggest::Origin::Managed),
+                candidate("prod-db", suggest::Origin::Managed),
+                candidate(
+                    "staging",
+                    suggest::Origin::External("/home/u/.ssh/config".into()),
+                ),
+            ],
+            home: "/home/u".into(),
             ..TunnelsScreen::default()
         };
         screen.refilter();
@@ -1090,8 +1177,12 @@ pub(super) mod tests {
         type_text(&mut screen, "stag");
         screen.handle_key(key(KeyCode::Tab));
         assert_eq!(screen.form.value(HOST), "staging");
+        assert!(
+            screen.form.suggestions.is_none(),
+            "a pick closes the dropdown"
+        );
         screen.handle_key(key(KeyCode::Tab));
-        assert_eq!(screen.form.active, KIND, "a completed host moves on");
+        assert_eq!(screen.form.active, KIND, "Tab without a dropdown moves on");
         screen.handle_key(key(KeyCode::Char(' ')));
         screen.handle_key(key(KeyCode::Right));
         assert_eq!(screen.form.kind(), Kind::Dynamic);
@@ -1155,17 +1246,17 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn t_and_esc_leave_and_q_quits() {
+    fn esc_never_leaves_and_q_quits() {
         let mut screen = screen_with(vec![report("db", TunnelStatus::Stopped)]);
+        assert!(screen.is_browsing());
+        assert_eq!(screen.handle_key(key(KeyCode::Esc)), TunnelAction::None);
         assert_eq!(
             screen.handle_key(key(KeyCode::Char('T'))),
-            TunnelAction::Leave
+            TunnelAction::None
         );
-        assert_eq!(
-            screen.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
-            TunnelAction::Leave
-        );
-        assert_eq!(screen.handle_key(key(KeyCode::Esc)), TunnelAction::Leave);
+        screen.handle_key(key(KeyCode::Char('/')));
+        assert!(!screen.is_browsing(), "the filter takes the keys");
+        screen.handle_key(key(KeyCode::Esc));
         assert_eq!(
             screen.handle_key(key(KeyCode::Char('q'))),
             TunnelAction::Quit
@@ -1222,5 +1313,108 @@ pub(super) mod tests {
             .map(|line| line.to_string())
             .collect();
         assert!(text.contains(&"  line 1".to_owned()));
+    }
+
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    fn host_form() -> TunnelsScreen {
+        let mut screen = screen_with(Vec::new());
+        screen.handle_key(key(KeyCode::Char('a')));
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(screen.form.active, HOST);
+        screen
+    }
+
+    fn suggested(screen: &TunnelsScreen) -> Vec<&str> {
+        screen
+            .form
+            .suggestions
+            .as_ref()
+            .map_or_else(Vec::new, |list| {
+                list.items.iter().map(|item| item.alias.as_str()).collect()
+            })
+    }
+
+    #[test]
+    fn the_host_dropdown_opens_while_typing_and_closes_on_an_exact_match() {
+        let mut screen = host_form();
+        assert!(
+            screen.form.suggestions.is_none(),
+            "nothing typed, nothing listed"
+        );
+        type_text(&mut screen, "pro");
+        assert_eq!(suggested(&screen), ["prod", "prod-db"]);
+        assert_eq!(screen.footer(), "↑↓ choose  Enter pick  Esc close");
+        type_text(&mut screen, "d");
+        assert!(
+            screen.form.suggestions.is_none(),
+            "an exact match needs no list"
+        );
+        screen.handle_key(key(KeyCode::Backspace));
+        assert_eq!(suggested(&screen), ["prod", "prod-db"]);
+        screen.handle_key(key(KeyCode::Up));
+        assert!(screen.form.suggestions.is_some(), "Up chooses in the list");
+        assert_eq!(screen.form.active, HOST);
+    }
+
+    #[test]
+    fn ctrl_space_opens_the_host_dropdown_on_demand() {
+        let mut screen = host_form();
+        assert!(screen.footer().contains("Ctrl+Space suggest"));
+        screen.handle_key(ctrl(' '));
+        assert_eq!(suggested(&screen), ["prod", "prod-db", "staging"]);
+        let text = screen
+            .form_lines(60, 30)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("│> prod "), "{text}");
+        assert!(text.contains("managed"), "{text}");
+        assert!(text.contains("~/.ssh/config"), "{text}");
+        screen.handle_key(ctrl(' '));
+        assert!(screen.form.suggestions.is_some());
+        // Ctrl+Space elsewhere does nothing.
+        screen.handle_key(key(KeyCode::Esc));
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(ctrl(' '));
+        assert!(screen.form.suggestions.is_none());
+    }
+
+    #[test]
+    fn enter_picks_esc_closes_and_a_second_esc_cancels() {
+        let mut screen = host_form();
+        type_text(&mut screen, "pr");
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            TunnelAction::None,
+            "Enter picks rather than saves"
+        );
+        assert_eq!(screen.form.value(HOST), "prod-db");
+        assert!(screen.form.suggestions.is_none());
+        screen.handle_key(key(KeyCode::Backspace));
+        assert!(screen.form.suggestions.is_some());
+        screen.handle_key(key(KeyCode::Esc));
+        assert!(screen.form.suggestions.is_none());
+        assert_eq!(
+            screen.screen,
+            Screen::Form,
+            "the first Esc only closes the list"
+        );
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.screen, Screen::Browse);
+    }
+
+    #[test]
+    fn pasting_into_host_opens_the_dropdown_and_leaving_the_field_closes_it() {
+        let mut screen = host_form();
+        screen.paste("sta");
+        assert_eq!(suggested(&screen), ["staging"]);
+        screen.handle_key(key(KeyCode::BackTab));
+        assert!(screen.form.suggestions.is_none());
+        assert_eq!(screen.form.active, 0);
     }
 }

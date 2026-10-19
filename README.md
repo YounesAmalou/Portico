@@ -17,7 +17,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Prints one versioned JSON document per command for scripts and desktop panels.
 - Comes with a desktop panel for Quickshell and Omarchy to open hosts and container shells in a new terminal and to start and stop tunnels.
-- Provides a master-detail TUI when run without a subcommand.
+- Provides a TUI with Hosts, Tunnels and Containers tabs when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
@@ -358,6 +358,21 @@ Connecting runs `portico connect --new-terminal`, so the terminal is the one `xd
 
 ## TUI keys
 
+The TUI has three tabs, shown at the top with their numbers: **Hosts**, **Tunnels** and **Containers**. It opens on Hosts. Each tab keeps its own selection, filter, scroll and open form while you look at another one, and a test, listing or tunnel start keeps running when you switch away.
+
+| Key | Action |
+|---|---|
+| `1` / `2` / `3` | Show the Hosts, Tunnels or Containers tab |
+| `Tab` / `Shift+Tab` | Show the next or previous tab |
+| `T` | Show the Tunnels tab |
+| `c` | Show the Containers tab; on the Hosts tab, for the selected host |
+| `r` / `F5` | Refresh the tab shown |
+| `q` | Quit (running tunnels keep running) |
+
+These keys work while a tab is browsing its list. In a filter, a form or a picker, digits are typed and `Tab` moves between fields or picks a suggestion; a confirmation, the trust prompt and the adopt and export checklist keep their own keys until you answer them. `Esc` never switches tabs.
+
+### Hosts tab
+
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move through hosts |
@@ -371,11 +386,8 @@ Connecting runs `portico connect --new-terminal`, so the terminal is the one `xd
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
 | `m` | Adopt the selected external host, or export the selected managed host, after a preview |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
-| `c` | Show the selected host's containers in the containers panel (the focus stays on the hosts) |
-| `Tab` / `Shift+Tab` | Move the focus between the hosts and the containers panel; this never lists anything |
-| `T` | Open the tunnels screen |
+| `c` | Show the selected host's containers on the Containers tab |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
-| `q` | Quit |
 
 In the filter and the host form, type normally: `Backspace` and `Delete` erase text, `←` / `→` / `Home` / `End` move the cursor, `Enter` applies the filter or saves the form, and `Esc` cancels.
 Form errors appear next to the field they belong to. `ProxyJump` takes `[user@]host[:port]` or an existing alias, with commas between several hops and no spaces.
@@ -391,27 +403,14 @@ Under the resolved fields, the details list the host's identities as `portico sh
 
 A test shows `✓` or `✗` beside the host and its result in the details until the host is edited or removed or the inventory is refreshed. `Esc` cancels a running test. An unknown host key opens a prompt showing its fingerprint: `y` trusts it and tests again, `n` or `Esc` declines. If you have moved on by the time the result arrives (into the filter or a form, say), no prompt interrupts you: the host is marked untrusted, and `t` tests it again to review the key. Editing a form cancels its running test.
 
-The containers panel sits under the hosts and shows this machine's containers, listed when the TUI starts. `c` in the hosts panel shows the selected host's containers instead, and `L` in the panel comes back to this machine; moving through the hosts never changes it. `c` and `L` list a target the first time and after a failed listing, and otherwise show the result kept for the session; `r` lists again. Its details show the selected container. Keys in the panel:
-
-| Key | Action |
-|---|---|
-| `↑` / `↓` / `j` / `k` | Move through containers |
-| `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, as the hosts filter matches |
-| `Enter` | Open a shell in this terminal |
-| `n` | Open a shell in a new terminal |
-| `u` | Set the user for the next shell (empty means the image's user; not saved) |
-| `r` | List again |
-| `L` | Show this machine's containers again |
-| `g` / `s` | Add yourself to the docker group / start docker, shown only when the error offers it |
-| `Esc` | Cancel a listing, otherwise clear the applied filter, otherwise back to the hosts |
-| `Tab` / `Shift+Tab` | Back to the hosts |
-| `q` | Quit |
-
-The filter edits like the hosts filter: `Enter` applies it and `Esc` cancels the edit. The panel's title shows it, a Compose project's header stays only while one of its containers matches, and showing another target clears it.
-
 The `m` checklist shows every host, dimming those that cannot move with the reason. `Space` marks a host, `a` marks every shown host that can move (again to unmark), and `/` filters with the hosts filter's keys; marks stay when the filter hides them, and `Enter` previews every marked host. `Esc` clears an applied filter, otherwise closes the checklist.
 
-The tunnels screen (`T`) lists the saved tunnels with their status, and the selected one's details: its command line, the status with its PID and age, warnings, and the end of ssh's log after a failure. The statuses are re-read every 2 seconds while the screen is shown, from local state only. Running tunnels keep running after you quit, and the screen says so while any runs. Keys on the tunnels screen:
+External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
+Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
+
+### Tunnels tab
+
+The Tunnels tab lists the saved tunnels with their status, and the selected one's details: its command line, the status with its PID and age, warnings, and the end of ssh's log after a failure. The statuses are re-read when you open the tab and every 2 seconds while it is shown, from local state only. Running tunnels keep running after you quit, and the tab says so while any runs.
 
 | Key | Action |
 |---|---|
@@ -423,13 +422,28 @@ The tunnels screen (`T`) lists the saved tunnels with their status, and the sele
 | `x` | Remove the selected tunnel, after a confirmation (not while it runs) |
 | `r` / `F5` | Re-read the tunnels and their status |
 | `o` | Show the whole log of a failed tunnel, or its last lines again |
-| `T` / `Esc` | Back to the hosts (`Esc` first clears an applied filter) |
-| `q` | Quit |
+| `Esc` | Clear the applied filter |
 
-In the tunnel form, `↑` / `↓` (or `Tab`) move between fields: name, host, kind, bind address, bind port, target host and target port (a dynamic forward has no target). `Space` or `←` / `→` changes the kind, `Tab` in the host field completes a known alias, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
+In the tunnel form, `↑` / `↓` (or `Tab` / `Shift+Tab`) move between fields: name, host, kind, bind address, bind port, target host and target port (a dynamic forward has no target). While you type a host, a dropdown lists the known hosts that match, as the ProxyJump field does: `↑` / `↓` choose, `Enter` or `Tab` fills in the alias, `Esc` closes the list (a second `Esc` cancels the form), and `Ctrl+Space` opens it before you type. `Space` or `←` / `→` changes the kind, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
 
-External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
-Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
+### Containers tab
+
+The Containers tab lists the containers of one target, shown on its first line: `Target: this machine` or `Target: <alias>`. Nothing is listed when the TUI starts: this machine's containers are listed the first time you open the tab. `c` on the Hosts tab targets the selected host, `h` picks the target with the fuzzy picker (this machine first, then every host), and `L` comes back to this machine. A target is listed the first time it is shown and after a failed listing, and otherwise shows the result kept for the session; `r` or `F5` lists again. Only the target shown is ever listed. The right side shows the selected container.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` / `j` / `k` | Move through containers |
+| `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, as the hosts filter matches |
+| `Enter` | Open a shell in this terminal |
+| `n` | Open a shell in a new terminal |
+| `u` | Set the user for the next shell (empty means the image's user; not saved) |
+| `h` | Pick the target: type to narrow, `↑` / `↓` choose, `Enter` picks, `Esc` keeps the current one |
+| `L` | Show this machine's containers again |
+| `r` / `F5` | List again |
+| `g` / `s` | Add yourself to the docker group / start docker, shown only when the error offers it |
+| `Esc` | Cancel a listing, otherwise clear the applied filter |
+
+The filter edits like the hosts filter: `Enter` applies it and `Esc` cancels the edit. The list's title shows it, a Compose project's header stays only while one of its containers matches, and showing another target clears it.
 
 ## Development checks
 

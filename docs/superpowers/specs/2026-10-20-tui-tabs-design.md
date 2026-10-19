@@ -1,6 +1,6 @@
 # TUI Tabs Design
 
-**Status:** Draft; awaiting review
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -188,6 +188,19 @@ Per tab, the existing keys are kept, except:
 - **PTY acceptance (`tests/support/tui_pty.py`, a new scenario run from `tests/acceptance.rs`):** on a real terminal, the tab bar is drawn, `2` shows the tunnels table, `3` shows the containers tab and lists this machine (a fake `docker`), Tab wraps back to Hosts, `/` then `2` types a `2` into the hosts filter, and `q` quits.
 - The existing tests that use Tab to focus the containers panel or `T`/Esc to leave the tunnels screen are rewritten for the tabs.
 
-## Questions for the maintainer
+## Removed behaviour
 
-1. **`c` on the Tunnels tab.** As settled above it only switches to the Containers tab. It could instead target the selected tunnel's host, which is handy for "what is running behind this forward" but makes `c` mean three things. Proposed: keep it a plain switch.
+No browse-mode binding on any of the three surfaces uses `1`, `2` or `3` today, so the digits take nothing away. Tab, Esc and the start-up listing do change:
+
+- **Tab and Shift+Tab** no longer move the focus between the hosts list and the containers panel (there is no panel under the hosts any more); they switch tabs.
+- **`T` and Esc on the tunnels screen** no longer return to the hosts; `T` there does nothing, Esc only clears the filter or cancels a start.
+- **Tab, Shift+Tab and Esc in the containers panel** no longer return to the hosts; Esc only cancels a listing or clears the filter.
+- **This machine's containers** are no longer listed when the TUI starts, only once the Containers tab is first shown.
+- **The tunnel form's hidden Tab completion** of the Host field is replaced by the visible dropdown; Tab without the dropdown moves to the next field.
+
+The changelog line is the pull request title; the README describes each of these.
+
+## Decided in review
+
+1. **`c` on the Tunnels tab** is a plain switch to the Containers tab; it does not retarget.
+2. **Narrow terminals:** the tab bar never wraps and always shows the active tab. When the full labels do not fit, the inactive tabs shorten to their numbers (`1 │ [2 Tunnels] │ 3`), and if even that does not fit only the active tab is drawn. A 40-column render is tested.

@@ -1,8 +1,8 @@
-//! The containers panel under the hosts: what it lists, its keys, and how it reads.
+//! The containers tab: the target it lists, its keys, and how it reads.
 
 use std::{cell::Cell, collections::HashMap};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -14,7 +14,7 @@ use crate::{
     container::{Container, GroupTool, display_name, group, remote_command},
     fuzzy,
     openssh::ConnectionOutcome,
-    picker::HIT,
+    picker::{HIT, Outcome, Row, Single, State},
 };
 
 /// Why a target could not be listed, as the panel shows it.
@@ -35,8 +35,9 @@ pub(super) enum PanelState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PanelAction {
     None,
-    Leave,
     Quit,
+    /// Asks for the target picker, which needs the hosts the panel does not know.
+    ChooseTarget,
     List(Target),
     CancelList,
     Shell {
@@ -52,7 +53,22 @@ pub(super) enum PanelAction {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+/// The open target picker and the target of each of its rows.
+pub(super) struct TargetPicker {
+    picker: Single,
+    targets: Vec<Target>,
+}
+
+impl std::fmt::Debug for TargetPicker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TargetPicker")
+            .field("targets", &self.targets)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
 pub(super) struct Panel {
     /// The host whose containers are shown, or this machine when `None`.
     host: Option<String>,
@@ -70,10 +86,14 @@ pub(super) struct Panel {
     /// The first line shown when the lines outgrow the panel, moved only as far as the
     /// selection needs.
     scroll: Cell<usize>,
+    /// The target picker, while it is open.
+    picker: Option<TargetPicker>,
+    /// The last shell's or fix's outcome, until the next key.
+    status: Option<String>,
 }
 
 impl Panel {
-    /// The machine whose containers the panel shows: this one until `c` picks a host.
+    /// The machine whose containers the panel shows: this one until `c`, or `h`, picks a host.
     pub(super) fn target(&self) -> Target {
         self.host.clone().map_or(Target::Local, Target::Host)
     }
@@ -97,7 +117,70 @@ impl Panel {
         }
     }
 
+    /// Whether the list has the keys, rather than the filter, the user or the target picker.
+    pub(super) fn is_browsing(&self) -> bool {
+        !self.editing_filter && !self.editing_user && self.picker.is_none()
+    }
+
+    pub(super) fn set_status(&mut self, status: Option<String>) {
+        self.status = status;
+    }
+
+    pub(super) fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    /// Opens the target picker: this machine first, then each host `(alias, origin)`.
+    pub(super) fn choose_target(&mut self, hosts: Vec<(String, String)>) {
+        let mut rows = vec![Row {
+            fields: vec!["this machine".into()],
+            extra: Vec::new(),
+        }];
+        let mut targets = vec![Target::Local];
+        for (alias, origin) in hosts {
+            rows.push(Row {
+                fields: vec![alias.clone()],
+                extra: vec![origin],
+            });
+            targets.push(Target::Host(alias));
+        }
+        self.picker = Some(TargetPicker {
+            picker: Single::new("target", rows),
+            targets,
+        });
+    }
+
+    /// Draws the open target picker into `area`.
+    pub(super) fn render_picker(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+    ) {
+        if let Some(open) = &self.picker {
+            open.picker.render(frame, area);
+        }
+    }
+
+    pub(super) fn picker_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> PanelAction {
+        self.status = None;
+        if let Some(open) = &mut self.picker {
+            return match open.picker.handle_key(key) {
+                Outcome::Continue => PanelAction::None,
+                Outcome::Cancelled => {
+                    self.picker = None;
+                    PanelAction::None
+                }
+                Outcome::Picked(rows) => {
+                    let target = open.targets[rows[0]].clone();
+                    self.picker = None;
+                    self.show(target)
+                }
+            };
+        }
         if self.editing_filter {
             match key.code {
                 KeyCode::Enter => self.editing_filter = false,
@@ -139,10 +222,12 @@ impl Panel {
                 self.set_filter(TextInput::default());
                 PanelAction::None
             }
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => PanelAction::Leave,
             KeyCode::Char('q') => PanelAction::Quit,
             KeyCode::Char('L') => self.show(Target::Local),
-            KeyCode::Char('r') => PanelAction::List(target),
+            KeyCode::Char('h') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                PanelAction::ChooseTarget
+            }
+            KeyCode::Char('r') | KeyCode::F(5) => PanelAction::List(target),
             KeyCode::Char('/') => {
                 self.filter_before_edit = self.filter.as_str().to_owned();
                 self.filter.cursor = self.filter.as_str().len();
@@ -196,7 +281,9 @@ impl Panel {
     /// Pastes into the filter or the user while it is being edited; otherwise a paste means
     /// nothing here.
     pub(super) fn paste(&mut self, text: &str) {
-        if self.editing_filter {
+        if let Some(open) = &mut self.picker {
+            open.picker.paste(text);
+        } else if self.editing_filter {
             let mut filter = self.filter.clone();
             filter.paste(text);
             self.set_filter(filter);
@@ -270,9 +357,20 @@ impl Panel {
         self.selected = self.selected.min(count.saturating_sub(1));
     }
 
-    /// `Containers: <target> /<filter>`, with the filter's cursor while it is edited.
+    /// `Target: <target>` and the keys that change it, for the tab's first line.
+    pub(super) fn target_line(&self) -> Line<'static> {
+        Line::from(vec![
+            Span::raw(format!("Target: {}", self.target())),
+            Span::styled(
+                "   h change  L this machine",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])
+    }
+
+    /// `Containers /<filter>`, with the filter's cursor while it is edited.
     pub(super) fn title(&self) -> Line<'static> {
-        let mut title = vec![Span::raw(format!("Containers: {} /", self.target()))];
+        let mut title = vec![Span::raw("Containers /")];
         title.extend(self.filter.spans(self.editing_filter));
         Line::from(title)
     }
@@ -445,7 +543,9 @@ impl Panel {
     }
 
     pub(super) fn footer(&self) -> String {
-        if self.editing_filter {
+        if self.picker.is_some() {
+            "type to search  ↑↓ choose  Enter pick  Esc cancel".into()
+        } else if self.editing_filter {
             "type to filter  ←→ move  Enter apply  Esc cancel".into()
         } else if self.editing_user {
             "Enter apply  Esc cancel".into()
@@ -456,7 +556,7 @@ impl Panel {
                 "  Esc clear filter"
             };
             format!(
-                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
             )
         }
     }
@@ -782,10 +882,14 @@ mod tests {
     fn starts_on_this_machine_and_l_comes_back_to_it() {
         let mut panel = Panel::default();
         assert_eq!(panel.target(), Target::Local);
-        assert_eq!(panel.title().to_string(), "Containers: this machine /");
+        assert_eq!(panel.title().to_string(), "Containers /");
+        assert_eq!(
+            panel.target_line().to_string(),
+            "Target: this machine   h change  L this machine"
+        );
         panel.show(host("dev"));
         assert_eq!(panel.target(), host("dev"));
-        assert_eq!(panel.title().to_string(), "Containers: dev /");
+        assert_eq!(panel.title().to_string(), "Containers /");
 
         assert_eq!(
             press(&mut panel, KeyCode::Char('L')),
@@ -906,15 +1010,17 @@ mod tests {
         );
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
             PanelAction::Shell { user: None, .. }
         ));
-        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::Leave);
-        assert_eq!(press(&mut panel, KeyCode::Tab), PanelAction::Leave);
-        assert_eq!(press(&mut panel, KeyCode::BackTab), PanelAction::Leave);
+        assert_eq!(
+            press(&mut panel, KeyCode::Esc),
+            PanelAction::None,
+            "Esc never leaves the tab"
+        );
         assert_eq!(
             press(&mut panel, KeyCode::Char('r')),
             PanelAction::List(host("dev"))
@@ -1449,10 +1555,10 @@ mod tests {
     fn filter_edit_esc_restores_and_esc_clears() {
         let mut panel = listed_panel();
         type_filter(&mut panel, "db");
-        assert_eq!(panel.title().to_string(), "Containers: dev /db");
+        assert_eq!(panel.title().to_string(), "Containers /db");
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
         );
 
         press(&mut panel, KeyCode::Char('/'));
@@ -1464,19 +1570,19 @@ mod tests {
         press(&mut panel, KeyCode::Backspace);
         assert_eq!(press(&mut panel, KeyCode::Char('q')), PanelAction::None);
         panel.paste("uu\n");
-        assert_eq!(panel.title().to_string(), "Containers: dev /quu ");
+        assert_eq!(panel.title().to_string(), "Containers /quu ");
         assert_eq!(
             texts(&panel.lines(false, 100, 200)),
             ["No containers match \"quu\"."]
         );
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None);
-        assert_eq!(panel.title().to_string(), "Containers: dev /db");
+        assert_eq!(panel.title().to_string(), "Containers /db");
         assert_eq!(texts(&panel.lines(false, 100, 200)).len(), 2);
 
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None, "clears");
-        assert_eq!(panel.title().to_string(), "Containers: dev /");
+        assert_eq!(panel.title().to_string(), "Containers /");
         assert_eq!(texts(&panel.lines(false, 100, 200)).len(), 7);
-        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::Leave);
+        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None);
     }
 
     #[test]
@@ -1511,13 +1617,13 @@ mod tests {
         press(&mut panel, KeyCode::Down);
         type_filter(&mut panel, "web");
         panel.show(host("dev"));
-        assert_eq!(
-            panel.title().to_string(),
-            "Containers: dev /web",
-            "same target"
-        );
+        assert_eq!(panel.title().to_string(), "Containers /web", "same target");
         panel.show(Target::Local);
-        assert_eq!(panel.title().to_string(), "Containers: this machine /");
+        assert_eq!(panel.title().to_string(), "Containers /");
+        assert_eq!(
+            panel.target_line().to_string(),
+            "Target: this machine   h change  L this machine"
+        );
         panel.finish(Target::Local, Ok(list(Target::Local, containers())));
         assert_eq!(texts(&panel.lines(false, 100, 200))[1], "> api  Up 2 hours");
     }

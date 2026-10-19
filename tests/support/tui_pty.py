@@ -260,6 +260,25 @@ def check_terminal(scenario):
             read_screen("Testing dev\u2026 (Esc to cancel)")
             read_screen("\u2713 dev")
             assert "Testing dev" not in screen.text()
+        elif scenario == "tabs":
+            read_screen("1 Hosts")
+            # The Containers tab lists this machine only once it is shown.
+            time.sleep(0.3)
+            assert not Path(home, "docker-called").exists(), "listed before the tab was shown"
+            os.write(master, b"2")
+            read_screen("Tunnels /")
+            os.write(master, b"3")
+            read_screen("Target: this machine")
+            deadline = time.monotonic() + 5
+            while not Path(home, "docker-called").exists():
+                assert time.monotonic() < deadline, "the Containers tab listed nothing"
+                time.sleep(0.01)
+            os.write(master, b"\t")
+            read_screen("Hosts /")
+            # A digit in the filter is text, not a tab switch.
+            os.write(master, b"/2")
+            read_screen("Hosts /2")
+            os.write(master, b"\r")
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")

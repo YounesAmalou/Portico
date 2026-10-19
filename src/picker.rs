@@ -68,8 +68,9 @@ impl Picker for TerminalPicker {
     }
 }
 
-/// What the terminal loop needs of a picker.
-trait State {
+/// What the terminal loop (or the TUI, which draws one over its containers tab) needs of a
+/// picker.
+pub(crate) trait State {
     fn handle_key(&mut self, key: KeyEvent) -> Outcome;
     fn paste(&mut self, text: &str);
     fn height(&self, max: u16) -> u16;
