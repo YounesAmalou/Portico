@@ -140,8 +140,8 @@ pub fn apply(value: &str, hop: &Hop, alias: &str) -> (String, usize) {
 pub fn origin_label(origin: &Origin, home: Option<&Path>) -> String {
     match origin {
         Origin::Managed => "managed".into(),
-        Origin::External(path) => match home.and_then(|home| path.strip_prefix(home).ok()) {
-            Some(rest) => format!("~/{}", rest.display()),
+        Origin::External(path) => match home {
+            Some(home) => crate::home::tilde(path, home),
             None => path.display().to_string(),
         },
         Origin::Note(note) => note.clone(),

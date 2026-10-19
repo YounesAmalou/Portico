@@ -376,6 +376,7 @@ fn rejected(rejection: &ConfigRejection, context: &Context<'_>) -> Parts {
             path,
             line,
             message,
+            ..
         } => parts
             .fact(Label::File, shorten(&path.display().to_string(), home))
             .fact(Label::Line, format!("{line} ({message})"))
@@ -433,16 +434,7 @@ fn with_address(parts: Parts, context: &Context<'_>) -> Parts {
 
 /// Shows a path under `home` with `~`.
 fn shorten(path: &str, home: &Path) -> String {
-    match Path::new(path).strip_prefix(home) {
-        Ok(rest) if !home.as_os_str().is_empty() => {
-            if rest.as_os_str().is_empty() {
-                "~".into()
-            } else {
-                format!("~/{}", rest.display())
-            }
-        }
-        _ => path.to_string(),
-    }
+    crate::home::tilde(Path::new(path), home)
 }
 
 /// Breaks `text` into lines of at most `width` columns at spaces; a longer word keeps its own line.
@@ -815,6 +807,7 @@ mod tests {
             path: "/home/me/.ssh/config".into(),
             line: 12,
             message: "Bad configuration option: bogus".into(),
+            home: home(),
         });
         assert_eq!(
             by_hand(user_file, Operation::Test),

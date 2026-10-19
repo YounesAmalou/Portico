@@ -479,6 +479,7 @@ impl App {
                 let managed = &self.store.paths().managed;
                 // ssh read the user's own configuration; nothing was staged.
                 let files = ConfigFiles {
+                    home: self.home(),
                     managed,
                     managed_text: &read_lossy(managed),
                     entry: None,
@@ -641,6 +642,7 @@ impl App {
                     .alias;
                 let managed = &self.store.paths().managed;
                 let files = ConfigFiles {
+                    home: self.home(),
                     managed,
                     managed_text: &read_lossy(managed),
                     entry: None,
@@ -754,8 +756,7 @@ impl App {
 
     /// The user's home directory as the configuration paths know it.
     pub fn home(&self) -> &Path {
-        let paths = self.store.paths();
-        paths.ssh_dir.parent().unwrap_or(&paths.ssh_dir)
+        self.store.paths().home()
     }
 
     /// The test result for a configuration OpenSSH refused before it could connect.
@@ -1217,6 +1218,7 @@ mod tests {
                 path: "/home/x/.ssh/extra".into(),
                 line: 4,
                 message: "Bad configuration option: bogus".into(),
+                home: app.home().to_owned(),
             }))
         );
         assert!(report.explanation.is_some());

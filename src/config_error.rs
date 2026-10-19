@@ -20,6 +20,8 @@ pub enum ConfigRejection {
         path: PathBuf,
         line: u32,
         message: String,
+        /// The home directory `path` is shown under, as `~`.
+        home: PathBuf,
     },
     /// A line Portico itself wrote into the staged validation entry.
     Internal { raw: String },
@@ -28,6 +30,8 @@ pub enum ConfigRejection {
 }
 
 pub struct ConfigFiles<'a> {
+    /// The home directory a rejected file of the user's is shown under.
+    pub home: &'a Path,
     pub managed: &'a Path,
     pub managed_text: &'a str,
     /// The staged entry Portico wrote to validate a change, when there is one. Without it every
@@ -47,39 +51,27 @@ pub struct StagedEntry<'a> {
     pub portico_lines: &'a [u32],
 }
 
-impl ConfigRejection {
-    pub fn display_with_home(&self, home: &Path) -> String {
+impl fmt::Display for ConfigRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Managed {
                 alias,
                 directive,
                 message,
                 ..
-            } => format!("{directive} for {alias}: {message}"),
+            } => write!(f, "{directive} for {alias}: {message}"),
             Self::UserFile {
                 path,
                 line,
                 message,
-            } => {
-                let shown = match path.strip_prefix(home) {
-                    Ok(rest) if !home.as_os_str().is_empty() => {
-                        Path::new("~").join(rest).display().to_string()
-                    }
-                    _ => path.display().to_string(),
-                };
-                format!("line {line} of {shown}: {message}")
-            }
-            Self::Internal { raw } | Self::Unrecognised { raw } => raw.clone(),
+                home,
+            } => write!(
+                f,
+                "line {line} of {}: {message}",
+                crate::home::tilde(path, home)
+            ),
+            Self::Internal { raw } | Self::Unrecognised { raw } => f.write_str(raw),
         }
-    }
-}
-
-impl fmt::Display for ConfigRejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        f.write_str(&self.display_with_home(&home))
     }
 }
 
@@ -111,6 +103,7 @@ pub fn interpret(stderr: &str, files: &ConfigFiles<'_>) -> ConfigRejection {
                 path: entry.source.to_path_buf(),
                 line,
                 message,
+                home: files.home.to_path_buf(),
             }
         }
     } else {
@@ -118,6 +111,7 @@ pub fn interpret(stderr: &str, files: &ConfigFiles<'_>) -> ConfigRejection {
             path,
             line,
             message,
+            home: files.home.to_path_buf(),
         }
     }
 }
@@ -190,6 +184,7 @@ mod tests {
 
     fn files<'a>(managed: &'a Path, entry: &'a Path) -> ConfigFiles<'a> {
         ConfigFiles {
+            home: Path::new("/home/me"),
             managed,
             managed_text: MANAGED,
             entry: Some(StagedEntry {
@@ -203,6 +198,7 @@ mod tests {
     #[test]
     fn without_a_staged_entry_the_entry_file_is_the_users_own() {
         let files = ConfigFiles {
+            home: Path::new("/home/me"),
             managed: Path::new("/home/me/.ssh/portico/config"),
             managed_text: MANAGED,
             entry: None,
@@ -216,6 +212,7 @@ mod tests {
                 path: "/home/me/.ssh/config".into(),
                 line: 3,
                 message: "Bad configuration option: bogus".into(),
+                home: "/home/me".into(),
             }
         );
     }
@@ -257,7 +254,8 @@ mod tests {
                 ConfigRejection::UserFile {
                     path: path.into(),
                     line: 7,
-                    message: "Bad configuration option: bogus".into()
+                    message: "Bad configuration option: bogus".into(),
+                    home: "/home/me".into(),
                 },
                 "{text}"
             );
@@ -291,10 +289,11 @@ mod tests {
                 path: SOURCE.into(),
                 line: 3,
                 message: "Bad configuration option: bogus".into(),
+                home: "/home/me".into(),
             }
         );
         assert_eq!(
-            rejection.display_with_home(Path::new("/home/me")),
+            rejection.to_string(),
             "line 3 of ~/.ssh/config: Bad configuration option: bogus"
         );
     }
@@ -314,20 +313,16 @@ mod tests {
             path: "/etc/ssh/ssh_config".into(),
             line: 1,
             message: "x".into(),
+            home: "/home/u".into(),
         };
-        assert_eq!(
-            rejection.display_with_home(Path::new("/home/u")),
-            "line 1 of /etc/ssh/ssh_config: x"
-        );
+        assert_eq!(rejection.to_string(), "line 1 of /etc/ssh/ssh_config: x");
         let rejection = ConfigRejection::UserFile {
             path: "/home/u/.ssh/config".into(),
             line: 12,
             message: "x".into(),
+            home: "/home/u".into(),
         };
-        assert_eq!(
-            rejection.display_with_home(Path::new("/home/u")),
-            "line 12 of ~/.ssh/config: x"
-        );
+        assert_eq!(rejection.to_string(), "line 12 of ~/.ssh/config: x");
     }
 
     #[test]
@@ -335,6 +330,7 @@ mod tests {
         let (m, e) = (Path::new("/tmp/m"), Path::new("/tmp/e"));
         let text = "Host \"my host\"\n    hostname x\n";
         let files = ConfigFiles {
+            home: Path::new("/home/me"),
             managed: m,
             managed_text: text,
             entry: Some(StagedEntry {

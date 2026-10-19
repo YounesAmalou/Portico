@@ -1171,10 +1171,7 @@ fn run_migration<I: BufRead, O: Write>(
 fn describe_source(direction: Direction, candidate: &Candidate, home: &Path) -> String {
     match direction {
         Direction::Export => "managed".into(),
-        Direction::Adopt => match candidate.source.strip_prefix(home) {
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => candidate.source.display().to_string(),
-        },
+        Direction::Adopt => crate::home::tilde(&candidate.source, home),
     }
 }
 
@@ -1364,7 +1361,7 @@ fn print_identities(
     for identity in &identities.identities {
         lines.push(format!(
             "Identity: {}{default}: {}",
-            identity::tilde_text(&identity.configured, home),
+            crate::home::tilde_text(&identity.configured, home),
             identity.describe()
         ));
     }
@@ -1423,7 +1420,7 @@ fn print_inventory(
         let socket = known
             .agent
             .socket()
-            .map(|socket| identity::tilde(socket, home))
+            .map(|socket| crate::home::tilde(socket, home))
             .unwrap_or_default();
         let (name, state) = match &known.agent {
             Agent::Listed { provider, keys, .. } => {
