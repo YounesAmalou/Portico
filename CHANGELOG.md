@@ -7,6 +7,16 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-19
+
+### Added
+
+- Filter the containers panel and load hosts on c ([#39](https://github.com/YounesAmalou/Portico/pull/39))
+
+### Fixed
+
+- Address the v0.3.0 review of adoption, export and containers ([#36](https://github.com/YounesAmalou/Portico/pull/36))
+
 ## [0.3.0] - 2026-10-18
 
 ### Added
