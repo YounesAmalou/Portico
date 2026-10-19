@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub enum Origin {
     Managed,
     External(PathBuf),
+    /// A label shown as it is, such as an identity file's availability.
+    Note(String),
 }
 
 /// A known host alias that can be suggested as a jump host.
@@ -142,6 +144,7 @@ pub fn origin_label(origin: &Origin, home: Option<&Path>) -> String {
             Some(rest) => format!("~/{}", rest.display()),
             None => path.display().to_string(),
         },
+        Origin::Note(note) => note.clone(),
     }
 }
 

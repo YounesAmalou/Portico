@@ -9,6 +9,8 @@ use thiserror::Error;
 mod containers;
 mod identities;
 
+pub(crate) use identities::key_files_in;
+
 pub use containers::{
     ContainerError, ContainerList, ContainerPrograms, DockerIssue, Offer, Target,
 };

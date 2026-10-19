@@ -394,13 +394,8 @@ impl App {
                 }
             }
         }
-        for public_path in public_keys_in(&home.join(".ssh")) {
-            let private = public_path.with_extension("");
-            let path = if is_file(&private) {
-                private
-            } else {
-                public_path.clone()
-            };
+        for path in key_files_in(&home.join(".ssh")) {
+            let public_path = identity::public_key_path(&path);
             let known = files.iter().any(|(known, _, _)| {
                 known
                     .as_ref()
@@ -455,6 +450,18 @@ impl App {
             .sort_by(|a, b| a.configured.cmp(&b.configured));
         Ok(inventory)
     }
+}
+
+/// The key pairs and lone public keys directly in `dir`: a private key's path when it exists
+/// beside its `.pub`, otherwise the `.pub` path itself. Only `stat` touches the private files.
+pub(crate) fn key_files_in(dir: &Path) -> Vec<PathBuf> {
+    public_keys_in(dir)
+        .into_iter()
+        .map(|public| {
+            let private = public.with_extension("");
+            if is_file(&private) { private } else { public }
+        })
+        .collect()
 }
 
 /// The `*.pub` files directly in `dir`, certificates excluded, sorted.
