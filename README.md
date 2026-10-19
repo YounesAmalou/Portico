@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers, and starts and stops saved tunnels. Machine-readable output and a Quickshell integration are planned follow-up work (see the [roadmap](ROADMAP.md)).
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
 ## What V1 does
 
@@ -15,6 +15,8 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
 - Lists the running Docker containers on this machine or a host, grouped by Compose project, and opens a shell in one.
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
+- Prints one versioned JSON document per command for scripts and desktop panels.
+- Comes with a desktop panel for Quickshell and Omarchy to open hosts and container shells in a new terminal and to start and stop tunnels.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
@@ -29,6 +31,7 @@ Private keys remain where they already live. Portico stores identity-file refere
 - OpenSSH client tools (`ssh`)
 - `xdg-terminal-exec` for the new-terminal option only
 - `docker`, only for container shells, on this machine or on the host (Docker only; Podman is not supported)
+- Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
 
@@ -318,6 +321,41 @@ Portico shows an exact preview of both files first and, unless you pass `--yes`,
 
 Use `portico <command> --help` for the authoritative options for a command.
 
+## Desktop panel
+
+![The desktop panel, with saved tunnels and an expanded host](desktop/quickshell/preview.png)
+
+`desktop/quickshell/` is a small Quickshell panel: the saved tunnels with their status and a Start or Stop button, and the hosts to connect to in a new terminal, each expandable to its running containers to open a shell in. It runs `portico` with `--json` when it opens and lists the tunnels again every 5 seconds while it stays open; nothing runs while it is closed. Containers are listed only when you expand a host (`→`), and the panel never runs `portico show`. It manages nothing: hosts and tunnels are added, edited and removed in the CLI and the TUI. Typing filters, `↑` / `↓` move, `Enter` connects, opens the shell or starts or stops the tunnel, `←` collapses, `F5` lists again and `Esc` closes.
+
+The panel runs from a checkout of this repository; nothing installs it for you. It finds `portico` through `$PORTICO_BIN`, then `PATH`, then `~/.cargo/bin/portico`. A session started by the compositor often lacks `~/.cargo/bin` on its `PATH`; in Hyprland, set `env = PORTICO_BIN,/path/to/portico`. The panel needs a Portico with `--json` and says so when the one it finds is older or newer than it reads.
+
+**Plain Quickshell.** Try it from the checkout, then open it:
+
+```sh
+qs -p desktop/quickshell
+qs -p desktop/quickshell ipc call portico toggle
+```
+
+To keep it, link it as a named configuration, start it with your session, and bind the toggle to a key:
+
+```sh
+ln -s "$PWD/desktop/quickshell" ~/.config/quickshell/portico
+qs -c portico
+qs -c portico ipc call portico toggle
+```
+
+**Omarchy.** The same directory is an Omarchy plugin with a bar icon and a popup. Link it (a `git pull` then updates it) or copy it into the plugins directory, then enable it:
+
+```sh
+ln -s "$PWD/desktop/quickshell" ~/.config/omarchy/plugins/portico
+omarchy-shell shell rescanPlugins
+omarchy plugin enable portico
+```
+
+The icon opens the panel under it; for a keybinding, bind `omarchy-shell shell toggle portico '{}'`. `omarchy plugin add` does not apply, because the plugin is a directory of this repository rather than a repository of its own. To remove it, `omarchy plugin disable portico` and delete the link.
+
+Connecting runs `portico connect --new-terminal`, so the terminal is the one `xdg-terminal-exec` opens, and a failure is explained there or under the row. Start and stop run in the background (a start can take as long as the host's `ConnectTimeout`) under `setsid`, so a reload of the panel never interrupts one.
+
 ## TUI keys
 
 | Key | Action |
@@ -401,7 +439,7 @@ scripts/ci-checks.sh clippy
 scripts/ci-checks.sh test
 ```
 
-The same script also runs `msrv`, `audit`, `deny` and `package`, which is what continuous integration runs. The automated tests use temporary SSH homes, do not connect to remote machines, and must run as a regular user. See [CONTRIBUTING.md](CONTRIBUTING.md).
+The same script also runs `msrv`, `audit`, `deny` and `package`, which is what continuous integration runs, and `desktop`, which lints the desktop panel and tests its JSON parsing against the golden files (it needs `qt6-declarative` and `quickshell`). The automated tests use temporary SSH homes, do not connect to remote machines, and must run as a regular user. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
@@ -409,4 +447,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 
 ## Current scope
 
-V1 deliberately does not include Podman, container logs or lifecycle, tunnels that start or restart by themselves, SSH-agent or password-manager discovery, key generation, Quickshell, a daemon, or a machine-readable API. Those features remain deferred until their workflows and integration contracts are clear.
+V1 deliberately does not include Podman, container logs or lifecycle, tunnels that start or restart by themselves, SSH-agent or password-manager discovery, key generation, or a daemon. Those features remain deferred until their workflows and integration contracts are clear.
