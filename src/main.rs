@@ -10,6 +10,7 @@ use portico::{
     managed::{ConfigPaths, ManagedStore},
     openssh::OpenSsh,
     picker::TerminalPicker,
+    tunnel::runtime::RuntimeDir,
 };
 
 fn main() -> ExitCode {
@@ -17,10 +18,15 @@ fn main() -> ExitCode {
         eprintln!("error: HOME is not set");
         return ExitCode::FAILURE;
     };
+    let runtime = RuntimeDir::locate(
+        home.as_ref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    );
     let app = App::new(
         ManagedStore::new(ConfigPaths::from_home(home)),
         OpenSsh::system(),
-    );
+    )
+    .with_runtime_dir(runtime);
     let cli = Cli::parse();
     let stdin = io::stdin();
     let interactive = stdin.is_terminal();

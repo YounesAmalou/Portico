@@ -14,6 +14,7 @@ pub mod picker;
 pub mod probe;
 pub mod suggest;
 pub mod tui;
+pub mod tunnel;
 
 #[cfg(test)]
 #[path = "../tests/support/executable.rs"]

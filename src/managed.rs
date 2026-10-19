@@ -1323,7 +1323,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),

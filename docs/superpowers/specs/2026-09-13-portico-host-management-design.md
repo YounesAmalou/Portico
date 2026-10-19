@@ -227,7 +227,7 @@ A focused manual smoke test uses the installed OpenSSH tools to initialize an is
 Later work retains these requirements without constraining their implementation prematurely:
 
 1. Identity awareness: delivered (see below).
-2. **Tunnels:** model local, remote, and dynamic forwards; detect local conflicts; and supervise explicitly started tunnels.
+2. Tunnels: delivered (see below).
 3. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
 
 _(The former fifth slice, herdr tool integration, was dropped on 2026-10-13. The machine-readable output it called for is now part of the desktop surface slice in `ROADMAP.md`.)_
@@ -245,3 +245,4 @@ Each slice requires its own design review before implementation.
 - **Container shells:** `portico containers` and `portico shell`, and the TUI containers panel, list the running Docker containers on this machine or a host, grouped by Compose project, and open a shell in one with `docker exec`, through `ssh -t` on a host. Designed in `2026-10-18-container-shells-design.md`.
 - **Fuzzy pickers:** commands given no host (`show`, `connect`, `test`, `edit`, `remove`, a bare `--on`) ask in a built-in inline picker that ranks fuzzy matches, `adopt` and `export` in a checklist, and `portico shell` picks its container the same way; the TUI hosts and containers filters match fuzzily and the `m` checklist gets a filter. `fzf` is no longer used. Designed in `2026-10-19-fuzzy-pickers-design.md`.
 - **Identity awareness:** `portico show`, the TUI details and the new `portico identities` show which identities each host offers (IdentityFile references, the agent from `IdentityAgent` or `SSH_AUTH_SOCK`, including 1Password's SSH agent) and whether each is in the agent, a key file, missing or unchecked, and the IdentityFile form field suggests known identities. Portico only stats private key files and reads public ones with `ssh-keygen -l` and agents with `ssh-add -l`. Designed in `2026-10-19-identity-awareness-design.md`.
+- **Tunnels:** `portico tunnels` and `portico tunnel add|edit|remove|show|start|stop`, and the TUI tunnels screen (`T`), save local, remote and dynamic forwards in `~/.ssh/portico/tunnels` and start them on demand as background `ssh` processes that outlive Portico. Conflicts with busy ports and with running saved tunnels are detected before starting, and a started tunnel is found again and stopped only after its PID, start time, boot and command line are verified. Designed in `2026-10-19-tunnels-design.md`.

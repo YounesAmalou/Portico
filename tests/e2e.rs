@@ -31,3 +31,5 @@ mod tui_first_run;
 mod tui_hangup;
 #[path = "e2e/tui_maintenance.rs"]
 mod tui_maintenance;
+#[path = "e2e/tunnels.rs"]
+mod tunnels;

@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, and opens shells in Docker containers. Tunnels and a Quickshell integration are planned follow-up work (see the [roadmap](ROADMAP.md)).
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers, and starts and stops saved tunnels. Machine-readable output and a Quickshell integration are planned follow-up work (see the [roadmap](ROADMAP.md)).
 
 ## What V1 does
 
@@ -14,11 +14,12 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Tests on demand whether a host's login works, without opening a shell.
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
 - Lists the running Docker containers on this machine or a host, grouped by Compose project, and opens a shell in one.
+- Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
-Portico owns only `~/.ssh/portico/config`. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
+Portico owns only `~/.ssh/portico/config` and, for saved tunnels, `~/.ssh/portico/tunnels`, which OpenSSH never reads. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents. To show identities it only checks that key files exist, reads public key files with `ssh-keygen -l`, and asks agents for their public key list with `ssh-add -l`; it never generates keys, loads them into an agent, or asks an agent to sign.
 
@@ -130,6 +131,14 @@ portico shell [<container>] [--on [<alias>]] [-u <user>] [-n]
                                 Open a shell in a container
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
+portico tunnels                 List saved tunnels and their status
+portico tunnel add <name> --on <alias> (-L|-R|-D) <spec>
+                                Save a tunnel
+portico tunnel edit [<name>] [--name <new>] [--on <alias>] [-L|-R|-D <spec>]
+portico tunnel remove [<name>] [-f]
+portico tunnel show [<name>]    Show a tunnel, its command line and its log
+portico tunnel start [<name>...]
+portico tunnel stop [<name>...] [-A|--all]
 ```
 
 ### Picking a host
@@ -258,6 +267,27 @@ portico remove development
 portico remove development --force
 ```
 
+### Tunnels
+
+A tunnel is a saved port forward through a host Portico knows: a local (`-L`), remote (`-R`) or dynamic SOCKS (`-D`) forward of a TCP port, written in ssh's own syntax.
+
+```sh
+portico tunnel add db --on prod-db -L 127.0.0.1:5432:localhost:5432
+portico tunnel add socks --on bastion -D 1080
+portico tunnel add preview --on staging -R 8080:localhost:3000
+portico tunnel start db
+portico tunnels
+portico tunnel stop db
+```
+
+`portico tunnels` lists each tunnel with its status: `stopped`, `running` (with its PID and start time), `failed` (with the reason) or `port-in-use` (a local port it needs is taken, and by which tunnel when it is one of yours). Two saved tunnels may share a port, for a staging and a production database say; both show a warning, and only one can run at a time. `portico tunnel show` prints the exact ssh command line, the status and, for a failed tunnel, the end of ssh's log.
+
+`start` checks first that the host is known, that OpenSSH accepts the forward, that no running tunnel uses the same port, and that every local address the forward listens on is free (without a bind address that is both `127.0.0.1` and `::1`). It then runs `ssh -f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none …` and waits until ssh has set up every forward, remote ones included, or failed. The started tunnel is an ordinary `ssh` process that keeps running after Portico exits, after the TUI quits and after the terminal closes; nothing starts it again by itself, and nothing starts a tunnel automatically. It never prompts: a key with a passphrase must be in an agent, and a new host key must be trusted first with `portico test <alias>`. Your own ssh configuration applies as for `ssh <alias>`, including forwards the host itself declares.
+
+`stop` signals only the process Portico started: it recognises it by its PID together with its start time, the boot and its command line, so a PID reused by another process is never signalled. `start` and `stop` succeed when the tunnel is already in that state, so scripts can call them directly. A running tunnel cannot be edited or removed; stop it first. Without a name, `show`, `edit`, `remove`, `start` and `stop` pick a tunnel with the picker.
+
+Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory; if the record is lost while the tunnel runs, Portico finds the process again.
+
 ### Adopt and export hosts
 
 `portico adopt` moves a host from your own SSH configuration into Portico, comments included, so you can edit it there; `ssh <alias>` behaves exactly as before. Only a simple block qualifies: a single concrete alias, declared once, using only `HostName`, `User`, `Port`, `IdentityFile` and `ProxyJump`, in a file you own and can write, where OpenSSH reports the same effective configuration after the move. Every other host is listed with the reason it cannot be adopted.
@@ -291,6 +321,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
 | `c` | Show the selected host's containers in the containers panel (the focus stays on the hosts) |
 | `Tab` / `Shift+Tab` | Move the focus between the hosts and the containers panel; this never lists anything |
+| `T` | Open the tunnels screen |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |
 
@@ -328,6 +359,23 @@ The filter edits like the hosts filter: `Enter` applies it and `Esc` cancels the
 
 The `m` checklist shows every host, dimming those that cannot move with the reason. `Space` marks a host, `a` marks every shown host that can move (again to unmark), and `/` filters with the hosts filter's keys; marks stay when the filter hides them, and `Enter` previews every marked host. `Esc` clears an applied filter, otherwise closes the checklist.
 
+The tunnels screen (`T`) lists the saved tunnels with their status, and the selected one's details: its command line, the status with its PID and age, warnings, and the end of ssh's log after a failure. The statuses are re-read every 2 seconds while the screen is shown, from local state only. Running tunnels keep running after you quit, and the screen says so while any runs. Keys on the tunnels screen:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` / `j` / `k` | Move through tunnels |
+| `/` | Filter tunnels by name, host or forward |
+| `s` | Start the selected tunnel, or stop it when it runs; `Esc` cancels a start that is still connecting |
+| `a` | Add a tunnel |
+| `e` | Edit the selected tunnel (not while it runs) |
+| `x` | Remove the selected tunnel, after a confirmation (not while it runs) |
+| `r` / `F5` | Re-read the tunnels and their status |
+| `o` | Show the whole log of a failed tunnel, or its last lines again |
+| `T` / `Esc` | Back to the hosts (`Esc` first clears an applied filter) |
+| `q` | Quit |
+
+In the tunnel form, `↑` / `↓` (or `Tab`) move between fields: name, host, kind, bind address, bind port, target host and target port (a dynamic forward has no target). `Space` or `←` / `→` changes the kind, `Tab` in the host field completes a known alias, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
+
 External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
 
@@ -347,4 +395,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 
 ## Current scope
 
-V1 deliberately does not include Podman, container logs or lifecycle, tunnels, port-conflict management, SSH-agent or password-manager discovery, key generation, Quickshell, a daemon, or a machine-readable API. Those features remain deferred until their workflows and integration contracts are clear.
+V1 deliberately does not include Podman, container logs or lifecycle, tunnels that start or restart by themselves, SSH-agent or password-manager discovery, key generation, Quickshell, a daemon, or a machine-readable API. Those features remain deferred until their workflows and integration contracts are clear.

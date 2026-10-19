@@ -39,6 +39,7 @@ mod lister;
 mod migrate;
 mod planner;
 mod tester;
+mod tunnels;
 
 use crate::{
     adopt,
@@ -65,6 +66,7 @@ use migrate::{MigrateAction, MigrateState};
 use planner::Planner;
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
+use tunnels::{Starter, TunnelAction, TunnelsScreen};
 
 /// One row of the Add/Edit form.
 struct FormField {
@@ -221,8 +223,9 @@ fn browse<B: Backend<Error = io::Error>>(
         let lister = Lister::spawn(scope, app);
         let planner = Planner::spawn(scope, app);
         let indexer = Indexer::spawn(scope, app);
+        let starter = Starter::spawn(scope, app);
         browse_hosts(
-            app, terminal, signals, session, resolver, tester, lister, planner, indexer,
+            app, terminal, signals, session, resolver, tester, lister, planner, indexer, starter,
         )
     })
 }
@@ -241,6 +244,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     mut lister: Lister,
     mut planner: Planner,
     mut indexer: Indexer,
+    mut starter: Starter,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
@@ -278,6 +282,17 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         if state.in_form() {
             indexer.request();
         }
+        if let Some((name, result)) = starter.poll() {
+            state.tunnels.finish_start(&name, result);
+            state.tunnels.reload(app);
+            redraw = true;
+        }
+        if state.mode == Mode::Tunnels && state.tunnels.is_stale() {
+            state.tunnels.reload(app);
+            redraw = true;
+        }
+        let starting = starter.running().map(str::to_owned);
+        state.tunnels.set_starting(starting);
         let testing = tester.running().map(str::to_owned);
         if state.testing != testing {
             state.testing = testing;
@@ -293,6 +308,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             || lister.is_running()
             || planner.is_running()
             || indexer.is_running()
+            || starter.running().is_some()
         {
             Duration::from_millis(25)
         } else {
@@ -329,6 +345,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         match state.handle_key(key) {
             UiAction::None => {}
             UiAction::Quit => return Ok(()),
+            UiAction::OpenTunnels => {
+                state.tunnels.reload(app);
+                state.mode = Mode::Tunnels;
+            }
+            UiAction::Tunnels(action) => run_tunnel_action(app, &mut state, &mut starter, action),
             UiAction::Connect {
                 alias,
                 new_terminal,
@@ -493,6 +514,42 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     }
 }
 
+/// Carries out what the tunnels screen asked for.
+fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, action: TunnelAction) {
+    let screen = &mut state.tunnels;
+    match action {
+        TunnelAction::None | TunnelAction::Leave | TunnelAction::Quit => return,
+        TunnelAction::Refresh => screen.set_status("Refreshed"),
+        TunnelAction::Start(name) => {
+            starter.start(name);
+            screen.set_starting(starter.running().map(str::to_owned));
+            return;
+        }
+        TunnelAction::CancelStart => {
+            starter.cancel();
+            screen.set_starting(None);
+        }
+        TunnelAction::Stop(name) => screen.set_status(match app.stop_tunnel(&name) {
+            Ok(crate::app::StopOutcome::Stopped) => format!("Stopped {name}"),
+            Ok(crate::app::StopOutcome::NotRunning) => format!("{name} was not running"),
+            Err(error) => error.to_string(),
+        }),
+        TunnelAction::Add(tunnel) => {
+            let done = format!("Saved {}", tunnel.name);
+            screen.finish_change(app.add_tunnel(tunnel), done);
+        }
+        TunnelAction::Edit { name, changes } => {
+            let done = format!("Saved {}", changes.name.as_deref().unwrap_or(&name));
+            screen.finish_change(app.edit_tunnel(&name, changes), done);
+        }
+        TunnelAction::Remove(name) => {
+            let done = format!("Removed {name}");
+            screen.finish_change(app.remove_tunnel(&name), done);
+        }
+    }
+    screen.reload(app);
+}
+
 /// Runs `child` in the terminal with the interface suspended and the terminal's Ctrl+C left to
 /// the child (Portico waits for it), then redraws. Failing to leave or re-enter the screen is
 /// the outer error; the child's own result is passed through.
@@ -588,7 +645,10 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
         | AppError::UnknownHost(_)
         | AppError::AliasCollision(_)
         | AppError::IncompleteDiscovery(_)
-        | AppError::KnownHosts { .. } => false,
+        | AppError::KnownHosts { .. }
+        | AppError::TunnelStore(_)
+        | AppError::InvalidTunnel(_)
+        | AppError::Tunnel(_) => false,
     }
 }
 
@@ -1032,6 +1092,7 @@ enum Mode {
     ConfirmRemove,
     ConfirmTrust,
     Migrate,
+    Tunnels,
 }
 
 /// A single-line text field edited at a cursor.
@@ -1234,6 +1295,8 @@ struct UiState {
     /// The home whose `~/.ssh` the IdentityFile suggestions scan and whose paths show as `~`;
     /// empty (nothing scanned) until the session sets it from the app.
     home: PathBuf,
+    /// The tunnels screen, shown in `Mode::Tunnels`.
+    tunnels: TunnelsScreen,
 }
 
 /// The left-column panel that receives keys while browsing.
@@ -1385,6 +1448,8 @@ struct PendingTrust {
 enum UiAction {
     None,
     Quit,
+    OpenTunnels,
+    Tunnels(TunnelAction),
     Connect {
         alias: String,
         new_terminal: bool,
@@ -1445,6 +1510,7 @@ impl UiState {
             migrate: None,
             identity_inventory: None,
             home: PathBuf::new(),
+            tunnels: TunnelsScreen::default(),
         }
     }
 
@@ -1524,6 +1590,16 @@ impl UiState {
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         self.status = None;
         self.edit_pending = false;
+        if self.mode == Mode::Tunnels {
+            return match self.tunnels.handle_key(key) {
+                TunnelAction::Leave => {
+                    self.mode = Mode::Browse;
+                    UiAction::None
+                }
+                TunnelAction::Quit => UiAction::Quit,
+                action => UiAction::Tunnels(action),
+            };
+        }
         if self.mode == Mode::Browse && self.focus == Focus::Containers {
             let action = self.containers.handle_key(key);
             if matches!(action, PanelAction::Leave | PanelAction::CancelList) {
@@ -1550,6 +1626,7 @@ impl UiState {
             Mode::ConfirmRemove => self.handle_remove_key(key),
             Mode::ConfirmTrust => self.handle_trust_key(key),
             Mode::Migrate => self.handle_migrate_key(key),
+            Mode::Tunnels => UiAction::None,
         };
         // Unfolded output belongs to one selection, or to one open form.
         if (selected, in_form) != (self.selected, self.in_form()) {
@@ -1577,6 +1654,7 @@ impl UiState {
                     migrate.paste(text);
                 }
             }
+            Mode::Tunnels => self.tunnels.paste(text),
             Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
         UiAction::None
@@ -1621,6 +1699,10 @@ impl UiState {
             KeyCode::Char('r') | KeyCode::F(5) => return UiAction::Refresh,
             KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.test_selected();
+            }
+            // Terminals report Shift+T as `T`, with or without the Shift modifier.
+            KeyCode::Char('T') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return UiAction::OpenTunnels;
             }
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(alias) = self.selected_alias() {
@@ -2362,6 +2444,10 @@ fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> Hos
 }
 
 fn render(frame: &mut Frame<'_>, state: &UiState) {
+    if state.mode == Mode::Tunnels {
+        state.tunnels.render(frame);
+        return;
+    }
     let footer = footer_text(state);
     let status = state.status_line();
     let footer_height = (footer.chars().count() as u16)
@@ -2567,7 +2653,7 @@ fn footer_text(state: &UiState) -> String {
                 ""
             };
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  c list containers  Tab containers  q quit"
+                "{output}t test  Enter connect  {new_terminal}  c list containers  Tab containers  T tunnels  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -2592,7 +2678,9 @@ fn footer_text(state: &UiState) -> String {
                 Some(Ownership::External) => {
                     format!("↑↓ move  / filter{clear_filter}  a add  m adopt  {refresh}  {connect}")
                 }
-                None => format!("/ filter{clear_filter}  a add  {refresh}  Tab containers  q quit"),
+                None => format!(
+                    "/ filter{clear_filter}  a add  {refresh}  Tab containers  T tunnels  q quit"
+                ),
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -2618,6 +2706,7 @@ fn footer_text(state: &UiState) -> String {
             .migrate
             .as_ref()
             .map_or_else(|| "Esc cancel".into(), MigrateState::footer),
+        Mode::Tunnels => state.tunnels.footer(),
     }
 }
 
@@ -6236,5 +6325,47 @@ mod tests {
             "{}",
             buffer_text(&buffer)
         );
+    }
+
+    #[test]
+    fn t_still_tests_and_shift_t_opens_tunnels() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        assert!(matches!(
+            press(&mut state, KeyCode::Char('t')),
+            UiAction::Test { .. }
+        ));
+        assert_eq!(press(&mut state, KeyCode::Char('T')), UiAction::OpenTunnels);
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            UiAction::OpenTunnels
+        );
+        assert!(footer_text(&state).contains("T tunnels"));
+    }
+
+    #[test]
+    fn the_tunnels_screen_takes_keys_and_draws_until_it_is_left() {
+        use crate::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.tunnels = tunnels::tests::screen_with(vec![TunnelReport {
+            tunnel: Tunnel::new("db", "dev", Forward::parse(Kind::Dynamic, "1080").unwrap())
+                .unwrap(),
+            status: TunnelStatus::Running { pid: 7, started: 0 },
+            warnings: Vec::new(),
+        }]);
+        state.mode = Mode::Tunnels;
+        assert_eq!(
+            press(&mut state, KeyCode::Char('s')),
+            UiAction::Tunnels(TunnelAction::Stop("db".into()))
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Tunnels"), "{text}");
+        assert!(text.contains("socks 1080"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        assert!(text.contains("keep running after q"), "{text}");
+        assert_eq!(press(&mut state, KeyCode::Char('T')), UiAction::None);
+        assert_eq!(state.mode, Mode::Browse);
     }
 }
