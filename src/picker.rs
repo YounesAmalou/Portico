@@ -5,7 +5,7 @@
 use std::{
     cell::Cell,
     collections::BTreeSet,
-    io::{self, Stderr},
+    io::{self, IsTerminal, Stderr},
 };
 
 use crossterm::{
@@ -40,6 +40,8 @@ const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// Asks the user to choose among rows.
 pub trait Picker {
+    /// Whether the picker can be shown; without it a command needs its arguments.
+    fn available(&self) -> bool;
     /// The chosen row, or `None` when cancelled.
     fn pick_one(&mut self, prompt: &str, rows: Vec<Row>) -> Result<Option<usize>, String>;
     /// The marked rows in input order, or `None` when cancelled.
@@ -50,6 +52,12 @@ pub trait Picker {
 pub struct TerminalPicker;
 
 impl Picker for TerminalPicker {
+    /// Drawing needs stderr, and the cursor position is asked and answered through stdout,
+    /// so both must be the terminal; otherwise stdout would carry the query.
+    fn available(&self) -> bool {
+        io::stdout().is_terminal() && io::stderr().is_terminal()
+    }
+
     fn pick_one(&mut self, prompt: &str, rows: Vec<Row>) -> Result<Option<usize>, String> {
         Ok(interact(&mut Single::new(prompt, rows))?.map(|picked| picked[0]))
     }

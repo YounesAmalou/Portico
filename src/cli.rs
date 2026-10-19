@@ -477,7 +477,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
                                 .to_string());
                             }
                         },
-                        None if interactive => {
+                        None if interactive && picker.available() => {
                             let (ids, rows): (Vec<String>, Vec<Row>) =
                                 container_rows(&list).into_iter().unzip();
                             match picker.pick_one("container", rows)? {
@@ -722,7 +722,7 @@ fn host_argument(
     if let Some(alias) = alias {
         return Ok(Some(alias));
     }
-    if !interactive {
+    if !interactive || !picker.available() {
         return Err(format!(
             "choose a host: portico {usage} <alias> (no terminal for the picker)"
         ));
@@ -990,7 +990,7 @@ fn run_migration<I: BufRead, O: Write>(
 ) -> Result<ExitCode, String> {
     let verb = migration.verb();
     let named = !migration.aliases.is_empty() || migration.all;
-    if !named && !interactive {
+    if !named && !(interactive && picker.available()) {
         return Err(format!(
             "{verb} requires host aliases or --all in non-interactive mode"
         ));
@@ -1728,13 +1728,15 @@ fi
     struct Scripted {
         answers: std::collections::VecDeque<Option<&'static str>>,
         seen: Vec<(String, Vec<Row>)>,
+        /// Stands for output that is not a terminal, so no picker can be drawn.
+        unavailable: bool,
     }
 
     impl Scripted {
         fn new(answers: &[Option<&'static str>]) -> Self {
             Self {
                 answers: answers.iter().copied().collect(),
-                seen: Vec::new(),
+                ..Self::default()
             }
         }
 
@@ -1772,6 +1774,10 @@ fi
     }
 
     impl Picker for Scripted {
+        fn available(&self) -> bool {
+            !self.unavailable
+        }
+
         fn pick_one(&mut self, prompt: &str, rows: Vec<Row>) -> Result<Option<usize>, String> {
             Ok(self.answer(prompt, rows).map(|picked| picked[0]))
         }
@@ -2008,6 +2014,35 @@ fi
             let (exit, _, error) = run_command(&app, args, "", false);
             assert_eq!(exit, ExitCode::FAILURE, "{args:?}");
             assert_eq!(error, format!("error: {message}\n"));
+        }
+    }
+
+    #[test]
+    fn without_a_terminal_for_the_picker_nothing_is_asked() {
+        let (dir, app) = two_hosts();
+        two_containers(&dir);
+        for (args, message) in [
+            (
+                &["show"][..],
+                "choose a host: portico show <alias> (no terminal for the picker)",
+            ),
+            (
+                &["containers", "--on"],
+                "choose a host: portico containers --on <alias> (no terminal for the picker)",
+            ),
+            (
+                &["adopt"],
+                "adopt requires host aliases or --all in non-interactive mode",
+            ),
+        ] {
+            let mut picker = Scripted {
+                unavailable: true,
+                ..Scripted::default()
+            };
+            let (exit, _, error) = run_picking(&app, args, "", true, &mut picker);
+            assert_eq!(exit, ExitCode::FAILURE, "{args:?}");
+            assert_eq!(error, format!("error: {message}\n"));
+            assert!(picker.seen.is_empty());
         }
     }
 

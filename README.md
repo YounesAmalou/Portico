@@ -138,7 +138,7 @@ The picker opens under the prompt and ranks hosts as you type: the letters only 
 
 `portico adopt` and `portico export` without hosts open a checklist with the TUI's keys: `↑` / `↓` / `j` / `k` move, `Space` marks a host, `a` marks every shown host (again to unmark), `/` filters, `Enter` takes the marked hosts, also those the filter hides, and `Esc` clears the filter or cancels.
 
-Without a terminal, every command needs its alias.
+Without a terminal, or with its output redirected (`portico show > file`), every command needs its alias.
 
 Host fields and their aliases:
 
