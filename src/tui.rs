@@ -12,7 +12,7 @@ use std::{
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
@@ -32,6 +32,7 @@ use ratatui::{
 };
 
 mod containers;
+mod hangup;
 mod lister;
 mod migrate;
 mod planner;
@@ -52,6 +53,7 @@ use crate::{
     suggest::{self, Candidate},
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
+use hangup::{HangupWatch, Input};
 use lister::Lister;
 use migrate::{MigrateAction, MigrateState};
 use planner::Planner;
@@ -128,6 +130,8 @@ pub enum TuiError {
 pub fn run(app: &App) -> Result<(), TuiError> {
     let signals = Signals::install()?;
     let terminated = signals.flag();
+    // A closed terminal ends the TUI like SIGHUP, even when crossterm is reading it.
+    let _hangup = HangupWatch::start(signals.shared_flag())?;
     let session = Arc::new(TerminalSession::detect());
     // Declared before the guard, so the terminal is restored before the hook is removed.
     let _panic_hook = PanicHook::install({
@@ -174,10 +178,12 @@ fn confirm_initialization<B: Backend<Error = io::Error>>(
         if terminated.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-        match event::read()? {
+        let event = match hangup::next_event(Duration::from_millis(100))? {
+            Input::Event(event) => event,
+            Input::Idle => continue,
+            Input::Closed => return Ok(false),
+        };
+        match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     return Ok(false);
@@ -274,10 +280,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         } else {
             Duration::from_millis(100)
         };
-        if !event::poll(wait)? {
-            continue;
-        }
-        let event = event::read()?;
+        let event = match hangup::next_event(wait)? {
+            Input::Event(event) => event,
+            Input::Idle => continue,
+            Input::Closed => return Ok(()),
+        };
         if matches!(event, Event::Resize(_, _)) {
             redraw = true;
             continue;
@@ -801,6 +808,11 @@ impl Signals {
     /// Set once a signal asks the TUI to end.
     fn flag(&self) -> &AtomicBool {
         &self.terminated
+    }
+
+    /// The same flag, for whatever else may end the TUI.
+    fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.terminated)
     }
 
     /// Marks an in-place child as owning the terminal until the returned scope is dropped.
