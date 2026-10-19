@@ -161,7 +161,7 @@ fn install(
         None => Part::Skipped,
     };
     let (launcher_part, launcher_notes) = if options.launcher {
-        plan_launcher(env)
+        plan_launcher(env, target)
     } else {
         (Part::Skipped, Vec::new())
     };
@@ -391,7 +391,7 @@ fn plan_panel(env: &DesktopEnv, target: Target) -> Part {
                 steps.push(run(&["omarchy-shell", "shell", "rescanPlugins"]));
             }
             if enabled != Some(true) {
-                steps.push(run(&["omarchy", "plugin", "enable", "portico"]));
+                steps.push(Step::EnableOmarchyPlugin);
             }
         }
         Target::Quickshell => {
@@ -412,7 +412,8 @@ fn plan_panel(env: &DesktopEnv, target: Target) -> Part {
     }
 }
 
-fn plan_launcher(env: &DesktopEnv) -> (Part, Vec<String>) {
+fn plan_launcher(env: &DesktopEnv, target: Option<Target>) -> (Part, Vec<String>) {
+    let omarchy = target == Some(Target::Omarchy);
     let (desktop_path, icon_path) = launcher::paths(env);
     for path in [&desktop_path, &icon_path] {
         if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -434,7 +435,10 @@ fn plan_launcher(env: &DesktopEnv) -> (Part, Vec<String>) {
             );
         }
     }
-    if fs::symlink_metadata(&desktop_path).is_err()
+    // On Omarchy a package's generic entry is shadowed by one that launches Omarchy's TUI
+    // terminal; elsewhere the package's entry is enough.
+    if !omarchy
+        && fs::symlink_metadata(&desktop_path).is_err()
         && let Some(system) = launcher::system_entry(env)
     {
         return (
@@ -452,7 +456,7 @@ fn plan_launcher(env: &DesktopEnv) -> (Part, Vec<String>) {
     }
     let mut steps = Vec::new();
     for (path, contents) in [
-        (desktop_path, launcher::desktop_file(&exe)),
+        (desktop_path, launcher::desktop_file(&exe, omarchy)),
         (icon_path, launcher::icon_file()),
     ] {
         if std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str()) {
@@ -572,6 +576,10 @@ fn print_step(env: &DesktopEnv, output: Out, step: &Step) -> Result<(), String> 
                 writeln!(output, "  run      {line}")
             }
         }
+        Step::EnableOmarchyPlugin => writeln!(
+            output,
+            "  run      omarchy plugin enable portico   (once Omarchy lists the plugin)"
+        ),
         Step::WriteFile { path, contents } => match launcher::exec_of_text(contents) {
             Some(exec) if path.extension().is_some_and(|ext| ext == "desktop") => {
                 writeln!(output, "  write    {} (runs {exec})", show(path))
@@ -748,6 +756,10 @@ fn report(env: &DesktopEnv, output: Out, step: &Step, said: Option<String>) -> R
         Step::Run(args) => match said {
             Some(said) => writeln!(output, "Ran {}: {said}", args.join(" ")),
             None => writeln!(output, "Ran {}.", args.join(" ")),
+        },
+        Step::EnableOmarchyPlugin => match said {
+            Some(said) => writeln!(output, "Ran omarchy plugin enable portico: {said}"),
+            None => writeln!(output, "Ran omarchy plugin enable portico."),
         },
         Step::WriteFile { path, .. } => writeln!(output, "Wrote {}.", show(path)),
         Step::Edit {
@@ -1008,7 +1020,7 @@ mod tests {
         write_executable(bin.join("omarchy-shell"), "#!/bin/sh\nexit 0\n");
         write_executable(
             bin.join("omarchy"),
-            "#!/bin/sh\n[ \"$2\" = list ] && echo '[]'\n[ \"$2\" = enable ] && echo \"Enabled $3\"\nexit 0\n",
+            "#!/bin/sh\n[ \"$2\" = list ] && echo '[{\"id\":\"portico\",\"enabled\":false}]'\n[ \"$2\" = enable ] && echo \"Enabled $3\"\nexit 0\n",
         );
         write_executable(
             bin.join("hyprctl"),
@@ -1055,7 +1067,7 @@ mod tests {
     fn asks_per_component_and_accepts_another_combination() {
         let (_dir, env) = omarchy();
         let (result, out) = install(&env, "y\nn\nSUPER + P\nnot a combo +\nCTRL + ALT + P\ny\n");
-        assert!(result.is_ok(), "{out}");
+        assert_eq!(result, Ok(ExitCode::SUCCESS), "{out}");
         assert!(
             out.contains("Install the panel? [y/N] Install the launcher entry? [y/N] "),
             "{out}"

@@ -58,11 +58,19 @@ impl Desktop {
         fs::create_dir_all(desktop.home.join(".config/omarchy/plugins")).unwrap();
         fs::create_dir_all(desktop.home.join(".config/hypr")).unwrap();
         fs::write(desktop.home.join(".config/hypr/bindings.lua"), BINDINGS_LUA).unwrap();
-        desktop.program("omarchy-shell", "exit 0");
+        // Like Omarchy's shell, a rescan returns before the plugin is registered: the plugin
+        // becomes known after `discover-after` more listings (0 unless a test sets it).
+        desktop.program(
+            "omarchy-shell",
+            &format!(
+                "if [ \"$2\" = rescanPlugins ]; then\n  n=0; [ -f '{0}/discover-after' ] && read -r n < '{0}/discover-after'\n  echo \"$n\" > '{0}/pending'\nfi",
+                desktop.root.display()
+            ),
+        );
         desktop.program(
             "omarchy",
             &format!(
-                "case \"$2\" in\n  list) if [ -f '{0}/enabled' ]; then printf '[{{\"id\":\"portico\",\"enabled\":true}}]\\n'; else printf '[]\\n'; fi ;;\n  enable) [ -f '{0}/fail-enable' ] && {{ echo 'omarchy-plugin-enable: plugin is not known' >&2; exit 1; }}; : > '{0}/enabled'; echo \"Enabled $3\" ;;\n  disable) rm -f '{0}/enabled'; echo \"Disabled $3\" ;;\nesac",
+                "case \"$2\" in\n  list)\n    if [ -f '{0}/pending' ]; then\n      read -r n < '{0}/pending'\n      if [ \"$n\" -le 0 ]; then : > '{0}/known'; /bin/rm -f '{0}/pending'; else echo $((n - 1)) > '{0}/pending'; fi\n    fi\n    if [ -f '{0}/enabled' ]; then printf '[{{\"id\":\"portico\",\"enabled\":true}}]\\n'\n    elif [ -f '{0}/known' ]; then printf '[{{\"id\":\"portico\",\"enabled\":false}}]\\n'\n    else printf '[]\\n'; fi ;;\n  enable)\n    if [ -f '{0}/fail-enable' ] || [ ! -f '{0}/known' ]; then echo \"omarchy-plugin-enable: plugin '$3' is not known; run: omarchy-shell shell rescanPlugins\" >&2; exit 1; fi\n    : > '{0}/enabled'; echo \"Enabled $3\" ;;\n  disable) /bin/rm -f '{0}/enabled'; echo \"Disabled $3\" ;;\nesac",
                 desktop.root.display()
             ),
         );
@@ -239,7 +247,7 @@ fn installs_everything_on_omarchy_with_yes() {
     );
     let entry = read(&desktop.path(".local/share/applications/portico.desktop"));
     assert!(
-        entry.contains(&format!("Exec={}", env!("CARGO_BIN_EXE_portico"))),
+        entry.contains(&format!("-e {}", env!("CARGO_BIN_EXE_portico"))),
         "{entry}"
     );
     assert!(
@@ -341,7 +349,7 @@ fn a_failed_command_is_reported_and_later_components_still_install() {
         out.contains("error: omarchy plugin enable portico failed"),
         "{out}"
     );
-    assert!(out.contains("plugin is not known"), "{out}");
+    assert!(out.contains("plugin 'portico' is not known"), "{out}");
     assert!(out.contains("Some steps failed"), "{out}");
     assert!(
         desktop
@@ -350,6 +358,86 @@ fn a_failed_command_is_reported_and_later_components_still_install() {
     );
     assert!(
         read(&desktop.path(".config/hypr/bindings.lua")).contains("portico desktop install: begin")
+    );
+}
+
+#[test]
+fn waits_for_omarchy_to_list_the_plugin_before_enabling_it() {
+    let desktop = Desktop::omarchy();
+    fs::write(desktop.root.join("discover-after"), "5").unwrap();
+    let output = desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(
+        out.contains("run      omarchy plugin enable portico   (once Omarchy lists the plugin)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Ran omarchy plugin enable portico: Enabled portico"),
+        "{out}"
+    );
+    let listings = fs::read_to_string(desktop.root.join("calls"))
+        .unwrap()
+        .lines()
+        .filter(|line| *line == "omarchy plugin list --json")
+        .count();
+    assert!(listings >= 6, "listed {listings} times");
+}
+
+#[test]
+fn says_how_to_enable_the_plugin_when_omarchy_never_lists_it() {
+    let desktop = Desktop::omarchy();
+    fs::write(desktop.root.join("discover-after"), "1000").unwrap();
+    let output = desktop.run(
+        &["desktop", "install", "--yes", "--no-bind", "--no-launcher"],
+        "",
+    );
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("error: Omarchy did not list the portico plugin within 2 seconds of the rescan; enable it with: omarchy plugin enable portico"),
+        "{out}"
+    );
+    assert!(
+        !desktop
+            .calls()
+            .contains(&"omarchy plugin enable portico".to_string())
+    );
+}
+
+#[test]
+fn the_omarchy_launcher_entry_opens_omarchy_s_tui_terminal() {
+    let desktop = Desktop::omarchy();
+    let system = desktop.root.join("usr/share/applications");
+    fs::create_dir_all(&system).unwrap();
+    fs::write(
+        system.join("portico.desktop"),
+        "[Desktop Entry]\nExec=portico\nTerminal=true\n",
+    )
+    .unwrap();
+    let output = desktop
+        .command(&["desktop", "install", "--yes", "--no-bind"])
+        .env("XDG_DATA_DIRS", desktop.root.join("usr/share"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let entry = read(&desktop.path(".local/share/applications/portico.desktop"));
+    assert!(
+        entry.contains(&format!(
+            "\nExec=xdg-terminal-exec --app-id=TUI.tile -e {}\n",
+            env!("CARGO_BIN_EXE_portico")
+        )),
+        "{entry}"
+    );
+    assert!(entry.contains("\nTerminal=false\n"), "{entry}");
+    let status = text(&desktop.run(&["desktop", "status"], ""));
+    assert!(
+        status.contains(&format!("(runs {})", env!("CARGO_BIN_EXE_portico"))),
+        "{status}"
     );
 }
 
