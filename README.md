@@ -4,7 +4,7 @@ Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux.
 
 Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
-## What V1 does
+## What Portico does
 
 - Lists Portico-managed and existing OpenSSH hosts in one inventory.
 - Adds, edits, inspects, renames, and removes managed hosts.
@@ -135,9 +135,9 @@ portico shell [<container>] [--on [<alias>]] [-u <user>] [-n]
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
 portico tunnels                 List saved tunnels and their status
-portico tunnel add <name> --on <alias> (-L|-R|-D) <spec>
+portico tunnel add <name> --on [<alias>] (-L|-R|-D) <spec>
                                 Save a tunnel
-portico tunnel edit [<name>] [--name <new>] [--on <alias>] [-L|-R|-D <spec>]
+portico tunnel edit [<name>] [--name <new>] [--on [<alias>]] [-L|-R|-D <spec>]
 portico tunnel remove [<name>] [-f]
 portico tunnel show [<name>]    Show a tunnel, its command line and its log
 portico tunnel start [<name>...]
@@ -447,4 +447,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 
 ## Current scope
 
-V1 deliberately does not include Podman, container logs or lifecycle, tunnels that start or restart by themselves, SSH-agent or password-manager discovery, key generation, or a daemon. Those features remain deferred until their workflows and integration contracts are clear.
+Portico deliberately does not include Podman, container logs or lifecycle, tunnels that start or restart by themselves, key generation, loading keys into an agent, or a daemon. Those features remain deferred until their workflows and integration contracts are clear.
