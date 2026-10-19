@@ -124,6 +124,7 @@ fn convert(
             .map(|line| (*line).to_owned())
             .collect(),
         fields: BTreeMap::new(),
+        trailing: Vec::new(),
     };
     comments.leading.extend(trailing_comment(lines[start]));
 
@@ -205,22 +206,35 @@ pub(crate) fn remove_lines(contents: &[u8], ranges: &[Range<usize>]) -> Vec<u8> 
         .collect()
 }
 
-/// Inserts `text` after the first line, giving a first line without a line ending one.
-pub(crate) fn insert_after_first_line(contents: &[u8], text: &[u8]) -> Vec<u8> {
+/// Inserts `text` below the global directives that follow the first line (the Portico Include):
+/// before the comments and blank lines leading to the first `Host` or `Match` line, or at the end
+/// when there is none. Inserting higher would put those directives under the last inserted block.
+pub(crate) fn insert_before_first_block(contents: &[u8], text: &[u8]) -> Vec<u8> {
+    let kinds = lines_of(&String::from_utf8_lossy(contents))
+        .into_iter()
+        .map(|line| classify(line).0)
+        .collect::<Vec<_>>();
+    let mut index = kinds
+        .iter()
+        .position(|kind| matches!(kind, Kind::Host | Kind::Match))
+        .unwrap_or(kinds.len())
+        .max(1);
+    while index > 1 && matches!(kinds[index - 1], Kind::Blank | Kind::Comment) {
+        index -= 1;
+    }
+    let lines = contents
+        .split_inclusive(|&byte| byte == b'\n')
+        .collect::<Vec<_>>();
     let mut output = Vec::with_capacity(contents.len() + text.len() + 1);
-    match contents.iter().position(|&byte| byte == b'\n') {
-        Some(position) => {
-            output.extend_from_slice(&contents[..=position]);
-            output.extend_from_slice(text);
-            output.extend_from_slice(&contents[position + 1..]);
-        }
-        None => {
-            output.extend_from_slice(contents);
-            if !contents.is_empty() {
-                output.push(b'\n');
-            }
-            output.extend_from_slice(text);
-        }
+    for line in &lines[..index.min(lines.len())] {
+        output.extend_from_slice(line);
+    }
+    if !output.is_empty() && !output.ends_with(b"\n") {
+        output.push(b'\n');
+    }
+    output.extend_from_slice(text);
+    for line in lines.iter().skip(index) {
+        output.extend_from_slice(line);
     }
     output
 }
@@ -337,14 +351,25 @@ mod tests {
     }
 
     #[test]
-    fn insert_after_first_line_variants() {
+    fn insert_before_first_block_variants() {
         assert_eq!(
-            insert_after_first_line(b"Include x\nrest\n", b"Host a\n\n"),
-            b"Include x\nHost a\n\nrest\n"
+            insert_before_first_block(b"Include x\nHost b\n", b"Host a\n\n"),
+            b"Include x\nHost a\n\nHost b\n"
         );
         assert_eq!(
-            insert_after_first_line(b"Include x", b"Host a\n"),
+            insert_before_first_block(b"Include x", b"Host a\n"),
             b"Include x\nHost a\n"
+        );
+        assert_eq!(
+            insert_before_first_block(
+                b"Include x\nAddKeysToAgent yes\n\n# hosts\nMatch all\n",
+                b"Host a\n\n"
+            ),
+            b"Include x\nAddKeysToAgent yes\nHost a\n\n\n# hosts\nMatch all\n"
+        );
+        assert_eq!(
+            insert_before_first_block(b"Include x\nUser u\n", b"Host a\n"),
+            b"Include x\nUser u\nHost a\n"
         );
     }
 }

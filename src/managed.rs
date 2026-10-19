@@ -60,11 +60,15 @@ pub struct HostComments {
     pub leading: Vec<String>,
     /// Rendered directly above the directive of the field.
     pub fields: BTreeMap<HostField, Vec<String>>,
+    /// Rendered below the last directive: the comments that end the file after the host.
+    pub trailing: Vec<String>,
 }
 
 impl HostComments {
     pub fn is_empty(&self) -> bool {
-        self.leading.is_empty() && self.fields.values().all(Vec::is_empty)
+        self.leading.is_empty()
+            && self.fields.values().all(Vec::is_empty)
+            && self.trailing.is_empty()
     }
 }
 
@@ -882,8 +886,9 @@ impl ManagedConfig {
         for (index, raw_line) in input.lines().enumerate() {
             let line = index + 1;
             let trimmed = raw_line.trim();
-            if trimmed.is_empty() {
-                pending.clear();
+            // A comment separated by blank lines still belongs to what follows it; only the
+            // header Portico writes on the first line is no host's.
+            if trimmed.is_empty() || (index == 0 && trimmed == HEADER) {
                 continue;
             }
             if trimmed.starts_with('#') {
@@ -941,7 +946,8 @@ impl ManagedConfig {
             }
         }
 
-        if let Some(host) = current {
+        if let Some(mut host) = current {
+            host.trailing_comments = pending;
             config.push_parsed(host)?;
         }
         Ok(config)
@@ -1061,6 +1067,7 @@ impl ManagedConfig {
             proxy_jump,
             leading_comments,
             field_comments,
+            trailing_comments,
         } = parsed;
         let hostname = hostname.ok_or(ManagedError::MissingHostName { line })?;
         let hostname_line = hostname.1;
@@ -1099,6 +1106,7 @@ impl ManagedConfig {
         let comments = HostComments {
             leading: leading_comments,
             fields: field_comments,
+            trailing: trailing_comments,
         };
         self.set_comments(&host, comments);
         self.hosts.push(host);
@@ -1589,6 +1597,7 @@ struct ParsedHost {
     proxy_jump: Option<(String, usize)>,
     leading_comments: Vec<String>,
     field_comments: BTreeMap<HostField, Vec<String>>,
+    trailing_comments: Vec<String>,
 }
 
 impl ParsedHost {
@@ -1603,6 +1612,7 @@ impl ParsedHost {
             proxy_jump: None,
             leading_comments,
             field_comments: BTreeMap::new(),
+            trailing_comments: Vec::new(),
         }
     }
 }
@@ -1722,6 +1732,14 @@ pub(crate) fn render_host(host: &Host, comments: Option<&HostComments>) -> Strin
     if let Some(proxy_jump) = host.proxy_jump() {
         directive(HostField::ProxyJump, format!("ProxyJump {proxy_jump}"));
     }
+    if let Some(comments) = comments {
+        lines.extend(
+            comments
+                .trailing
+                .iter()
+                .map(|comment| format!("    {comment}")),
+        );
+    }
     lines.join("\n")
 }
 
@@ -1777,14 +1795,6 @@ mod tests {
     }
 
     #[test]
-    fn header_and_detached_comments_never_attach() {
-        let text = "# Managed by Portico. Do not edit manually.\n\n# detached\n\nHost dev\n    HostName dev.example\n";
-        let config = ManagedConfig::parse(text).unwrap();
-        assert!(config.comments("dev").is_none_or(HostComments::is_empty));
-        assert!(!config.render().contains("# detached"));
-    }
-
-    #[test]
     fn rename_keeps_comments_and_clear_drops_field_comments() {
         let mut config = ManagedConfig::empty();
         let comments = HostComments {
@@ -1793,6 +1803,7 @@ mod tests {
                 (HostField::User, vec!["# who".into()]),
                 (HostField::Port, vec!["# p".into()]),
             ]),
+            trailing: Vec::new(),
         };
         config
             .insert_with_comments(
@@ -1826,6 +1837,7 @@ mod tests {
                 (HostField::User, vec!["# who".into()]),
                 (HostField::Port, vec!["# p".into()]),
             ]),
+            trailing: Vec::new(),
         };
         let host = Host::new("dev", "h", Some("bob".into()), Some(2222), None, None).unwrap();
         config.insert_with_comments(host.clone(), comments).unwrap();
@@ -1844,11 +1856,27 @@ mod tests {
     }
 
     #[test]
+    fn keeps_detached_and_final_comments_but_never_the_header() {
+        let input =
+            format!("{HEADER}\n\n# prod database\n\nHost db\n    HostName d\n\n    # last\n");
+        let config = ManagedConfig::parse(&input).unwrap();
+        let comments = config.comments("db").unwrap();
+        assert_eq!(comments.leading, ["# prod database"]);
+        assert_eq!(comments.trailing, ["# last"]);
+        assert_eq!(
+            config.render(),
+            format!("{HEADER}\n\n# prod database\nHost db\n    HostName d\n    # last\n")
+        );
+        assert_eq!(ManagedConfig::parse(&config.render()).unwrap(), config);
+    }
+
+    #[test]
     fn remove_entry_returns_the_comments() {
         let mut config = ManagedConfig::empty();
         let comments = HostComments {
             leading: vec!["# lead".into()],
             fields: BTreeMap::from([(HostField::Hostname, vec!["# where".into()])]),
+            trailing: Vec::new(),
         };
         config
             .insert_with_comments(

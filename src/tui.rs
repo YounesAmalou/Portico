@@ -34,6 +34,7 @@ use ratatui::{
 mod containers;
 mod lister;
 mod migrate;
+mod planner;
 mod tester;
 
 use crate::{
@@ -52,6 +53,7 @@ use crate::{
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
 use lister::Lister;
 use migrate::{MigrateAction, MigrateState};
+use planner::Planner;
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
 
@@ -204,10 +206,17 @@ fn browse<B: Backend<Error = io::Error>>(
         let resolver = Resolver::spawn(scope, app);
         let tester = Tester::spawn(scope, app);
         let lister = Lister::spawn(scope, app);
-        browse_hosts(app, terminal, signals, session, resolver, tester, lister)
+        let planner = Planner::spawn(scope, app);
+        browse_hosts(
+            app, terminal, signals, session, resolver, tester, lister, planner,
+        )
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each worker is spawned in the caller's scope"
+)]
 fn browse_hosts<B: Backend<Error = io::Error>>(
     app: &App,
     terminal: &mut Terminal<B>,
@@ -216,6 +225,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     mut resolver: Resolver,
     mut tester: Tester,
     mut lister: Lister,
+    mut planner: Planner,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
@@ -239,6 +249,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             state.containers.finish(target, result);
             redraw = true;
         }
+        if let Some((planned, preselect)) = planner.try_finished() {
+            state.finish_plan(planned, &preselect, app.home());
+            redraw = true;
+        }
         let testing = tester.running().map(str::to_owned);
         if state.testing != testing {
             state.testing = testing;
@@ -249,7 +263,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             redraw = false;
         }
         // Poll quickly while a resolution or a test is running so its result appears promptly.
-        let wait = if resolver.is_pending() || tester.running().is_some() || lister.is_running() {
+        let wait = if resolver.is_pending()
+            || tester.running().is_some()
+            || lister.is_running()
+            || planner.is_running()
+        {
             Duration::from_millis(25)
         } else {
             Duration::from_millis(100)
@@ -386,19 +404,15 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 direction,
                 preselect,
             } => {
-                let plan = match direction {
-                    adopt::Direction::Adopt => app.adoption_plan(),
-                    adopt::Direction::Export => app.export_plan(),
-                };
-                match plan {
-                    Ok(plan) => {
-                        let migrate = MigrateState::new(plan, Some(&preselect));
-                        state.migrate = Some(migrate.with_home(app.home()));
-                        state.mode = Mode::Migrate;
-                    }
-                    Err(error) => state.report_error(&error),
+                // The screen shows that the plan is being checked until it arrives.
+                state.migrate = None;
+                state.mode = Mode::Migrate;
+                if !planner.start(direction, preselect) {
+                    state.mode = Mode::Browse;
+                    state.status = Some("the adoption worker stopped".into());
                 }
             }
+            UiAction::CancelPlan => planner.cancel(),
             UiAction::Migrate(aliases) => {
                 if let Some(migrate) = state.migrate.take() {
                     let result = app.migrate_cancellable(&migrate.plan, &aliases, terminated);
@@ -1327,6 +1341,8 @@ enum UiAction {
     },
     /// Moves the checked hosts of the open migrate screen.
     Migrate(Vec<String>),
+    /// Stops building the plan of the migrate screen, which closed before it arrived.
+    CancelPlan,
 }
 
 impl UiState {
@@ -2027,10 +2043,35 @@ impl UiState {
         }
     }
 
+    /// Opens the migrate screen on the plan the worker built, unless it was closed meanwhile.
+    fn finish_plan(
+        &mut self,
+        planned: Result<adopt::MigrationPlan, AppError>,
+        preselect: &str,
+        home: &std::path::Path,
+    ) {
+        if self.mode != Mode::Migrate || self.migrate.is_some() {
+            return;
+        }
+        match planned {
+            Ok(plan) => {
+                self.migrate = Some(MigrateState::new(plan, Some(preselect)).with_home(home));
+            }
+            Err(error) => {
+                self.mode = Mode::Browse;
+                self.report_error(&error);
+            }
+        }
+    }
+
     fn handle_migrate_key(&mut self, key: KeyEvent) -> UiAction {
         let Some(migrate) = &mut self.migrate else {
+            // The plan is still being built; only Esc does anything.
+            if key.code != KeyCode::Esc {
+                return UiAction::None;
+            }
             self.mode = Mode::Browse;
-            return UiAction::None;
+            return UiAction::CancelPlan;
         };
         match migrate.handle_key(key) {
             MigrateAction::None => {}
@@ -2314,10 +2355,12 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             ))],
         ),
         Mode::ConfirmTrust => ("Trust host key", trust_lines(state.trust.as_ref())),
-        Mode::Migrate => state
-            .migrate
-            .as_ref()
-            .map_or(("Migrate", Vec::new()), |migrate| {
+        Mode::Migrate => state.migrate.as_ref().map_or(
+            (
+                "Migrate",
+                vec![Line::raw("Checking each host with OpenSSH…")],
+            ),
+            |migrate| {
                 (
                     migrate.title(),
                     migrate.lines(
@@ -2325,7 +2368,8 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                         usize::from(columns[1].height.saturating_sub(2)),
                     ),
                 )
-            }),
+            },
+        ),
         _ => {
             let container = state.containers.details().filter(|_| panel_focused);
             let title = if container.is_some() {
@@ -5175,6 +5219,34 @@ mod tests {
         assert_eq!((hours.len(), minutes.len()), (2, 2), "{time}");
         assert!(hours.parse::<u8>().unwrap() < 24);
         assert!(minutes.parse::<u8>().unwrap() < 60);
+    }
+
+    #[test]
+    fn the_migrate_screen_waits_for_its_plan_and_esc_cancels_it() {
+        let plan = || {
+            adopt::MigrationPlan::for_tests(
+                adopt::Direction::Adopt,
+                vec![adopt::Candidate {
+                    alias: "web".into(),
+                    source: "/home/test/.ssh/config".into(),
+                    reason: None,
+                }],
+            )
+        };
+        let home = std::path::Path::new("/home/test");
+        let mut state = test_state(vec![summary("web", Ownership::External)]);
+        state.mode = Mode::Migrate;
+        assert_eq!(press(&mut state, KeyCode::Char('a')), UiAction::None);
+        assert_eq!(state.mode, Mode::Migrate);
+        state.finish_plan(Ok(plan()), "web", home);
+        assert!(state.migrate.is_some());
+
+        let mut state = test_state(vec![summary("web", Ownership::External)]);
+        state.mode = Mode::Migrate;
+        assert_eq!(press(&mut state, KeyCode::Esc), UiAction::CancelPlan);
+        assert_eq!(state.mode, Mode::Browse);
+        state.finish_plan(Ok(plan()), "web", home);
+        assert!(state.migrate.is_none());
     }
 
     #[test]

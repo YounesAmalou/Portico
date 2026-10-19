@@ -72,7 +72,7 @@ struct Move {
     /// resolved; a key of the snapshot.
     file: PathBuf,
     /// Adoption: the 0-based half-open line range of `file` the block occupies. Export: empty,
-    /// the blocks go below the first line.
+    /// the blocks go below the global directives that follow the Include.
     removed: Range<usize>,
     host: Host,
     comments: HostComments,
@@ -231,8 +231,9 @@ fn lossless_reason(
     ))
 }
 
-/// The first rule `path` breaks as a file to rewrite: a regular file, valid UTF-8, owned by
-/// `euid`, and writable along with its directory.
+/// The first rule `path` breaks as a file to rewrite: a regular file without other hard links
+/// (replacing it would detach them), valid UTF-8, owned by `euid`, and writable along with its
+/// directory.
 fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -240,6 +241,9 @@ fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
     };
     if !metadata.is_file() {
         return Some("not a regular file".into());
+    }
+    if metadata.nlink() > 1 {
+        return Some("has other hard links".into());
     }
     if std::str::from_utf8(contents).is_err() {
         return Some("not valid UTF-8".into());
@@ -280,8 +284,8 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Managed blocks as export writes them below the Portico Include: alphabetical, separated and
-/// followed by one blank line.
+/// Managed blocks as export writes them below the Include and the global directives after it:
+/// alphabetical, separated and followed by one blank line.
 fn export_blocks<'a>(moves: impl IntoIterator<Item = &'a Move>) -> String {
     let mut moves = moves.into_iter().collect::<Vec<_>>();
     moves.sort_by_key(|item| item.host.alias().to_ascii_lowercase());
@@ -472,7 +476,7 @@ impl ManagedStore {
             }
         }
         let after_entry =
-            insert_after_first_line(&entry_bytes, export_blocks(moves.values()).as_bytes());
+            insert_before_first_block(&entry_bytes, export_blocks(moves.values()).as_bytes());
         let mut plan = MigrationPlan {
             direction: Direction::Export,
             candidates,
@@ -998,7 +1002,7 @@ impl MigrationPlan {
                         .remove_entry(item.host.alias())
                         .map_err(TransactionError::Operation)?;
                 }
-                let entry = insert_after_first_line(
+                let entry = insert_before_first_block(
                     &self.snapshot[&self.entry],
                     export_blocks(moves.iter().copied()).as_bytes(),
                 );
@@ -2022,6 +2026,33 @@ mod tests {
         );
         assert_eq!(read(&fixture.paths.managed), HEADER);
         assert_no_temporary_files(&fixture.paths);
+    }
+
+    #[test]
+    fn a_hard_linked_source_is_not_eligible() {
+        let fixture = fixture("Include extra\n");
+        let extra = fixture.paths.ssh_dir.join("extra");
+        fs::write(&extra, "Host dev\n  HostName d\n").unwrap();
+        fs::hard_link(&extra, fixture.dir.path().join("linked")).unwrap();
+        let plan = fixture.store.adoption_plan(same()).unwrap();
+        assert_eq!(
+            reasons(&plan),
+            [("dev".into(), Some("has other hard links".into()))]
+        );
+    }
+
+    #[test]
+    fn export_keeps_global_directives_above_the_blocks() {
+        let fixture = fixture_with(
+            "AddKeysToAgent yes\n\nHost *\n  User u\n",
+            "\nHost dev\n    HostName d\n",
+        );
+        let plan = fixture.store.export_plan(same()).unwrap();
+        migrate(&fixture, &plan, &["dev"]).unwrap();
+        assert_eq!(
+            read(&fixture.paths.entry),
+            "Include ~/.ssh/portico/config\nAddKeysToAgent yes\nHost dev\n    HostName d\n\n\nHost *\n  User u\n"
+        );
     }
 
     #[test]
