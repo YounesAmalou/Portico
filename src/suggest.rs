@@ -91,7 +91,7 @@ pub fn rank(query: &str, candidates: &[Candidate], exclude: &[&str]) -> Vec<Cand
 
 /// `text` lowercased, with accented Latin letters (Latin-1 and Latin Extended-A) replaced by their
 /// base letters, so `cafe` finds `CAFÉ`. Only used to compare; aliases are shown as written.
-fn fold(text: &str) -> String {
+pub(crate) fn fold(text: &str) -> String {
     text.to_lowercase()
         .chars()
         .map(|character| {

@@ -267,7 +267,7 @@ mod tests {
             running: None,
         };
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
+        panel.show(Target::Host("dev".into()));
 
         lister.list(&mut panel, Target::Host("dev".into()));
 

@@ -13,6 +13,7 @@ use crate::{
     app::{ContainerError, ContainerList, Offer, Target},
     container::{Container, GroupTool, display_name, group, remote_command},
     openssh::ConnectionOutcome,
+    suggest::fold,
 };
 
 /// Why a target could not be listed, as the panel shows it.
@@ -52,13 +53,17 @@ pub(super) enum PanelAction {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct Panel {
-    pinned_local: bool,
+    /// The host whose containers are shown, or this machine when `None`.
     host: Option<String>,
     lists: HashMap<Target, PanelState>,
     selected: usize,
     user: TextInput,
     editing_user: bool,
     previous_user: String,
+    filter: TextInput,
+    editing_filter: bool,
+    /// The filter as it was when its edit began, which Esc restores.
+    filter_before_edit: String,
     /// The listing a running refresh replaces, which cancelling it restores.
     refreshing: HashMap<Target, PanelState>,
     /// The first line shown when the lines outgrow the panel, moved only as far as the
@@ -67,44 +72,48 @@ pub(super) struct Panel {
 }
 
 impl Panel {
-    /// This machine when pinned with `L`, otherwise the host the hosts panel has selected.
-    pub(super) fn target(&self) -> Option<Target> {
-        if self.pinned_local {
-            Some(Target::Local)
-        } else {
-            self.host.clone().map(Target::Host)
-        }
+    /// The machine whose containers the panel shows: this one until `c` picks a host.
+    pub(super) fn target(&self) -> Target {
+        self.host.clone().map_or(Target::Local, Target::Host)
     }
 
-    /// Follows the host selected in the hosts panel, which undoes an `L`.
-    pub(super) fn follow(&mut self, alias: Option<&str>) {
-        let before = self.target();
-        self.host = alias.map(String::from);
-        self.pinned_local = false;
-        if self.target() != before {
+    /// Shows `target`'s containers, listing them unless a listing is kept or running. Another
+    /// target starts unfiltered at its first row.
+    pub(super) fn show(&mut self, target: Target) -> PanelAction {
+        if target != self.target() {
+            self.host = match &target {
+                Target::Local => None,
+                Target::Host(alias) => Some(alias.clone()),
+            };
             self.selected = 0;
             self.scroll.set(0);
+            self.filter = TextInput::default();
+            self.editing_filter = false;
         }
-    }
-
-    /// Follows the selected host only when it moved, so an `L` survives other keys.
-    pub(super) fn follow_selection(&mut self, alias: Option<&str>) {
-        if self.host.as_deref() != alias {
-            self.follow(alias);
-        }
-    }
-
-    /// Lists the target the first time the panel gains focus for it.
-    pub(super) fn on_focus(&mut self) -> PanelAction {
-        match self.target() {
-            Some(target) if matches!(self.state(&target), PanelState::Unlisted) => {
-                PanelAction::List(target)
-            }
-            _ => PanelAction::None,
+        match self.state(&target) {
+            PanelState::Unlisted | PanelState::Failed(_) => PanelAction::List(target),
+            PanelState::Listing | PanelState::Listed(_) => PanelAction::None,
         }
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> PanelAction {
+        if self.editing_filter {
+            match key.code {
+                KeyCode::Enter => self.editing_filter = false,
+                KeyCode::Esc => {
+                    self.editing_filter = false;
+                    let before = std::mem::take(&mut self.filter_before_edit);
+                    self.set_filter(TextInput::new(&before));
+                }
+                _ => {
+                    let mut filter = self.filter.clone();
+                    if filter.handle_key(key) {
+                        self.set_filter(filter);
+                    }
+                }
+            }
+            return PanelAction::None;
+        }
         if self.editing_user {
             match key.code {
                 KeyCode::Enter => self.editing_user = false,
@@ -119,25 +128,26 @@ impl Panel {
             return PanelAction::None;
         }
         let target = self.target();
-        let state = target.as_ref().map(|target| self.state(target));
+        let state = self.state(&target);
         match key.code {
-            KeyCode::Esc if matches!(state, Some(PanelState::Listing)) => {
-                if let Some(target) = target {
-                    self.abandon(target);
-                }
+            KeyCode::Esc if matches!(state, PanelState::Listing) => {
+                self.abandon(target);
                 PanelAction::CancelList
+            }
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.set_filter(TextInput::default());
+                PanelAction::None
             }
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => PanelAction::Leave,
             KeyCode::Char('q') => PanelAction::Quit,
-            KeyCode::Char('L') => {
-                if !self.pinned_local {
-                    self.pinned_local = true;
-                    self.selected = 0;
-                    self.scroll.set(0);
-                }
-                self.on_focus()
+            KeyCode::Char('L') => self.show(Target::Local),
+            KeyCode::Char('r') => PanelAction::List(target),
+            KeyCode::Char('/') => {
+                self.filter_before_edit = self.filter.as_str().to_owned();
+                self.filter.cursor = self.filter.as_str().len();
+                self.editing_filter = true;
+                PanelAction::None
             }
-            KeyCode::Char('r') => target.map_or(PanelAction::None, PanelAction::List),
             KeyCode::Char('u') => {
                 self.previous_user = self.user.as_str().to_owned();
                 self.editing_user = true;
@@ -156,8 +166,8 @@ impl Panel {
             }
             KeyCode::Enter => self.shell(false),
             KeyCode::Char('n') => self.shell(true),
-            KeyCode::Char(character @ ('g' | 's')) => match (state, target) {
-                (Some(PanelState::Failed(failure)), Some(target)) => match &failure.offer {
+            KeyCode::Char(character @ ('g' | 's')) => match state {
+                PanelState::Failed(failure) => match &failure.offer {
                     Some(offer @ Offer::JoinGroup { .. }) if character == 'g' => PanelAction::Fix {
                         target,
                         offer: offer.clone(),
@@ -182,11 +192,43 @@ impl Panel {
         }
     }
 
-    /// Pastes into the user while it is being edited; otherwise a paste means nothing here.
+    /// Pastes into the filter or the user while it is being edited; otherwise a paste means
+    /// nothing here.
     pub(super) fn paste(&mut self, text: &str) {
-        if self.editing_user {
+        if self.editing_filter {
+            let mut filter = self.filter.clone();
+            filter.paste(text);
+            self.set_filter(filter);
+        } else if self.editing_user {
             self.user.paste(text);
         }
+    }
+
+    /// Applies a new filter, keeping the selected container when it still matches and
+    /// otherwise selecting the first match.
+    fn set_filter(&mut self, filter: TextInput) {
+        let selected = self.rows().get(self.selected).map(|row| row.id.clone());
+        self.filter = filter;
+        self.selected = selected
+            .and_then(|id| self.rows().iter().position(|row| row.id == id))
+            .unwrap_or(0);
+    }
+
+    /// Whether `container` matches the filter on the name the panel shows, its name, Compose
+    /// project and service, or image, ignoring case and accents.
+    fn matches(&self, container: &Container, all: &[Container]) -> bool {
+        let filter = fold(self.filter.as_str());
+        let shown = display_name(container, all);
+        [
+            Some(shown.as_str()),
+            Some(container.name.as_str()),
+            container.project.as_deref(),
+            container.service.as_deref(),
+            Some(container.image.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|field| fold(field).contains(&filter))
     }
 
     /// Shows that `target` could not be listed for a reason of Portico's own.
@@ -202,7 +244,7 @@ impl Panel {
     }
 
     /// Forgets a listing that will not finish: a refreshed listing comes back, anything else
-    /// is listed again on the next focus.
+    /// is left unlisted until `r`, `c` or `L` lists it.
     pub(super) fn abandon(&mut self, target: Target) {
         match self.refreshing.remove(&target) {
             Some(previous) => self.lists.insert(target, previous),
@@ -222,11 +264,11 @@ impl Panel {
         self.selected = self.selected.min(count.saturating_sub(1));
     }
 
-    pub(super) fn title(&self) -> String {
-        match self.target() {
-            Some(target) => format!("Containers: {target}"),
-            None => "Containers".into(),
-        }
+    /// `Containers: <target> /<filter>`, with the filter's cursor while it is edited.
+    pub(super) fn title(&self) -> Line<'static> {
+        let mut title = vec![Span::raw(format!("Containers: {} /", self.target()))];
+        title.extend(self.filter.spans(self.editing_filter));
+        Line::from(title)
     }
 
     /// The panel's lines for `height` rows of `width` columns, scrolled so the selected row
@@ -271,12 +313,10 @@ impl Panel {
                 .into_iter()
                 .map(move |line| Line::styled(line, style))
         };
-        let Some(target) = self.target() else {
-            return (vec![Line::raw("No host selected")], None);
-        };
+        let target = self.target();
         let mut selected = None;
         let lines = match self.state(&target) {
-            PanelState::Unlisted => vec![Line::raw("Tab to list containers")],
+            PanelState::Unlisted => vec![Line::raw("Not listed: r lists containers")],
             PanelState::Listing => vec![Line::raw("Listing…")],
             PanelState::Failed(failure) => {
                 let mut lines: Vec<Line> = failure
@@ -318,11 +358,19 @@ impl Panel {
                 }
                 let mut row = 0;
                 for group in group(all) {
+                    let shown: Vec<&Container> = group
+                        .containers
+                        .into_iter()
+                        .filter(|container| self.matches(container, all))
+                        .collect();
+                    if shown.is_empty() {
+                        continue;
+                    }
                     lines.push(Line::styled(
                         group.project.unwrap_or("Other").to_owned(),
                         bold,
                     ));
-                    for container in group.containers {
+                    for container in shown {
                         let mark = if row == self.selected {
                             selected = Some(lines.len());
                             ">"
@@ -335,6 +383,12 @@ impl Panel {
                         ]));
                         row += 1;
                     }
+                }
+                if row == 0 && !all.is_empty() {
+                    lines.extend(wrapped(
+                        &format!("No containers match \"{}\".", self.filter.as_str()),
+                        Style::default(),
+                    ));
                 }
                 lines
             }
@@ -374,11 +428,20 @@ impl Panel {
         )
     }
 
-    pub(super) fn footer(&self) -> &'static str {
-        if self.editing_user {
-            "Enter apply  Esc cancel"
+    pub(super) fn footer(&self) -> String {
+        if self.editing_filter {
+            "type to filter  ←→ move  Enter apply  Esc cancel".into()
+        } else if self.editing_user {
+            "Enter apply  Esc cancel".into()
         } else {
-            "↑↓ choose  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+            let clear_filter = if self.filter.is_empty() {
+                ""
+            } else {
+                "  Esc clear filter"
+            };
+            format!(
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+            )
         }
     }
 
@@ -387,18 +450,21 @@ impl Panel {
     }
 
     fn listed(&self) -> Option<&ContainerList> {
-        match self.state(&self.target()?) {
+        match self.state(&self.target()) {
             PanelState::Listed(list) => Some(list),
             _ => None,
         }
     }
 
-    /// The containers of the current listing in the order they are shown, headers left out.
+    /// The containers of the current listing that match the filter, in the order they are
+    /// shown, headers left out.
     fn rows(&self) -> Vec<&Container> {
         self.listed().map_or_else(Vec::new, |list| {
-            group(&list.listing.containers)
+            let all = &list.listing.containers;
+            group(all)
                 .into_iter()
                 .flat_map(|group| group.containers)
+                .filter(|container| self.matches(container, all))
                 .collect()
         })
     }
@@ -638,12 +704,20 @@ mod tests {
         Target::Host(alias.into())
     }
 
-    /// A panel following `dev`, listed with [`containers`].
+    /// A panel showing `dev`, listed with [`containers`].
     fn listed_panel() -> Panel {
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
+        panel.show(host("dev"));
         panel.finish(host("dev"), Ok(list(host("dev"), containers())));
         panel
+    }
+
+    fn type_filter(panel: &mut Panel, text: &str) {
+        assert_eq!(press(panel, KeyCode::Char('/')), PanelAction::None);
+        for character in text.chars() {
+            assert_eq!(press(panel, KeyCode::Char(character)), PanelAction::None);
+        }
+        assert_eq!(press(panel, KeyCode::Enter), PanelAction::None);
     }
 
     fn texts(lines: &[Line<'_>]) -> Vec<String> {
@@ -662,39 +736,48 @@ mod tests {
     }
 
     #[test]
-    fn focus_lists_once_per_target() {
+    fn show_lists_once_per_target_and_again_after_a_failure() {
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
-        assert_eq!(panel.on_focus(), PanelAction::List(host("dev")));
+        assert_eq!(panel.show(host("dev")), PanelAction::List(host("dev")));
         panel.set_listing(host("dev"));
-        assert_eq!(panel.on_focus(), PanelAction::None, "already listing");
+        assert_eq!(
+            panel.show(host("dev")),
+            PanelAction::None,
+            "already listing"
+        );
         panel.finish(host("dev"), Ok(list(host("dev"), containers())));
-        assert_eq!(panel.on_focus(), PanelAction::None);
+        assert_eq!(panel.show(host("dev")), PanelAction::None);
 
-        panel.follow(Some("web"));
-        assert_eq!(panel.on_focus(), PanelAction::List(host("web")));
-        panel.follow(Some("dev"));
-        assert_eq!(panel.on_focus(), PanelAction::None, "kept for the session");
+        assert_eq!(panel.show(host("web")), PanelAction::List(host("web")));
+        panel.finish(host("web"), Err(issue(None)));
+        assert_eq!(
+            panel.show(host("web")),
+            PanelAction::List(host("web")),
+            "a failure is listed again"
+        );
+        assert_eq!(
+            panel.show(host("dev")),
+            PanelAction::None,
+            "kept for the session"
+        );
     }
 
     #[test]
-    fn follow_unpins_local() {
+    fn starts_on_this_machine_and_l_comes_back_to_it() {
         let mut panel = Panel::default();
-        assert_eq!(panel.target(), None);
-        assert_eq!(panel.title(), "Containers");
-        panel.follow(Some("dev"));
-        assert_eq!(panel.target(), Some(host("dev")));
+        assert_eq!(panel.target(), Target::Local);
+        assert_eq!(panel.title().to_string(), "Containers: this machine /");
+        panel.show(host("dev"));
+        assert_eq!(panel.target(), host("dev"));
+        assert_eq!(panel.title().to_string(), "Containers: dev /");
 
         assert_eq!(
             press(&mut panel, KeyCode::Char('L')),
             PanelAction::List(Target::Local)
         );
-        assert_eq!(panel.target(), Some(Target::Local));
-        assert_eq!(panel.title(), "Containers: this machine");
-
-        panel.follow(Some("web"));
-        assert_eq!(panel.target(), Some(host("web")));
-        assert_eq!(panel.title(), "Containers: web");
+        assert_eq!(panel.target(), Target::Local);
+        panel.finish(Target::Local, Ok(list(Target::Local, containers())));
+        assert_eq!(press(&mut panel, KeyCode::Char('L')), PanelAction::None);
     }
 
     #[test]
@@ -732,7 +815,7 @@ mod tests {
         );
 
         press(&mut panel, KeyCode::Down);
-        panel.follow(Some("web"));
+        panel.show(host("web"));
         panel.finish(host("web"), Ok(list(host("web"), containers())));
         assert_eq!(
             selected(&panel),
@@ -807,7 +890,7 @@ mod tests {
         );
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+            "↑↓ choose  / filter  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
@@ -826,12 +909,16 @@ mod tests {
     #[test]
     fn esc_while_listing_cancels() {
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
+        panel.show(host("dev"));
         panel.set_listing(host("dev"));
         assert_eq!(texts(&panel.lines(true, 100, 200))[0], "Listing…");
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::CancelList);
         assert_eq!(
-            panel.on_focus(),
+            texts(&panel.lines(false, 100, 200)),
+            ["Not listed: r lists containers"]
+        );
+        assert_eq!(
+            panel.show(host("dev")),
             PanelAction::List(host("dev")),
             "lists again"
         );
@@ -840,7 +927,7 @@ mod tests {
     #[test]
     fn offer_keys_only_for_matching_offer() {
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
+        panel.show(host("dev"));
         panel.finish(host("dev"), Err(issue(Some(Offer::StartDaemon))));
         assert_eq!(press(&mut panel, KeyCode::Char('g')), PanelAction::None);
         assert_eq!(
@@ -874,11 +961,10 @@ mod tests {
     #[test]
     fn renders_groups_and_hint() {
         let mut panel = Panel::default();
-        assert_eq!(texts(&panel.lines(false, 100, 200)), ["No host selected"]);
-        panel.follow(Some("dev"));
+        panel.show(host("dev"));
         assert_eq!(
             texts(&panel.lines(false, 100, 200)),
-            ["Tab to list containers"]
+            ["Not listed: r lists containers"]
         );
 
         let mut listed = list(host("dev"), containers());
@@ -956,7 +1042,7 @@ mod tests {
     #[test]
     fn failure_lines_for_ssh_and_docker() {
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
+        panel.show(host("dev"));
         panel.finish(
             host("dev"),
             Err(ContainerError::Ssh {
@@ -1038,7 +1124,7 @@ mod tests {
         assert_eq!(texts(&panel.lines(false, 100, 200)), ["Listing…"]);
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::CancelList);
         assert_eq!(texts(&panel.lines(false, 100, 200)), before);
-        assert_eq!(panel.on_focus(), PanelAction::None);
+        assert_eq!(panel.show(host("dev")), PanelAction::None);
 
         panel.set_listing(host("dev"));
         panel.finish(host("dev"), Ok(list(host("dev"), Vec::new())));
@@ -1047,8 +1133,8 @@ mod tests {
         panel.set_listing(host("dev"));
         press(&mut panel, KeyCode::Esc);
         assert_eq!(
-            panel.on_focus(),
-            PanelAction::List(host("dev")),
+            texts(&panel.lines(false, 100, 200)),
+            ["Not listed: r lists containers"],
             "a failure is not restored"
         );
     }
@@ -1183,13 +1269,12 @@ mod tests {
     fn abandoning_a_superseded_listing() {
         let mut panel = listed_panel();
         panel.set_listing(host("dev"));
-        panel.follow(Some("web"));
+        panel.show(host("web"));
         panel.set_listing(host("web"));
         panel.abandon(host("dev"));
         panel.abandon(host("web"));
-        assert_eq!(panel.on_focus(), PanelAction::List(host("web")));
-        panel.follow(Some("dev"));
-        assert_eq!(panel.on_focus(), PanelAction::None);
+        assert_eq!(panel.show(host("web")), PanelAction::List(host("web")));
+        assert_eq!(panel.show(host("dev")), PanelAction::None);
         assert_eq!(texts(&panel.lines(false, 100, 200))[1], "> api  Up 2 hours");
     }
 
@@ -1209,7 +1294,7 @@ mod tests {
         };
         let command = remote_command(&join.words());
         let mut panel = Panel::default();
-        panel.follow(Some("dev"));
+        panel.show(host("dev"));
         let ContainerError::Docker(mut issue) = issue(Some(join)) else {
             unreachable!()
         };
@@ -1246,5 +1331,147 @@ mod tests {
                 .unwrap()
                 .starts_with("This runs: sudo")
         );
+    }
+
+    #[test]
+    fn filter_matches_shown_name_project_service_and_image() {
+        let mut all = containers();
+        all[3].image = "Redis:7".into();
+        all.push(container("eeee", "Café-Bar", None, None));
+        let shown = |filter: &str| {
+            let mut panel = Panel::default();
+            panel.finish(Target::Local, Ok(list(Target::Local, all.clone())));
+            type_filter(&mut panel, filter);
+            texts(&panel.lines(false, 100, 200))
+        };
+        assert_eq!(
+            shown("API"),
+            ["shop", "> api  Up 2 hours"],
+            "shown name, any case"
+        );
+        assert_eq!(
+            shown("wiki-db"),
+            ["wiki", "> db  Up 2 hours"],
+            "container name"
+        );
+        assert_eq!(
+            shown("shop"),
+            ["shop", "> api  Up 2 hours", "  web  Up 2 hours"],
+            "project"
+        );
+        assert_eq!(shown("we"), ["shop", "> web  Up 2 hours"], "service");
+        assert_eq!(shown("redis:7"), ["Other", "> redis  Up 2 hours"], "image");
+        assert_eq!(
+            shown("CAFE"),
+            ["Other", "> Café-Bar  Up 2 hours"],
+            "accents"
+        );
+        assert_eq!(shown("nope"), ["No containers match \"nope\"."]);
+    }
+
+    #[test]
+    fn filter_keeps_the_selection_or_moves_to_the_first_match() {
+        let mut panel = listed_panel();
+        press(&mut panel, KeyCode::Down);
+        type_filter(&mut panel, "w");
+        assert_eq!(
+            texts(&panel.lines(false, 100, 200)),
+            ["shop", "> web  Up 2 hours", "wiki", "  db  Up 2 hours"],
+            "web still matches"
+        );
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Down);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell { id, .. } if id == "cccc"
+        ));
+        assert!(panel.details().unwrap().starts_with("name: wiki-db-1"));
+
+        type_filter(&mut panel, "eb");
+        assert_eq!(
+            texts(&panel.lines(false, 100, 200)),
+            ["shop", "> web  Up 2 hours"],
+            "db no longer matches"
+        );
+        type_filter(&mut panel, "x");
+        assert_eq!(press(&mut panel, KeyCode::Enter), PanelAction::None);
+        assert_eq!(panel.details(), None);
+    }
+
+    #[test]
+    fn filter_edit_esc_restores_and_esc_clears() {
+        let mut panel = listed_panel();
+        type_filter(&mut panel, "db");
+        assert_eq!(panel.title().to_string(), "Containers: dev /db");
+        assert_eq!(
+            panel.footer(),
+            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  r refresh  L this machine  Tab hosts"
+        );
+
+        press(&mut panel, KeyCode::Char('/'));
+        assert_eq!(
+            panel.footer(),
+            "type to filter  ←→ move  Enter apply  Esc cancel"
+        );
+        press(&mut panel, KeyCode::Backspace);
+        press(&mut panel, KeyCode::Backspace);
+        assert_eq!(press(&mut panel, KeyCode::Char('q')), PanelAction::None);
+        panel.paste("uu\n");
+        assert_eq!(panel.title().to_string(), "Containers: dev /quu ");
+        assert_eq!(
+            texts(&panel.lines(false, 100, 200)),
+            ["No containers match \"quu\"."]
+        );
+        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None);
+        assert_eq!(panel.title().to_string(), "Containers: dev /db");
+        assert_eq!(texts(&panel.lines(false, 100, 200)).len(), 2);
+
+        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None, "clears");
+        assert_eq!(panel.title().to_string(), "Containers: dev /");
+        assert_eq!(texts(&panel.lines(false, 100, 200)).len(), 7);
+        assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::Leave);
+    }
+
+    #[test]
+    fn filtered_listing_scrolls_to_selection() {
+        let mut panel = listed_panel();
+        type_filter(&mut panel, "-");
+        let shown = |panel: &Panel| texts(&panel.lines(true, 3, 200));
+        assert_eq!(
+            shown(&panel),
+            ["shop", "> api  Up 2 hours", "user: image default"]
+        );
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Down);
+        assert_eq!(
+            shown(&panel),
+            ["wiki", "> db  Up 2 hours", "user: image default"],
+            "redis is filtered out, so the selection stops at db"
+        );
+        type_filter(&mut panel, "x");
+        type_filter(&mut panel, "");
+        assert_eq!(
+            shown(&panel),
+            ["No containers match \"-x\".", "user: image default"],
+            "a scroll past the end is clamped"
+        );
+    }
+
+    #[test]
+    fn another_target_clears_the_filter() {
+        let mut panel = listed_panel();
+        press(&mut panel, KeyCode::Down);
+        type_filter(&mut panel, "web");
+        panel.show(host("dev"));
+        assert_eq!(
+            panel.title().to_string(),
+            "Containers: dev /web",
+            "same target"
+        );
+        panel.show(Target::Local);
+        assert_eq!(panel.title().to_string(), "Containers: this machine /");
+        panel.finish(Target::Local, Ok(list(Target::Local, containers())));
+        assert_eq!(texts(&panel.lines(false, 100, 200))[1], "> api  Up 2 hours");
     }
 }

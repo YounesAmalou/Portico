@@ -257,7 +257,8 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
 | `m` | Adopt the selected external host, or export the selected managed host, after a preview |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
-| `Tab` / `Shift+Tab` | Move the focus between the hosts and the containers panel |
+| `c` | Show the selected host's containers in the containers panel (the focus stays on the hosts) |
+| `Tab` / `Shift+Tab` | Move the focus between the hosts and the containers panel; this never lists anything |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 | `q` | Quit |
 
@@ -272,20 +273,23 @@ Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolut
 
 A test shows `✓` or `✗` beside the host and its result in the details until the host is edited or removed or the inventory is refreshed. `Esc` cancels a running test. An unknown host key opens a prompt showing its fingerprint: `y` trusts it and tests again, `n` or `Esc` declines. If you have moved on by the time the result arrives (into the filter or a form, say), no prompt interrupts you: the host is marked untrusted, and `t` tests it again to review the key. Editing a form cancels its running test.
 
-The containers panel sits under the hosts and follows the selected host. It lists only when it gains focus for a host not yet listed, or on `r`, and keeps the result for the session. Its details show the selected container. Keys in the panel:
+The containers panel sits under the hosts and shows this machine's containers, listed when the TUI starts. `c` in the hosts panel shows the selected host's containers instead, and `L` in the panel comes back to this machine; moving through the hosts never changes it. `c` and `L` list a target the first time and after a failed listing, and otherwise show the result kept for the session; `r` lists again. Its details show the selected container. Keys in the panel:
 
 | Key | Action |
 |---|---|
 | `↑` / `↓` / `j` / `k` | Move through containers |
+| `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, ignoring case and accents |
 | `Enter` | Open a shell in this terminal |
 | `n` | Open a shell in a new terminal |
 | `u` | Set the user for the next shell (empty means the image's user; not saved) |
 | `r` | List again |
-| `L` | List this machine instead of the selected host |
+| `L` | Show this machine's containers again |
 | `g` / `s` | Add yourself to the docker group / start docker, shown only when the error offers it |
-| `Esc` | Cancel a listing, otherwise back to the hosts |
+| `Esc` | Cancel a listing, otherwise clear the applied filter, otherwise back to the hosts |
 | `Tab` / `Shift+Tab` | Back to the hosts |
 | `q` | Quit |
+
+The filter edits like the hosts filter: `Enter` applies it and `Esc` cancels the edit. The panel's title shows it, a Compose project's header stays only while one of its containers matches, and showing another target clears it.
 
 External hosts can be inspected, tested and connected to, but Portico will not edit or remove them until you adopt them with `m` or `portico adopt`.
 Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into the active filter or form field.
