@@ -33,6 +33,7 @@ use ratatui::{
 };
 
 mod containers;
+mod dropdown;
 mod hangup;
 mod identities;
 mod lister;
@@ -59,6 +60,7 @@ use crate::{
     suggest::{self, Candidate},
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
+use dropdown::{SUGGESTION_ROWS, Suggestions, suggestion_lines};
 use hangup::{HangupWatch, Input};
 use identities::Indexer;
 use lister::Lister;
@@ -250,7 +252,6 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
     state.home = app.home().to_owned();
     sync_details(&mut state, &mut resolver, false);
-    lister.list(&mut state.containers, Target::Local);
     let mut redraw = true;
 
     loop {
@@ -287,7 +288,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             state.tunnels.reload(app);
             redraw = true;
         }
-        if state.mode == Mode::Tunnels && state.tunnels.is_stale() {
+        if state.tab == Tab::Tunnels && state.tunnels.is_stale() {
             state.tunnels.reload(app);
             redraw = true;
         }
@@ -342,13 +343,14 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         }
 
         let mut inventory_changed = false;
-        match state.handle_key(key) {
+        let tab = state.tab;
+        let action = state.handle_key(key);
+        if state.tab != tab && state.tab == Tab::Tunnels {
+            state.tunnels.reload(app);
+        }
+        match action {
             UiAction::None => {}
             UiAction::Quit => return Ok(()),
-            UiAction::OpenTunnels => {
-                state.tunnels.reload(app);
-                state.mode = Mode::Tunnels;
-            }
             UiAction::Tunnels(action) => run_tunnel_action(app, &mut state, &mut starter, action),
             UiAction::Connect {
                 alias,
@@ -386,14 +388,16 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 } else {
                     suspended(terminal, session, signals, || Ok(shell(Some(terminated))))?
                 };
-                state.status = Some(shell_status(&target, result));
+                state
+                    .containers
+                    .set_status(Some(shell_status(&target, result)));
             }
             UiAction::Containers(PanelAction::Fix { target, offer }) => {
                 let result = suspended(terminal, session, signals, || {
                     show_fix(&mut io::stdout(), &target, &offer)?;
                     Ok(app.docker_fix(&target, &offer))
                 })?;
-                state.status = fix_status(&offer, result);
+                state.containers.set_status(fix_status(&offer, result));
                 lister.list(&mut state.containers, target);
             }
             UiAction::Containers(_) => {}
@@ -514,11 +518,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     }
 }
 
-/// Carries out what the tunnels screen asked for.
+/// Carries out what the Tunnels tab asked for.
 fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, action: TunnelAction) {
     let screen = &mut state.tunnels;
     match action {
-        TunnelAction::None | TunnelAction::Leave | TunnelAction::Quit => return,
+        TunnelAction::None | TunnelAction::Quit => return,
         TunnelAction::Refresh => screen.set_status("Refreshed"),
         TunnelAction::Start(name) => {
             starter.start(name);
@@ -1092,7 +1096,37 @@ enum Mode {
     ConfirmRemove,
     ConfirmTrust,
     Migrate,
+}
+
+/// The tabs, in the order the tab bar shows them and Tab cycles them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Tab {
+    #[default]
+    Hosts,
     Tunnels,
+    Containers,
+}
+
+impl Tab {
+    const ALL: [Self; 3] = [Self::Hosts, Self::Tunnels, Self::Containers];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hosts => "Hosts",
+            Self::Tunnels => "Tunnels",
+            Self::Containers => "Containers",
+        }
+    }
+
+    fn number(self) -> usize {
+        Self::ALL.iter().position(|&tab| tab == self).unwrap_or(0) + 1
+    }
+
+    /// The tab `by` places after this one, wrapping around.
+    fn cycled(self, by: isize) -> Self {
+        let count = Self::ALL.len() as isize;
+        Self::ALL[(self.number() as isize - 1 + by).rem_euclid(count) as usize]
+    }
 }
 
 /// A single-line text field edited at a cursor.
@@ -1258,7 +1292,7 @@ impl DetailsCache {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct UiState {
     hosts: Vec<HostSummary>,
     warnings: Vec<DiscoveryWarning>,
@@ -1286,7 +1320,8 @@ struct UiState {
     /// The host key awaiting the user's decision while in `Mode::ConfirmTrust`.
     trust: Option<PendingTrust>,
     containers: Panel,
-    focus: Focus,
+    /// The tab shown and receiving keys.
+    tab: Tab,
     /// The migrate screen while in `Mode::Migrate`.
     migrate: Option<MigrateState>,
     /// Every identity Portico knows of, for the IdentityFile suggestions; built once a form
@@ -1295,16 +1330,8 @@ struct UiState {
     /// The home whose `~/.ssh` the IdentityFile suggestions scan and whose paths show as `~`;
     /// empty (nothing scanned) until the session sets it from the app.
     home: PathBuf,
-    /// The tunnels screen, shown in `Mode::Tunnels`.
+    /// The Tunnels tab.
     tunnels: TunnelsScreen,
-}
-
-/// The left-column panel that receives keys while browsing.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum Focus {
-    #[default]
-    Hosts,
-    Containers,
 }
 
 /// The outcome of a host's last connection test.
@@ -1380,53 +1407,6 @@ struct FormState {
 const IDENTITY_FILE: usize = 4;
 /// The index of ProxyJump in `FORM_FIELDS`.
 const PROXY_JUMP: usize = 5;
-/// How many suggestions the dropdown shows at once.
-const SUGGESTION_ROWS: usize = 5;
-
-/// The open jump host dropdown.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Suggestions {
-    /// The matching aliases, never empty while the dropdown is open.
-    items: Vec<Candidate>,
-    selected: usize,
-    /// The first visible row; the selection always stays within the visible rows.
-    offset: usize,
-    /// Whether Ctrl+Space opened it, which keeps it open for an empty hop.
-    forced: bool,
-    /// The form field it suggests for: ProxyJump or IdentityFile.
-    field: usize,
-}
-
-impl Suggestions {
-    /// A dropdown of `items`, keeping the selection of the `previous` one when it still lists it.
-    fn reopened(previous: Option<Self>, items: Vec<Candidate>, forced: bool, field: usize) -> Self {
-        let selected = previous
-            .and_then(|list| {
-                let alias = &list.items[list.selected].alias;
-                items.iter().position(|item| &item.alias == alias)
-            })
-            .unwrap_or(0);
-        let mut list = Self {
-            items,
-            selected: 0,
-            offset: 0,
-            forced,
-            field,
-        };
-        list.select(selected);
-        list
-    }
-
-    fn select(&mut self, selected: usize) {
-        self.selected = selected.min(self.items.len() - 1);
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset + SUGGESTION_ROWS {
-            self.offset = self.selected + 1 - SUGGESTION_ROWS;
-        }
-    }
-}
-
 /// A form's connection test result, with the explanation shown under it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FormTestResult {
@@ -1448,7 +1428,6 @@ struct PendingTrust {
 enum UiAction {
     None,
     Quit,
-    OpenTunnels,
     Tunnels(TunnelAction),
     Connect {
         alias: String,
@@ -1506,7 +1485,7 @@ impl UiState {
             show_raw: false,
             trust: None,
             containers: Panel::default(),
-            focus: Focus::Hosts,
+            tab: Tab::Hosts,
             migrate: None,
             identity_inventory: None,
             home: PathBuf::new(),
@@ -1588,32 +1567,96 @@ impl UiState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
-        self.status = None;
+        // An `e` waiting for details is dropped by any other key, a tab switch included.
         self.edit_pending = false;
-        if self.mode == Mode::Tunnels {
-            return match self.tunnels.handle_key(key) {
-                TunnelAction::Leave => {
-                    self.mode = Mode::Browse;
-                    UiAction::None
-                }
+        if let Some(action) = self.handle_tab_key(key) {
+            return action;
+        }
+        match self.tab {
+            Tab::Hosts => self.handle_hosts_key(key),
+            Tab::Tunnels => match self.tunnels.handle_key(key) {
                 TunnelAction::Quit => UiAction::Quit,
                 action => UiAction::Tunnels(action),
-            };
-        }
-        if self.mode == Mode::Browse && self.focus == Focus::Containers {
-            let action = self.containers.handle_key(key);
-            if matches!(action, PanelAction::Leave | PanelAction::CancelList) {
-                self.focus = Focus::Hosts;
-            }
-            return match action {
+            },
+            Tab::Containers => match self.containers.handle_key(key) {
                 PanelAction::Quit => UiAction::Quit,
+                PanelAction::ChooseTarget => {
+                    let hosts = self
+                        .hosts
+                        .iter()
+                        .map(|host| {
+                            let origin = match host.ownership {
+                                Ownership::Managed => suggest::Origin::Managed,
+                                Ownership::External => {
+                                    suggest::Origin::External(host.source.clone())
+                                }
+                            };
+                            (
+                                host.alias.clone(),
+                                suggest::origin_label(&origin, Some(&self.home)),
+                            )
+                        })
+                        .collect();
+                    self.containers.choose_target(hosts);
+                    UiAction::None
+                }
                 action => UiAction::Containers(action),
-            };
+            },
         }
-        if self.mode == Mode::Browse && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.focus = Focus::Containers;
-            return UiAction::None;
+    }
+
+    /// Whether the active tab is browsing, so the keys shared by every tab apply: no text input,
+    /// form, confirmation or checklist has them.
+    fn browsing(&self) -> bool {
+        match self.tab {
+            Tab::Hosts => self.mode == Mode::Browse,
+            Tab::Tunnels => self.tunnels.is_browsing(),
+            Tab::Containers => self.containers.is_browsing(),
         }
+    }
+
+    /// The keys shared by every browsing tab: `1` `2` `3`, Tab and Shift+Tab switch tabs, `T`
+    /// shows the tunnels and `c` the containers, of the selected host when on the hosts.
+    fn handle_tab_key(&mut self, key: KeyEvent) -> Option<UiAction> {
+        if !self.browsing()
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        let tab = match key.code {
+            KeyCode::Char('1') => Tab::Hosts,
+            KeyCode::Char('2') => Tab::Tunnels,
+            KeyCode::Char('3') => Tab::Containers,
+            KeyCode::Tab => self.tab.cycled(1),
+            KeyCode::BackTab => self.tab.cycled(-1),
+            // Terminals report Shift+T as `T`, with or without the Shift modifier.
+            KeyCode::Char('T') => Tab::Tunnels,
+            KeyCode::Char('c') => {
+                if self.tab == Tab::Hosts
+                    && let Some(alias) = self.selected_alias()
+                {
+                    let target = Target::Host(alias.to_owned());
+                    self.tab = Tab::Containers;
+                    return Some(UiAction::Containers(self.containers.show(target)));
+                }
+                Tab::Containers
+            }
+            _ => return None,
+        };
+        let entered = tab != self.tab;
+        self.tab = tab;
+        // A target is listed once its tab is shown, never before.
+        if entered && tab == Tab::Containers {
+            let target = self.containers.target();
+            return Some(UiAction::Containers(self.containers.show(target)));
+        }
+        Some(UiAction::None)
+    }
+
+    fn handle_hosts_key(&mut self, key: KeyEvent) -> UiAction {
+        self.status = None;
         if key.code == KeyCode::Esc && self.testing.is_some() {
             self.status = Some("Test cancelled".into());
             return UiAction::CancelTest;
@@ -1626,7 +1669,6 @@ impl UiState {
             Mode::ConfirmRemove => self.handle_remove_key(key),
             Mode::ConfirmTrust => self.handle_trust_key(key),
             Mode::Migrate => self.handle_migrate_key(key),
-            Mode::Tunnels => UiAction::None,
         };
         // Unfolded output belongs to one selection, or to one open form.
         if (selected, in_form) != (self.selected, self.in_form()) {
@@ -1636,6 +1678,17 @@ impl UiState {
     }
 
     fn handle_paste(&mut self, text: &str) -> UiAction {
+        match self.tab {
+            Tab::Hosts => {}
+            Tab::Tunnels => {
+                self.tunnels.paste(text);
+                return UiAction::None;
+            }
+            Tab::Containers => {
+                self.containers.paste(text);
+                return UiAction::None;
+            }
+        }
         self.status = None;
         match self.mode {
             Mode::Filter => {
@@ -1648,13 +1701,11 @@ impl UiState {
                 input.paste(text);
                 return self.form_input_changed(&before, cursor);
             }
-            Mode::Browse if self.focus == Focus::Containers => self.containers.paste(text),
             Mode::Migrate => {
                 if let Some(migrate) = &mut self.migrate {
                     migrate.paste(text);
                 }
             }
-            Mode::Tunnels => self.tunnels.paste(text),
             Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
         }
         UiAction::None
@@ -1700,16 +1751,6 @@ impl UiState {
             KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.test_selected();
             }
-            // Terminals report Shift+T as `T`, with or without the Shift modifier.
-            KeyCode::Char('T') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return UiAction::OpenTunnels;
-            }
-            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(alias) = self.selected_alias() {
-                    let target = Target::Host(alias.to_owned());
-                    return UiAction::Containers(self.containers.show(target));
-                }
-            }
             KeyCode::Char('o') if key.modifiers.is_empty() && self.selected_has_foldable_raw() => {
                 self.show_raw = !self.show_raw;
             }
@@ -1741,8 +1782,9 @@ impl UiState {
         }
     }
 
+    /// Opens the edit form `e` asked for, unless the Hosts tab has been left since.
     fn open_pending_edit(&mut self) {
-        if std::mem::take(&mut self.edit_pending) {
+        if std::mem::take(&mut self.edit_pending) && self.tab == Tab::Hosts {
             self.begin_edit();
         }
     }
@@ -2104,7 +2146,7 @@ impl UiState {
     /// cancels its test, so a form result that arrives finds its own form.
     fn can_prompt(&self, origin: &Origin) -> bool {
         match origin {
-            Origin::Host(_) => self.mode == Mode::Browse,
+            Origin::Host(_) => self.tab == Tab::Hosts && self.mode == Mode::Browse,
             Origin::Form => self.in_form(),
         }
     }
@@ -2444,40 +2486,174 @@ fn details_for_selected(selected: &HostSummary, mut details: HostDetails) -> Hos
 }
 
 fn render(frame: &mut Frame<'_>, state: &UiState) {
-    if state.mode == Mode::Tunnels {
-        state.tunnels.render(frame);
-        return;
+    let [bar, body] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .areas(frame.area());
+    frame.render_widget(Paragraph::new(tab_bar(state.tab, bar.width)), bar);
+    match state.tab {
+        Tab::Hosts => render_hosts(frame, body, state),
+        Tab::Tunnels => {
+            let content = tab_areas(
+                body,
+                state.tunnels.status_line(),
+                &state.tunnels.footer(),
+                frame,
+            );
+            state.tunnels.render(frame, content);
+        }
+        Tab::Containers => render_containers(frame, body, state),
     }
+}
+
+/// The tab bar: each tab's number and name, the active one highlighted. When the names do not
+/// fit, the other tabs show only their numbers, and when even that does not fit only the active
+/// tab is shown, so the bar never wraps or hides the active tab.
+fn tab_bar(active: Tab, width: u16) -> Line<'static> {
+    let separator = " \u{2502} ";
+    let full = |tab: Tab| format!("{} {}", tab.number(), tab.label());
+    let labels = |short: bool| {
+        Tab::ALL
+            .iter()
+            .map(|&tab| {
+                if short && tab != active {
+                    tab.number().to_string()
+                } else {
+                    full(tab)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let fits = |labels: &[String]| {
+        1 + labels
+            .iter()
+            .map(|label| display_width(label))
+            .sum::<usize>()
+            + separator.chars().count() * (labels.len() - 1)
+            <= usize::from(width)
+    };
+    let highlight = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ")];
+    let (full_labels, short_labels) = (labels(false), labels(true));
+    let shown = if fits(&full_labels) {
+        Some(full_labels)
+    } else if fits(&short_labels) {
+        Some(short_labels)
+    } else {
+        None
+    };
+    match shown {
+        Some(shown) => {
+            for (index, (tab, label)) in Tab::ALL.iter().zip(shown).enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(separator));
+                }
+                if *tab == active {
+                    spans.push(Span::styled(label, highlight));
+                } else {
+                    spans.push(Span::raw(label));
+                }
+            }
+        }
+        None => spans.push(Span::styled(full(active), highlight)),
+    }
+    Line::from(spans)
+}
+
+/// Draws a tab's status line and footer at the bottom of `area`, and returns the rest.
+fn tab_areas(area: Rect, status: Option<String>, footer: &str, frame: &mut Frame<'_>) -> Rect {
+    let footer_height = (footer.chars().count() as u16)
+        .div_ceil(area.width.max(1))
+        .max(1);
+    let [content, status_area, footer_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(u16::from(status.is_some())),
+            Constraint::Length(footer_height),
+        ])
+        .areas(area);
+    frame.render_widget(Paragraph::new(status.unwrap_or_default()), status_area);
+    frame.render_widget(
+        Paragraph::new(footer.to_owned()).wrap(Wrap { trim: true }),
+        footer_area,
+    );
+    content
+}
+
+/// The Containers tab: the target line, the list with the user line, and the selected
+/// container's details, with the target picker over them while it is open.
+fn render_containers(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    let panel = &state.containers;
+    let content = tab_areas(
+        area,
+        panel.status().map(str::to_owned),
+        &panel.footer(),
+        frame,
+    );
+    let [target, body] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .areas(content);
+    frame.render_widget(Paragraph::new(panel.target_line()), target);
+    let [left, right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(body);
+    frame.render_widget(
+        Paragraph::new(panel.lines(
+            true,
+            usize::from(left.height.saturating_sub(2)),
+            usize::from(left.width.saturating_sub(2)),
+        ))
+        .block(Block::default().borders(Borders::ALL).title(panel.title())),
+        left,
+    );
+    let details = panel.details().unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(
+            details
+                .lines()
+                .map(|line| Line::raw(line.to_owned()))
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Container")),
+        right,
+    );
+    if panel.picker_open() {
+        let height = body.height.min(crate::picker::MAX_HEIGHT + 2);
+        let area = Rect { height, ..body };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Containers on");
+        let inner = block.inner(area);
+        frame.render_widget(ratatui::widgets::Clear, area);
+        frame.render_widget(block, area);
+        panel.render_picker(frame, inner);
+    }
+}
+
+/// The Hosts tab: the hosts on the left, the details, a form or a prompt on the right.
+fn render_hosts(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let footer = footer_text(state);
     let status = state.status_line();
     let footer_height = (footer.chars().count() as u16)
-        .div_ceil(frame.area().width.max(1))
+        .div_ceil(area.width.max(1))
         .max(1);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(
-                state
-                    .warnings
-                    .len()
-                    .min(usize::from(frame.area().height / 3)) as u16,
-            ),
+            Constraint::Length(state.warnings.len().min(usize::from(area.height / 3)) as u16),
             Constraint::Length(u16::from(status.is_some())),
             Constraint::Length(footer_height),
         ])
-        .split(frame.area());
+        .split(area);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(areas[0]);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length((columns[0].height * 2 / 5).max(6)),
-        ])
-        .split(columns[0]);
 
     let hosts = state
         .visible
@@ -2518,30 +2694,9 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                     .title(Line::from(title)),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-        left[0],
+        columns[0],
         &mut list_state,
     );
-    let panel_focused = state.mode == Mode::Browse && state.focus == Focus::Containers;
-    let panel_border = if panel_focused {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    frame.render_widget(
-        Paragraph::new(state.containers.lines(
-            panel_focused,
-            usize::from(left[1].height.saturating_sub(2)),
-            usize::from(left[1].width.saturating_sub(2)),
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(panel_border)
-                .title(state.containers.title()),
-        ),
-        left[1],
-    );
-
     let (right_title, detail_lines) = match state.mode {
         Mode::AddForm | Mode::EditForm => (
             Line::from(if state.mode == Mode::AddForm {
@@ -2583,16 +2738,10 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
                 )
             },
         ),
-        _ => {
-            let container = state.containers.details().filter(|_| panel_focused);
-            let title = if container.is_some() {
-                "Container"
-            } else {
-                "Details"
-            };
-            let text = container.unwrap_or_else(|| details_text(state));
+        Mode::Browse | Mode::Filter => {
+            let text = details_text(state);
             (
-                Line::from(title),
+                Line::from("Details"),
                 text.lines()
                     .map(|line| Line::raw(line.to_owned()))
                     .collect(),
@@ -2636,10 +2785,8 @@ fn trust_lines(pending: Option<&PendingTrust>) -> Vec<Line<'static>> {
     lines
 }
 
+/// The Hosts tab's footer.
 fn footer_text(state: &UiState) -> String {
-    if state.mode == Mode::Browse && state.focus == Focus::Containers {
-        return state.containers.footer();
-    }
     match state.mode {
         Mode::Browse => {
             let new_terminal = if state.ctrl_enter {
@@ -2654,7 +2801,7 @@ fn footer_text(state: &UiState) -> String {
                 ""
             };
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  c list containers  Tab containers  T tunnels  q quit"
+                "{output}t test  Enter connect  {new_terminal}  c containers  Tab/1-3 tabs  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -2679,9 +2826,7 @@ fn footer_text(state: &UiState) -> String {
                 Some(Ownership::External) => {
                     format!("↑↓ move  / filter{clear_filter}  a add  m adopt  {refresh}  {connect}")
                 }
-                None => format!(
-                    "/ filter{clear_filter}  a add  {refresh}  Tab containers  T tunnels  q quit"
-                ),
+                None => format!("/ filter{clear_filter}  a add  {refresh}  Tab/1-3 tabs  q quit"),
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -2707,7 +2852,6 @@ fn footer_text(state: &UiState) -> String {
             .migrate
             .as_ref()
             .map_or_else(|| "Esc cancel".into(), MigrateState::footer),
-        Mode::Tunnels => state.tunnels.footer(),
     }
 }
 
@@ -2778,70 +2922,13 @@ fn form_lines(
     lines
 }
 
-/// The jump host dropdown as boxed lines under the value of `label`'s row: at most `rows` rows
-/// around the selection, fitted to `width` columns by shortening the indent, then the origins
-/// (keeping their end), then the aliases.
-fn suggestion_lines(
-    list: &Suggestions,
-    label: &str,
-    home: &Path,
-    width: usize,
-    rows: usize,
-) -> Vec<Line<'static>> {
-    let first = list
-        .offset
-        .max((list.selected + 1).saturating_sub(rows))
-        .min(list.selected);
-    let visible = &list.items[first..(first + rows).min(list.items.len())];
-    let longest = visible
-        .iter()
-        .map(|item| display_width(&item.alias))
-        .max()
-        .unwrap_or(0);
-    // A row is `│> alias │`: the alias column plus five columns of border, marker and padding.
-    let column = longest.min(width.saturating_sub(5)).max(1);
-    let boxed = column + 5;
-    let indent =
-        " ".repeat(display_width(&format!("> {label}: ")).min(width.saturating_sub(boxed)));
-    let room = width.saturating_sub(indent.len() + boxed + 2);
-    let border = "─".repeat(column + 3);
-    let mut lines = vec![Line::raw(format!("{indent}┌{border}┐"))];
-    lines.extend(visible.iter().enumerate().map(|(row, item)| {
-        let selected = first + row == list.selected;
-        let alias = keep_start(&item.alias, column);
-        let padding = " ".repeat(column - display_width(&alias));
-        let cell = format!("{} {alias}{padding} ", if selected { '>' } else { ' ' });
-        let origin = suggest::origin_label(&item.origin, Some(home));
-        let origin = if room >= 4 {
-            keep_end(&origin, room)
-        } else {
-            String::new()
-        };
-        Line::from(vec![
-            Span::raw(format!("{indent}│")),
-            if selected {
-                Span::styled(cell, Style::default().add_modifier(Modifier::REVERSED))
-            } else {
-                Span::raw(cell)
-            },
-            Span::raw(if origin.is_empty() {
-                "│".to_owned()
-            } else {
-                format!("│  {origin}")
-            }),
-        ])
-    }));
-    lines.push(Line::raw(format!("{indent}└{border}┘")));
-    lines
-}
-
 /// The terminal columns `text` takes.
 pub(crate) fn display_width(text: &str) -> usize {
     Span::raw(text).width()
 }
 
 /// `text` cut to at most `columns` columns, keeping its start and marking the cut with `…`.
-fn keep_start(text: &str, columns: usize) -> String {
+pub(super) fn keep_start(text: &str, columns: usize) -> String {
     if display_width(text) <= columns {
         return text.to_owned();
     }
@@ -2856,7 +2943,7 @@ fn keep_start(text: &str, columns: usize) -> String {
 }
 
 /// `text` cut to at most `columns` columns, keeping its end and marking the cut with `…`.
-fn keep_end(text: &str, columns: usize) -> String {
+pub(super) fn keep_end(text: &str, columns: usize) -> String {
     if display_width(text) <= columns {
         return text.to_owned();
     }
@@ -3568,7 +3655,7 @@ mod tests {
         press(&mut state, KeyCode::Down);
         resolve(&mut state, details("beta", Ownership::Managed));
         state.set_filter("b");
-        let before = state.clone();
+        let (hosts, selected) = (state.hosts.clone(), state.selected);
 
         let changed = apply_refresh(&mut state, || Err::<HostInventory, _>("cannot read config"));
 
@@ -3577,8 +3664,8 @@ mod tests {
             state.status.as_deref(),
             Some("Refresh failed: cannot read config")
         );
-        assert_eq!(state.hosts, before.hosts);
-        assert_eq!(state.selected, before.selected);
+        assert_eq!(state.hosts, hosts);
+        assert_eq!(state.selected, selected);
         assert_eq!(state.filter.as_str(), "b");
         assert!(
             state.selected_details().is_some(),
@@ -3976,6 +4063,26 @@ mod tests {
 
         assert_eq!(state.mode, Mode::EditForm);
         assert_eq!(state.form.values[0].as_str(), "dev");
+    }
+
+    #[test]
+    fn a_tab_switch_drops_a_pending_edit() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('e'));
+        press(&mut state, KeyCode::Char('2'));
+        resolve(&mut state, details("dev", Ownership::Managed));
+        state.open_pending_edit();
+        assert_eq!(state.mode, Mode::Browse);
+        press(&mut state, KeyCode::Char('1'));
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(!state.in_form());
+        assert!(rendered(&state).contains("Details"));
+
+        // Even a pending edit left on a hidden tab never opens there.
+        press(&mut state, KeyCode::Char('2'));
+        state.edit_pending = true;
+        state.open_pending_edit();
+        assert_eq!(state.mode, Mode::Browse);
     }
 
     #[test]
@@ -6133,61 +6240,405 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tab_only_moves_the_focus() {
-        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        assert_eq!(press(&mut state, KeyCode::Tab), UiAction::None);
-        assert_eq!(state.focus, Focus::Containers);
-        assert_eq!(state.containers.target(), Target::Local);
-        assert_eq!(
-            press(&mut state, KeyCode::Tab),
-            UiAction::Containers(PanelAction::Leave)
-        );
-        assert_eq!(state.focus, Focus::Hosts);
-        assert_eq!(press(&mut state, KeyCode::BackTab), UiAction::None);
-        assert_eq!(state.focus, Focus::Containers);
-        assert_eq!(
-            press(&mut state, KeyCode::BackTab),
-            UiAction::Containers(PanelAction::Leave)
-        );
-        assert_eq!(state.focus, Focus::Hosts);
-        assert_eq!(state.containers.target(), Target::Local);
+    fn char(state: &mut UiState, character: char) -> UiAction {
+        press(state, KeyCode::Char(character))
+    }
+
+    fn dev_listed(state: &mut UiState) {
+        let dev = Target::Host("dev".into());
+        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+    }
+
+    fn tunnels_state() -> UiState {
+        use crate::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("web", Ownership::External),
+        ]);
+        state.tunnels = tunnels::tests::screen_with(vec![TunnelReport {
+            tunnel: Tunnel::new("db", "dev", Forward::parse(Kind::Dynamic, "1080").unwrap())
+                .unwrap(),
+            status: TunnelStatus::Running { pid: 7, started: 0 },
+            warnings: Vec::new(),
+        }]);
+        state
     }
 
     #[test]
-    fn c_lists_the_selected_host_and_keeps_the_focus() {
+    fn digits_tab_and_the_aliases_switch_tabs() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert_eq!(state.tab, Tab::Hosts);
+        assert_eq!(char(&mut state, '2'), UiAction::None);
+        assert_eq!(state.tab, Tab::Tunnels);
+        assert_eq!(
+            char(&mut state, '3'),
+            UiAction::Containers(PanelAction::List(Target::Local)),
+            "the Containers tab lists its target when first shown"
+        );
+        assert_eq!(state.tab, Tab::Containers);
+        assert_eq!(char(&mut state, '1'), UiAction::None);
+        assert_eq!(state.tab, Tab::Hosts);
+
+        for expected in [Tab::Tunnels, Tab::Containers, Tab::Hosts] {
+            press(&mut state, KeyCode::Tab);
+            assert_eq!(state.tab, expected);
+        }
+        for expected in [Tab::Containers, Tab::Tunnels, Tab::Hosts] {
+            press(&mut state, KeyCode::BackTab);
+            assert_eq!(state.tab, expected);
+        }
+
+        char(&mut state, 'T');
+        assert_eq!(state.tab, Tab::Tunnels);
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            UiAction::None
+        );
+        assert_eq!(state.tab, Tab::Tunnels, "Shift+T is T");
+        char(&mut state, 'c');
+        assert_eq!(state.tab, Tab::Containers);
+        assert_eq!(
+            state.containers.target(),
+            Target::Local,
+            "c off the Hosts tab keeps the target"
+        );
+        char(&mut state, 'T');
+        assert_eq!(state.tab, Tab::Tunnels);
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            UiAction::Tunnels(TunnelAction::None),
+            "Ctrl+C is the main loop's"
+        );
+        assert_eq!(state.tab, Tab::Tunnels);
+    }
+
+    #[test]
+    fn t_still_tests_on_the_hosts_tab() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert!(matches!(char(&mut state, 't'), UiAction::Test { .. }));
+        assert_eq!(state.tab, Tab::Hosts);
+    }
+
+    #[test]
+    fn c_targets_the_selected_host_and_lists_it_once() {
         let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("web", Ownership::External),
         ]);
         press(&mut state, KeyCode::Down);
+        let web = Target::Host("web".into());
         assert_eq!(
-            press(&mut state, KeyCode::Char('c')),
-            UiAction::Containers(PanelAction::List(Target::Host("web".into())))
+            char(&mut state, 'c'),
+            UiAction::Containers(PanelAction::List(web.clone()))
         );
-        assert_eq!(state.focus, Focus::Hosts);
-        assert_eq!(state.containers.target(), Target::Host("web".into()));
-        assert!(rendered(&state).contains("Containers: web /"));
+        assert_eq!(state.tab, Tab::Containers);
+        assert_eq!(state.containers.target(), web);
+        state.containers.set_listing(web.clone());
+        char(&mut state, '1');
         assert_eq!(
-            state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            UiAction::None,
-            "Ctrl+C is the main loop's"
+            char(&mut state, 'c'),
+            UiAction::Containers(PanelAction::None),
+            "a listing already running or kept is not started again"
+        );
+        char(&mut state, '1');
+        assert_eq!(
+            char(&mut state, '3'),
+            UiAction::Containers(PanelAction::None)
         );
 
         let mut empty = test_state(Vec::new());
-        assert_eq!(press(&mut empty, KeyCode::Char('c')), UiAction::None);
+        assert_eq!(
+            char(&mut empty, 'c'),
+            UiAction::Containers(PanelAction::List(Target::Local)),
+            "without a host, c only shows the tab"
+        );
         assert_eq!(empty.containers.target(), Target::Local);
     }
 
     #[test]
-    fn paste_goes_to_the_panel_user_while_editing() {
+    fn nothing_is_listed_before_the_containers_tab_opens() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        press(&mut state, KeyCode::Char('c'));
+        for code in [KeyCode::Down, KeyCode::Char('2'), KeyCode::Char('1')] {
+            assert!(!matches!(
+                press(&mut state, code),
+                UiAction::Containers(PanelAction::List(_))
+            ));
+        }
+        assert!(!rendered(&state).contains("Target:"));
+    }
+
+    #[test]
+    fn digits_are_typed_in_every_text_input() {
+        let mut state = tunnels_state();
+        // The hosts filter.
+        char(&mut state, '/');
+        char(&mut state, '2');
+        assert_eq!((state.tab, state.filter.as_str()), (Tab::Hosts, "2"));
+        press(&mut state, KeyCode::Esc);
+        // The host form, where Tab still moves between fields.
+        char(&mut state, 'a');
+        char(&mut state, '3');
         press(&mut state, KeyCode::Tab);
-        let dev = Target::Host("dev".into());
-        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+        assert_eq!((state.tab, state.form.active), (Tab::Hosts, 1));
+        assert_eq!(state.form.values[0].as_str(), "3");
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!((state.tab, state.form.active), (Tab::Hosts, 0));
+        press(&mut state, KeyCode::Esc);
+        // The tunnels filter and form.
+        char(&mut state, '2');
+        char(&mut state, '/');
+        char(&mut state, '1');
+        assert_eq!(state.tab, Tab::Tunnels);
+        assert!(!state.tunnels.is_browsing());
+        press(&mut state, KeyCode::Esc);
+        char(&mut state, 'a');
+        char(&mut state, '1');
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.tab, Tab::Tunnels);
+        assert!(state.tunnels.footer().contains("Ctrl+Space suggest"));
+        press(&mut state, KeyCode::Esc);
+        // The containers filter, user and target picker.
+        char(&mut state, '3');
+        dev_listed(&mut state);
+        for opener in ['/', 'u', 'h'] {
+            char(&mut state, opener);
+            char(&mut state, '1');
+            press(&mut state, KeyCode::Tab);
+            assert_eq!(state.tab, Tab::Containers, "after {opener}");
+            press(&mut state, KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn questions_ignore_digits_and_tab() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        for mode in [Mode::ConfirmRemove, Mode::ConfirmTrust, Mode::Migrate] {
+            state.mode = mode.clone();
+            for code in [KeyCode::Char('2'), KeyCode::Char('3'), KeyCode::Tab] {
+                press(&mut state, code);
+                assert_eq!(state.tab, Tab::Hosts, "{mode:?}");
+            }
+        }
+        // The tunnel form's Kind row takes no text but is part of the form.
+        let mut state = tunnels_state();
+        char(&mut state, '2');
+        char(&mut state, 'a');
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        for code in [KeyCode::Char('1'), KeyCode::Char('3'), KeyCode::Tab] {
+            press(&mut state, code);
+            assert_eq!(state.tab, Tab::Tunnels);
+        }
+        assert!(!state.tunnels.is_browsing());
+    }
+
+    #[test]
+    fn each_tab_keeps_its_selection_and_filter() {
+        let mut state = tunnels_state();
+        press(&mut state, KeyCode::Down);
+        state.set_filter("w");
+        char(&mut state, '2');
+        char(&mut state, '/');
+        state.handle_paste("d");
+        press(&mut state, KeyCode::Enter);
+        char(&mut state, '3');
+        dev_listed(&mut state);
+        state.containers.show(Target::Host("dev".into()));
+        dev_listed(&mut state);
+        char(&mut state, 'j');
+        let details = state.containers.details();
+
+        char(&mut state, '1');
+        assert_eq!(state.filter.as_str(), "w");
+        assert_eq!(state.selected_alias(), Some("web"));
+        char(&mut state, '2');
+        assert!(render_text_at(&state, 100).contains("Tunnels /d"));
+        char(&mut state, '3');
+        assert_eq!(state.containers.details(), details);
+        assert_eq!(state.containers.target(), Target::Host("dev".into()));
+    }
+
+    fn render_text_at(state: &UiState, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn refresh_quit_and_esc_belong_to_the_active_tab() {
+        let mut state = tunnels_state();
+        assert_eq!(char(&mut state, 'r'), UiAction::Refresh);
+        assert_eq!(press(&mut state, KeyCode::F(5)), UiAction::Refresh);
+        char(&mut state, '2');
+        assert_eq!(
+            char(&mut state, 'r'),
+            UiAction::Tunnels(TunnelAction::Refresh)
+        );
+        assert_eq!(
+            press(&mut state, KeyCode::F(5)),
+            UiAction::Tunnels(TunnelAction::Refresh)
+        );
+        assert_eq!(char(&mut state, 'q'), UiAction::Quit);
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.tab, Tab::Tunnels, "Esc never switches");
+        char(&mut state, '3');
+        state
+            .containers
+            .finish(Target::Local, Ok(shop_list(Target::Local)));
+        assert_eq!(
+            char(&mut state, 'r'),
+            UiAction::Containers(PanelAction::List(Target::Local))
+        );
+        state
+            .containers
+            .finish(Target::Local, Ok(shop_list(Target::Local)));
+        assert_eq!(
+            press(&mut state, KeyCode::F(5)),
+            UiAction::Containers(PanelAction::List(Target::Local))
+        );
+        state
+            .containers
+            .finish(Target::Local, Ok(shop_list(Target::Local)));
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.tab, Tab::Containers, "Esc never switches");
+        assert_eq!(char(&mut state, 'q'), UiAction::Quit);
+        char(&mut state, '1');
+        assert_eq!(char(&mut state, 'q'), UiAction::Quit);
+    }
+
+    #[test]
+    fn a_trust_prompt_waits_for_the_hosts_tab() {
+        let dev = summary("dev", Ownership::Managed);
+        let mut state = test_state(vec![dev.clone()]);
+        char(&mut state, '2');
+        state.record_test(
+            Finished {
+                origin: Origin::Host(dev.clone()),
+                target: TestTarget::Saved("dev".into()),
+                outcome: Ok(unknown_key("dev", "dev.example")),
+            },
+            "12:00".into(),
+        );
+        assert_eq!(state.mode, Mode::Browse, "no prompt on another tab");
+        assert!(state.trust.is_none());
+        assert!(state.results.get(&dev).is_some_and(|mark| !mark.passed));
+    }
+
+    #[test]
+    fn the_tab_bar_highlights_the_active_tab_and_never_wraps() {
+        let line = tab_bar(Tab::Tunnels, 100);
+        assert_eq!(
+            line.to_string(),
+            " 1 Hosts \u{2502} 2 Tunnels \u{2502} 3 Containers"
+        );
+        let active = line
+            .spans
+            .iter()
+            .find(|span| span.content == "2 Tunnels")
+            .unwrap();
+        assert!(active.style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(
+            tab_bar(Tab::Containers, 30).to_string(),
+            " 1 \u{2502} 2 \u{2502} 3 Containers"
+        );
+        assert_eq!(tab_bar(Tab::Containers, 14).to_string(), " 3 Containers");
+
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        char(&mut state, '3');
+        for width in [40, 30, 20, 12] {
+            let text = render_text_at(&state, width);
+            let first = text.lines().next().unwrap();
+            assert!(first.contains("3 Contain"), "{width}: {first}");
+            if width >= 40 {
+                assert!(first.contains("1 Hosts"), "{first}");
+            }
+        }
+    }
+
+    #[test]
+    fn footers_name_the_tab_keys() {
+        let state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let footer = footer_text(&state);
+        assert!(
+            footer.contains("c containers  Tab/1-3 tabs  q quit"),
+            "{footer}"
+        );
+        assert!(!footer.contains("T tunnels"));
+        let state = test_state(Vec::new());
+        assert!(footer_text(&state).contains("Tab/1-3 tabs"));
+        let state = tunnels_state();
+        assert!(state.tunnels.footer().contains("Tab/1-3 tabs  q quit"));
+        assert!(state.containers.footer().contains("h target"));
+    }
+
+    #[test]
+    fn the_containers_tab_shows_the_target_list_and_details() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        char(&mut state, 'c');
+        dev_listed(&mut state);
+        let text = rendered(&state);
+        assert!(
+            text.contains("Target: dev   h change  L this machine"),
+            "{text}"
+        );
+        assert!(text.contains("Containers /"), "{text}");
+        assert!(text.contains("shop"), "{text}");
+        assert!(text.contains("> db"), "{text}");
+        assert!(text.contains("image: db:latest"), "{text}");
+        assert!(text.contains("user: image default"), "{text}");
+        assert!(!text.contains("Hosts /"), "{text}");
+    }
+
+    #[test]
+    fn h_picks_the_containers_target() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("web", Ownership::External),
+        ]);
+        char(&mut state, '3');
+        assert_eq!(char(&mut state, 'h'), UiAction::None);
+        assert!(state.containers.picker_open());
+        let text = rendered(&state);
+        assert!(text.contains("this machine"), "{text}");
+        assert!(text.contains("web"), "{text}");
+        assert!(text.contains("managed"), "{text}");
+        assert!(footer_text_of(&state).starts_with("type to search"));
+        state.handle_paste("we");
+        assert_eq!(
+            press(&mut state, KeyCode::Enter),
+            UiAction::Containers(PanelAction::List(Target::Host("web".into())))
+        );
+        assert!(!state.containers.picker_open());
+        assert_eq!(state.containers.target(), Target::Host("web".into()));
+
+        char(&mut state, 'h');
+        type_text(&mut state, "dev");
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.containers.picker_open());
+        assert_eq!(
+            state.containers.target(),
+            Target::Host("web".into()),
+            "Esc leaves the target alone"
+        );
+        char(&mut state, 'h');
+        type_text(&mut state, "this");
+        assert_eq!(
+            press(&mut state, KeyCode::Enter),
+            UiAction::Containers(PanelAction::List(Target::Local))
+        );
+    }
+
+    fn footer_text_of(state: &UiState) -> String {
+        state.containers.footer()
+    }
+
+    #[test]
+    fn paste_goes_to_the_containers_user_while_editing() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        char(&mut state, 'c');
+        dev_listed(&mut state);
         state.handle_paste("ignored");
-        press(&mut state, KeyCode::Char('u'));
+        char(&mut state, 'u');
         state.handle_paste("root\n");
         press(&mut state, KeyCode::Enter);
         assert!(
@@ -6198,111 +6649,24 @@ mod tests {
     }
 
     #[test]
-    fn panel_keys_route_when_focused() {
-        let mut state = test_state(vec![
-            summary("dev", Ownership::Managed),
-            summary("web", Ownership::Managed),
-        ]);
-        press(&mut state, KeyCode::Char('c'));
-        press(&mut state, KeyCode::Tab);
-        let dev = Target::Host("dev".into());
-        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
-        assert!(state.containers.details().unwrap().contains("db-id"));
-        assert_eq!(
-            press(&mut state, KeyCode::Char('j')),
-            UiAction::Containers(PanelAction::None)
-        );
-        assert_eq!(state.selected_alias(), Some("dev"));
-        assert!(state.containers.details().unwrap().contains("web-id"));
-        assert_eq!(press(&mut state, KeyCode::Char('q')), UiAction::Quit);
-    }
-
-    #[test]
-    fn moving_host_selection_keeps_the_panel() {
-        let mut state = test_state(vec![
-            summary("dev", Ownership::Managed),
-            summary("web", Ownership::Managed),
-        ]);
-        assert_eq!(state.containers.target(), Target::Local);
-        press(&mut state, KeyCode::Char('c'));
-        press(&mut state, KeyCode::Down);
-        assert_eq!(state.containers.target(), Target::Host("dev".into()));
-        state.set_filter("w");
-        state.set_filter("");
-        assert_eq!(state.containers.target(), Target::Host("dev".into()));
-
-        press(&mut state, KeyCode::Tab);
-        assert_eq!(
-            press(&mut state, KeyCode::Char('L')),
-            UiAction::Containers(PanelAction::List(Target::Local))
-        );
-        press(&mut state, KeyCode::Esc);
-        assert_eq!(state.containers.target(), Target::Local, "kept on leaving");
-        press(&mut state, KeyCode::Up);
-        assert_eq!(state.containers.target(), Target::Local);
-    }
-
-    #[test]
-    fn panel_filter_keys_route_when_focused() {
+    fn container_results_show_on_the_containers_tab() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        press(&mut state, KeyCode::Char('c'));
-        press(&mut state, KeyCode::Tab);
-        let dev = Target::Host("dev".into());
-        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
-        press(&mut state, KeyCode::Char('/'));
-        assert!(footer_text(&state).starts_with("type to filter"));
-        state.handle_paste("web");
-        press(&mut state, KeyCode::Enter);
-        assert_eq!(state.filter.as_str(), "", "the hosts filter is untouched");
-        let text = rendered(&state);
-        assert!(text.contains("Containers: dev /web"), "{text}");
-        assert!(text.contains("> web"), "{text}");
-        assert!(!text.contains(" db "), "{text}");
-        assert!(footer_text(&state).contains("Esc clear filter"));
-        assert_eq!(
-            press(&mut state, KeyCode::Esc),
-            UiAction::Containers(PanelAction::None)
-        );
-        assert_eq!(state.focus, Focus::Containers);
-        assert_eq!(
-            press(&mut state, KeyCode::Esc),
-            UiAction::Containers(PanelAction::Leave)
-        );
-        assert_eq!(state.focus, Focus::Hosts);
+        char(&mut state, 'c');
+        dev_listed(&mut state);
+        state
+            .containers
+            .set_status(Some("Shell on dev ended".into()));
+        assert!(rendered(&state).contains("Shell on dev ended"));
+        char(&mut state, 'j');
+        assert!(!rendered(&state).contains("Shell on dev ended"));
+        char(&mut state, '1');
+        assert!(state.status.is_none());
     }
 
     #[test]
-    fn details_pane_shows_container_when_focused() {
+    fn a_narrow_containers_tab_wraps_the_fix_command_in_full() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        press(&mut state, KeyCode::Char('c'));
-        let dev = Target::Host("dev".into());
-        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
-        let text = rendered(&state);
-        assert!(text.contains("Containers: dev"), "{text}");
-        assert!(text.contains("shop"), "{text}");
-        assert!(!text.contains("image: db:latest"), "{text}");
-
-        press(&mut state, KeyCode::Tab);
-        let text = rendered(&state);
-        assert!(text.contains("image: db:latest"), "{text}");
-        assert!(text.contains("> db"), "{text}");
-        assert!(text.contains("u user"), "{text}");
-        assert!(text.contains("user: image default"), "{text}");
-    }
-
-    #[test]
-    fn browse_footer_mentions_tab_containers() {
-        let state = test_state(vec![summary("dev", Ownership::Managed)]);
-        assert!(footer_text(&state).contains("c list containers  Tab containers"));
-        let state = test_state(Vec::new());
-        assert!(footer_text(&state).contains("Tab containers"));
-        assert!(!footer_text(&state).contains("c list containers"));
-    }
-
-    #[test]
-    fn a_narrow_panel_wraps_the_fix_command_in_full() {
-        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        press(&mut state, KeyCode::Char('c'));
+        char(&mut state, 'c');
         let offer = crate::app::Offer::JoinGroup {
             user: "deploy".into(),
             socket: "/var/run/docker.sock".into(),
@@ -6320,12 +6684,12 @@ mod tests {
             Target::Host("dev".into()),
             Err(crate::app::ContainerError::from(issue)),
         );
-        let backend = TestBackend::new(60, 40);
+        let backend = TestBackend::new(40, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let panel: String = (0..buffer.area.height)
-            .map(|y| (1..20).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|y| (1..19).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect();
         let squashed = |text: &str| text.split_whitespace().collect::<String>();
         assert!(
@@ -6336,44 +6700,20 @@ mod tests {
     }
 
     #[test]
-    fn t_still_tests_and_shift_t_opens_tunnels() {
-        let dev = summary("dev", Ownership::Managed);
-        let mut state = test_state(vec![dev.clone()]);
-        assert!(matches!(
-            press(&mut state, KeyCode::Char('t')),
-            UiAction::Test { .. }
-        ));
-        assert_eq!(press(&mut state, KeyCode::Char('T')), UiAction::OpenTunnels);
+    fn the_tunnels_tab_takes_keys_and_draws() {
+        let mut state = tunnels_state();
+        char(&mut state, '2');
         assert_eq!(
-            state.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
-            UiAction::OpenTunnels
-        );
-        assert!(footer_text(&state).contains("T tunnels"));
-    }
-
-    #[test]
-    fn the_tunnels_screen_takes_keys_and_draws_until_it_is_left() {
-        use crate::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
-        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
-        state.tunnels = tunnels::tests::screen_with(vec![TunnelReport {
-            tunnel: Tunnel::new("db", "dev", Forward::parse(Kind::Dynamic, "1080").unwrap())
-                .unwrap(),
-            status: TunnelStatus::Running { pid: 7, started: 0 },
-            warnings: Vec::new(),
-        }]);
-        state.mode = Mode::Tunnels;
-        assert_eq!(
-            press(&mut state, KeyCode::Char('s')),
+            char(&mut state, 's'),
             UiAction::Tunnels(TunnelAction::Stop("db".into()))
         );
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &state)).unwrap();
-        let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("Tunnels"), "{text}");
+        let text = render_text_at(&state, 100);
+        assert!(text.contains("Tunnels /"), "{text}");
         assert!(text.contains("socks 1080"), "{text}");
         assert!(text.contains("running"), "{text}");
         assert!(text.contains("keep running after q"), "{text}");
-        assert_eq!(press(&mut state, KeyCode::Char('T')), UiAction::None);
-        assert_eq!(state.mode, Mode::Browse);
+        assert!(text.contains("Tab/1-3 tabs"), "{text}");
+        assert_eq!(char(&mut state, 'T'), UiAction::None);
+        assert_eq!(state.tab, Tab::Tunnels);
     }
 }
