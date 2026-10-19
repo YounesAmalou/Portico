@@ -226,7 +226,7 @@ A focused manual smoke test uses the installed OpenSSH tools to initialize an is
 
 Later work retains these requirements without constraining their implementation prematurely:
 
-1. **Identity awareness:** discover file references and agent/provider identities, including 1Password, while keeping private keys with their provider. Identity knowledge must remain separate from credential possession.
+1. Identity awareness: delivered (see below).
 2. **Tunnels:** model local, remote, and dynamic forwards; detect local conflicts; and supervise explicitly started tunnels.
 3. **Desktop surface:** add a lightweight Quickshell launcher/status view rather than duplicating management UI.
 
@@ -244,3 +244,4 @@ Each slice requires its own design review before implementation.
 - **Safe adoption:** `portico adopt` and `portico export`, and the TUI `m` key, move a concrete external block into the managed file and back losslessly, after an exact preview, with a backup, rollback and an `ssh -G` equality check. Designed in `2026-10-18-safe-adoption-design.md`.
 - **Container shells:** `portico containers` and `portico shell`, and the TUI containers panel, list the running Docker containers on this machine or a host, grouped by Compose project, and open a shell in one with `docker exec`, through `ssh -t` on a host. Designed in `2026-10-18-container-shells-design.md`.
 - **Fuzzy pickers:** commands given no host (`show`, `connect`, `test`, `edit`, `remove`, a bare `--on`) ask in a built-in inline picker that ranks fuzzy matches, `adopt` and `export` in a checklist, and `portico shell` picks its container the same way; the TUI hosts and containers filters match fuzzily and the `m` checklist gets a filter. `fzf` is no longer used. Designed in `2026-10-19-fuzzy-pickers-design.md`.
+- **Identity awareness:** `portico show`, the TUI details and the new `portico identities` show which identities each host offers (IdentityFile references, the agent from `IdentityAgent` or `SSH_AUTH_SOCK`, including 1Password's SSH agent) and whether each is in the agent, a key file, missing or unchecked, and the IdentityFile form field suggests known identities. Portico only stats private key files and reads public ones with `ssh-keygen -l` and agents with `ssh-add -l`. Designed in `2026-10-19-identity-awareness-design.md`.

@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, and opens shells in Docker containers. Tunnels, identity-provider discovery, and a Quickshell integration are planned follow-up work (see the [roadmap](ROADMAP.md)).
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, and opens shells in Docker containers. Tunnels and a Quickshell integration are planned follow-up work (see the [roadmap](ROADMAP.md)).
 
 ## What V1 does
 
@@ -12,6 +12,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Connects in the current terminal or through `xdg-terminal-exec`.
 - Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
+- Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
 - Lists the running Docker containers on this machine or a host, grouped by Compose project, and opens a shell in one.
 - Provides a master-detail TUI when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
@@ -19,7 +20,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 
 Portico owns only `~/.ssh/portico/config`. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
-Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents.
+Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents. To show identities it only checks that key files exist, reads public key files with `ssh-keygen -l`, and asks agents for their public key list with `ssh-add -l`; it never generates keys, loads them into an agent, or asks an agent to sign.
 
 ## Requirements
 
@@ -122,6 +123,7 @@ portico edit [<alias>] [options]
 portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
+portico identities              List agents and identity files, and whether each is available
 portico containers [--on [<alias>]]
                                 List running containers, here or on a host
 portico shell [<container>] [--on [<alias>]] [-u <user>] [-n]
@@ -199,6 +201,26 @@ A test passes only when OpenSSH completes authentication. It never opens a shell
 
 The first time a host is tested its key is usually unknown. In a terminal, Portico shows the key's fingerprint and asks before trusting it. Without a terminal it trusts nothing, prints the fingerprint and fails; `--accept-host-key` trusts the key only if its fingerprint matches the one given exactly, then tests again. A changed host key is never offered for trust.
 
+### Identities
+
+`portico show` ends with the host's identities: the agent it uses (from `IdentityAgent`, or `SSH_AUTH_SOCK`), then each IdentityFile with whether it is available.
+
+```text
+Agent: 1Password, ~/.1password/agent.sock, 3 keys
+Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:3/9rWBEcW/rifhH7XvLTSnlsXPJpccrkcu/8GpD/85o "GitHub")
+Identity: ~/.ssh/id_work: missing (no such file)
+IdentitiesOnly: yes
+```
+
+- **in agent:** the host's agent holds the key, matched by fingerprint through the `.pub` file. This is how a 1Password key shows up: point IdentityFile at its public key (`~/.ssh/github.pub`) and the agent does the rest.
+- **key file:** the private key file exists, so ssh can load it (perhaps asking for its passphrase).
+- **missing:** neither, with the reason (no such file, or only the public key while the agent does not hold it or cannot be reached).
+- **unchecked:** the path uses a token Portico does not expand, such as `%C`.
+
+A host without IdentityFile uses OpenSSH's default key files; only those that exist are listed. Without `IdentitiesOnly yes`, the agent's other keys are offered too, and `show` names them. The agent is asked once per command, with a 3 second limit and no way to prompt: an agent that waits to be unlocked (1Password while locked, say) is reported as not answering.
+
+`portico identities` lists every agent Portico knows of (the one in `SSH_AUTH_SOCK` and those hosts name) with its keys, then every identity file hosts reference or `~/.ssh` holds, with its availability and the hosts that use it. Nothing is written to disk.
+
 ### Container shells
 
 ```sh
@@ -261,7 +283,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 | `a` | Add a host |
 | `e` | Edit the selected managed host |
 | `x` | Remove the selected managed host |
-| `r` / `F5` | Refresh: re-read the inventory and discard cached host details |
+| `r` / `F5` | Refresh: re-read the inventory and discard cached host details and agent listings |
 | `Enter` | Connect in the current terminal |
 | `Ctrl+Enter` / `n` | Connect in a new terminal |
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
@@ -275,11 +297,14 @@ Use `portico <command> --help` for the authoritative options for a command.
 In the filter and the host form, type normally: `Backspace` and `Delete` erase text, `←` / `→` / `Home` / `End` move the cursor, `Enter` applies the filter or saves the form, and `Esc` cancels.
 Form errors appear next to the field they belong to. `ProxyJump` takes `[user@]host[:port]` or an existing alias, with commas between several hops and no spaces.
 While you type a ProxyJump hop, a dropdown lists the known hosts whose alias contains what you typed, ignoring case and accents: `↑` / `↓` choose, `Enter` or `Tab` fills in the hop, and `Esc` closes the list (a second `Esc` cancels the form). In the ProxyJump field, `Ctrl+Space` opens the list even before you type.
+The IdentityFile field suggests the same way: key files in `~/.ssh` and every identity file a host uses, and `Ctrl+Space` opens the list. Opening a form starts checking every host's identities in the background; until that is done, rows read `key file` or `public key` from `~/.ssh` alone, and then each says whether it is in an agent, a key file or missing (missing files last). A list asked for with `Ctrl+Space` before then opens when the check is done.
 Form fields only accept characters they can hold, whether typed or pasted: alias, hostname, user, port (digits only), and ProxyJump never take whitespace, and IdentityFile takes spaces inside a path but not at its start or end. Saving still validates everything.
 
 `Ctrl+Enter` needs a terminal that reports modified keys, such as kitty, WezTerm, Ghostty, or foot, and is only shown in the footer when Portico detects one. `n` works everywhere.
 
 Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it. Portico re-reads the inventory and re-resolves details when it changes the configuration itself; edits made elsewhere, such as in `~/.ssh/config` or an included file, appear after `r` or `F5`. The selection and filter are kept, and if the files cannot be read the list stays as it was and the footer reports why.
+
+Under the resolved fields, the details list the host's identities as `portico show` does, each with `✓` (in agent or key file), `✗` (missing) or `?` (unchecked) and the word. Each agent is asked once per session, in the background, and again after `r` or `F5`, so loading a key into an agent and refreshing shows it.
 
 A test shows `✓` or `✗` beside the host and its result in the details until the host is edited or removed or the inventory is refreshed. `Esc` cancels a running test. An unknown host key opens a prompt showing its fingerprint: `y` trusts it and tests again, `n` or `Esc` declines. If you have moved on by the time the result arrives (into the filter or a form, say), no prompt interrupts you: the host is marked untrusted, and `t` tests it again to review the key. Editing a form cancels its running test.
 

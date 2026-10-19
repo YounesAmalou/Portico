@@ -19,6 +19,7 @@ use crate::{
     discovery::DiscoveryWarning,
     explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},
+    identity::{self, Agent, HostIdentities, IdentityInventory},
     managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     picker::{Picker, Row},
@@ -108,6 +109,8 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// List the agents and identity files Portico knows of, and whether each key is available.
+    Identities,
     Containers {
         /// List on this host; without an alias, choose one.
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
@@ -338,7 +341,14 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 return Ok(ExitCode::from(CANCELLED));
             };
             let details = app.show(&alias).map_err(|error| error.to_string())?;
-            print_details(output, &details)?;
+            print_details(output, &details, app.home())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Identities) => {
+            let inventory = app
+                .identity_inventory()
+                .map_err(|error| error.to_string())?;
+            print_inventory(output, &inventory, app.home())?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Add {
@@ -1221,7 +1231,11 @@ fn print_init_plan(output: &mut impl Write, plan: &InitPlan) -> Result<(), Strin
     Ok(())
 }
 
-fn print_details(output: &mut impl Write, details: &HostDetails) -> Result<(), String> {
+fn print_details(
+    output: &mut impl Write,
+    details: &HostDetails,
+    home: &Path,
+) -> Result<(), String> {
     writeln!(output, "Alias: {}", details.summary.alias).map_err(|error| error.to_string())?;
     writeln!(
         output,
@@ -1266,11 +1280,182 @@ fn print_details(output: &mut impl Write, details: &HostDetails) -> Result<(), S
             writeln!(output, "Resolution error: {error}").map_err(|error| error.to_string())?;
         }
     }
+    if let Some(identities) = &details.identities {
+        print_identities(output, identities, home)?;
+    }
     for warning in &details.warnings {
         writeln!(output, "Warning: {}", format_warning(warning))
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// The identities block of `portico show`, after every resolved field.
+fn print_identities(
+    output: &mut impl Write,
+    identities: &HostIdentities,
+    home: &Path,
+) -> Result<(), String> {
+    let mut lines = vec![format!("Agent: {}", identities.agent.describe(home))];
+    let default = if identities.defaults {
+        " (OpenSSH default)"
+    } else {
+        ""
+    };
+    for identity in &identities.identities {
+        lines.push(format!(
+            "Identity: {}{default}: {}",
+            identity::tilde_text(&identity.configured, home),
+            identity.describe()
+        ));
+    }
+    if identities.defaults {
+        lines.push(if identities.identities.is_empty() {
+            "Identity: OpenSSH defaults: none present".into()
+        } else {
+            "Identity: other OpenSSH defaults: none present".into()
+        });
+    } else if identities.identities.is_empty() {
+        lines.push("Identity: none".into());
+    }
+    if identities.identities_only {
+        lines.push("IdentitiesOnly: yes".into());
+    } else if identities.agent.keys().is_some() {
+        let mut line = format!(
+            "Also offered by the agent: {}",
+            identities.also_offered.len()
+        );
+        if !identities.also_offered.is_empty() {
+            let names = identities
+                .also_offered
+                .iter()
+                .map(|key| {
+                    if key.comment.is_empty() {
+                        key.fingerprint.clone()
+                    } else {
+                        key.comment.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            line.push_str(&format!(" ({})", names.join(", ")));
+        }
+        lines.push(line);
+    }
+    if let Some(provider) = &identities.pkcs11_provider {
+        lines.push(format!("PKCS#11 provider: {provider}"));
+    }
+    for line in lines {
+        writeln!(output, "{line}").map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// `portico identities`: the agents with their keys, then every identity file.
+fn print_inventory(
+    output: &mut impl Write,
+    inventory: &IdentityInventory,
+    home: &Path,
+) -> Result<(), String> {
+    let mut text = String::from("Agents\n");
+    if inventory.agents.is_empty() {
+        text.push_str("  none (SSH_AUTH_SOCK is not set and no host names an agent)\n");
+    }
+    for known in &inventory.agents {
+        let socket = known
+            .agent
+            .socket()
+            .map(|socket| identity::tilde(socket, home))
+            .unwrap_or_default();
+        let (name, state) = match &known.agent {
+            Agent::Listed { provider, keys, .. } => {
+                (provider.name(), identity::count(keys.len(), "key"))
+            }
+            Agent::Unavailable {
+                provider, reason, ..
+            } => (
+                provider.name(),
+                format!("unavailable: {}", reason.describe()),
+            ),
+            Agent::Disabled | Agent::NotConfigured { .. } => continue,
+        };
+        let mut uses = Vec::new();
+        if known.environment {
+            uses.push("SSH_AUTH_SOCK".to_owned());
+        }
+        if !known.used_by.is_empty() {
+            uses.push(format!(
+                "used by {}",
+                identity::count(known.used_by.len(), "host")
+            ));
+        }
+        text.push_str(&format!("  {name}  {socket}  {state}"));
+        if !uses.is_empty() {
+            text.push_str(&format!("  ({})", uses.join(", ")));
+        }
+        text.push('\n');
+        let keys = known.agent.keys().unwrap_or_default();
+        let types = keys.iter().map(|key| key.key_type.len()).max().unwrap_or(0);
+        let fingerprints = keys
+            .iter()
+            .map(|key| key.fingerprint.len())
+            .max()
+            .unwrap_or(0);
+        let comments = keys
+            .iter()
+            .map(|key| key.comment.chars().count())
+            .max()
+            .unwrap_or(0);
+        for key in keys {
+            let paired = inventory.files.iter().find(|file| {
+                file.public_key
+                    .as_ref()
+                    .is_some_and(|own| own.fingerprint == key.fingerprint)
+            });
+            let line = format!(
+                "    {:<types$}  {:<fingerprints$}  {:<comments$}  {}",
+                key.key_type,
+                key.fingerprint,
+                key.comment,
+                paired.map_or("", |file| file.configured.as_str())
+            );
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+    }
+    text.push_str("\nIdentity files\n");
+    if inventory.files.is_empty() {
+        text.push_str("  none\n");
+    }
+    let paths = inventory
+        .files
+        .iter()
+        .map(|file| file.configured.chars().count())
+        .max()
+        .unwrap_or(0);
+    let words = inventory
+        .files
+        .iter()
+        .map(|file| file.availability.word().len())
+        .max()
+        .unwrap_or(0);
+    for file in &inventory.files {
+        let used_by = if file.used_by.is_empty() {
+            "-".to_owned()
+        } else {
+            file.used_by.join(", ")
+        };
+        text.push_str(&format!(
+            "  {:<paths$}  {:<words$}  used by: {used_by}\n",
+            file.configured,
+            file.availability.word(),
+        ));
+    }
+    for warning in &inventory.warnings {
+        text.push_str(&format!("Warning: {warning}\n"));
+    }
+    output
+        .write_all(text.as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 fn print_optional(output: &mut impl Write, label: &str, value: Option<&str>) -> Result<(), String> {
@@ -2387,5 +2572,174 @@ fi
             OpenSsh::new(ssh.clone(), ssh),
         );
         (dir, app)
+    }
+
+    fn key(fingerprint: &str, comment: &str) -> identity::PublicKey {
+        identity::PublicKey {
+            key_type: "ED25519".into(),
+            bits: 256,
+            fingerprint: fingerprint.into(),
+            comment: comment.into(),
+        }
+    }
+
+    fn shown_details(identities: Option<HostIdentities>) -> String {
+        let details = HostDetails {
+            summary: HostSummary {
+                alias: "dev".into(),
+                ownership: Ownership::External,
+                source: "/home/me/.ssh/config".into(),
+            },
+            declared: None,
+            resolution: Ok(crate::openssh::ResolvedConfig {
+                hostname: "dev.example".into(),
+                user: Some("deploy".into()),
+                port: Some(22),
+                identity_files: vec!["~/.ssh/github.pub".into(), "~/.ssh/id_work".into()],
+                proxy_jump: None,
+                proxy_command: None,
+                proxy_use_fdpass: false,
+                known_hosts_files: Vec::new(),
+                identity_agent: None,
+                identities_only: true,
+                pkcs11_provider: None,
+            }),
+            identities,
+            warnings: Vec::new(),
+        };
+        let mut output = Vec::new();
+        print_details(&mut output, &details, Path::new("/home/me")).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn show_keeps_existing_lines_unchanged() {
+        let before = "Alias: dev\nOwnership: external\nSource: /home/me/.ssh/config\n\
+                      Resolved HostName: dev.example\nResolved User: deploy\nResolved Port: 22\n\
+                      Resolved IdentityFile: ~/.ssh/github.pub, ~/.ssh/id_work\n\
+                      Resolved ProxyJump: -\n";
+        assert_eq!(shown_details(None), before);
+        let identities = HostIdentities {
+            agent: Agent::Listed {
+                socket: "/home/me/.1password/agent.sock".into(),
+                provider: identity::Provider::OnePassword,
+                keys: vec![key("SHA256:gh", "GitHub"), key("SHA256:vps", "VPS")],
+            },
+            defaults: false,
+            identities: vec![
+                identity::Identity {
+                    configured: "~/.ssh/github.pub".into(),
+                    path: Some("/home/me/.ssh/github.pub".into()),
+                    public_key: Some(key("SHA256:gh", "GitHub")),
+                    availability: identity::Availability::InAgent,
+                },
+                identity::Identity {
+                    configured: "/home/me/.ssh/id_work".into(),
+                    path: Some("/home/me/.ssh/id_work".into()),
+                    public_key: None,
+                    availability: identity::Availability::Missing(
+                        identity::MissingReason::NoSuchFile,
+                    ),
+                },
+            ],
+            identities_only: true,
+            also_offered: Vec::new(),
+            pkcs11_provider: Some("/usr/lib/p11.so".into()),
+        };
+        assert_eq!(
+            shown_details(Some(identities)),
+            format!(
+                "{before}Agent: 1Password, ~/.1password/agent.sock, 2 keys\n\
+                 Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:gh \"GitHub\")\n\
+                 Identity: ~/.ssh/id_work: missing (no such file)\n\
+                 IdentitiesOnly: yes\n\
+                 PKCS#11 provider: /usr/lib/p11.so\n"
+            )
+        );
+    }
+
+    #[test]
+    fn show_names_defaults_and_keys_the_agent_also_offers() {
+        let identities = HostIdentities {
+            agent: Agent::Listed {
+                socket: "/run/agent".into(),
+                provider: identity::Provider::Generic,
+                keys: vec![key("SHA256:vps", "VPS"), key("SHA256:x", "")],
+            },
+            defaults: true,
+            identities: Vec::new(),
+            identities_only: false,
+            also_offered: vec![key("SHA256:vps", "VPS"), key("SHA256:x", "")],
+            pkcs11_provider: None,
+        };
+        let shown = shown_details(Some(identities));
+        assert!(
+            shown.ends_with(
+                "Agent: SSH agent, /run/agent, 2 keys\n\
+                 Identity: OpenSSH defaults: none present\n\
+                 Also offered by the agent: 2 (VPS, SHA256:x)\n"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn identities_lists_agents_then_files() {
+        let inventory = IdentityInventory {
+            agents: vec![
+                identity::InventoryAgent {
+                    agent: Agent::Listed {
+                        socket: "/home/me/.1password/agent.sock".into(),
+                        provider: identity::Provider::OnePassword,
+                        keys: vec![key("SHA256:gh", "GitHub"), key("SHA256:vps", "VPS")],
+                    },
+                    environment: true,
+                    used_by: vec!["a".into(), "b".into()],
+                },
+                identity::InventoryAgent {
+                    agent: Agent::Unavailable {
+                        socket: "/run/gone".into(),
+                        provider: identity::Provider::Generic,
+                        reason: identity::AgentProblem::NoSuchSocket,
+                    },
+                    environment: false,
+                    used_by: vec!["c".into()],
+                },
+            ],
+            files: vec![
+                identity::InventoryFile {
+                    configured: "~/.ssh/github.pub".into(),
+                    path: Some("/home/me/.ssh/github.pub".into()),
+                    public_key: Some(key("SHA256:gh", "GitHub")),
+                    availability: identity::Availability::InAgent,
+                    used_by: vec!["a".into(), "b".into()],
+                },
+                identity::InventoryFile {
+                    configured: "~/.ssh/old".into(),
+                    path: Some("/home/me/.ssh/old".into()),
+                    public_key: None,
+                    availability: identity::Availability::KeyFile {
+                        public_key_found: false,
+                    },
+                    used_by: Vec::new(),
+                },
+            ],
+            warnings: vec!["z: could not resolve: boom".into()],
+        };
+        let mut output = Vec::new();
+        print_inventory(&mut output, &inventory, Path::new("/home/me")).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Agents\n\
+             \x20 1Password  ~/.1password/agent.sock  2 keys  (SSH_AUTH_SOCK, used by 2 hosts)\n\
+             \x20   ED25519  SHA256:gh   GitHub  ~/.ssh/github.pub\n\
+             \x20   ED25519  SHA256:vps  VPS\n\
+             \x20 SSH agent  /run/gone  unavailable: no such socket  (used by 1 host)\n\
+             \n\
+             Identity files\n\
+             \x20 ~/.ssh/github.pub  in agent  used by: a, b\n\
+             \x20 ~/.ssh/old         key file  used by: -\n\
+             Warning: z: could not resolve: boom\n"
+        );
     }
 }

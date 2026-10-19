@@ -1,5 +1,6 @@
 use std::{
     io, panic,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -33,6 +34,7 @@ use ratatui::{
 
 mod containers;
 mod hangup;
+mod identities;
 mod lister;
 mod migrate;
 mod planner;
@@ -49,6 +51,7 @@ use crate::{
     explain::Explanation,
     fuzzy,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
+    identity::IdentityInventory,
     managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     picker::HIT,
@@ -56,6 +59,7 @@ use crate::{
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
 use hangup::{HangupWatch, Input};
+use identities::Indexer;
 use lister::Lister;
 use migrate::{MigrateAction, MigrateState};
 use planner::Planner;
@@ -216,8 +220,9 @@ fn browse<B: Backend<Error = io::Error>>(
         let tester = Tester::spawn(scope, app);
         let lister = Lister::spawn(scope, app);
         let planner = Planner::spawn(scope, app);
+        let indexer = Indexer::spawn(scope, app);
         browse_hosts(
-            app, terminal, signals, session, resolver, tester, lister, planner,
+            app, terminal, signals, session, resolver, tester, lister, planner, indexer,
         )
     })
 }
@@ -235,9 +240,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     mut tester: Tester,
     mut lister: Lister,
     mut planner: Planner,
+    mut indexer: Indexer,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
+    state.home = app.home().to_owned();
     sync_details(&mut state, &mut resolver, false);
     lister.list(&mut state.containers, Target::Local);
     let mut redraw = true;
@@ -263,6 +270,14 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             state.finish_plan(planned, &preselect, app.home());
             redraw = true;
         }
+        if let Some(built) = indexer.try_finished() {
+            state.finish_identities(built);
+            redraw = true;
+        }
+        // The IdentityFile suggestions draw on every host's identities, built once a form opens.
+        if state.in_form() {
+            indexer.request();
+        }
         let testing = tester.running().map(str::to_owned);
         if state.testing != testing {
             state.testing = testing;
@@ -277,6 +292,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             || tester.running().is_some()
             || lister.is_running()
             || planner.is_running()
+            || indexer.is_running()
         {
             Duration::from_millis(25)
         } else {
@@ -361,6 +377,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }
             UiAction::Containers(_) => {}
             UiAction::Refresh => {
+                // Agents and key files may have changed too: ask them again on the next look.
+                app.forget_identities();
+                indexer.reset();
+                state.identity_inventory = None;
                 inventory_changed = apply_refresh(&mut state, || app.hosts());
                 if inventory_changed {
                     tester.cancel_if(|origin, _| matches!(origin, Origin::Host(_)));
@@ -1208,6 +1228,12 @@ struct UiState {
     focus: Focus,
     /// The migrate screen while in `Mode::Migrate`.
     migrate: Option<MigrateState>,
+    /// Every identity Portico knows of, for the IdentityFile suggestions; built once a form
+    /// opens and dropped on refresh.
+    identity_inventory: Option<IdentityInventory>,
+    /// The home whose `~/.ssh` the IdentityFile suggestions scan and whose paths show as `~`;
+    /// empty (nothing scanned) until the session sets it from the app.
+    home: PathBuf,
 }
 
 /// The left-column panel that receives keys while browsing.
@@ -1280,10 +1306,15 @@ struct FormState {
     error: Option<String>,
     /// The last connection test of the typed values, shown until the form is edited.
     test_result: Option<FormTestResult>,
-    /// The jump host dropdown under ProxyJump, while it is open.
+    /// The dropdown under ProxyJump or IdentityFile, while it is open.
     suggestions: Option<Suggestions>,
+    /// Ctrl+Space asked for IdentityFile suggestions before there were any: the dropdown opens
+    /// when the identity inventory arrives, unless the focus left the field meanwhile.
+    identity_pending: bool,
 }
 
+/// The index of IdentityFile in `FORM_FIELDS`.
+const IDENTITY_FILE: usize = 4;
 /// The index of ProxyJump in `FORM_FIELDS`.
 const PROXY_JUMP: usize = 5;
 /// How many suggestions the dropdown shows at once.
@@ -1299,9 +1330,30 @@ struct Suggestions {
     offset: usize,
     /// Whether Ctrl+Space opened it, which keeps it open for an empty hop.
     forced: bool,
+    /// The form field it suggests for: ProxyJump or IdentityFile.
+    field: usize,
 }
 
 impl Suggestions {
+    /// A dropdown of `items`, keeping the selection of the `previous` one when it still lists it.
+    fn reopened(previous: Option<Self>, items: Vec<Candidate>, forced: bool, field: usize) -> Self {
+        let selected = previous
+            .and_then(|list| {
+                let alias = &list.items[list.selected].alias;
+                items.iter().position(|item| &item.alias == alias)
+            })
+            .unwrap_or(0);
+        let mut list = Self {
+            items,
+            selected: 0,
+            offset: 0,
+            forced,
+            field,
+        };
+        list.select(selected);
+        list
+    }
+
     fn select(&mut self, selected: usize) {
         self.selected = selected.min(self.items.len() - 1);
         if self.selected < self.offset {
@@ -1391,6 +1443,8 @@ impl UiState {
             containers: Panel::default(),
             focus: Focus::Hosts,
             migrate: None,
+            identity_inventory: None,
+            home: PathBuf::new(),
         }
     }
 
@@ -1630,7 +1684,7 @@ impl UiState {
 
     fn handle_form_key(&mut self, key: KeyEvent) -> UiAction {
         if key.code == KeyCode::Char(' ') && key.modifiers == KeyModifiers::CONTROL {
-            if self.form.active == PROXY_JUMP {
+            if matches!(self.form.active, PROXY_JUMP | IDENTITY_FILE) {
                 self.suggest(true);
             }
             return UiAction::None;
@@ -1678,8 +1732,16 @@ impl UiState {
                 }
             }
         }
-        if self.form.active != PROXY_JUMP {
+        if self
+            .form
+            .suggestions
+            .as_ref()
+            .is_some_and(|list| list.field != self.form.active)
+        {
             self.form.suggestions = None;
+        }
+        if self.form.active != IDENTITY_FILE || key.code == KeyCode::Esc {
+            self.form.identity_pending = false;
         }
         UiAction::None
     }
@@ -1710,6 +1772,26 @@ impl UiState {
         let form = &mut self.form;
         let previous = form.suggestions.take();
         let forced = on_demand || previous.as_ref().is_some_and(|list| list.forced);
+        if form.active == IDENTITY_FILE {
+            let candidates = identities::candidates(self.identity_inventory.as_ref(), &self.home);
+            let query = form.values[IDENTITY_FILE].as_str();
+            let items = identities::missing_last(suggest::rank(query, &candidates, &[]));
+            let exact = items.iter().any(|item| item.alias == query);
+            if items.is_empty() && on_demand && self.identity_inventory.is_none() {
+                form.identity_pending = true;
+            }
+            if items.is_empty() || (!forced && query.is_empty()) || (!on_demand && exact) {
+                return;
+            }
+            form.identity_pending = false;
+            form.suggestions = Some(Suggestions::reopened(
+                previous,
+                items,
+                forced,
+                IDENTITY_FILE,
+            ));
+            return;
+        }
         if form.active != PROXY_JUMP {
             return;
         }
@@ -1751,20 +1833,7 @@ impl UiState {
         if items.is_empty() || (!forced && hop.query.is_empty()) || (!on_demand && exact) {
             return;
         }
-        let selected = previous
-            .and_then(|list| {
-                let alias = &list.items[list.selected].alias;
-                items.iter().position(|item| &item.alias == alias)
-            })
-            .unwrap_or(0);
-        let mut list = Suggestions {
-            items,
-            selected: 0,
-            offset: 0,
-            forced,
-        };
-        list.select(selected);
-        form.suggestions = Some(list);
+        form.suggestions = Some(Suggestions::reopened(previous, items, forced, PROXY_JUMP));
     }
 
     /// Replaces the hop under the ProxyJump cursor with the selected suggestion.
@@ -1772,6 +1841,15 @@ impl UiState {
         let Some(list) = self.form.suggestions.take() else {
             return UiAction::None;
         };
+        if list.field == IDENTITY_FILE {
+            let input = &mut self.form.values[IDENTITY_FILE];
+            let (before, cursor) = (input.as_str().to_owned(), input.cursor);
+            input.text = list.items[list.selected].alias.clone();
+            input.cursor = input.text.len();
+            let action = self.form_input_changed(&before, cursor);
+            self.form.suggestions = None;
+            return action;
+        }
         let input = &mut self.form.values[PROXY_JUMP];
         let Some(hop) = suggest::current_hop(input.as_str(), input.cursor) else {
             return UiAction::None;
@@ -2065,6 +2143,20 @@ impl UiState {
         }
     }
 
+    /// Keeps the built identity inventory and, while IdentityFile has the focus, recomputes its
+    /// dropdown: what was typed, or an earlier Ctrl+Space, can now find candidates. A failed
+    /// build leaves the suggestions to the key files in `~/.ssh`.
+    fn finish_identities(&mut self, built: Result<IdentityInventory, String>) {
+        match built {
+            Ok(inventory) => self.identity_inventory = Some(inventory),
+            Err(error) => self.status = Some(format!("Could not list identities: {error}")),
+        }
+        if self.in_form() && self.form.active == IDENTITY_FILE {
+            let pending = std::mem::take(&mut self.form.identity_pending);
+            self.suggest(pending);
+        }
+    }
+
     /// Opens the migrate screen on the plan the worker built, unless it was closed meanwhile.
     fn finish_plan(
         &mut self,
@@ -2143,6 +2235,7 @@ impl Default for FormState {
             error: None,
             test_result: None,
             suggestions: None,
+            identity_pending: false,
         }
     }
 }
@@ -2169,6 +2262,7 @@ impl FormState {
             error: None,
             test_result: None,
             suggestions: None,
+            identity_pending: false,
         }
     }
 
@@ -2511,7 +2605,7 @@ fn footer_text(state: &UiState) -> String {
             if state.form.suggestions.is_some() {
                 return "↑↓ choose  Enter pick  Esc close".into();
             }
-            let suggest = if state.form.active == PROXY_JUMP {
+            let suggest = if matches!(state.form.active, PROXY_JUMP | IDENTITY_FILE) {
                 "  Ctrl+Space suggest"
             } else {
                 ""
@@ -2554,8 +2648,8 @@ fn form_lines(form: &FormState, show_raw: bool, width: usize, height: usize) -> 
         let rows = height
             .saturating_sub(FORM_FIELDS.len() + 4)
             .clamp(1, SUGGESTION_ROWS);
-        let rows = suggestion_lines(list, FORM_FIELDS[PROXY_JUMP].label, width, rows);
-        lines.splice(PROXY_JUMP + 1..PROXY_JUMP + 1, rows);
+        let rows = suggestion_lines(list, FORM_FIELDS[list.field].label, width, rows);
+        lines.splice(list.field + 1..list.field + 1, rows);
     }
     lines.push(Line::raw(""));
     let active = &FORM_FIELDS[form.active];
@@ -2688,7 +2782,7 @@ fn details_text(state: &UiState) -> String {
         return "No host selected".into();
     };
     let text = match state.details.get(selected) {
-        Some(Ok(details)) => detail_text(details),
+        Some(Ok(details)) => detail_text(details, &state.home),
         Some(Err(error)) => format!("Could not load details: {error}"),
         None => "Resolving…".into(),
     };
@@ -2791,7 +2885,7 @@ fn declared_rows(host: &Host) -> [DetailRow; 5] {
 
 /// Describes a host with each field shown once, as OpenSSH resolves it. Portico's own
 /// declaration only appears where it does not take effect, or while resolution is unavailable.
-fn detail_text(details: &HostDetails) -> String {
+fn detail_text(details: &HostDetails, home: &Path) -> String {
     let mut text = format!(
         "Ownership: {}\nSource: {}\n\n",
         ownership(details.summary.ownership),
@@ -2801,7 +2895,17 @@ fn detail_text(details: &HostDetails) -> String {
     match &details.resolution {
         Ok(resolved) => {
             let rows = resolved_rows(resolved);
-            push_rows(&mut text, &rows);
+            // The identities section shows the IdentityFile paths with their availability.
+            let shown = rows
+                .iter()
+                .filter(|row| details.identities.is_none() || row.label != "IdentityFile");
+            for row in shown {
+                push_rows(&mut text, std::slice::from_ref(row));
+            }
+            if let Some(identities) = &details.identities {
+                text.push('\n');
+                text.push_str(&identities::detail_lines(identities, home));
+            }
             let overridden = declared
                 .iter()
                 .flatten()
@@ -2937,7 +3041,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Instant};
+    use std::time::Instant;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -2996,7 +3100,11 @@ mod tests {
                 proxy_command: None,
                 proxy_use_fdpass: false,
                 known_hosts_files: vec!["~/.ssh/known_hosts".into()],
+                identity_agent: None,
+                identities_only: false,
+                pkcs11_provider: None,
             }),
+            identities: None,
             warnings: Vec::new(),
         }
     }
@@ -5387,6 +5495,172 @@ mod tests {
 
     fn suggestion(state: &UiState) -> &Suggestions {
         state.form.suggestions.as_ref().expect("suggestions open")
+    }
+
+    fn identity_form(inventory: Option<IdentityInventory>) -> UiState {
+        let mut state = test_state(Vec::new());
+        state.identity_inventory = inventory;
+        press(&mut state, KeyCode::Char('a'));
+        for _ in 0..IDENTITY_FILE {
+            press(&mut state, KeyCode::Tab);
+        }
+        state
+    }
+
+    fn identity_inventory() -> IdentityInventory {
+        use crate::identity::{Availability, InventoryFile, MissingReason};
+        let file = |path: &str, availability| InventoryFile {
+            configured: path.into(),
+            path: None,
+            public_key: None,
+            availability,
+            used_by: Vec::new(),
+        };
+        IdentityInventory {
+            agents: Vec::new(),
+            files: vec![
+                file("~/.ssh/github.pub", Availability::InAgent),
+                file(
+                    "~/.ssh/gitlab",
+                    Availability::Missing(MissingReason::NoSuchFile),
+                ),
+                file(
+                    "~/.ssh/git_work",
+                    Availability::KeyFile {
+                        public_key_found: true,
+                    },
+                ),
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn identity_file_suggests_known_identities_with_missing_last() {
+        let mut state = identity_form(Some(identity_inventory()));
+        assert_eq!(state.form.active, IDENTITY_FILE);
+        assert!(state.form.suggestions.is_none());
+        assert!(footer_text(&state).contains("Ctrl+Space suggest"));
+        type_text(&mut state, "git");
+        assert_eq!(
+            listed(&state),
+            ["~/.ssh/git_work", "~/.ssh/github.pub", "~/.ssh/gitlab"]
+        );
+        press(&mut state, KeyCode::Down);
+        assert_eq!(press(&mut state, KeyCode::Enter), UiAction::FormEdited);
+        assert_eq!(
+            state.form.values[IDENTITY_FILE].as_str(),
+            "~/.ssh/github.pub"
+        );
+        assert_eq!(state.form.active, IDENTITY_FILE);
+        assert!(state.form.suggestions.is_none());
+        assert_eq!(state.mode, Mode::AddForm);
+    }
+
+    #[test]
+    fn identity_suggestions_open_when_the_inventory_arrives_for_an_empty_home() {
+        let home = tempfile::tempdir().unwrap();
+        // Ctrl+Space before the inventory, with no key files to scan, opens it once it arrives.
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        state.handle_key(ctrl(' '));
+        assert!(state.form.suggestions.is_none());
+        state.finish_identities(Ok(identity_inventory()));
+        assert_eq!(listed(&state).len(), 3);
+
+        // So does what was typed meanwhile.
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        type_text(&mut state, "hub");
+        assert!(state.form.suggestions.is_none());
+        state.finish_identities(Ok(identity_inventory()));
+        assert_eq!(listed(&state), ["~/.ssh/github.pub"]);
+
+        // A Ctrl+Space whose field lost the focus is forgotten.
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        state.handle_key(ctrl(' '));
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::BackTab);
+        state.finish_identities(Ok(identity_inventory()));
+        assert!(state.form.suggestions.is_none());
+
+        // Nothing opens outside a form.
+        let mut state = test_state(Vec::new());
+        state.finish_identities(Ok(identity_inventory()));
+        assert!(state.form.suggestions.is_none());
+    }
+
+    #[test]
+    fn identity_suggestions_never_scan_without_a_home() {
+        let mut state = identity_form(None);
+        assert_eq!(state.home, PathBuf::new());
+        state.handle_key(ctrl(' '));
+        assert!(state.form.suggestions.is_none());
+    }
+
+    #[test]
+    fn identity_file_ctrl_space_lists_everything_and_moving_away_closes_it() {
+        let mut state = identity_form(Some(identity_inventory()));
+        state.handle_key(ctrl(' '));
+        assert_eq!(listed(&state).len(), 3);
+        assert_eq!(suggestion(&state).field, IDENTITY_FILE);
+        press(&mut state, KeyCode::Esc);
+        assert!(state.form.suggestions.is_none());
+        assert_eq!(state.mode, Mode::AddForm);
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.form.active, PROXY_JUMP);
+        assert!(state.form.suggestions.is_none());
+    }
+
+    #[test]
+    fn identity_suggestions_follow_the_inventory_when_it_arrives() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh/scanned.pub"), "").unwrap();
+        let mut state = identity_form(None);
+        state.home = home.path().to_owned();
+        state.handle_key(ctrl(' '));
+        assert_eq!(listed(&state), ["~/.ssh/scanned.pub"]);
+        state.finish_identities(Ok(identity_inventory()));
+        assert_eq!(listed(&state).len(), 3);
+        state.finish_identities(Err("boom".into()));
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Could not list identities: boom")
+        );
+    }
+
+    #[test]
+    fn identities_replace_the_identity_file_row_in_the_details() {
+        let mut details = details("web", Ownership::Managed);
+        let plain = detail_text(&details, Path::new("/home/test"));
+        assert!(plain.contains("IdentityFile ~/.ssh/id_ed25519"), "{plain}");
+        details.identities = Some(crate::identity::HostIdentities {
+            agent: crate::identity::Agent::Disabled,
+            defaults: false,
+            identities: vec![crate::identity::Identity {
+                configured: "~/.ssh/id_ed25519".into(),
+                path: None,
+                public_key: None,
+                availability: crate::identity::Availability::KeyFile {
+                    public_key_found: false,
+                },
+            }],
+            identities_only: false,
+            also_offered: Vec::new(),
+            pkcs11_provider: None,
+        });
+        let text = detail_text(&details, Path::new("/home/test"));
+        assert_eq!(text.matches("~/.ssh/id_ed25519").count(), 1, "{text}");
+        assert!(
+            text.contains(
+                "Agent        none (IdentityAgent none)\n\
+                 IdentityFile ~/.ssh/id_ed25519  ✓ key file (agent not checked: no public key file)\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("ProxyJump"), "{text}");
     }
 
     #[test]

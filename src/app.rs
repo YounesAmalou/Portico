@@ -7,6 +7,9 @@ use std::{
 use thiserror::Error;
 
 mod containers;
+mod identities;
+
+pub(crate) use identities::key_files_in;
 
 pub use containers::{
     ContainerError, ContainerList, ContainerPrograms, DockerIssue, Offer, Target,
@@ -18,6 +21,7 @@ use crate::{
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
     explain::{Context, Explanation, Operation, explain},
     host::{Change, Host, HostChanges, HostError},
+    identity::HostIdentities,
     managed::{
         InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError, read_lossy,
     },
@@ -32,6 +36,7 @@ pub struct App {
     store: ManagedStore,
     openssh: OpenSsh,
     container_programs: ContainerPrograms,
+    identities: identities::IdentityState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +63,8 @@ pub struct HostDetails {
     pub summary: HostSummary,
     pub declared: Option<Host>,
     pub resolution: Result<ResolvedConfig, String>,
+    /// The host's identities and whether each is available; absent when resolution failed.
+    pub identities: Option<HostIdentities>,
     pub warnings: Vec<DiscoveryWarning>,
 }
 
@@ -173,6 +180,7 @@ impl App {
             store,
             openssh,
             container_programs: ContainerPrograms::default(),
+            identities: identities::IdentityState::default(),
         }
     }
 
@@ -291,10 +299,15 @@ impl App {
             None => self.openssh.resolve(&summary.alias),
         }
         .map_err(|error| error.to_string());
+        let identities = resolution
+            .as_ref()
+            .ok()
+            .map(|resolved| self.host_identities(&summary.alias, resolved));
         Ok(HostDetails {
             summary,
             declared,
             resolution,
+            identities,
             warnings: discovery.warnings,
         })
     }

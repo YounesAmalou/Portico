@@ -34,6 +34,7 @@ pub struct OpenSsh {
     ssh: PathBuf,
     terminal: PathBuf,
     keygen: PathBuf,
+    ssh_add: PathBuf,
     /// Portico's own executable, run in a new terminal so a failure can be explained there.
     portico: Option<PathBuf>,
 }
@@ -49,6 +50,10 @@ pub struct ResolvedConfig {
     /// `ProxyUseFdpass`: the `ProxyCommand` hands ssh its connected socket.
     pub proxy_use_fdpass: bool,
     pub known_hosts_files: Vec<String>,
+    /// `IdentityAgent` as ssh printed it; `None` when absent.
+    pub identity_agent: Option<String>,
+    pub identities_only: bool,
+    pub pkcs11_provider: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -178,6 +183,7 @@ impl OpenSsh {
             ssh,
             terminal,
             keygen: "ssh-keygen".into(),
+            ssh_add: "ssh-add".into(),
             portico: None,
         }
     }
@@ -188,6 +194,30 @@ impl OpenSsh {
 
     pub fn with_keygen(self, keygen: PathBuf) -> Self {
         Self { keygen, ..self }
+    }
+
+    pub fn with_ssh_add(self, ssh_add: PathBuf) -> Self {
+        Self { ssh_add, ..self }
+    }
+
+    pub(crate) fn keygen_program(&self) -> &Path {
+        &self.keygen
+    }
+
+    pub(crate) fn ssh_add_program(&self) -> &Path {
+        &self.ssh_add
+    }
+
+    /// The identity files OpenSSH tries when none is configured, read with no configuration
+    /// file at all.
+    pub fn default_identity_files(&self) -> Result<Vec<String>, OpenSshError> {
+        let text = self.effective(Path::new("none"), "portico-defaults", None)?;
+        Ok(text
+            .lines()
+            .filter_map(|line| line.split_once(char::is_whitespace))
+            .filter(|(key, _)| key.eq_ignore_ascii_case("identityfile"))
+            .map(|(_, value)| value.trim_start().to_owned())
+            .collect())
     }
 
     pub fn validate(&self, entry: &Path, aliases: &[String]) -> Result<(), OpenSshError> {
@@ -278,6 +308,9 @@ impl OpenSsh {
         let mut proxy_command = None;
         let mut proxy_use_fdpass = false;
         let mut known_hosts_files = Vec::new();
+        let mut identity_agent = None;
+        let mut identities_only = false;
+        let mut pkcs11_provider = None;
         for line in text.lines() {
             let Some((key, value)) = line.split_once(char::is_whitespace) else {
                 continue;
@@ -302,6 +335,12 @@ impl OpenSsh {
                 proxy_use_fdpass = value.eq_ignore_ascii_case("yes");
             } else if key.eq_ignore_ascii_case("userknownhostsfile") {
                 known_hosts_files = value.split_whitespace().map(String::from).collect();
+            } else if key.eq_ignore_ascii_case("identityagent") {
+                identity_agent = Some(value.into());
+            } else if key.eq_ignore_ascii_case("identitiesonly") {
+                identities_only = value.eq_ignore_ascii_case("yes");
+            } else if key.eq_ignore_ascii_case("pkcs11provider") {
+                pkcs11_provider = Some(value.into());
             }
         }
         Ok(ResolvedConfig {
@@ -314,6 +353,9 @@ impl OpenSsh {
             proxy_command,
             proxy_use_fdpass,
             known_hosts_files,
+            identity_agent,
+            identities_only,
+            pkcs11_provider,
         })
     }
 
@@ -1499,6 +1541,32 @@ mod tests {
                 port: 2222,
                 fd_passing: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_identity_settings_and_defaults() {
+        let fake = fake_resolver(
+            "hostname h\nidentitiesonly yes\nidentityagent /home/me/.1password/agent.sock\n\
+             pkcs11provider /usr/lib/p11.so\nidentityfile ~/.ssh/a.pub\nidentityfile ~/.ssh/b\n",
+        );
+        let openssh = OpenSsh::new(fake.path(), "xdg-terminal-exec".into());
+        let resolved = openssh.resolve("h").unwrap();
+        assert!(resolved.identities_only);
+        assert_eq!(
+            resolved.identity_agent.as_deref(),
+            Some("/home/me/.1password/agent.sock")
+        );
+        assert_eq!(resolved.pkcs11_provider.as_deref(), Some("/usr/lib/p11.so"));
+        assert_eq!(resolved.identity_files, ["~/.ssh/a.pub", "~/.ssh/b"]);
+
+        assert_eq!(
+            openssh.default_identity_files().unwrap(),
+            ["~/.ssh/a.pub", "~/.ssh/b"]
+        );
+        assert_eq!(
+            fs::read_to_string(fake.log()).unwrap(),
+            "-G\n-F\nnone\n--\nportico-defaults\n"
         );
     }
 
