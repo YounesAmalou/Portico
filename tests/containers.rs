@@ -379,12 +379,29 @@ fn shell_new_terminal_passes_resolved_id() {
 fn the_desktop_panel_shell_form_opens_a_new_terminal() {
     let env = env_with_dev(&shop_listing());
 
-    env.run(["shell", "--new-terminal", "--on", "dev", "--", "aaaa1111"])
+    env.run(["shell", "--new-terminal", "--on=dev", "--", "aaaa1111"])
         .assert_success();
     assert_eq!(
         fs::read_to_string(env.connection_log()).unwrap(),
         format!(
             "{}\nshell\n--hold\n--on\ndev\n--\naaaa1111\n",
+            env!("CARGO_BIN_EXE_portico")
+        )
+    );
+}
+
+/// The desktop panel opens a shell on this machine with exactly this form (no `--on`).
+#[test]
+fn the_desktop_panel_local_shell_form_opens_a_new_terminal() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+
+    env.run(["shell", "--new-terminal", "--", "aaaa1111"])
+        .assert_success();
+    assert_eq!(
+        fs::read_to_string(env.connection_log()).unwrap(),
+        format!(
+            "{}\nshell\n--hold\n--\naaaa1111\n",
             env!("CARGO_BIN_EXE_portico")
         )
     );

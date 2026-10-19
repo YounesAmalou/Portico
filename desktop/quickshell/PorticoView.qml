@@ -373,6 +373,27 @@ FocusScope {
                             anchors.right: parent.right
                             spacing: 8
 
+                            // An expanded host lists its containers again.
+                            Text {
+                                visible: row.item.type === "host" && row.item.expanded
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "↻"
+                                color: reloadArea.containsMouse ? view.fg : view.dim
+                                font.family: view.fontFamily
+                                font.pixelSize: view.fontSize
+                                MouseArea {
+                                    id: reloadArea
+                                    anchors.fill: parent
+                                    anchors.margins: -4
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        view.currentKey = row.item.key
+                                        view.model.reloadContainers(row.item.target)
+                                    }
+                                }
+                            }
+
                             Text {
                                 anchors.verticalCenter: parent.verticalCenter
                                 textFormat: Text.PlainText
@@ -458,7 +479,7 @@ FocusScope {
 
         Text {
             width: parent.width
-            text: "Enter connects or starts · → containers · Esc closes · manage hosts and tunnels in portico"
+            text: "Enter connects or starts · → containers (↻ lists them again) · F5 lists all again · Esc closes · manage hosts and tunnels in portico"
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             color: view.dim

@@ -207,4 +207,38 @@ TestCase {
         compare(Portico.parseLookup(""), { program: "", setsid: false })
         compare(Portico.notFound(["portico"]).message, "Portico was not found.")
     }
+
+    function test_a_failed_listing_is_listed_again() {
+        verify(Portico.needsListing(undefined))
+        verify(Portico.needsListing({ state: "failed", rows: [], error: { message: "down" } }))
+        verify(!Portico.needsListing({ state: "loading", rows: [], error: null }))
+        verify(!Portico.needsListing({ state: "loaded", rows: [], error: null }))
+    }
+
+    function test_commands_keep_values_from_being_read_as_flags() {
+        compare(Portico.containersCommand("/p", ""), ["/p", "containers", "--json"])
+        compare(Portico.containersCommand("/p", "-dash"), ["/p", "containers", "--json", "--on=-dash"])
+        compare(Portico.connectCommand("/p", "-dash"), ["/p", "connect", "--new-terminal", "--", "-dash"])
+        compare(Portico.shellCommand("/p", "", "aaaa1111"), ["/p", "shell", "--new-terminal", "--", "aaaa1111"])
+        compare(Portico.shellCommand("/p", "dev", "aaaa1111"), ["/p", "shell", "--new-terminal", "--on=dev", "--", "aaaa1111"])
+        compare(Portico.actionCommand("/p", "start", "db", false), ["/p", "tunnel", "start", "--json", "--", "db"])
+        compare(Portico.actionCommand("/p", "stop", "db", true),
+                ["setsid", "--fork", "--wait", "/p", "tunnel", "stop", "--json", "--", "db"])
+    }
+
+    function test_a_start_without_json_is_the_row_error() {
+        var outcome = Portico.actionOutcome("", 2, "db")
+        compare(outcome.row, null)
+        compare(outcome.outcome, "failed")
+        compare(outcome.error.message, Portico.OLD_PORTICO)
+        var started = Portico.actionOutcome(golden("tunnel-start.json"), 1, "preview")
+        compare(started.error.kind, "ssh")
+    }
+
+    function test_malformed_lists_do_not_throw() {
+        compare(Portico.containerRows({ schema: 1, containers: [null, { id: "abcd" }] }, "").length, 2)
+        compare(Portico.hostRows({ schema: 1, hosts: [null, { alias: "a" }] }).length, 1)
+        compare(Portico.tunnelRows({ schema: 1, tunnels: [null] })[0].stateText, "Unknown")
+        compare(Portico.actionResult({ schema: 1, results: [null] }, "db").outcome, "failed")
+    }
 }

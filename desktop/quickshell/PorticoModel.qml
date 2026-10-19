@@ -66,7 +66,7 @@ Item {
             r.destroy()
         })
         r.notStarted.connect(function () {
-            model.problem = Portico.notFound([command[0]])
+            model.problem = Portico.notFound([model.program || command[0]])
             done(null, "", -1)
             r.destroy()
         })
@@ -103,6 +103,7 @@ Item {
             model.problem = null
             listHosts()
             listTunnels()
+            Object.keys(model.expanded).forEach(function (target) { model.loadContainers(target) })
         })
     }
 
@@ -139,7 +140,16 @@ Item {
         let before = actionsFinished
         run([program, "tunnels", "--json"], function (stdout, stderr, exitCode) {
             model.tunnelsRunning = false
-            if (current !== session || stdout === null || before !== actionsFinished)
+            if (stdout === null)
+                return
+            // A listing from an earlier opening is stale: list again for this one
+            // rather than wait for the next tick.
+            if (current !== model.session) {
+                if (model.opened)
+                    model.listTunnels()
+                return
+            }
+            if (before !== model.actionsFinished)
                 return
             let doc = read(stdout, exitCode)
             if (!doc)
@@ -152,8 +162,13 @@ Item {
 
     function setExpanded(target, on) {
         expanded = assign(expanded, target, on ? true : undefined)
-        if (on && !containers[target])
+        if (on && Portico.needsListing(containers[target]))
             loadContainers(target)
+    }
+
+    // Lists a host's containers again (its refresh action, and refresh()).
+    function reloadContainers(target) {
+        loadContainers(target)
     }
 
     function loadContainers(target) {
@@ -161,10 +176,7 @@ Item {
             return
         let current = session
         containers = assign(containers, target, { state: "loading", rows: [], error: null })
-        let command = [program, "containers", "--json"]
-        if (target !== "")
-            command = command.concat(["--on", target])
-        run(command, function (stdout, stderr, exitCode) {
+        run(Portico.containersCommand(program, target), function (stdout, stderr, exitCode) {
             if (current !== session || stdout === null)
                 return
             let parsed = Portico.parse(stdout, exitCode)
@@ -196,14 +208,11 @@ Item {
     }
 
     function connect(alias) {
-        launch("host:" + alias, [program, "connect", "--new-terminal", "--", alias])
+        launch("host:" + alias, Portico.connectCommand(program, alias))
     }
 
     function openShell(target, id) {
-        let command = [program, "shell", "--new-terminal"]
-        if (target !== "")
-            command = command.concat(["--on", target])
-        launch("container:" + target + "/" + id, command.concat(["--", id]))
+        launch("container:" + target + "/" + id, Portico.shellCommand(program, target, id))
     }
 
     function act(verb, name) {
@@ -212,20 +221,12 @@ Item {
         let key = "tunnel:" + name
         busy = assign(busy, name, verb === "start" ? "starting" : "stopping")
         rowErrors = assign(rowErrors, key, undefined)
-        let command = [program, "tunnel", verb, "--json", "--", name]
-        if (setsid)
-            command = ["setsid", "--fork", "--wait"].concat(command)
-        run(command, function (stdout, stderr, exitCode) {
+        run(Portico.actionCommand(program, verb, name, setsid), function (stdout, stderr, exitCode) {
             model.actionsFinished += 1
             model.busy = model.assign(model.busy, name, undefined)
             if (stdout === null)
                 return
-            let parsed = Portico.parse(stdout, exitCode)
-            if (!parsed.ok) {
-                model.problem = parsed.problem
-                return
-            }
-            let result = Portico.actionResult(parsed.doc, name)
+            let result = Portico.actionOutcome(stdout, exitCode, name)
             if (result.row) {
                 model.tunnels = model.tunnels.map(function (row) { return row.name === name ? result.row : row })
             }

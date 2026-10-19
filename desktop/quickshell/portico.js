@@ -123,7 +123,8 @@ function tunnelRows(doc) {
 // `target` is "" for this machine, otherwise the alias.
 function containerRows(doc, target) {
     return list(doc && doc.containers).map(function (c) {
-        var id = text(c && c.id)
+        c = c || {}
+        var id = text(c.id)
         return {
             key: "container:" + target + "/" + id,
             target: target,
@@ -235,4 +236,45 @@ var LOOKUP_SCRIPT = 'for c in "$@"; do p=$(command -v "$c") && [ -x "$p" ] && { 
 
 function lookupCommand(porticoBin, home) {
     return ["sh", "-c", LOOKUP_SCRIPT, "portico-lookup"].concat(candidates(porticoBin, home))
+}
+
+// Whether a host's containers need listing when it is expanded: never listed,
+// or the last listing failed (docker may have been started since).
+function needsListing(entry) {
+    return !entry || entry.state === "failed"
+}
+
+// The commands the panel runs. `--on=<alias>` and `--` keep an alias, ID or
+// name that starts with "-" from being read as a flag; tests/cli.rs,
+// tests/containers.rs and tests/json.rs pin each form.
+function onArgument(target) {
+    return text(target) === "" ? [] : ["--on=" + text(target)]
+}
+
+function containersCommand(program, target) {
+    return [program, "containers", "--json"].concat(onArgument(target))
+}
+
+function connectCommand(program, alias) {
+    return [program, "connect", "--new-terminal", "--", alias]
+}
+
+function shellCommand(program, target, id) {
+    return [program, "shell", "--new-terminal"].concat(onArgument(target), ["--", id])
+}
+
+// Start and stop run under `setsid --fork --wait` when it exists, so a reload
+// that kills the panel's processes leaves Portico to finish them.
+function actionCommand(program, verb, name, setsid) {
+    var command = [program, "tunnel", verb, "--json", "--", name]
+    return setsid ? ["setsid", "--fork", "--wait"].concat(command) : command
+}
+
+// What a start or stop says about its row: a document that is not schema 1
+// is that row's error, so the rest of the panel keeps working.
+function actionOutcome(stdout, exitCode, name) {
+    var parsed = parse(stdout, exitCode)
+    if (!parsed.ok)
+        return { row: null, outcome: "failed", error: parsed.problem }
+    return actionResult(parsed.doc, name)
 }
