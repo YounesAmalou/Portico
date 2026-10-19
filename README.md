@@ -141,6 +141,8 @@ portico tunnel start [<name>...]
 portico tunnel stop [<name>...] [-A|--all]
 ```
 
+`hosts`, `show`, `identities`, `containers`, `tunnels`, `tunnel show`, `tunnel start` and `tunnel stop` also take `--json` (see [Machine-readable output](#machine-readable-output)).
+
 ### Picking a host
 
 Leave out the alias and Portico asks for it in the terminal: `show`, `connect` and `test` offer every host, `edit` and `remove` the managed ones. A bare `--on` does the same for `containers` and `shell`; without `--on` they use this machine. Because `--on` takes the next word as its alias, name a container before a bare `--on` (`portico shell web --on`).
@@ -287,6 +289,18 @@ portico tunnel stop db
 `stop` signals only the process Portico started: it recognises it by its PID together with its start time, the boot and its command line, so a PID reused by another process is never signalled. `start` and `stop` succeed when the tunnel is already in that state, so scripts can call them directly. A running tunnel cannot be edited or removed; stop it first. Without a name, `show`, `edit`, `remove`, `start` and `stop` pick a tunnel with the picker.
 
 Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory; if the record is lost while the tunnel runs, Portico finds the process again.
+
+### Machine-readable output
+
+For scripts and desktop panels, `portico hosts`, `show`, `identities`, `containers`, `tunnels` and `tunnel show|start|stop` print one JSON document on stdout when given `--json`, success or failure, with a `schema` version:
+
+```sh
+portico tunnels --json
+portico tunnel start db --json
+portico containers --on prod-db --json
+```
+
+In JSON mode Portico never opens a picker or asks a question (a missing name is an error), never prompts for a password, writes nothing to stderr, and prints nothing the text output does not show: no key material and no credentials. The documents, their fields, the errors and the versioning rules are in [`docs/json-output.md`](docs/json-output.md).
 
 ### Adopt and export hosts
 

@@ -405,3 +405,38 @@ fn the_release_pr_body_renders_with_the_pinned_release_plz() {
     assert!(body.contains("- Filter the containers panel"), "{body}");
     assert!(!body.contains("release-plz"), "no credit footer: {body}");
 }
+
+#[test]
+fn the_json_contract_shows_every_golden_document_verbatim() {
+    let page = read("docs/json-output.md");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/json");
+    let mut goldens: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    goldens.sort();
+    assert!(!goldens.is_empty());
+    for name in &goldens {
+        let body = fs::read_to_string(dir.join(name)).unwrap();
+        let block = format!("<!-- golden: {name} -->\n```json\n{body}```");
+        assert!(
+            page.contains(&block),
+            "docs/json-output.md does not show {name} verbatim after its marker"
+        );
+    }
+    // Every marker names a golden file.
+    for marker in page.split("<!-- golden: ").skip(1) {
+        let name = marker.split_once(" -->").unwrap().0;
+        assert!(
+            goldens.iter().any(|golden| golden == name),
+            "docs/json-output.md names a missing golden file {name}"
+        );
+    }
+}
+
+#[test]
+fn readme_points_consumers_at_the_json_contract() {
+    let readme = read("README.md");
+    assert!(readme.contains("docs/json-output.md"));
+    assert!(readme.contains("--json"));
+}

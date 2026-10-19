@@ -1,6 +1,6 @@
 # Machine-Readable Output Design
 
-**Status:** Draft; awaiting review
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -34,7 +34,7 @@ It implements v3 item 1 of `ROADMAP.md`, "Machine-readable output", which the v1
 - **In JSON mode Portico writes nothing to stderr.** What it printed there (explanations, warnings, ssh's captured stderr for a failed listing) moves into the document. The consumer may still discard or log stderr: a child program Portico does not capture could in principle write there.
 - **`start` and `stop` report JSON results,** one per name in order, each with the tunnel's report as it stands after the action, so the panel redraws without running `portico tunnels` again. A per-name failure is a result, not an error document; the document is an error document only when the command failed before acting on any name (no name given, the tunnels file unreadable).
 - **Serialization is a rendering of the existing report types,** not a parallel model: `HostInventory`, `HostDetails` (with `HostIdentities`), `IdentityInventory`, `ContainerList`, `TunnelReport`, `StartOutcome`, `StopOutcome`, `ContainerError` and `AppError`, built by the same `App` functions the human output uses. One module, `src/cli/json.rs`, maps each type to a `serde_json::Value`, the way `print_details` and its siblings map them to text. The domain types gain no derive and no serde attribute, so the field names of the contract are spelled out in one file, next to each other, and a rename in the code cannot change the contract by accident.
-- **The dependency is `serde_json`** (MIT OR Apache-2.0), with its default features. `serde`, `itoa`, `ryu` and `memchr` are already in `Cargo.lock` as dev-dependency transitives, so the build graph grows by about one crate. Hand-written JSON would need its own escaping of control characters, lone surrogates in lossy text and non-UTF-8 paths, which is exactly where strict consumer parsers fail; `serde_json` is the standard answer. `cargo deny` and `cargo audit` check it in CI, which runs them because `Cargo.toml` changes. No `derive` feature is needed, since nothing derives.
+- **The dependency is `serde_json`** (MIT OR Apache-2.0), with its default features. `serde`, `itoa` and `memchr` are already in `Cargo.lock` as dev-dependency transitives, so the build graph grows by two crates (`serde_json` and its float formatter `zmij`, both MIT OR Apache-2.0). Hand-written JSON would need its own escaping of control characters, lone surrogates in lossy text and non-UTF-8 paths, which is exactly where strict consumer parsers fail; `serde_json` is the standard answer. `cargo deny` and `cargo audit` check it in CI, which runs them because `Cargo.toml` changes. No `derive` feature is needed, since nothing derives.
 - **The contract is documented in `docs/json-output.md`,** a consumer page with each document, a field table and the versioning rules. Its examples are the golden files of the tests, copied verbatim, and a doc guard checks that they stay identical (see "Testing").
 
 ## Decisions
@@ -63,7 +63,7 @@ It implements v3 item 1 of `ROADMAP.md`, "Machine-readable output", which the v1
   | `usage` | A required name is missing (the human output would have opened a picker) |
   | `unknown-host` | The alias is not in the inventory |
   | `unknown-tunnel` | No saved (or recorded) tunnel has that name |
-  | `ssh` | ssh could not reach or authenticate to the host (listing containers, starting a tunnel) |
+  | `ssh` | ssh could not reach or authenticate to the host (listing containers), or did not establish a tunnel |
   | `docker` | docker failed on the target; adds `"problem"`: `not-installed`, `daemon-down`, `permission-denied` or `other` |
   | `other` | Anything else: an unreadable config, a refused start (`port 5432 on 127.0.0.1 is in use by tunnel db`), a runtime directory error |
 
@@ -246,7 +246,7 @@ Agents are those the human output lists (with a socket: `listed` or `unavailable
 | `containers[]` | The running containers, in the human output's order (grouped by Compose project, then the others) |
 | `.id` | Docker's short ID: what `portico shell <id> --on <alias>` accepts, so the panel needs no name resolution |
 | `.name`, `.image`, `.status` | Docker's own, as the human columns |
-| `.display_name` | The name the human output shows first (`project/service`, numbered when a service has several) |
+| `.display_name` | The name the human output shows first (the Compose service, numbered when it has several containers, or the container's name) |
 | `.project`, `.service` | The Compose labels, or `null` |
 | `via` | `sg` when docker had to run inside the docker group, otherwise `null` |
 | `note` | The human note said once when `via` is set, or `null` |
@@ -333,7 +333,7 @@ Both render `TunnelReport`, built by the function the human list and the TUI use
 
 - One result per name, in the order given; `stop --all` has one per running tunnel (and `results: []` when none runs, exit 0).
 - `outcome` for `start`: `started`, `already-running` or `failed`; for `stop`: `stopped`, `not-running` or `failed`. `pid` is set for `started` and `already-running`, otherwise `null`; `error` is set exactly when the outcome is `failed`.
-- A failed start uses the start's reason as `message` and its explanation's next steps as `next` (kind `ssh` when the explanation is a connection failure, `other` otherwise); a refusal (unknown tunnel, unknown host, port in use, a running collision) uses the refusal's kind and text.
+- A failed start (ssh ran and did not establish the tunnel) is kind `ssh`, with the explanation's headline and next steps, or the start's reason when Portico has no explanation; a refusal (unknown tunnel, unknown host, port in use, a running collision) uses the refusal's kind and text.
 - `tunnel` is the report after the action, or `null` when the name is not a saved tunnel (an unknown name, or a stopped tunnel that was no longer saved).
 - The exit status is 1 when any result failed, as today.
 
@@ -345,7 +345,7 @@ The contract is `schema` 1. Without changing the number, a later Portico may:
 - add values to `error.kind`, to a warning's `kind` and to `problem` (a consumer treats an unknown value as `other`);
 - add commands that accept `--json`.
 
-Anything else is breaking and raises `schema` to 2: removing or renaming a key, changing a value's type or meaning, turning a nullable value into an absent key, or adding a value to `status.state`, `outcome`, `availability`, `agent.state`, `ownership` or `forward.kind` (the closed sets a consumer switches on). A breaking change is a `feat!:` commit, and its release notes say so. Portico prints only its current schema; there is no flag to ask for an older one. A consumer checks `schema` first and says "this Portico is too new (or too old) for this panel" rather than misreading a document; with additive changes kept within one schema, that should be rare.
+Anything else is breaking and raises `schema` to 2: removing or renaming a key, changing a value's type or meaning, turning a nullable value into an absent key, or adding a value to `status.state`, `outcome`, `availability`, `agent.state`, `ownership`, `target.kind` or `forward.kind` (the closed sets a consumer switches on). A breaking change is a `feat!:` commit, and its release notes say so. Portico prints only its current schema; there is no flag to ask for an older one. A consumer checks `schema` first and says "this Portico is too new (or too old) for this panel" rather than misreading a document; with additive changes kept within one schema, that should be rare.
 
 ### What is never printed
 
@@ -391,5 +391,5 @@ A test pins this (see "Testing").
 1. **The contract is public.** A separately installed panel (the Omarchy plugin) may run against another Portico release, so the schema number and the versioning rules above are a promise to any consumer, and `docs/json-output.md` says so.
 2. **`show` may wake an agent.** Listing a host's agent can make a locked 1Password show its unlock prompt. That is fine for an explicit request, so the consumer page says to run `show` only when the user opens a host, never to prefetch every host. `hosts --json` stays free of `ssh`, `ssh-add` and `ssh-keygen`, pinned by a test whose fake programs fail when run.
 3. **Sorted keys are guarded.** `serde_json`'s `Map` is a `BTreeMap` unless its `preserve_order` feature is on, and the golden files rely on sorted keys, so nothing enables that feature and a unit test fails if feature unification ever does.
-4. **A failure before any output is still a document.** An unreadable or unparsable configuration, or any other error before the command has anything to print, is an error document on stdout with exit status 1, never text on stderr. Pinned by a test.
+4. **A failure before any output is still a document.** An unreadable or unparsable configuration, or any other error before the command has anything to print, is an error document on stdout with exit status 1, never text on stderr. Pinned by a test. (`tunnels` lists tunnels without the inventory, as its human form does, so an unreadable `~/.ssh/config` only costs it the unknown-host warnings.)
 5. **Start and stop block.** `start` returns when ssh has established the tunnel or given up, which can take as long as the host's `ConnectTimeout`, and `stop` can wait up to 3 seconds for ssh to exit. The consumer page says to run both asynchronously; the document arrives when they finish.

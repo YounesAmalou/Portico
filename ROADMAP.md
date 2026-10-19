@@ -18,24 +18,23 @@ Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/s
 
 ### v3: long-running work and the desktop
 
-The desktop surface starts and stops saved tunnels and reads everything through one CLI contract, so these ship together.
+The desktop surface starts and stops saved tunnels and reads everything through the `--json` CLI contract.
 
-1. **Machine-readable output.** The smallest `--json` contract (hosts, one host's details, their containers, and tunnels and their status) that the desktop surface needs, defined by that consumer's requirements and carrying no credentials.
-2. **Desktop surface (Quickshell).** A Quickshell component for quick connection and tunnel control: a short list of hosts (and their containers) to connect to, and the saved tunnels with their status and a start or stop action. It reads from the CLI contract above and does not duplicate management: adding, editing and adopting stay in the TUI and CLI.
+1. **Desktop surface (Quickshell).** A Quickshell component for quick connection and tunnel control: a short list of hosts (and their containers) to connect to, and the saved tunnels with their status and a start or stop action. It reads the `--json` CLI contract (`docs/json-output.md`) and does not duplicate management: adding, editing and adopting stay in the TUI and CLI.
    - **Quickshell first, Omarchy second.** Omarchy's shell is a Quickshell configuration, so one Quickshell component can serve both. On a plain Quickshell setup it runs as its own panel; on Omarchy it can additionally be packaged as an Omarchy plugin (a `plugin.json` with a bar widget and a panel entry point, as other plugins in `~/.config/omarchy/plugins` do) and offered through the Omarchy menu. The shared part is the panel; only the thin entry points differ.
    - Open design questions: bar widget versus launcher-style popup, how connecting opens a terminal (reuse the `xdg-terminal-exec` path), and how the panel learns of status changes without a daemon (poll the CLI on open).
 
 ### v4: more places to open a shell
 
-3. **Proxmox container shells.** The same list-and-shell flow for LXC containers on a Proxmox VE node Portico knows: list them with `pct list` over `ssh`, and open a shell with `pct exec <vmid>` as the chosen user, `bash` first and `sh` otherwise. It is a second backend behind the container shells picker, not a separate feature.
+2. **Proxmox container shells.** The same list-and-shell flow for LXC containers on a Proxmox VE node Portico knows: list them with `pct list` over `ssh`, and open a shell with `pct exec <vmid>` as the chosen user, `bash` first and `sh` otherwise. It is a second backend behind the container shells picker, not a separate feature.
    - Open design questions, settled when the slice starts: `pct` needs root on the node, and whether stopped containers are listed.
-4. **Podman.** `portico shell` supports Docker only and never run `podman`. Add Podman as a second engine behind the same picker, listing and shell. Open design questions, settled when the slice starts: rootless Podman's per-user containers, and whether `podman` and `docker` on one target are both listed.
-5. **Remembered container user.** `portico shell` stores nothing, so the user chosen for a container's shell must be picked again each time. Remember the last user per Compose service (or container) so it becomes the default. It needs its own design for a small Portico-owned preferences file, within the rule of no database.
+3. **Podman.** `portico shell` supports Docker only and never run `podman`. Add Podman as a second engine behind the same picker, listing and shell. Open design questions, settled when the slice starts: rootless Podman's per-user containers, and whether `podman` and `docker` on one target are both listed.
+4. **Remembered container user.** `portico shell` stores nothing, so the user chosen for a container's shell must be picked again each time. Remember the last user per Compose service (or container) so it becomes the default. It needs its own design for a small Portico-owned preferences file, within the rule of no database.
 
 ### Unscheduled
 
-6. **More OpenSSH directives (optional, undecided).** Managed hosts support only host, user, port, identity file and ProxyJump today. Supporting more directives is wanted but must not overload the tool. Whether this ships as a curated set added one directive at a time, as a free-form "custom directive" field validated by OpenSSH, or both, is an open design question; the answer decides the slice's size. It stays optional: the default form does not grow.
-7. **Pin an agent key to a host by writing its public half (optional, undecided).** With 1Password and other agents, choosing one key for a host means saving that key's public half as a `.pub` file and pointing IdentityFile at it (with `IdentitiesOnly yes`). Portico could offer that from `portico identities` or the host form. It writes no secret, but it would be the first key-related file Portico writes, so it needs its own design review on that ground.
+5. **More OpenSSH directives (optional, undecided).** Managed hosts support only host, user, port, identity file and ProxyJump today. Supporting more directives is wanted but must not overload the tool. Whether this ships as a curated set added one directive at a time, as a free-form "custom directive" field validated by OpenSSH, or both, is an open design question; the answer decides the slice's size. It stays optional: the default form does not grow.
+6. **Pin an agent key to a host by writing its public half (optional, undecided).** With 1Password and other agents, choosing one key for a host means saving that key's public half as a `.pub` file and pointing IdentityFile at it (with `IdentitiesOnly yes`). Portico could offer that from `portico identities` or the host form. It writes no secret, but it would be the first key-related file Portico writes, so it needs its own design review on that ground.
 
 ## Production readiness
 
