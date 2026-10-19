@@ -13,7 +13,7 @@ pub use containers::{
 };
 
 use crate::{
-    adopt::{AdoptError, MigrationPlan},
+    adopt::{AdoptError, Direction, MigrationPlan},
     config_error::{ConfigFiles, ConfigRejection, interpret},
     discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
     explain::{Context, Explanation, Operation, explain},
@@ -477,12 +477,26 @@ impl App {
 
     /// Which external hosts could move into the managed fragment, and what moving each would change.
     pub fn adoption_plan(&self) -> Result<MigrationPlan, AppError> {
-        Ok(self.store.adoption_plan(&self.effective(None))?)
+        self.migration_plan(Direction::Adopt, None)
     }
 
     /// Which managed hosts could move back into the entry config, and what that would change.
     pub fn export_plan(&self) -> Result<MigrationPlan, AppError> {
-        Ok(self.store.export_plan(&self.effective(None))?)
+        self.migration_plan(Direction::Export, None)
+    }
+
+    /// The plan of `direction`; once `cancelled` is set, its remaining `ssh -G` probes fail at
+    /// once, so the caller should drop the result.
+    pub(crate) fn migration_plan(
+        &self,
+        direction: Direction,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<MigrationPlan, AppError> {
+        let effective = self.effective(cancelled);
+        Ok(match direction {
+            Direction::Adopt => self.store.adoption_plan(&effective)?,
+            Direction::Export => self.store.export_plan(&effective)?,
+        })
     }
 
     /// Moves the selected hosts of `plan` in one rollback-safe transaction and returns their

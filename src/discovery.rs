@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap},
     env, fs, io,
     path::{Path, PathBuf},
 };
@@ -143,14 +143,16 @@ pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryErro
     let mut scanner = Scanner {
         root,
         managed: managed.canonicalize().ok(),
-        visited: HashSet::new(),
+        visited: HashMap::new(),
+        includes: Vec::new(),
+        stack: vec![canonical.clone()],
         discovery: Discovery {
             aliases_complete: true,
             ..Discovery::default()
         },
     };
 
-    scanner.visited.insert(canonical);
+    scanner.visited.insert(canonical, false);
     scanner.scan_entry(entry.to_path_buf())?;
     scanner.report_duplicates();
     Ok(scanner.discovery)
@@ -159,7 +161,12 @@ pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryErro
 struct Scanner {
     root: PathBuf,
     managed: Option<PathBuf>,
-    visited: HashSet<PathBuf>,
+    /// Every file scanned, the entry config first, and whether any Include of it is conditional.
+    visited: HashMap<PathBuf, bool>,
+    /// Each Include edge seen, as canonical (including file, included file).
+    includes: Vec<(PathBuf, PathBuf)>,
+    /// The canonical files being scanned, innermost last.
+    stack: Vec<PathBuf>,
     discovery: Discovery,
 }
 
@@ -178,14 +185,52 @@ impl Scanner {
             Ok(path) => path,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
-        if self.managed.as_ref() == Some(&canonical) || !self.visited.insert(canonical.clone()) {
+        if self.managed.as_ref() == Some(&canonical) {
             return;
         }
+        if let Some(parent) = self.stack.last() {
+            self.includes.push((parent.clone(), canonical.clone()));
+        }
+        match self.visited.get(&canonical) {
+            Some(&false) if conditional => return self.mark_conditional(canonical),
+            Some(_) => return,
+            None => self.visited.insert(canonical.clone(), conditional),
+        };
         let contents = match fs::read(&path) {
             Ok(contents) => contents,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
+        self.stack.push(canonical);
         self.scan_contents(&contents, &path, conditional);
+        self.stack.pop();
+    }
+
+    /// Marks the hosts of `file`, scanned before through an unconditional Include, and of every
+    /// file it includes as conditional, now that a conditional Include also reaches it.
+    fn mark_conditional(&mut self, file: PathBuf) {
+        let mut pending = vec![file];
+        while let Some(file) = pending.pop() {
+            if self.stack.first() == Some(&file)
+                || self.visited.insert(file.clone(), true) == Some(true)
+            {
+                continue;
+            }
+            for host in &mut self.discovery.hosts {
+                if host
+                    .source
+                    .canonicalize()
+                    .is_ok_and(|source| source == file)
+                {
+                    host.conditional = true;
+                }
+            }
+            pending.extend(
+                self.includes
+                    .iter()
+                    .filter(|(parent, _)| *parent == file)
+                    .map(|(_, child)| child.clone()),
+            );
+        }
     }
 
     fn scan_contents(&mut self, contents: &[u8], source: &Path, conditional: bool) {
@@ -232,7 +277,13 @@ impl Scanner {
             Err(message) => return self.warn_include(pattern.into(), message),
         };
         let path = target.path();
-        let matches = match glob::glob(&target.glob()) {
+        // As OpenSSH's glob(3), a wildcard never matches a leading dot, so Portico's own
+        // `.<name>.portico-*` files beside an included file are not read as configuration.
+        let options = glob::MatchOptions {
+            require_literal_leading_dot: true,
+            ..glob::MatchOptions::new()
+        };
+        let matches = match glob::glob_with(&target.glob(), options) {
             Ok(matches) => matches,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
@@ -697,6 +748,50 @@ mod tests {
             .collect();
 
         assert_eq!(found, [("a", 3, false), ("b", 5, false), ("c", 5, false)]);
+    }
+
+    #[test]
+    fn a_file_also_included_conditionally_is_conditional() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::write(ssh.join("common"), "Include nested\nHost a\n").unwrap();
+        fs::write(ssh.join("nested"), "Host b\n").unwrap();
+        fs::write(ssh.join("plain"), "Host c\n").unwrap();
+        for (config, conditional) in [
+            ("Include common\nMatch host x\nInclude common\n", true),
+            (
+                "Match host x\nInclude common\nMatch all\nInclude common\n",
+                true,
+            ),
+            ("Include common\nInclude common\n", false),
+        ] {
+            fs::write(ssh.join("config"), format!("Include plain\n{config}")).unwrap();
+            let result = discover(&ssh.join("config"), &ssh.join("managed")).unwrap();
+            let found: Vec<_> = result
+                .hosts
+                .iter()
+                .map(|host| (host.alias.as_str(), host.conditional))
+                .collect();
+            assert_eq!(
+                found,
+                [("c", false), ("b", conditional), ("a", conditional)],
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn include_wildcards_skip_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        fs::write(ssh.join("conf.d/web"), "Host web\n").unwrap();
+        fs::write(ssh.join("conf.d/.web.portico-adopt-backup-1"), "Host web\n").unwrap();
+        fs::write(ssh.join("config"), "Include conf.d/*\n").unwrap();
+        let result = discover(&ssh.join("config"), &ssh.join("managed")).unwrap();
+        assert_eq!(result.hosts.len(), 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]

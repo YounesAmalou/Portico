@@ -202,7 +202,7 @@ portico shell 3f9a1c -n
 
 `portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in a terminal: `fzf` when it is installed, a numbered menu otherwise. Cancelling exits with 130.
 
-A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name, or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
+A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
 
 Only Docker is supported, and Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
 
@@ -210,7 +210,7 @@ When Docker fails, Portico explains why and, where it can, offers the fix. The f
 
 - **Not in the `docker` group:** it offers `sudo` to create the group, add you to it and give the group the socket. Members of the group have root-equivalent access.
 - **Daemon not running:** it offers `sudo systemctl start docker`, only when `systemctl` exists on the target.
-- **Group added but this session is older:** it runs docker through `sg docker` (or `newgrp docker`), so no logout is needed. Other shells need `newgrp docker` or a new login.
+- **Group added but this session is older:** it runs docker through `sg docker`, so no logout is needed; without `sg`, it asks for a new login. Other shells need `newgrp docker` or a new login.
 
 ### When something fails
 
@@ -238,7 +238,7 @@ portico adopt --all
 
 Portico shows an exact preview of both files first and, unless you pass `--yes`, asks before changing anything. Without `--yes` it asks in a terminal; scripts must pass `--yes` and name hosts or `--all`. Each file is backed up beside the original for the duration of the move and the backup is deleted once it succeeds; if anything fails, the files are restored. If the configuration changed since the preview, nothing is written and you run the command again.
 
-`portico export` is the way back: it moves managed hosts, comments included, into `~/.ssh/config` below the Portico include, with the same preview and options.
+`portico export` is the way back: it moves managed hosts, comments included, into `~/.ssh/config` below the Portico include and any global options that follow it, with the same preview and options.
 
 Use `portico <command> --help` for the authoritative options for a command.
 
