@@ -69,9 +69,9 @@ jobs:
             while read -r file; do
               case "$file" in
                 "") ;;
+                # The binary embeds the panel's files, and the doc guards read them.
+                desktop/*) rust=true docs=true ;;
                 *.md | docs/*) docs=true ;;
-                # The doc guards read the panel's files.
-                desktop/*) docs=true ;;
                 *) rust=true ;;
               esac
               case "$file" in

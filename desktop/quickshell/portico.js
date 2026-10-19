@@ -231,6 +231,25 @@ function candidates(porticoBin, home) {
     return list
 }
 
+// The banner shown when `portico desktop install` wrote this panel for another
+// Portico: `stamp` is the VERSION file next to the panel ("0.6.0+<hash>"), and
+// `versionOutput` what `portico --version` printed. A panel run from a checkout
+// has no stamp, and gets no banner.
+function versionBanner(stamp, versionOutput) {
+    var panel = text(stamp).trim().split("+")[0]
+    var match = /^portico\s+(\S+)$/.exec(lastLine(versionOutput))
+    if (panel === "" || !match || match[1] === panel)
+        return ""
+    return "This panel is from Portico " + panel + " and portico is " + match[1] +
+        ". Run portico desktop install to update it."
+}
+
+// A local file path from a file: URL (Qt.resolvedUrl of a file next to the panel).
+function localPath(url) {
+    var value = text(url)
+    return value.indexOf("file://") === 0 ? decodeURIComponent(value.slice("file://".length)) : value
+}
+
 // Positional arguments only: the candidates are never part of the script.
 var LOOKUP_SCRIPT = 'for c in "$@"; do p=$(command -v "$c") && [ -x "$p" ] && { printf "portico=%s\\n" "$p"; break; }; done; command -v setsid >/dev/null 2>&1 && printf "setsid=yes\\n"; exit 0'
 

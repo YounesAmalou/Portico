@@ -68,7 +68,8 @@ FocusScope {
         if (model.problem)
             return [message(model.problem)]
         let query = filter.text
-        let list = [{ type: "section", text: "Tunnels" }]
+        let list = model.versionBanner ? [{ type: "message", lines: [model.versionBanner] }] : []
+        list.push({ type: "section", text: "Tunnels" })
         if (model.tunnelsError) {
             list.push(message(model.tunnelsError))
         } else if (!model.tunnelsLoaded) {

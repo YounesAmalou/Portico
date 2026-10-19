@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import "portico.js" as Portico
 
 // Runs the portico CLI for the panel and holds what it said. Nothing runs
@@ -24,6 +25,8 @@ Item {
     // A view-wide problem ({kind, message, next}): Portico not found, or a
     // document with another schema. The view then shows only this.
     property var problem: null
+    // Set when `portico desktop install` wrote this panel for another Portico.
+    property string versionBanner: ""
 
     property bool hostsLoaded: false
     property var hosts: []
@@ -101,9 +104,28 @@ Item {
             }
             model.program = found.program
             model.problem = null
+            checkVersion()
             listHosts()
             listTunnels()
             Object.keys(model.expanded).forEach(function (target) { model.loadContainers(target) })
+        })
+    }
+
+    // The stamp `portico desktop install` writes next to the panel's files.
+    FileView {
+        id: stamp
+        path: Portico.localPath(Qt.resolvedUrl("VERSION"))
+        blockLoading: true
+        printErrors: false
+    }
+
+    function checkVersion() {
+        let current = session
+        run([program, "--version"], function (stdout) {
+            if (current !== session || stdout === null)
+                return
+            stamp.reload()
+            model.versionBanner = Portico.versionBanner(stamp.text(), stdout)
         })
     }
 

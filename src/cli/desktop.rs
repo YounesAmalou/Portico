@@ -1020,14 +1020,25 @@ mod tests {
         let (_dir, env) = omarchy();
         let (result, out) = install(&env, "y\nn\nSUPER + P\nnot a combo +\nCTRL + ALT + P\ny\n");
         assert!(result.is_ok(), "{out}");
-        assert!(out.contains("Install the panel? [y/N] Install the launcher entry? [y/N] "), "{out}");
         assert!(
-            out.contains("Add the keybinding SUPER + ALT + P? Type y, n, or another combination [y/N] "),
+            out.contains("Install the panel? [y/N] Install the launcher entry? [y/N] "),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "Add the keybinding SUPER + ALT + P? Type y, n, or another combination [y/N] "
+            ),
             "{out}"
         );
         assert!(out.contains("SUPER + P is taken (Pseudo window). Type another combination, or press Enter to skip: "), "{out}");
-        assert!(out.contains("\"not a combo +\" names more than one key."), "{out}");
-        assert!(out.contains("o.bind(\"CTRL + ALT + P\", \"Portico\""), "{out}");
+        assert!(
+            out.contains("\"not a combo +\" names more than one key."),
+            "{out}"
+        );
+        assert!(
+            out.contains("o.bind(\"CTRL + ALT + P\", \"Portico\""),
+            "{out}"
+        );
         assert!(out.contains("Skipped the launcher entry."), "{out}");
         assert!(env.panel_dir().join("VERSION").is_file());
         assert!(!launcher::paths(&env).0.exists());
@@ -1054,7 +1065,11 @@ mod tests {
     fn stopping_at_a_question_changes_nothing() {
         let (_dir, env) = omarchy();
         let (result, out) = install(&env, "y\ny\n");
-        assert_eq!(result.unwrap_err(), "no answer; nothing was changed", "{out}");
+        assert_eq!(
+            result.unwrap_err(),
+            "no answer; nothing was changed",
+            "{out}"
+        );
         assert!(!env.panel_dir().exists());
         assert!(!launcher::paths(&env).0.exists());
         assert_eq!(bindings(&env), BINDINGS);

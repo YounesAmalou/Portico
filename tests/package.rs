@@ -50,21 +50,32 @@ fn published_crate_contains_only_intended_files() {
     let files = String::from_utf8(output.stdout).unwrap();
     let files: Vec<&str> = files.lines().collect();
 
-    for expected in ["LICENSE-MIT", "LICENSE-APACHE", "README.md", "src/main.rs"] {
+    // The binary embeds the desktop panel and the launcher entry, so the crate carries them.
+    for expected in [
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "README.md",
+        "src/main.rs",
+        "desktop/quickshell/shell.qml",
+        "desktop/quickshell/manifest.json",
+        "packaging/desktop/portico.desktop",
+        "packaging/desktop/portico.svg",
+    ] {
         assert!(
             files.contains(&expected),
             "{expected} missing from {files:?}"
         );
     }
     // Repository-hygiene tests read files that are not published, so they must not ship either,
-    // and the desktop panel is installed from a checkout, not from the crate.
+    // nor do the panel's tests and preview image, or the AUR packaging.
     for forbidden in [
         ".superpowers",
         ".worktrees",
         "target/",
         "docs/superpowers",
-        "packaging/",
-        "desktop/",
+        "packaging/aur",
+        "desktop/quickshell/tests",
+        "desktop/quickshell/preview.png",
         "tests/docs.rs",
         "tests/package.rs",
     ] {

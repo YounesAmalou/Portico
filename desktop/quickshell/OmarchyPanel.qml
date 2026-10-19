@@ -3,7 +3,7 @@ import qs.Commons
 
 // Omarchy `panel` entry point: the launcher-style popup, summoned with
 //
-//   omarchy-shell shell toggle portico '{}'
+//   omarchy-shell shell toggle portico
 //
 // (bind it to a key). The shell calls open() and close(); the manifest keeps
 // it loaded, so a start or stop still running when the popup closes finishes.

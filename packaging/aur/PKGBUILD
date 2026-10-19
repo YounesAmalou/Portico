@@ -39,4 +39,6 @@ package() {
   install -Dm755 target/release/portico "$pkgdir/usr/bin/portico"
   install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
   install -Dm644 README.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 packaging/desktop/portico.desktop "$pkgdir/usr/share/applications/portico.desktop"
+  install -Dm644 packaging/desktop/portico.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/portico.svg"
 }

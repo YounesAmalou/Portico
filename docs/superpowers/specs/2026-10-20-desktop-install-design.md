@@ -1,6 +1,6 @@
 # Desktop Install Design
 
-**Status:** Draft; awaiting review
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -180,11 +180,12 @@ Wrote ~/.local/share/portico/panel (0.6.0).
 Linked ~/.config/omarchy/plugins/portico -> ~/.local/share/portico/panel.
 Ran omarchy-shell shell rescanPlugins.
 Ran omarchy plugin enable portico: Enabled portico
-Wrote ~/.local/share/applications/portico.desktop and the icon.
-Backed up ~/.config/hypr/bindings.lua to bindings.lua.portico-bak.1792432000.
-Added SUPER + ALT + P to ~/.config/hypr/bindings.lua (lines 62-64); Hyprland has picked it up.
+Wrote ~/.local/share/applications/portico.desktop.
+Wrote ~/.local/share/icons/hicolor/scalable/apps/portico.svg.
+Added the keybinding to ~/.config/hypr/bindings.lua (backup ~/.config/hypr/bindings.lua.portico-bak.1792432000).
 
-Done. Open the panel from the Portico icon in the bar or with SUPER + ALT + P.
+Done.
+Open the panel from the Portico icon in the bar or with SUPER + ALT + P.
 Run portico desktop status to check it, and portico desktop uninstall to remove it.
 ```
 
@@ -218,10 +219,10 @@ Wrote ~/.local/share/portico/panel (0.6.0).
 Linked ~/.config/quickshell/portico -> ~/.local/share/portico/panel.
 Ran qs -c portico -n -d.
 Skipped the launcher entry.
-Backed up ~/.config/hypr/bindings.conf to bindings.conf.portico-bak.1792432000.
-Added SUPER + ALT + P to ~/.config/hypr/bindings.conf (lines 41-43); Hyprland has picked it up.
+Added the keybinding to ~/.config/hypr/bindings.conf (backup ~/.config/hypr/bindings.conf.portico-bak.1792432000).
 
-Done. Toggle the panel with SUPER + ALT + P.
+Done.
+Toggle the panel with SUPER + ALT + P.
 Portico does not start the panel with your session. Add this line to ~/.config/hypr/hyprland.conf:
   exec-once = qs -c portico
 Run portico desktop status to check it, and portico desktop uninstall to remove it.
@@ -247,8 +248,9 @@ Remove the desktop integration? [y/N] y
 Ran omarchy plugin disable portico: Disabled portico
 Removed ~/.config/omarchy/plugins/portico.
 Ran omarchy-shell shell rescanPlugins.
-Removed SUPER + ALT + P from ~/.config/hypr/bindings.lua (backup bindings.lua.portico-bak.1792518400).
-Removed the launcher entry.
+Removed Portico's keybinding from ~/.config/hypr/bindings.lua (backup ~/.config/hypr/bindings.lua.portico-bak.1792518400).
+Removed ~/.local/share/applications/portico.desktop.
+Removed ~/.local/share/icons/hicolor/scalable/apps/portico.svg.
 Removed ~/.local/share/portico/panel.
 ```
 
@@ -267,6 +269,7 @@ Removed ~/.local/share/portico/panel.
 - **The embedded list** matches `desktop/quickshell/` minus `tests/` and `preview.png`, and the embedded launcher files equal `packaging/desktop/`.
 - **Integration tests** (`tests/desktop.rs`) run the real binary in a temporary `HOME` with `XDG_*` pointing into it and `PATH` set to a directory of fake `omarchy-shell`, `omarchy`, `qs`, `hyprctl` and `swaymsg` scripts that log their arguments and answer from fixtures (a `hyprctl binds -j` listing, `omarchy plugin list --json`). They cover the Omarchy and plain-Quickshell transcripts above (the prompts answered through stdin), `--yes`, `--yes` with a taken combination (nothing changed, exit 1), `--bind`, `--no-bind`, the non-interactive refusal, no target found, a forced target, a link to elsewhere being replaced and a real directory being refused, a failing `omarchy plugin enable` (exit 1, later components still installed), `status` in each state, `uninstall` removing exactly what was created (byte-for-byte equality of the keybinding file with its pre-install content), the auto-refresh on an ordinary command (`portico hosts --json` with an old `VERSION` rewrites the panel and its stdout is still exactly the JSON document), and a refresh failure that leaves the command's output and exit status unchanged. No test touches the real `~/.config`.
 - **Panel:** `tst_portico.qml` covers the banner function (equal versions, different versions, a missing or malformed stamp, `portico --version` output with a trailing newline); `qmllint` covers the `FileView` addition.
+- **CI:** the binary now embeds `desktop/`, so a change there runs the Rust checks as well as the doc guards (the `changes` job of `ci.yml`).
 - **Docs guard** (`tests/docs.rs`): the README's desktop section names `portico desktop install`; `packaging/aur/PKGBUILD` installs both launcher files.
 - **Manual, on the maintainer's machine, read-only:** Omarchy's launcher lists entries from Quickshell's `DesktopEntries` (`/usr/share/omarchy/shell/services/AppLibrary.qml`), which scans `$XDG_DATA_HOME/applications`, and indexes icons under `~/.local/share/icons/**/apps/`. That `portico.desktop` parses and is listed is checked by running a throwaway Quickshell configuration that prints `DesktopEntries.applications` with `XDG_DATA_HOME` pointing at a temporary directory holding the generated files, without writing to the maintainer's `~/.local/share`. That Omarchy's own launcher then shows it needs the files in the real location, which this slice must not write; it goes in the pull request's manual check list, with the full `portico desktop install` on Omarchy.
 
