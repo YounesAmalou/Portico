@@ -12,6 +12,7 @@ use std::{
     ffi::OsString,
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
@@ -36,6 +37,9 @@ impl Client {
         let bin = dir.path().join("bin");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&bin).unwrap();
+        let runtime = dir.path().join("run");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         assert_ne!(
             home,
             current_user().1,
@@ -86,6 +90,16 @@ exec /usr/bin/ssh -F "$flat" "$@"
         &self.home
     }
 
+    /// The runtime directory Portico runs with.
+    pub fn runtime(&self) -> PathBuf {
+        self._dir.path().join("run")
+    }
+
+    /// Where Portico keeps the records and logs of started tunnels.
+    pub fn tunnel_runtime(&self) -> PathBuf {
+        self.runtime().join("portico/tunnels")
+    }
+
     pub fn known_hosts(&self) -> PathBuf {
         self.home.join(".ssh/known_hosts")
     }
@@ -103,6 +117,8 @@ exec /usr/bin/ssh -F "$flat" "$@"
         vec![
             ("HOME".into(), self.home.clone().into()),
             ("PATH".into(), std::env::join_paths(paths).unwrap()),
+            // Tunnel records go to a temporary runtime directory, never the real one.
+            ("XDG_RUNTIME_DIR".into(), self.runtime().into()),
         ]
     }
 

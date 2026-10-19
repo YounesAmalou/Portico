@@ -10,10 +10,12 @@ mod containers;
 mod identities;
 
 pub(crate) use identities::key_files_in;
+mod tunnels;
 
 pub use containers::{
     ContainerError, ContainerList, ContainerPrograms, DockerIssue, Offer, Target,
 };
+pub use tunnels::{StartOutcome, StopOutcome, TunnelChanges, TunnelRefusal};
 
 use crate::{
     adopt::{AdoptError, Direction, MigrationPlan},
@@ -30,6 +32,11 @@ use crate::{
         append_known_hosts,
     },
     probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
+    tunnel::{
+        TunnelError,
+        runtime::{Proc, RuntimeDir},
+        store::{StoreError, TunnelStore},
+    },
 };
 
 pub struct App {
@@ -37,6 +44,9 @@ pub struct App {
     openssh: OpenSsh,
     container_programs: ContainerPrograms,
     identities: identities::IdentityState,
+    tunnels: TunnelStore,
+    runtime: RuntimeDir,
+    proc: Proc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,16 +182,39 @@ pub enum AppError {
     IncompleteDiscovery(Vec<DiscoveryWarning>),
     #[error("cannot update known hosts file {path}: {reason}")]
     KnownHosts { path: PathBuf, reason: String },
+    #[error(transparent)]
+    TunnelStore(#[from] StoreError),
+    #[error(transparent)]
+    InvalidTunnel(#[from] TunnelError),
+    #[error(transparent)]
+    Tunnel(#[from] TunnelRefusal),
 }
 
 impl App {
     pub fn new(store: ManagedStore, openssh: OpenSsh) -> Self {
+        let portico_dir = store.paths().portico_dir.clone();
+        let home = portico_dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&portico_dir)
+            .to_path_buf();
         Self {
             store,
             openssh,
             container_programs: ContainerPrograms::default(),
             identities: identities::IdentityState::default(),
+            tunnels: TunnelStore::new(&portico_dir),
+            // Without `with_runtime_dir`, records stay under the home: tests never reach the
+            // user's real runtime directory.
+            runtime: RuntimeDir::locate(&home, None),
+            proc: Proc::system(),
         }
+    }
+
+    /// Replaces the directory of started tunnels' records and logs.
+    pub fn with_runtime_dir(mut self, runtime: RuntimeDir) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     /// Replaces the programs container commands run on this machine.

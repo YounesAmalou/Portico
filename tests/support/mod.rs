@@ -136,11 +136,13 @@ impl TestEnv {
         paths.extend(std::env::split_paths(&inherited));
         let path = std::env::join_paths(paths).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_portico"));
+        // Tunnel records stay in the temporary home, never in the real runtime directory.
         command
             .args(args)
             .env("HOME", &self.home)
             .env("PATH", path)
-            .env_remove("SSH_AUTH_SOCK");
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("XDG_RUNTIME_DIR");
         command
     }
 

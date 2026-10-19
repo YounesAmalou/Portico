@@ -962,7 +962,7 @@ fn reap_child_bounded(child: &mut std::process::Child) -> io::Result<()> {
 /// reached is still killed, and the first error is reported afterwards. Only
 /// failures that can leave a process alive are errors: a slow stop or a
 /// missing pidfd does not prevent the kill, so neither is reported.
-fn kill_process_tree(root: u32) -> io::Result<()> {
+pub(crate) fn kill_process_tree(root: u32) -> io::Result<()> {
     let mut first_error = None;
     let mut stopped = Vec::new();
     let mut pending = vec![(root, None)];
@@ -1058,7 +1058,7 @@ fn stop_process(
     Some(process)
 }
 
-fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+pub(crate) fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     #[cfg(test)]
     if FAIL_PIDFD_OPEN.with(|countdown| match countdown.get() {
         Some(0) => {
@@ -1092,7 +1092,7 @@ fn fail_pidfd_open_after(skipped: u32) {
     FAIL_PIDFD_OPEN.with(|countdown| countdown.set(Some(skipped)));
 }
 
-fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
+pub(crate) fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
     if unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,

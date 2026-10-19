@@ -25,6 +25,8 @@ use crate::{
     picker::{Picker, Row},
 };
 
+mod tunnels;
+
 #[derive(clap::Parser, Debug)]
 #[command(name = "portico", version)]
 pub struct Cli {
@@ -132,6 +134,13 @@ enum Command {
         /// Run docker inside the docker group, as the listing before the new terminal did.
         #[arg(long, hide = true, value_enum)]
         via: Option<Via>,
+    },
+    /// List saved tunnels and their status.
+    Tunnels,
+    /// Save, start and stop tunnels.
+    Tunnel {
+        #[command(subcommand)]
+        command: tunnels::TunnelCommand,
     },
 }
 
@@ -517,6 +526,10 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 Err(failure) => return Err(report_container_failure(error, failure)?),
             };
             finish_connection(outcome, hold, input, error)
+        }
+        Some(Command::Tunnels) => tunnels::list(app, output),
+        Some(Command::Tunnel { command }) => {
+            tunnels::run(command, app, picker, input, output, error, interactive)
         }
         Some(Command::Adopt { aliases, all, yes }) => {
             let interrupts = Interrupts::install(handle_signals)
