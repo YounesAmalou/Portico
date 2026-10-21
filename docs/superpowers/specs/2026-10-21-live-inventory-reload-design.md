@@ -1,6 +1,6 @@
 # Live Inventory Reload Design
 
-**Status:** Approved
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -54,6 +54,6 @@ The TUI owns one `ConfigWatch` in its loop. On each tick it calls `tick(now)`; w
 
 - Unit (`watch.rs`, fake metadata and explicit instants, no sleeps): no check before a second has passed; an unchanged file never reports; a change reports only after it is stable for 300 ms; a file that keeps changing does not report until it stops; a change undone before it settles is forgotten; a deleted file, a created one and one replaced by rename (same times, new inode) are changes; an unreadable path counts as absent; `rebase` forgets a pending change and follows the new set of paths; a settled change stays reported until `rebase`.
 - Unit (`events.rs`, fake reader and clock): input before the tick is passed on; a quiet wait ends in a tick; a tick due while input keeps arriving is delivered first; a closed terminal is `Closed`; reader errors propagate.
-- Unit (`discovery.rs`): `inputs` lists the entry, every file read by its opened path, a literal include that does not exist, and a glob's directory, each once; a managed file reached by `Include` is listed only as the managed file.
+- Unit (`discovery.rs`): `inputs` lists the entry, every file read by its opened path, a literal include that does not exist, and a glob's directory, each once, and the literal ancestor of a glob with a wildcard directory. Unit (`app.rs`): the inventory's inputs start with the entry config and name the managed file once.
 - Unit (`tui.rs`): the watch-triggered reload uses its own status wording, keeps the selection and filter, and a failure leaves the list; the waiting indicator shows in the status line only when no other message does.
 - PTY (`tests/support/tui_pty.py`, scenario `live_reload`): with the TUI running and no key pressed, a host appended to `~/.ssh/config` appears; an `Include` of a new file appears with its host; that file rewritten by rename shows its new host; with the add form open, an external change does not reach the list and the indicator shows, and leaving the form applies it; a host saved from the TUI leaves its `Saved` status in place, with no reload message after it. The existing `refresh` scenario keeps testing `r` for what the watch cannot see (the `ssh -G` answer) and the failure message.

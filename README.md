@@ -390,7 +390,7 @@ These keys work while a tab is browsing its list. In a filter, a form or a picke
 | `a` | Add a host |
 | `e` | Edit the selected managed host |
 | `x` | Remove the selected managed host |
-| `r` / `F5` | Refresh: re-read the inventory and discard cached host details and agent listings |
+| `r` / `F5` | Refresh: re-read the inventory and discard cached host details and agent listings (config file changes are picked up by themselves) |
 | `Enter` | Connect in the current terminal |
 | `Ctrl+Enter` / `n` | Connect in a new terminal |
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
@@ -407,7 +407,7 @@ Form fields only accept characters they can hold, whether typed or pasted: alias
 
 `Ctrl+Enter` needs a terminal that reports modified keys, such as kitty, WezTerm, Ghostty, or foot, and is only shown in the footer when Portico detects one. `n` works everywhere.
 
-Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it. Portico re-reads the inventory and re-resolves details when it changes the configuration itself; edits made elsewhere, such as in `~/.ssh/config` or an included file, appear after `r` or `F5`. The selection and filter are kept, and if the files cannot be read the list stays as it was and the footer reports why.
+Host details show each field once, as OpenSSH resolves it with `ssh -G`. Resolution runs in the background, so moving through the list never waits on it. A Portico-declared value is listed separately only when OpenSSH overrides it. Portico re-reads the inventory and re-resolves details when it changes the configuration itself, and when `~/.ssh/config`, a file it includes (at any depth, including files added to an included directory) or the managed file changes on disk, about a second after the last save; the status line says `Config changed: reloaded N hosts`. While a form, the filter or a confirmation is open the list is left alone and the status line says a change is waiting; it is applied when you close it. `r` or `F5` re-reads everything at once, also what no file shows, such as an `ssh -G` result that depends on the environment. The selection and filter are kept, and if the files cannot be read the list stays as it was and the footer reports why.
 
 Under the resolved fields, the details list the host's identities as `portico show` does, each with `✓` (in agent or key file), `✗` (missing) or `?` (unchecked) and the word. Each agent is asked once per session, in the background, and again after `r` or `F5`, so loading a key into an agent and refreshing shows it.
 
