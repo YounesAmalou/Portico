@@ -13,6 +13,8 @@
 Recorded after execution; the original text below is kept as written.
 
 - The `live_reload` PTY scenario runs in the default scenario list of the existing `tui_paste_and_terminal_lifecycle_work_on_a_real_pty` acceptance test, which already provides the home, the managed hosts and the `ssh` fake, instead of a new acceptance test.
+- Discovery lists a managed file reached by a literal `Include` among its inputs (it is where that Include looks), and `App::hosts` adds the managed file only when it is not there yet, so it is still watched once.
+- `ConfigWatch` has no `changed` method: `tick` returns whether a settled change waits, which is all the loop needs.
 - `UiState::config_changed` is recomputed on every tick from the watch and the mode, rather than set and cleared at separate places, so it can never outlive the change it announces.
 
 ## Global Constraints
