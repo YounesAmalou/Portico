@@ -750,7 +750,8 @@ impl TunnelStatus {
 
 /// `HH:MM` in local time of a Unix time.
 fn clock(unix: u64) -> String {
-    let Ok(time) = libc::time_t::try_from(unix) else {
+    // `time_t` is inferred: naming it is deprecated on musl, where it changes size.
+    let Ok(time) = unix.try_into() else {
         return "--:--".into();
     };
     // SAFETY: `localtime_r` only writes the `tm` it is given.

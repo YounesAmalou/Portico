@@ -34,13 +34,10 @@ Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/s
 | Item | Prerequisite |
 |---|---|
 | Project website and documentation: a static site that presents Portico (what it is, install, a short tour) and holds the user documentation now living in the README, kept in this repository and published from CI | A choice of generator (a docs-oriented static site tool) and hosting (GitHub Pages is the default candidate); the README stays the short entry point. Whatever is built is verified on GitHub, not only locally |
-| Leaner CI and CD, remainder: merge small jobs (for example `fmt` into `clippy`) so they share the setup each job pays (about 30 s: starting the container, installing packages and the toolchain) | Measured and left out: it saves runner time but no wall-clock time, because the jobs run in parallel and the slowest one sets the pace, and it renames checks that pull requests must pass. Revisit if runner time starts to matter |
 | AUR package `portico` (source build) | Built and merged; publishing is suspended until an AUR account and key exist. Then set the `aur` environment secret and re-run the failed job |
 | AUR package `portico-bin` (prebuilt binary) | Demand for faster installs; the source package ships first |
-| Linux release artifacts, ready to use without installing Rust: prebuilt tarballs (a static x86_64 musl build that runs on any distribution including Arch Linux, and an aarch64 build) and distribution packages (`.deb`, `.rpm` and an Arch Linux `.pkg.tar.zst`), each checksummed and attached to the GitHub Release | Its own design: the final target list, whether the aarch64 build needs native ARM runners in CI, how each package is built and verified in a clean container of its distribution, and how this fits the release-plz workflow; first check what the build and distribution channels already support natively |
 | macOS support, distributed through Homebrew | A portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher, with the end-to-end tests running on macOS |
 | Windows support, distributed through winget | The same portability work, plus a Windows terminal launcher |
-| Signed releases and SBOM/provenance attestations | A decision on signing keys and attestation format |
 | Trusted Publishing on crates.io | Configure the trust relationship on crates.io, then switch the publish job to OIDC and delete the stored token |
 | Replace the initial crates.io token with a crate-scoped token | Maintainer action on crates.io (unnecessary once Trusted Publishing is in place) |
 
@@ -55,5 +52,6 @@ Recorded so they are not mistaken for forgotten work:
 - An identity indicator in the host list: the host details and `portico identities` show identities on demand.
 - Container management beyond a shell: logs, restarts, Compose `up` and `down`, and starting or stopping Proxmox containers.
 - Background reachability polling (`portico test` covers the need on demand).
+- Merging small CI jobs (for example `fmt` into `clippy`) to share their setup: the jobs run in parallel, so it saves runner time but no wall-clock time, and it would rename checks that pull requests must pass.
 - A daemon, a database, or a plugin system inside Portico (see the rules at the top).
 - herdr integration.

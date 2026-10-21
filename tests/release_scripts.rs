@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, process::Command};
 
 use tempfile::TempDir;
 
@@ -56,14 +56,16 @@ fn changelog_notes_fails_for_a_missing_version() {
     );
 }
 
-/// Builds a release for a fake binary and returns the output directory and tarball path.
-fn package_release() -> (TempDir, std::path::PathBuf) {
+const TARGET: &str = "x86_64-unknown-linux-musl";
+
+#[test]
+fn package_release_builds_a_tarball_named_after_the_target_with_license_files() {
     let dir = TempDir::new().unwrap();
     let binary = dir.path().join("portico");
     fs::write(&binary, "#!/bin/sh\necho portico\n").unwrap();
     let out = dir.path().join("out");
     let output = Command::new(script("package-release.sh"))
-        .args(["0.1.0"])
+        .args(["0.1.0", TARGET])
         .arg(&binary)
         .arg(&out)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -74,31 +76,13 @@ fn package_release() -> (TempDir, std::path::PathBuf) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let tarball = String::from_utf8(output.stdout).unwrap().trim().into();
-    (dir, tarball)
-}
-
-fn verify_checksum(directory: &Path) -> bool {
-    Command::new("sha256sum")
-        .args([
-            "-c",
-            "portico-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
-        ])
-        .current_dir(directory)
-        .output()
-        .unwrap()
-        .status
-        .success()
-}
-
-#[test]
-fn package_release_builds_a_tarball_with_license_files_and_checksum() {
-    let (dir, tarball) = package_release();
-    let out = dir.path().join("out");
+    let tarball = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
     assert_eq!(
-        tarball.file_name().unwrap(),
-        "portico-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+        tarball.file_name().unwrap().to_str().unwrap(),
+        format!("portico-v0.1.0-{TARGET}.tar.gz")
     );
+    // SHA256SUMS, written by the release workflow, is the only checksum file.
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
 
     let unpacked = dir.path().join("unpacked");
     fs::create_dir(&unpacked).unwrap();
@@ -110,7 +94,7 @@ fn package_release_builds_a_tarball_with_license_files_and_checksum() {
         .status()
         .unwrap();
     assert!(status.success());
-    let root = unpacked.join("portico-v0.1.0-x86_64-unknown-linux-gnu");
+    let root = unpacked.join(format!("portico-v0.1.0-{TARGET}"));
     for file in ["portico", "LICENSE-MIT", "LICENSE-APACHE", "README.md"] {
         assert!(root.join(file).is_file(), "{file} missing from the tarball");
     }
@@ -123,15 +107,14 @@ fn package_release_builds_a_tarball_with_license_files_and_checksum() {
             & 0o111,
         0
     );
-    assert!(verify_checksum(&out));
 }
 
 #[test]
-fn package_release_checksum_detects_tampering() {
-    let (dir, tarball) = package_release();
-    let mut bytes = fs::read(&tarball).unwrap();
-    bytes.push(0);
-    fs::write(&tarball, bytes).unwrap();
-
-    assert!(!verify_checksum(&dir.path().join("out")));
+fn package_release_requires_the_target() {
+    let output = Command::new(script("package-release.sh"))
+        .args(["0.1.0", "portico", "out"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<target>"));
 }
