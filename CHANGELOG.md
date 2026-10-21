@@ -7,6 +7,13 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-21
+
+### Added
+
+- Attach static Linux binaries, .deb, .rpm and Arch packages with checksums and attestations to each release ([#59](https://github.com/YounesAmalou/Portico/pull/59))
+- Reload the TUI's host list when the config files change ([#58](https://github.com/YounesAmalou/Portico/pull/58))
+
 ## [0.6.0] - 2026-10-19
 
 ### Added
