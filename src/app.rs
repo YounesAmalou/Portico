@@ -66,6 +66,8 @@ pub struct HostSummary {
 pub struct HostInventory {
     pub hosts: Vec<HostSummary>,
     pub warnings: Vec<DiscoveryWarning>,
+    /// Every path the inventory was read from: discovery's inputs and the managed file.
+    pub inputs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,9 +279,15 @@ impl App {
             }))
             .collect::<Vec<_>>();
         hosts.sort_by_key(|host| host.alias.to_ascii_lowercase());
+        let mut inputs = external.inputs;
+        let managed = &self.store.paths().managed;
+        if !inputs.contains(managed) {
+            inputs.push(managed.clone());
+        }
         Ok(HostInventory {
             hosts,
             warnings: external.warnings,
+            inputs,
         })
     }
 
@@ -1382,6 +1390,19 @@ exit 255
 
         let error = app.remove("legacy").unwrap_err();
         assert!(matches!(error, AppError::ReadOnlyExternal(alias) if alias == "legacy"));
+    }
+
+    #[test]
+    fn the_inventory_names_the_files_it_was_read_from_with_the_managed_file_once() {
+        let app = test_app_with_external("Host legacy\n");
+        let paths = app.store.paths();
+        let inputs = app.hosts().unwrap().inputs;
+        assert_eq!(inputs.first(), Some(&paths.entry));
+        assert_eq!(
+            inputs.iter().filter(|path| **path == paths.managed).count(),
+            1,
+            "{inputs:?}"
+        );
     }
 
     #[test]

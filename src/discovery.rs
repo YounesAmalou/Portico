@@ -19,6 +19,10 @@ pub struct Discovery {
     pub hosts: Vec<ExternalHost>,
     pub warnings: Vec<DiscoveryWarning>,
     pub aliases_complete: bool,
+    /// Every path the result depends on, each once: the entry config first, each file read by
+    /// the path it was opened under, and where each Include looks (its path when literal, the
+    /// deepest directory without wildcards when a glob), so a file that appears there counts.
+    pub inputs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +157,7 @@ pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryErro
     };
 
     scanner.visited.insert(canonical, false);
+    scanner.record_input(entry.to_path_buf());
     scanner.scan_entry(entry.to_path_buf())?;
     scanner.report_duplicates();
     Ok(scanner.discovery)
@@ -196,6 +201,7 @@ impl Scanner {
             Some(_) => return,
             None => self.visited.insert(canonical.clone(), conditional),
         };
+        self.record_input(path.clone());
         let contents = match fs::read(&path) {
             Ok(contents) => contents,
             Err(error) => return self.warn_include(path, error.to_string()),
@@ -277,6 +283,7 @@ impl Scanner {
             Err(message) => return self.warn_include(pattern.into(), message),
         };
         let path = target.path();
+        self.record_input(target.location());
         // As OpenSSH's glob(3), a wildcard never matches a leading dot, so Portico's own
         // `.<name>.portico-*` files beside an included file are not read as configuration.
         let options = glob::MatchOptions {
@@ -335,6 +342,12 @@ impl Scanner {
         }
     }
 
+    fn record_input(&mut self, path: PathBuf) {
+        if !self.discovery.inputs.contains(&path) {
+            self.discovery.inputs.push(path);
+        }
+    }
+
     fn warn_include(&mut self, path: PathBuf, message: String) {
         self.discovery.aliases_complete = false;
         self.discovery
@@ -380,6 +393,23 @@ impl IncludeTarget {
 
     fn path(&self) -> PathBuf {
         self.base.join(&self.pattern)
+    }
+
+    /// Where a change can alter what the pattern matches: the path itself when it has no
+    /// wildcard, otherwise the directory above its first component with one.
+    fn location(&self) -> PathBuf {
+        let mut location = self.base.clone();
+        for component in Path::new(&self.pattern).components() {
+            if component
+                .as_os_str()
+                .to_string_lossy()
+                .contains(['*', '?', '['])
+            {
+                return location;
+            }
+            location.push(component);
+        }
+        location
     }
 
     fn glob(&self) -> String {
@@ -825,5 +855,65 @@ mod tests {
         assert!(!conditional("s"));
         assert!(conditional("i"));
         assert!(conditional("d"));
+    }
+
+    #[test]
+    fn inputs_are_every_file_read_and_where_each_include_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        let managed = ssh.join("portico/config");
+        fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "Host owned\n").unwrap();
+        fs::write(ssh.join("conf.d/b.conf"), "Host b\nInclude ../shared\n").unwrap();
+        fs::write(ssh.join("conf.d/a.conf"), "Host a\nInclude ../shared\n").unwrap();
+        fs::write(ssh.join("shared"), "Host s\n").unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include portico/config\nInclude conf.d/*.conf\nInclude later\nInclude conf.d/a.conf\n",
+        )
+        .unwrap();
+
+        let result = discover(&ssh.join("config"), &managed).unwrap();
+
+        // `../shared` is relative to the entry config's directory, not to the file including
+        // it, so it does not exist: it is watched where it would appear.
+        assert_eq!(
+            result.inputs,
+            [
+                ssh.join("config"),
+                managed,
+                ssh.join("conf.d"),
+                ssh.join("conf.d/a.conf"),
+                ssh.join("../shared"),
+                ssh.join("conf.d/b.conf"),
+                ssh.join("later"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_directory_is_watched_from_its_literal_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        fs::create_dir_all(ssh.join("work")).unwrap();
+        fs::write(ssh.join("work/config"), "Host w\n").unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include */config\nInclude /nowhere/x?/y\n",
+        )
+        .unwrap();
+
+        let result = discover(&ssh.join("config"), &ssh.join("managed")).unwrap();
+
+        assert_eq!(
+            result.inputs,
+            [
+                ssh.join("config"),
+                ssh.clone(),
+                ssh.join("work/config"),
+                PathBuf::from("/nowhere"),
+            ]
+        );
     }
 }

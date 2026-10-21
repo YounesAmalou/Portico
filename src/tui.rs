@@ -7,7 +7,7 @@ use std::{
         mpsc::{self, RecvTimeoutError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -34,6 +34,7 @@ use ratatui::{
 
 mod containers;
 mod dropdown;
+mod events;
 mod hangup;
 mod identities;
 mod lister;
@@ -41,6 +42,7 @@ mod migrate;
 mod planner;
 mod tester;
 mod tunnels;
+mod watch;
 
 use crate::{
     adopt,
@@ -61,7 +63,8 @@ use crate::{
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
 use dropdown::{SUGGESTION_ROWS, Suggestions, suggestion_lines};
-use hangup::{HangupWatch, Input};
+use events::{Step, TerminalEvents};
+use hangup::HangupWatch;
 use identities::Indexer;
 use lister::Lister;
 use migrate::{MigrateAction, MigrateState};
@@ -69,6 +72,7 @@ use planner::Planner;
 use tester::{Finished, Job, Origin, Tester};
 use thiserror::Error;
 use tunnels::{Starter, TunnelAction, TunnelsScreen};
+use watch::ConfigWatch;
 
 /// One row of the Add/Edit form.
 struct FormField {
@@ -126,6 +130,10 @@ const FORM_FIELDS: [FormField; 6] = [
 
 /// Longest quiet period after a selection change before the host is resolved.
 const RESOLVE_DEBOUNCE: Duration = Duration::from_millis(60);
+/// How often background work is looked at while a worker runs, so its result appears promptly.
+const BUSY_TICK: Duration = Duration::from_millis(25);
+/// How often background work is looked at otherwise.
+const IDLE_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
 pub enum TuiError {
@@ -153,8 +161,11 @@ pub fn run(app: &App) -> Result<(), TuiError> {
     let _guard = TerminalGuard(Arc::clone(&session));
     session.enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut events = TerminalEvents::terminal();
     let plan = app.init_plan()?;
-    if plan.requires_confirmation() && !confirm_initialization(&mut terminal, &plan, terminated)? {
+    if plan.requires_confirmation()
+        && !confirm_initialization(&mut terminal, &mut events, &plan, terminated)?
+    {
         return Ok(());
     }
     if plan.requires_confirmation()
@@ -166,7 +177,7 @@ pub fn run(app: &App) -> Result<(), TuiError> {
         return Err(error.into());
     }
 
-    browse(app, &mut terminal, &signals, &session)
+    browse(app, &mut terminal, &mut events, &signals, &session)
 }
 
 /// Clears the alternate screen and forgets what was drawn, so the next frame repaints everything.
@@ -180,6 +191,7 @@ fn redraw_from_scratch<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::
 
 fn confirm_initialization<B: Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
+    events: &mut TerminalEvents,
     plan: &InitPlan,
     terminated: &AtomicBool,
 ) -> Result<bool, TuiError> {
@@ -188,10 +200,10 @@ fn confirm_initialization<B: Backend<Error = io::Error>>(
         if terminated.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        let event = match hangup::next_event(Duration::from_millis(100))? {
-            Input::Event(event) => event,
-            Input::Idle => continue,
-            Input::Closed => return Ok(false),
+        let event = match events.next(IDLE_TICK)? {
+            Step::Input(event) => event,
+            Step::Tick(_) => continue,
+            Step::Closed => return Ok(false),
         };
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -213,6 +225,7 @@ fn confirm_initialization<B: Backend<Error = io::Error>>(
 fn browse<B: Backend<Error = io::Error>>(
     app: &App,
     terminal: &mut Terminal<B>,
+    events: &mut TerminalEvents,
     signals: &Signals,
     session: &TerminalSession,
 ) -> Result<(), TuiError> {
@@ -227,7 +240,8 @@ fn browse<B: Backend<Error = io::Error>>(
         let indexer = Indexer::spawn(scope, app);
         let starter = Starter::spawn(scope, app);
         browse_hosts(
-            app, terminal, signals, session, resolver, tester, lister, planner, indexer, starter,
+            app, terminal, events, signals, session, resolver, tester, lister, planner, indexer,
+            starter,
         )
     })
 }
@@ -239,6 +253,7 @@ fn browse<B: Backend<Error = io::Error>>(
 fn browse_hosts<B: Backend<Error = io::Error>>(
     app: &App,
     terminal: &mut Terminal<B>,
+    events: &mut TerminalEvents,
     signals: &Signals,
     session: &TerminalSession,
     mut resolver: Resolver,
@@ -249,7 +264,9 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     mut starter: Starter,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
-    let mut state = UiState::new(app.hosts()?, session.keyboard_enhancement());
+    let inventory = app.hosts()?;
+    let mut watch = ConfigWatch::new(&inventory.inputs, Instant::now());
+    let mut state = UiState::new(inventory, session.keyboard_enhancement());
     state.home = app.home().to_owned();
     sync_details(&mut state, &mut resolver, false);
     let mut redraw = true;
@@ -258,67 +275,85 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         if terminated.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if let Some((host, loaded)) = resolver.poll() {
-            state.details.insert(host, loaded);
-            state.open_pending_edit();
-            redraw = true;
-        }
-        if let Some(finished) = tester.poll() {
-            state.record_test(finished, local_time());
-            redraw = true;
-        }
-        if let Some((target, result)) = lister.try_finished() {
-            state.containers.finish(target, result);
-            redraw = true;
-        }
-        if let Some((planned, preselect)) = planner.try_finished() {
-            state.finish_plan(planned, &preselect, app.home());
-            redraw = true;
-        }
-        if let Some(built) = indexer.try_finished() {
-            state.finish_identities(built);
-            redraw = true;
-        }
-        // The IdentityFile suggestions draw on every host's identities, built once a form opens.
-        if state.in_form() {
-            indexer.request();
-        }
-        if let Some((name, result)) = starter.poll() {
-            state.tunnels.finish_start(&name, result);
-            state.tunnels.reload(app);
-            redraw = true;
-        }
-        if state.tab == Tab::Tunnels && state.tunnels.is_stale() {
-            state.tunnels.reload(app);
-            redraw = true;
-        }
-        let starting = starter.running().map(str::to_owned);
-        state.tunnels.set_starting(starting);
-        let testing = tester.running().map(str::to_owned);
-        if state.testing != testing {
-            state.testing = testing;
-            redraw = true;
-        }
         if redraw {
             terminal.draw(|frame| render(frame, &state))?;
             redraw = false;
         }
-        // Poll quickly while a resolution or a test is running so its result appears promptly.
-        let wait = if resolver.is_pending()
+        let busy = resolver.is_pending()
             || tester.running().is_some()
             || lister.is_running()
             || planner.is_running()
             || indexer.is_running()
-            || starter.running().is_some()
-        {
-            Duration::from_millis(25)
-        } else {
-            Duration::from_millis(100)
-        };
-        let event = match hangup::next_event(wait)? {
-            Input::Event(event) => event,
-            Input::Idle => continue,
-            Input::Closed => return Ok(()),
+            || starter.running().is_some();
+        let event = match events.next(if busy { BUSY_TICK } else { IDLE_TICK })? {
+            Step::Input(event) => event,
+            Step::Closed => return Ok(()),
+            Step::Tick(now) => {
+                if let Some((host, loaded)) = resolver.poll() {
+                    state.details.insert(host, loaded);
+                    state.open_pending_edit();
+                    redraw = true;
+                }
+                if let Some(finished) = tester.poll() {
+                    state.record_test(finished, local_time());
+                    redraw = true;
+                }
+                if let Some((target, result)) = lister.try_finished() {
+                    state.containers.finish(target, result);
+                    redraw = true;
+                }
+                if let Some((planned, preselect)) = planner.try_finished() {
+                    state.finish_plan(planned, &preselect, app.home());
+                    redraw = true;
+                }
+                if let Some(built) = indexer.try_finished() {
+                    state.finish_identities(built);
+                    redraw = true;
+                }
+                // The IdentityFile suggestions draw on every host's identities, built once a
+                // form opens.
+                if state.in_form() {
+                    indexer.request();
+                }
+                if let Some((name, result)) = starter.poll() {
+                    state.tunnels.finish_start(&name, result);
+                    state.tunnels.reload(app);
+                    redraw = true;
+                }
+                if state.tab == Tab::Tunnels && state.tunnels.is_stale() {
+                    state.tunnels.reload(app);
+                    redraw = true;
+                }
+                let starting = starter.running().map(str::to_owned);
+                state.tunnels.set_starting(starting);
+                let testing = tester.running().map(str::to_owned);
+                if state.testing != testing {
+                    state.testing = testing;
+                    redraw = true;
+                }
+                // A change of the config files is applied where `r` would be, and otherwise
+                // waits, announced, for the form or prompt to close.
+                let changed = watch.tick(now);
+                if changed && state.mode == Mode::Browse {
+                    let reason = Reload::ConfigChanged;
+                    let replaced = reload(
+                        app,
+                        &mut state,
+                        &mut indexer,
+                        &mut tester,
+                        &mut watch,
+                        reason,
+                    );
+                    sync_details(&mut state, &mut resolver, replaced);
+                    redraw = true;
+                }
+                let waiting = changed && state.mode != Mode::Browse;
+                if state.config_changed != waiting {
+                    state.config_changed = waiting;
+                    redraw = true;
+                }
+                continue;
+            }
         };
         if matches!(event, Event::Resize(_, _)) {
             redraw = true;
@@ -402,14 +437,15 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }
             UiAction::Containers(_) => {}
             UiAction::Refresh => {
-                // Agents and key files may have changed too: ask them again on the next look.
-                app.forget_identities();
-                indexer.reset();
-                state.identity_inventory = None;
-                inventory_changed = apply_refresh(&mut state, || app.hosts());
-                if inventory_changed {
-                    tester.cancel_if(|origin, _| matches!(origin, Origin::Host(_)));
-                }
+                let reason = Reload::Requested;
+                inventory_changed = reload(
+                    app,
+                    &mut state,
+                    &mut indexer,
+                    &mut tester,
+                    &mut watch,
+                    reason,
+                );
             }
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
@@ -417,6 +453,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 inventory_changed = finish_mutation(
                     app,
                     &mut state,
+                    &mut watch,
                     result,
                     Some(&alias),
                     &[],
@@ -436,6 +473,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 inventory_changed = finish_mutation(
                     app,
                     &mut state,
+                    &mut watch,
                     result,
                     Some(&selected),
                     &edited,
@@ -450,6 +488,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 inventory_changed = finish_mutation(
                     app,
                     &mut state,
+                    &mut watch,
                     result,
                     None,
                     &[&alias],
@@ -484,6 +523,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     inventory_changed = finish_mutation(
                         app,
                         &mut state,
+                        &mut watch,
                         result.map(drop),
                         None,
                         &changed,
@@ -589,22 +629,29 @@ fn cancel_host_test(tester: &mut Tester, aliases: &[&str]) {
 }
 
 /// Applies a mutation's outcome to the UI and reports whether the inventory may have changed.
-/// On success, the test results of `changed` aliases are dropped.
+/// On success, the test results of `changed` aliases are dropped. When the inventory was read
+/// again, the config watch starts over from there, so Portico's own write is never taken for an
+/// outside change.
 fn finish_mutation(
     app: &App,
     state: &mut UiState,
+    watch: &mut ConfigWatch,
     result: Result<(), AppError>,
     preferred: Option<&str>,
     changed: &[&str],
     status: String,
 ) -> bool {
-    match result {
+    let reread = match result {
         Ok(()) => {
             complete_mutation(state, preferred, changed, status, || app.hosts());
             true
         }
         Err(error) => fail_mutation(state, &error, || app.hosts()),
+    };
+    if reread {
+        watch.rebase(&state.inputs, Instant::now());
     }
+    reread
 }
 
 /// Reports a failed mutation and, when it may have altered the managed file, reloads the
@@ -656,10 +703,44 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
     }
 }
 
-/// Re-reads the inventory on request, so changes made outside Portico appear. Returns whether
-/// the inventory was replaced, which makes the caller discard the cached details. A failed read
+/// Why the inventory is read again, which only changes how the result is reported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Reload {
+    /// `r` or F5.
+    Requested,
+    /// The config watch saw the files change.
+    ConfigChanged,
+}
+
+/// Reads the inventory again: the one path for `r` and for a change of the config files. Agents
+/// and key files are asked again too, host tests in flight are cancelled when the inventory was
+/// replaced, and the config watch starts over from what was read, or from the paths it had when
+/// the read failed, so a broken file is not read again until it changes. Returns whether the
+/// inventory was replaced.
+fn reload(
+    app: &App,
+    state: &mut UiState,
+    indexer: &mut Indexer,
+    tester: &mut Tester,
+    watch: &mut ConfigWatch,
+    reason: Reload,
+) -> bool {
+    // Agents and key files may have changed too: ask them again on the next look.
+    app.forget_identities();
+    indexer.reset();
+    state.identity_inventory = None;
+    let replaced = apply_refresh(state, reason, || app.hosts());
+    if replaced {
+        tester.cancel_if(|origin, _| matches!(origin, Origin::Host(_)));
+    }
+    watch.rebase(&state.inputs, Instant::now());
+    replaced
+}
+
+/// Re-reads the inventory, so changes made outside Portico appear. Returns whether the
+/// inventory was replaced, which makes the caller discard the cached details. A failed read
 /// leaves everything as it was and only reports why.
-fn apply_refresh<E, F>(state: &mut UiState, read: F) -> bool
+fn apply_refresh<E, F>(state: &mut UiState, reason: Reload, read: F) -> bool
 where
     E: std::fmt::Display,
     F: FnOnce() -> Result<HostInventory, E>,
@@ -671,11 +752,17 @@ where
             state.results.clear();
             state.connections.clear();
             let noun = if count == 1 { "host" } else { "hosts" };
-            state.status = Some(format!("Refreshed: {count} {noun}"));
+            state.status = Some(match reason {
+                Reload::Requested => format!("Refreshed: {count} {noun}"),
+                Reload::ConfigChanged => format!("Config changed: reloaded {count} {noun}"),
+            });
             true
         }
         Err(error) => {
-            state.status = Some(format!("Refresh failed: {error}"));
+            state.status = Some(match reason {
+                Reload::Requested => format!("Refresh failed: {error}"),
+                Reload::ConfigChanged => format!("Config changed, reload failed: {error}"),
+            });
             false
         }
     }
@@ -1296,6 +1383,8 @@ impl DetailsCache {
 struct UiState {
     hosts: Vec<HostSummary>,
     warnings: Vec<DiscoveryWarning>,
+    /// The paths the inventory was read from, which the config watch follows.
+    inputs: Vec<PathBuf>,
     visible: Vec<usize>,
     selected: Option<usize>,
     filter: TextInput,
@@ -1319,6 +1408,8 @@ struct UiState {
     show_raw: bool,
     /// The host key awaiting the user's decision while in `Mode::ConfirmTrust`.
     trust: Option<PendingTrust>,
+    /// Set while a change of the config files waits for the open form or prompt to close.
+    config_changed: bool,
     containers: Panel,
     /// The tab shown and receiving keys.
     tab: Tab,
@@ -1463,12 +1554,17 @@ enum UiAction {
 
 impl UiState {
     fn new(inventory: HostInventory, ctrl_enter: bool) -> Self {
-        let HostInventory { hosts, warnings } = inventory;
+        let HostInventory {
+            hosts,
+            warnings,
+            inputs,
+        } = inventory;
         let visible = (0..hosts.len()).collect::<Vec<_>>();
         let selected = visible.first().copied();
         Self {
             hosts,
             warnings,
+            inputs,
             visible,
             selected,
             filter: TextInput::default(),
@@ -1484,6 +1580,7 @@ impl UiState {
             connections: PerHost::default(),
             show_raw: false,
             trust: None,
+            config_changed: false,
             containers: Panel::default(),
             tab: Tab::Hosts,
             migrate: None,
@@ -1544,6 +1641,7 @@ impl UiState {
         self.show_raw = false;
         self.hosts = inventory.hosts;
         self.warnings = inventory.warnings;
+        self.inputs = inventory.inputs;
         self.selected = None;
         self.refilter();
         // The same row if it survived, otherwise the host of that name wherever it is now defined.
@@ -2210,13 +2308,20 @@ impl UiState {
         UiAction::Trust(trusted)
     }
 
-    /// The status line: the last message, otherwise the test in flight.
+    /// The status line: the last message, otherwise the test in flight, otherwise a change of
+    /// the config files waiting to be applied.
     fn status_line(&self) -> Option<String> {
-        self.status.clone().or_else(|| {
-            self.testing
-                .as_ref()
-                .map(|alias| format!("Testing {alias}\u{2026} (Esc to cancel)"))
-        })
+        self.status
+            .clone()
+            .or_else(|| {
+                self.testing
+                    .as_ref()
+                    .map(|alias| format!("Testing {alias}\u{2026} (Esc to cancel)"))
+            })
+            .or_else(|| {
+                self.config_changed
+                    .then(|| "Config changed: the list reloads when this closes".into())
+            })
     }
 
     /// Shows an error on the form field it is about, and a plain status otherwise.
@@ -3240,6 +3345,7 @@ mod tests {
             HostInventory {
                 hosts,
                 warnings: Vec::new(),
+                inputs: Vec::new(),
             },
             false,
         )
@@ -3481,6 +3587,7 @@ mod tests {
         HostInventory {
             hosts,
             warnings: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 
@@ -3567,6 +3674,11 @@ mod tests {
         assert!(rendered(&state).contains("r refresh"));
     }
 
+    /// Applies a requested refresh that reads `inventory`.
+    fn refreshed(state: &mut UiState, inventory: HostInventory) -> bool {
+        apply_refresh(state, Reload::Requested, || Ok::<_, String>(inventory))
+    }
+
     #[test]
     fn refresh_replaces_the_inventory_and_its_warnings() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
@@ -3580,7 +3692,7 @@ mod tests {
             message: "unreadable".into(),
         }];
 
-        assert!(apply_refresh(&mut state, || Ok::<_, String>(fresh)));
+        assert!(refreshed(&mut state, fresh));
 
         assert_eq!(state.hosts.len(), 2);
         assert_eq!(state.warnings.len(), 1);
@@ -3592,7 +3704,7 @@ mod tests {
     fn refresh_status_counts_every_host_and_is_singular_for_one() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         state.set_filter("nomatch");
-        apply_refresh(&mut state, || {
+        apply_refresh(&mut state, Reload::Requested, || {
             Ok::<_, String>(inventory(vec![summary("dev", Ownership::Managed)]))
         });
         assert_eq!(state.status.as_deref(), Some("Refreshed: 1 host"));
@@ -3607,7 +3719,7 @@ mod tests {
             summary("beta", Ownership::Managed),
         ]);
         press(&mut state, KeyCode::Down);
-        apply_refresh(&mut state, || {
+        apply_refresh(&mut state, Reload::Requested, || {
             Ok::<_, String>(inventory(vec![
                 summary("aaa", Ownership::External),
                 summary("alpha", Ownership::Managed),
@@ -3624,7 +3736,7 @@ mod tests {
             summary_in("beta", Ownership::External, "/home/test/.ssh/config"),
         ]);
         press(&mut state, KeyCode::Down);
-        apply_refresh(&mut state, || {
+        apply_refresh(&mut state, Reload::Requested, || {
             Ok::<_, String>(inventory(vec![
                 summary_in("alpha", Ownership::External, "/home/test/.ssh/config"),
                 summary_in("BETA", Ownership::External, "/home/test/.ssh/extra"),
@@ -3640,7 +3752,7 @@ mod tests {
             summary("beta", Ownership::Managed),
         ]);
         press(&mut state, KeyCode::Down);
-        apply_refresh(&mut state, || {
+        apply_refresh(&mut state, Reload::Requested, || {
             Ok::<_, String>(inventory(vec![summary("alpha", Ownership::Managed)]))
         });
         assert_eq!(state.selected_alias(), Some("alpha"));
@@ -3657,7 +3769,9 @@ mod tests {
         state.set_filter("b");
         let (hosts, selected) = (state.hosts.clone(), state.selected);
 
-        let changed = apply_refresh(&mut state, || Err::<HostInventory, _>("cannot read config"));
+        let changed = apply_refresh(&mut state, Reload::Requested, || {
+            Err::<HostInventory, _>("cannot read config")
+        });
 
         assert!(!changed);
         assert_eq!(
@@ -3671,6 +3785,60 @@ mod tests {
             state.selected_details().is_some(),
             "cached details are kept"
         );
+    }
+
+    #[test]
+    fn a_config_change_reloads_like_a_refresh_and_says_why() {
+        let mut state = test_state(vec![
+            summary("alpha", Ownership::Managed),
+            summary("beta", Ownership::Managed),
+        ]);
+        press(&mut state, KeyCode::Down);
+        state.set_filter("a");
+        let fresh = inventory(vec![
+            summary("added", Ownership::External),
+            summary("alpha", Ownership::Managed),
+            summary("beta", Ownership::Managed),
+        ]);
+
+        assert!(apply_refresh(&mut state, Reload::ConfigChanged, || {
+            Ok::<_, String>(fresh)
+        }));
+
+        assert_eq!(state.selected_alias(), Some("beta"));
+        assert_eq!(state.filter.as_str(), "a");
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Config changed: reloaded 3 hosts")
+        );
+
+        let hosts = state.hosts.clone();
+        assert!(!apply_refresh(&mut state, Reload::ConfigChanged, || {
+            Err::<HostInventory, _>("cannot read config")
+        }));
+        assert_eq!(state.hosts, hosts);
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Config changed, reload failed: cannot read config")
+        );
+    }
+
+    #[test]
+    fn a_waiting_config_change_shows_only_when_nothing_else_is_said() {
+        let mut state = test_state(vec![summary("alpha", Ownership::Managed)]);
+        press(&mut state, KeyCode::Char('a'));
+        state.config_changed = true;
+        let waiting = "Config changed: the list reloads when this closes";
+        assert_eq!(state.status_line().as_deref(), Some(waiting));
+        assert!(rendered(&state).contains(waiting));
+
+        state.testing = Some("alpha".into());
+        assert_eq!(
+            state.status_line().as_deref(),
+            Some("Testing alpha\u{2026} (Esc to cancel)")
+        );
+        state.status = Some("Saved alpha".into());
+        assert_eq!(state.status_line().as_deref(), Some("Saved alpha"));
     }
 
     #[test]
@@ -3777,6 +3945,7 @@ mod tests {
         state.replace_hosts(HostInventory {
             hosts: vec![managed, external.clone()],
             warnings: Vec::new(),
+            inputs: Vec::new(),
         });
         assert_eq!(state.selected_summary(), Some(&external));
     }
@@ -4277,6 +4446,7 @@ mod tests {
                 summary("prod", Ownership::Managed),
             ],
             warnings: Vec::new(),
+            inputs: Vec::new(),
         });
 
         assert_eq!(state.selected_alias(), Some("prod"));
@@ -4535,6 +4705,7 @@ mod tests {
                 .map(|alias| summary(alias, Ownership::Managed))
                 .collect(),
             warnings: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 
@@ -5009,6 +5180,7 @@ mod tests {
                 summary("prod", Ownership::Managed),
             ],
             warnings: Vec::new(),
+            inputs: Vec::new(),
         };
         let mut state = test_state(inventory().hosts);
         for host in [&dev, &prod] {
@@ -5032,7 +5204,7 @@ mod tests {
             host_finished(dev.clone(), Ok(authenticated("dev"))),
             "12:34".into(),
         );
-        assert!(apply_refresh(&mut state, || Ok::<_, String>(inventory())));
+        assert!(refreshed(&mut state, inventory()));
         assert!(state.results.get(&dev).is_none());
         assert!(state.results.get(&prod).is_none());
     }
@@ -5547,6 +5719,7 @@ mod tests {
                 summary("prod", Ownership::Managed),
             ],
             warnings: Vec::new(),
+            inputs: Vec::new(),
         };
         let mut state = test_state(inventory().hosts);
         resolve(&mut state, details("dev", Ownership::Managed));
@@ -5596,7 +5769,7 @@ mod tests {
             Ok(exited_255("prod", Some(explanation("x", &[], false)))),
         );
         assert!(state.connections.get(&prod).is_some());
-        assert!(apply_refresh(&mut state, || Ok::<_, String>(inventory())));
+        assert!(refreshed(&mut state, inventory()));
         assert!(state.connections.get(&dev).is_none(), "refresh");
         assert!(state.connections.get(&prod).is_none(), "refresh");
     }
@@ -6033,12 +6206,14 @@ mod tests {
         state.replace_hosts(HostInventory {
             hosts: vec![summary("bastion", Ownership::Managed)],
             warnings: Vec::new(),
+            inputs: Vec::new(),
         });
         assert_eq!(listed(&state), ["bastion"]);
         assert_eq!(suggestion(&state).selected, 0);
         state.replace_hosts(HostInventory {
             hosts: vec![summary("web", Ownership::Managed)],
             warnings: Vec::new(),
+            inputs: Vec::new(),
         });
         assert_eq!(state.form.suggestions, None);
     }
