@@ -37,7 +37,6 @@ Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/s
 | Leaner CI and CD, remainder: merge small jobs (for example `fmt` into `clippy`) so they share the setup each job pays (about 30 s: starting the container, installing packages and the toolchain) | Measured and left out: it saves runner time but no wall-clock time, because the jobs run in parallel and the slowest one sets the pace, and it renames checks that pull requests must pass. Revisit if runner time starts to matter |
 | AUR package `portico` (source build) | Built and merged; publishing is suspended until an AUR account and key exist. Then set the `aur` environment secret and re-run the failed job |
 | AUR package `portico-bin` (prebuilt binary) | Demand for faster installs; the source package ships first |
-| Live inventory reload when the config changes | Its own design: watch `~/.ssh/config` and every included file (or poll modification times), debounce editors that save by renaming, and never reshuffle the list while a form is open; the manual refresh key already ships |
 | macOS support, distributed through Homebrew | A portable replacement for the Linux-specific process control (`pidfd`, `/proc`) and terminal launcher, with the end-to-end tests running on macOS |
 | Windows support, distributed through winget | The same portability work, plus a Windows terminal launcher |
 | Trusted Publishing on crates.io | Configure the trust relationship on crates.io, then switch the publish job to OIDC and delete the stored token |

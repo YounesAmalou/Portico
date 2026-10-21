@@ -94,6 +94,7 @@ def check_terminal(scenario):
         Path(home, "interrupt-connection").touch()
     if scenario == "launcher_failure":
         Path(home, "fail-launcher").touch()
+    managed_before = Path(scenario_home, ".ssh/portico/config").read_text() if scenario == "live_reload" else None
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
     before = termios.tcgetattr(slave)
@@ -233,27 +234,66 @@ def check_terminal(scenario):
                 assert line in block, block
             assert 'IdentityFile "~/.ssh/my key"\n' in block, block
         elif scenario == "refresh":
-            # Edits made outside Portico stay invisible, details included, until `r` re-reads them.
+            # What `ssh -G` resolves can change without any config file changing: no watch sees
+            # it, so it stays invisible until `r` re-reads everything.
             read_screen("fail.example")
-            with Path(home, ".ssh/config").open("a") as config:
-                config.write("\nHost external-new\n    HostName new.example\n")
             Path(home, "resolved-hostname").write_text("changed.example")
-            time.sleep(0.3)
-            assert "external-new" not in screen.text()
+            time.sleep(1.5)
             assert "changed.example" not in screen.text()
             os.write(master, b"r")
             read_screen("Refreshed: ")
-            read_screen("external-new")
             read_screen("changed.example")
             # A refresh that cannot read the inventory keeps the screen as it was.
             managed = Path(home, ".ssh/portico/config")
             managed.chmod(0)
             os.write(master, b"\x1b[15~")
             read_screen("Refresh failed")
-            assert "external-new" in screen.text() and "alpha" in screen.text()
+            assert "alpha" in screen.text()
             managed.chmod(0o600)
             os.write(master, b"r")
             read_screen("Refreshed: ")
+        elif scenario == "live_reload":
+            config = Path(home, ".ssh/config")
+            extra = Path(home, ".ssh/extra.conf")
+
+            def wait_gone(text, timeout=5):
+                deadline = time.monotonic() + timeout
+                while text in screen.text():
+                    pump(deadline)
+
+            # Edits made outside Portico appear by themselves, without a key.
+            read_screen("alpha")
+            with config.open("a") as file:
+                file.write("\nHost watched-direct\n    HostName direct.example\n")
+            read_screen("watched-direct")
+            read_screen("Config changed: reloaded")
+            # A new Include is followed, and its file is watched from then on, also when an
+            # editor saves it by renaming a new file over it.
+            extra.write_text("Host watched-included\n")
+            with config.open("a") as file:
+                file.write("Include extra.conf\n")
+            read_screen("watched-included")
+            partial = Path(home, ".ssh/extra.conf.tmp")
+            partial.write_text("Host watched-renamed\n")
+            os.replace(partial, extra)
+            read_screen("watched-renamed")
+            wait_gone("watched-included")
+            # Under an open form the list stays as it is and says why; leaving the form applies it.
+            os.write(master, b"a")
+            read_screen("Enter save")
+            with config.open("a") as file:
+                file.write("Host watched-later\n")
+            read_screen("the list reloads when this closes")
+            assert "watched-later" not in screen.text()
+            os.write(master, b"\x1b[27u")
+            read_screen("watched-later")
+            # Portico's own save is read back at once, and the watch takes no notice of it.
+            os.write(master, b"a")
+            read_screen("Enter save")
+            os.write(master, b"\x1b[200~own\x1b[201~\t\x1b[200~own.example\x1b[201~\r")
+            read_screen("Saved own")
+            time.sleep(2)
+            assert "Saved own" in screen.text() and "Config changed" not in screen.text()
         elif scenario == "connection_test":
             # The fake ssh answers after a second, so the test is visibly in flight first.
             os.write(master, b"t")
@@ -367,8 +407,12 @@ def check_terminal(scenario):
         if scenario == "refresh":
             Path(home, "resolved-hostname").unlink(missing_ok=True)
             Path(home, ".ssh/portico/config").chmod(0o600)
+        if scenario == "live_reload":
             config = Path(home, ".ssh/config")
-            config.write_text(config.read_text().split("\nHost external-new\n")[0])
+            config.write_text(config.read_text().split("\nHost watched-direct\n")[0])
+            Path(home, ".ssh/extra.conf").unlink(missing_ok=True)
+            Path(home, ".ssh/extra.conf.tmp").unlink(missing_ok=True)
+            Path(home, ".ssh/portico/config").write_text(managed_before)
         if scenario == "launcher_failure":
             Path(home, "fail-launcher").unlink(missing_ok=True)
         if scenario in ["launcher_failure", "ctrl_enter"]:
@@ -379,6 +423,6 @@ def check_terminal(scenario):
         os.close(slave)
 
 
-scenarios = requested or ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "refresh", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
+scenarios = requested or ["paste", "paste_filter_edit", "blocked_resolution", "blocked_mutation_lock", "blocked_init_lock", "blocked_connection", "interrupt_connection", "input_rules", "launcher_failure", "ctrl_enter", "refresh", "live_reload", "legacy_keyboard", "responsive_navigation", "normal_exit", "child_failure", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
 for scenario in scenarios:
     check_terminal(scenario)
