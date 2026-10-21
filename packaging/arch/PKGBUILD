@@ -1,0 +1,27 @@
+# Maintainer: Younes A. Amalou (Yousen)
+#
+# The Arch Linux package attached to each GitHub Release. It repackages the release
+# workflow's static x86_64 binary, so it builds nothing: scripts/package-arch.sh sets
+# pkgver and places the binary and the files below next to this PKGBUILD. The AUR
+# package (packaging/aur) builds from source instead.
+pkgname=portico
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='Keyboard-first terminal manager for OpenSSH hosts'
+arch=('x86_64')
+url='https://github.com/YounesAmalou/Portico'
+license=('MIT' 'Apache-2.0')
+depends=('openssh')
+options=('!debug' '!strip')
+source=('portico' 'LICENSE-MIT' 'LICENSE-APACHE' 'README.md' 'CHANGELOG.md' 'portico.desktop' 'portico.svg')
+# Local files staged by scripts/package-arch.sh from the build; the release checksums
+# and attestations cover the finished package.
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 portico "$pkgdir/usr/bin/portico"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 portico.desktop "$pkgdir/usr/share/applications/portico.desktop"
+  install -Dm644 portico.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/portico.svg"
+}

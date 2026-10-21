@@ -62,7 +62,7 @@ fn roadmap_keeps_every_pending_follow_up_slice_from_the_v1_spec() {
         );
     }
 
-    for planned in ["aarch64", "macOS", "Windows", "AUR", "Homebrew"] {
+    for planned in ["macOS", "Windows", "AUR", "Homebrew"] {
         assert!(roadmap.contains(planned), "roadmap lacks {planned}");
     }
 }
@@ -208,12 +208,15 @@ fn contributing_describes_the_changelog_and_every_release_step() {
 #[test]
 fn roadmap_records_the_release_follow_ups_and_no_longer_plans_shipped_release_work() {
     let roadmap = read("ROADMAP.md");
-    for planned in [
-        "Signed releases",
-        "Trusted Publishing",
-        "crate-scoped token",
-    ] {
+    for planned in ["Trusted Publishing", "crate-scoped token"] {
         assert!(roadmap.contains(planned), "roadmap lacks {planned}");
+    }
+    // Shipped by docs/superpowers/specs/2026-10-21-linux-release-artifacts-design.md.
+    for shipped in ["Linux release artifacts", "Signed releases"] {
+        assert!(
+            !roadmap.contains(shipped),
+            "the roadmap must not plan shipped work: {shipped}"
+        );
     }
     assert!(
         !roadmap.contains("First tagged release"),
@@ -317,6 +320,117 @@ fn aur_and_crates_publishing_are_independent_jobs_with_separate_secrets() {
         );
     }
     assert!(read("packaging/aur/known_hosts").contains("ssh-ed25519"));
+}
+
+/// The body of a job in the release workflow, up to its first blank line.
+fn release_job(job: &str) -> String {
+    read(".github/workflows/release.yml")
+        .split(&format!("\n  {job}:\n"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("release workflow has no {job} job"))
+        .split("\n\n")
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn release_artifacts_are_built_verified_checksummed_and_attested() {
+    let build = release_job("build");
+    for expected in [
+        "target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]",
+        "container: archlinux:base-devel",
+        "pacman -Syu --noconfirm rustup git cargo-deb cargo-generate-rpm cargo-cyclonedx",
+        "scripts/build-release.sh",
+        "sbom-path:",
+    ] {
+        assert!(build.contains(expected), "the build job lacks {expected}");
+    }
+    assert_eq!(build.matches("uses: actions/attest@").count(), 2);
+
+    let verify = release_job("verify-packages");
+    assert!(verify.contains("runner: ubuntu-24.04-arm"));
+    assert!(verify.contains("scripts/verify-packages.sh"));
+
+    let checksums = release_job("checksums");
+    assert!(checksums.contains("sha256sum -- * > SHA256SUMS"));
+    assert!(checksums.contains("subject-path: dist/SHA256SUMS"));
+    assert!(release_job("release").contains("needs: checksums"));
+
+    // Only the jobs that attest may request an OIDC token and write attestations, and
+    // the workflow default stays read-only.
+    let workflow = read(".github/workflows/release.yml");
+    assert!(workflow.contains("\npermissions:\n  contents: read\n"));
+    for job in [
+        "verify",
+        "ci-passed",
+        "verify-packages",
+        "release",
+        "crates",
+        "aur",
+    ] {
+        let section = release_job(job);
+        assert!(
+            !section.contains("id-token") && !section.contains("attestations"),
+            "{job} must not be able to attest"
+        );
+    }
+    for job in ["build", "checksums"] {
+        let section = release_job(job);
+        assert!(
+            section.contains("id-token: write") && section.contains("attestations: write"),
+            "{job} attests what it builds"
+        );
+        assert!(
+            !section.contains("contents: write"),
+            "{job} must not write the repository"
+        );
+    }
+}
+
+#[test]
+fn release_packages_install_the_static_binary_with_the_openssh_client() {
+    let manifest = read("Cargo.toml");
+    for expected in [
+        "[package.metadata.deb]",
+        "depends = \"openssh-client\"",
+        "[package.metadata.generate-rpm]",
+        "auto-req = \"no\"",
+        "openssh-clients = \"*\"",
+        "target/release/portico",
+        "packaging/desktop/portico.desktop",
+    ] {
+        assert!(manifest.contains(expected), "Cargo.toml lacks {expected}");
+    }
+    let pkgbuild = read("packaging/arch/PKGBUILD");
+    for expected in [
+        "pkgname=portico\n",
+        "depends=('openssh')",
+        "install -Dm755 portico \"$pkgdir/usr/bin/portico\"",
+        "portico.desktop \"$pkgdir/usr/share/applications/portico.desktop\"",
+    ] {
+        assert!(
+            pkgbuild.contains(expected),
+            "packaging/arch/PKGBUILD lacks {expected}"
+        );
+    }
+}
+
+#[test]
+fn readme_explains_how_to_verify_a_download() {
+    let readme = read("README.md");
+    for expected in [
+        "SHA256SUMS",
+        "sha256sum --check --ignore-missing SHA256SUMS",
+        "gh attestation verify portico-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo YounesAmalou/Portico",
+        "--source-ref refs/tags/vX.Y.Z",
+        "aarch64-unknown-linux-musl",
+        ".deb",
+        ".rpm",
+        ".pkg.tar.zst",
+    ] {
+        assert!(readme.contains(expected), "README lacks {expected}");
+    }
 }
 
 #[test]

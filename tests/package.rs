@@ -67,13 +67,14 @@ fn published_crate_contains_only_intended_files() {
         );
     }
     // Repository-hygiene tests read files that are not published, so they must not ship either,
-    // nor do the panel's tests and preview image, or the AUR packaging.
+    // nor do the panel's tests and preview image, or the AUR and Arch packaging.
     for forbidden in [
         ".superpowers",
         ".worktrees",
         "target/",
         "docs/superpowers",
         "packaging/aur",
+        "packaging/arch",
         "desktop/quickshell/tests",
         "desktop/quickshell/preview.png",
         "tests/docs.rs",

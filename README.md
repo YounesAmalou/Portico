@@ -45,17 +45,33 @@ yay -S portico
 
 The package builds from the tagged source; `cargo` is only a build dependency and is installed and removed for you.
 
-### Release binary
+### Release packages and binaries
 
-Download the tarball and its checksum from the [latest release](https://github.com/YounesAmalou/Portico/releases/latest), then verify and unpack it:
+Every [release](https://github.com/YounesAmalou/Portico/releases/latest) attaches packages for x86_64 and aarch64 (`.deb`, `.rpm`, and for x86_64 an Arch Linux `.pkg.tar.zst`) and static tarballs that run on any distribution. Each needs only the OpenSSH client. Install the package for your distribution with its package manager, for example:
 
 ```sh
-sha256sum -c portico-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf portico-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-install -Dm755 portico-vX.Y.Z-x86_64-unknown-linux-gnu/portico ~/.local/bin/portico
+sudo apt install ./portico_X.Y.Z-1_amd64.deb          # Debian, Ubuntu
+sudo dnf install ./portico-X.Y.Z-1.x86_64.rpm         # Fedora, RHEL
+sudo pacman -U portico-X.Y.Z-1-x86_64.pkg.tar.zst     # Arch Linux
 ```
 
-Release binaries are built on current Arch Linux, so they need a similarly recent glibc. On an older distribution, install with Cargo instead.
+or unpack the tarball (`aarch64-unknown-linux-musl` for 64-bit ARM):
+
+```sh
+tar -xzf portico-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
+install -Dm755 portico-vX.Y.Z-x86_64-unknown-linux-musl/portico ~/.local/bin/portico
+```
+
+#### Verify a download
+
+`SHA256SUMS` lists the checksum of every file of the release. Every file, `SHA256SUMS` included, has a build provenance attestation signed by the release workflow through GitHub, with no key to import; check one with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify portico-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo YounesAmalou/Portico
+```
+
+Add `--source-ref refs/tags/vX.Y.Z` to also require that the file was built from that release's tag. The same command verifies an installed binary (`gh attestation verify /usr/bin/portico --repo YounesAmalou/Portico`). The binary's dependencies are listed in a CycloneDX SBOM attached to the release (`portico-vX.Y.Z-<target>.cdx.json`) and attested for the binary, its tarball and its packages; `--predicate-type https://cyclonedx.org/bom` shows that attestation.
 
 ### Cargo
 
