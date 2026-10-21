@@ -1,6 +1,6 @@
 # Linux Release Artifacts Design
 
-**Status:** Approved
+**Status:** Approved; implemented and rehearsed on GitHub: a manual run of the release workflow from the branch (run 39581746766) built, verified, checksummed and attested every artifact, and `gh attestation verify` accepted each downloaded file, the extracted binary and the SBOM attestations; first used by the next tagged release
 **Date:** 2026-10-21
 
 ## Purpose
