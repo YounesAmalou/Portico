@@ -1,6 +1,6 @@
 [package]
 name = "portico-ssh"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Keyboard-first terminal UI and CLI for managing OpenSSH hosts without taking over OpenSSH"
