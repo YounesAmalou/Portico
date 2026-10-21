@@ -20,7 +20,7 @@ pub use tunnels::{StartOutcome, StopOutcome, TunnelChanges, TunnelRefusal};
 use crate::{
     adopt::{AdoptError, Direction, MigrationPlan},
     config_error::{ConfigFiles, ConfigRejection, interpret},
-    discovery::{Discovery, DiscoveryError, DiscoveryWarning, discover},
+    discovery::{Discovery, DiscoveryError, DiscoveryWarning, Input, discover},
     explain::{Context, Explanation, Operation, explain},
     host::{Change, Host, HostChanges, HostError},
     identity::HostIdentities,
@@ -66,8 +66,8 @@ pub struct HostSummary {
 pub struct HostInventory {
     pub hosts: Vec<HostSummary>,
     pub warnings: Vec<DiscoveryWarning>,
-    /// Every path the inventory was read from: discovery's inputs and the managed file.
-    pub inputs: Vec<PathBuf>,
+    /// Everything the inventory was read from: discovery's inputs and the managed file.
+    pub inputs: Vec<Input>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,9 +280,9 @@ impl App {
             .collect::<Vec<_>>();
         hosts.sort_by_key(|host| host.alias.to_ascii_lowercase());
         let mut inputs = external.inputs;
-        let managed = &self.store.paths().managed;
-        if !inputs.contains(managed) {
-            inputs.push(managed.clone());
+        let managed = Input::File(self.store.paths().managed.clone());
+        if !inputs.contains(&managed) {
+            inputs.push(managed);
         }
         Ok(HostInventory {
             hosts,
@@ -1397,9 +1397,10 @@ exit 255
         let app = test_app_with_external("Host legacy\n");
         let paths = app.store.paths();
         let inputs = app.hosts().unwrap().inputs;
-        assert_eq!(inputs.first(), Some(&paths.entry));
+        assert_eq!(inputs.first(), Some(&Input::File(paths.entry.clone())));
+        let managed = Input::File(paths.managed.clone());
         assert_eq!(
-            inputs.iter().filter(|path| **path == paths.managed).count(),
+            inputs.iter().filter(|input| **input == managed).count(),
             1,
             "{inputs:?}"
         );

@@ -1,9 +1,10 @@
 //! Notices when the files the host inventory was read from change.
 //!
-//! Nothing runs in the background: on the TUI's ticks the watch compares each path's metadata
-//! with what it was when the inventory was last read. A difference is reported once it has
-//! settled, so an editor's save (write, rename, chmod) or a script touching several files gives
-//! one reload, and a file is not read half-written.
+//! Nothing runs in the background: on the TUI's ticks the watch compares each file's metadata,
+//! and the paths each Include glob matches, with what they were when the inventory was last
+//! read. A difference is reported once it has settled, so an editor's save (write, rename,
+//! chmod) or a script touching several files gives one reload, and a file is not read
+//! half-written.
 
 use std::{
     fs,
@@ -11,6 +12,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+use crate::discovery::{self, Input};
 
 /// How often the files are looked at while nothing has changed.
 const CHECK_EVERY: Duration = Duration::from_secs(1);
@@ -33,6 +36,8 @@ pub(super) struct Stamp {
 /// Where stamps come from: the filesystem in the TUI, a map in tests.
 pub(super) trait Metadata {
     fn stamp(&self, path: &Path) -> Option<Stamp>;
+    /// The paths an Include glob matches, sorted.
+    fn matches(&self, glob: &str) -> Vec<PathBuf>;
 }
 
 /// The filesystem, following symbolic links as reading the file does.
@@ -49,52 +54,65 @@ impl Metadata for Filesystem {
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
     }
+
+    fn matches(&self, glob: &str) -> Vec<PathBuf> {
+        discovery::include_matches(glob)
+    }
+}
+
+/// What an input looked like at a check. A glob is judged by what it matches, never by its
+/// directory, so an editor's swap file or a rewritten `known_hosts` beside the matches is no
+/// change; each match is an input of its own, so its contents are followed too.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Seen {
+    File(Option<Stamp>),
+    Matches(Vec<PathBuf>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum State {
     /// The files are as they were read.
     Unchanged,
-    /// The files differ from what was read; these are the stamps the last check saw.
-    Settling(Vec<Option<Stamp>>),
+    /// The files differ from what was read; this is what the last check saw.
+    Settling(Vec<Seen>),
     /// A change has settled and waits for the inventory to be read again.
     Changed,
 }
 
-/// Follows the paths an inventory was read from, from one read to the next.
+/// Follows what an inventory was read from, from one read to the next.
 pub(super) struct ConfigWatch<M = Filesystem> {
     metadata: M,
-    paths: Vec<PathBuf>,
-    /// Each path's stamp right after the read, in the order of `paths`.
-    read: Vec<Option<Stamp>>,
+    inputs: Vec<Input>,
+    /// Each input as it was right after the read, in the order of `inputs`.
+    read: Vec<Seen>,
     state: State,
     next_check: Instant,
 }
 
 impl ConfigWatch {
-    pub(super) fn new(paths: &[PathBuf], now: Instant) -> Self {
-        Self::with_metadata(Filesystem, paths, now)
+    pub(super) fn new(inputs: &[Input], now: Instant) -> Self {
+        Self::with_metadata(Filesystem, inputs, now)
     }
 }
 
 impl<M: Metadata> ConfigWatch<M> {
-    fn with_metadata(metadata: M, paths: &[PathBuf], now: Instant) -> Self {
+    fn with_metadata(metadata: M, inputs: &[Input], now: Instant) -> Self {
         let mut watch = Self {
             metadata,
-            paths: Vec::new(),
+            inputs: Vec::new(),
             read: Vec::new(),
             state: State::Unchanged,
             next_check: now,
         };
-        watch.rebase(paths, now);
+        watch.rebase(inputs, now);
         watch
     }
 
-    /// Starts over from `paths` as they are now, just after the inventory was read from them.
+    /// Starts over from `inputs` as they are now, just after the inventory was read from them.
     /// Whatever was pending is taken as read.
-    pub(super) fn rebase(&mut self, paths: &[PathBuf], now: Instant) {
-        self.paths = paths.to_vec();
-        self.read = self.stamps();
+    pub(super) fn rebase(&mut self, inputs: &[Input], now: Instant) {
+        self.inputs = inputs.to_vec();
+        self.read = self.look();
         self.state = State::Unchanged;
         self.next_check = now + CHECK_EVERY;
     }
@@ -103,22 +121,25 @@ impl<M: Metadata> ConfigWatch<M> {
     /// inventory to be read again, which stays true until `rebase`.
     pub(super) fn tick(&mut self, now: Instant) -> bool {
         if self.state != State::Changed && now >= self.next_check {
-            let stamps = self.stamps();
-            (self.state, self.next_check) = if stamps == self.read {
+            let seen = self.look();
+            (self.state, self.next_check) = if seen == self.read {
                 (State::Unchanged, now + CHECK_EVERY)
-            } else if self.state == State::Settling(stamps.clone()) {
+            } else if self.state == State::Settling(seen.clone()) {
                 (State::Changed, now)
             } else {
-                (State::Settling(stamps), now + SETTLE)
+                (State::Settling(seen), now + SETTLE)
             };
         }
         self.state == State::Changed
     }
 
-    fn stamps(&self) -> Vec<Option<Stamp>> {
-        self.paths
+    fn look(&self) -> Vec<Seen> {
+        self.inputs
             .iter()
-            .map(|path| self.metadata.stamp(path))
+            .map(|input| match input {
+                Input::File(path) => Seen::File(self.metadata.stamp(path)),
+                Input::Glob(glob) => Seen::Matches(self.metadata.matches(glob)),
+            })
             .collect()
     }
 }
@@ -168,10 +189,23 @@ mod tests {
         fn stamp(&self, path: &Path) -> Option<Stamp> {
             self.0.borrow().get(path).copied()
         }
+
+        fn matches(&self, glob: &str) -> Vec<PathBuf> {
+            let pattern = glob::Pattern::new(glob).unwrap();
+            let mut matches = (self.0.borrow().keys())
+                .filter(|path| pattern.matches_path(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            matches.sort();
+            matches
+        }
     }
 
-    fn paths(paths: &[&str]) -> Vec<PathBuf> {
-        paths.iter().map(PathBuf::from).collect()
+    fn inputs(paths: &[&str]) -> Vec<Input> {
+        paths
+            .iter()
+            .map(|path| Input::File(PathBuf::from(path)))
+            .collect()
     }
 
     fn ms(milliseconds: u64) -> Duration {
@@ -182,7 +216,7 @@ mod tests {
     fn unchanged_files_are_never_reported() {
         let files = Files::with(&["config", "included"]);
         let start = Instant::now();
-        let mut watch = ConfigWatch::with_metadata(&files, &paths(&["config", "included"]), start);
+        let mut watch = ConfigWatch::with_metadata(&files, &inputs(&["config", "included"]), start);
         for second in 0..5 {
             assert!(!watch.tick(start + Duration::from_secs(second)));
         }
@@ -192,7 +226,7 @@ mod tests {
     fn a_change_is_reported_once_it_has_stayed_put_for_the_settling_time() {
         let files = Files::with(&["config"]);
         let start = Instant::now();
-        let mut watch = ConfigWatch::with_metadata(&files, &paths(&["config"]), start);
+        let mut watch = ConfigWatch::with_metadata(&files, &inputs(&["config"]), start);
 
         files.touch("config", 5);
         // Not looked at before a second has passed.
@@ -207,7 +241,7 @@ mod tests {
     fn a_file_that_keeps_changing_is_reported_once_it_stops() {
         let files = Files::with(&["config"]);
         let start = Instant::now();
-        let mut watch = ConfigWatch::with_metadata(&files, &paths(&["config"]), start);
+        let mut watch = ConfigWatch::with_metadata(&files, &inputs(&["config"]), start);
 
         files.touch("config", 5);
         assert!(!watch.tick(start + ms(1000)));
@@ -222,7 +256,7 @@ mod tests {
     fn a_change_undone_before_it_settles_is_forgotten() {
         let files = Files::with(&["config"]);
         let start = Instant::now();
-        let mut watch = ConfigWatch::with_metadata(&files, &paths(&["config"]), start);
+        let mut watch = ConfigWatch::with_metadata(&files, &inputs(&["config"]), start);
 
         files.touch("config", 5);
         assert!(!watch.tick(start + ms(1000)));
@@ -245,7 +279,7 @@ mod tests {
         for (edit, apply) in edits {
             let files = Files::with(&["config"]);
             let start = Instant::now();
-            let watched = paths(&["config", "later"]);
+            let watched = inputs(&["config", "later"]);
             let mut watch = ConfigWatch::with_metadata(&files, &watched, start);
 
             apply(&files);
@@ -259,14 +293,14 @@ mod tests {
     fn a_settled_change_stays_reported_until_the_inventory_is_read_again() {
         let files = Files::with(&["config"]);
         let start = Instant::now();
-        let mut watch = ConfigWatch::with_metadata(&files, &paths(&["config"]), start);
+        let mut watch = ConfigWatch::with_metadata(&files, &inputs(&["config"]), start);
 
         files.touch("config", 5);
         watch.tick(start + ms(1000));
         assert!(watch.tick(start + ms(1300)));
         assert!(watch.tick(start + ms(9000)));
 
-        watch.rebase(&paths(&["config"]), start + ms(9000));
+        watch.rebase(&inputs(&["config"]), start + ms(9000));
         assert!(!watch.tick(start + ms(10_000)));
     }
 
@@ -274,12 +308,12 @@ mod tests {
     fn rebasing_takes_what_was_pending_as_read_and_follows_the_new_paths() {
         let files = Files::with(&["config", "old.conf", "new.conf"]);
         let start = Instant::now();
-        let mut watch = ConfigWatch::with_metadata(&files, &paths(&["config", "old.conf"]), start);
+        let mut watch = ConfigWatch::with_metadata(&files, &inputs(&["config", "old.conf"]), start);
 
         // Portico's own write, read back before the change settles: never reported.
         files.touch("config", 5);
         assert!(!watch.tick(start + ms(1000)));
-        watch.rebase(&paths(&["config", "new.conf"]), start + ms(1100));
+        watch.rebase(&inputs(&["config", "new.conf"]), start + ms(1100));
         assert!(!watch.tick(start + ms(1400)));
         assert!(!watch.tick(start + ms(2100)));
 
@@ -290,6 +324,38 @@ mod tests {
         files.touch("new.conf", 7);
         assert!(!watch.tick(start + ms(4100)));
         assert!(watch.tick(start + ms(4400)));
+    }
+
+    #[test]
+    fn a_glob_changes_with_its_matches_and_not_with_the_rest_of_its_directory() {
+        let files = Files::with(&["config", "conf.d/a.conf"]);
+        let start = Instant::now();
+        let mut watched = inputs(&["config", "conf.d/a.conf"]);
+        watched.push(Input::Glob("conf.d/*.conf".into()));
+        let mut watch = ConfigWatch::with_metadata(&files, &watched, start);
+
+        // An editor opening a.conf leaves a swap file beside it.
+        files.write("conf.d/.a.conf.swp", 8, 3);
+        files.write("conf.d/notes.txt", 9, 3);
+        assert!(!watch.tick(start + ms(1000)));
+        assert!(!watch.tick(start + ms(2000)));
+
+        files.write("conf.d/b.conf", 10, 4);
+        assert!(!watch.tick(start + ms(3000)));
+        assert!(watch.tick(start + ms(3300)));
+    }
+
+    #[test]
+    fn a_glob_match_that_goes_away_is_a_change() {
+        let files = Files::with(&["conf.d/a.conf", "conf.d/b.conf"]);
+        let start = Instant::now();
+        let mut watched = inputs(&["conf.d/a.conf", "conf.d/b.conf"]);
+        watched.push(Input::Glob("conf.d/*.conf".into()));
+        let mut watch = ConfigWatch::with_metadata(&files, &watched, start);
+
+        files.remove("conf.d/b.conf");
+        assert!(!watch.tick(start + ms(1000)));
+        assert!(watch.tick(start + ms(1300)));
     }
 
     #[test]

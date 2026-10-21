@@ -51,7 +51,7 @@ use crate::{
         TestTarget,
     },
     config_error::ConfigRejection,
-    discovery::DiscoveryWarning,
+    discovery::{DiscoveryWarning, Input},
     explain::Explanation,
     fuzzy,
     host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
@@ -229,46 +229,26 @@ fn browse<B: Backend<Error = io::Error>>(
     signals: &Signals,
     session: &TerminalSession,
 ) -> Result<(), TuiError> {
-    // Host details come from `ssh -G` and connection tests run `ssh`, so workers do both while
-    // the UI keeps handling keys. The resolver and the tester are dropped (cancelling any running
-    // `ssh`) before the scope waits for the workers.
     thread::scope(|scope| {
-        let resolver = Resolver::spawn(scope, app);
-        let tester = Tester::spawn(scope, app);
-        let lister = Lister::spawn(scope, app);
-        let planner = Planner::spawn(scope, app);
-        let indexer = Indexer::spawn(scope, app);
-        let starter = Starter::spawn(scope, app);
-        browse_hosts(
-            app, terminal, events, signals, session, resolver, tester, lister, planner, indexer,
-            starter,
-        )
+        let workers = Workers::spawn(scope, app);
+        browse_hosts(app, terminal, events, signals, session, workers)
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each worker is spawned in the caller's scope"
-)]
 fn browse_hosts<B: Backend<Error = io::Error>>(
     app: &App,
     terminal: &mut Terminal<B>,
     events: &mut TerminalEvents,
     signals: &Signals,
     session: &TerminalSession,
-    mut resolver: Resolver,
-    mut tester: Tester,
-    mut lister: Lister,
-    mut planner: Planner,
-    mut indexer: Indexer,
-    mut starter: Starter,
+    mut workers: Workers,
 ) -> Result<(), TuiError> {
     let terminated = signals.flag();
     let inventory = app.hosts()?;
     let mut watch = ConfigWatch::new(&inventory.inputs, Instant::now());
     let mut state = UiState::new(inventory, session.keyboard_enhancement());
     state.home = app.home().to_owned();
-    sync_details(&mut state, &mut resolver, false);
+    sync_details(&mut state, &mut workers.resolver, false);
     let mut redraw = true;
 
     loop {
@@ -279,79 +259,12 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             terminal.draw(|frame| render(frame, &state))?;
             redraw = false;
         }
-        let busy = resolver.is_pending()
-            || tester.running().is_some()
-            || lister.is_running()
-            || planner.is_running()
-            || indexer.is_running()
-            || starter.running().is_some();
-        let event = match events.next(if busy { BUSY_TICK } else { IDLE_TICK })? {
+        let every = if workers.busy() { BUSY_TICK } else { IDLE_TICK };
+        let event = match events.next(every)? {
             Step::Input(event) => event,
             Step::Closed => return Ok(()),
             Step::Tick(now) => {
-                if let Some((host, loaded)) = resolver.poll() {
-                    state.details.insert(host, loaded);
-                    state.open_pending_edit();
-                    redraw = true;
-                }
-                if let Some(finished) = tester.poll() {
-                    state.record_test(finished, local_time());
-                    redraw = true;
-                }
-                if let Some((target, result)) = lister.try_finished() {
-                    state.containers.finish(target, result);
-                    redraw = true;
-                }
-                if let Some((planned, preselect)) = planner.try_finished() {
-                    state.finish_plan(planned, &preselect, app.home());
-                    redraw = true;
-                }
-                if let Some(built) = indexer.try_finished() {
-                    state.finish_identities(built);
-                    redraw = true;
-                }
-                // The IdentityFile suggestions draw on every host's identities, built once a
-                // form opens.
-                if state.in_form() {
-                    indexer.request();
-                }
-                if let Some((name, result)) = starter.poll() {
-                    state.tunnels.finish_start(&name, result);
-                    state.tunnels.reload(app);
-                    redraw = true;
-                }
-                if state.tab == Tab::Tunnels && state.tunnels.is_stale() {
-                    state.tunnels.reload(app);
-                    redraw = true;
-                }
-                let starting = starter.running().map(str::to_owned);
-                state.tunnels.set_starting(starting);
-                let testing = tester.running().map(str::to_owned);
-                if state.testing != testing {
-                    state.testing = testing;
-                    redraw = true;
-                }
-                // A change of the config files is applied where `r` would be, and otherwise
-                // waits, announced, for the form or prompt to close.
-                let changed = watch.tick(now);
-                if changed && state.mode == Mode::Browse {
-                    let reason = Reload::ConfigChanged;
-                    let replaced = reload(
-                        app,
-                        &mut state,
-                        &mut indexer,
-                        &mut tester,
-                        &mut watch,
-                        reason,
-                    );
-                    sync_details(&mut state, &mut resolver, replaced);
-                    redraw = true;
-                }
-                let waiting = changed && state.mode != Mode::Browse;
-                if state.config_changed != waiting {
-                    state.config_changed = waiting;
-                    redraw = true;
-                }
+                redraw |= on_tick(app, &mut state, &mut workers, &mut watch, now);
                 continue;
             }
         };
@@ -361,9 +274,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         }
         if let Event::Paste(text) = event {
             if state.handle_paste(&text) == UiAction::FormEdited {
-                tester.cancel_if(|origin, _| *origin == Origin::Form);
+                workers
+                    .tester
+                    .cancel_if(|origin, _| *origin == Origin::Form);
             }
-            sync_details(&mut state, &mut resolver, false);
+            sync_details(&mut state, &mut workers.resolver, false);
             redraw = true;
             continue;
         }
@@ -386,7 +301,9 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
         match action {
             UiAction::None => {}
             UiAction::Quit => return Ok(()),
-            UiAction::Tunnels(action) => run_tunnel_action(app, &mut state, &mut starter, action),
+            UiAction::Tunnels(action) => {
+                run_tunnel_action(app, &mut state, &mut workers.starter, action)
+            }
             UiAction::Connect {
                 alias,
                 new_terminal,
@@ -402,10 +319,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 state.finish_connect(&alias, result);
             }
             UiAction::Containers(PanelAction::List(target)) => {
-                lister.list(&mut state.containers, target);
+                workers.lister.list(&mut state.containers, target);
             }
             UiAction::Containers(PanelAction::CancelList) => {
-                lister.cancel();
+                workers.lister.cancel();
             }
             UiAction::Containers(PanelAction::Shell {
                 target,
@@ -433,19 +350,12 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Ok(app.docker_fix(&target, &offer))
                 })?;
                 state.containers.set_status(fix_status(&offer, result));
-                lister.list(&mut state.containers, target);
+                workers.lister.list(&mut state.containers, target);
             }
             UiAction::Containers(_) => {}
             UiAction::Refresh => {
                 let reason = Reload::Requested;
-                inventory_changed = reload(
-                    app,
-                    &mut state,
-                    &mut indexer,
-                    &mut tester,
-                    &mut watch,
-                    reason,
-                );
+                inventory_changed = reload(app, &mut state, &mut workers, &mut watch, reason);
             }
             UiAction::Add(host) => {
                 let alias = host.alias().to_owned();
@@ -468,7 +378,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 let result = app.edit_cancellable(&alias, changes, terminated);
                 let edited = [alias.as_str(), selected.as_str()];
                 if result.is_ok() {
-                    cancel_host_test(&mut tester, &edited);
+                    cancel_host_test(&mut workers.tester, &edited);
                 }
                 inventory_changed = finish_mutation(
                     app,
@@ -483,7 +393,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             UiAction::Remove(alias) => {
                 let result = app.remove_cancellable(&alias, terminated);
                 if result.is_ok() {
-                    cancel_host_test(&mut tester, &[&alias]);
+                    cancel_host_test(&mut workers.tester, &[&alias]);
                 }
                 inventory_changed = finish_mutation(
                     app,
@@ -502,19 +412,19 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 // The screen shows that the plan is being checked until it arrives.
                 state.migrate = None;
                 state.mode = Mode::Migrate;
-                if !planner.start(direction, preselect) {
+                if !workers.planner.start(direction, preselect) {
                     state.mode = Mode::Browse;
                     state.status = Some("the adoption worker stopped".into());
                 }
             }
-            UiAction::CancelPlan => planner.cancel(),
+            UiAction::CancelPlan => workers.planner.cancel(),
             UiAction::Migrate(aliases) => {
                 if let Some(migrate) = state.migrate.take() {
                     let result = app.migrate_cancellable(&migrate.plan, &aliases, terminated);
                     let moved = result.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
                     let changed = moved.iter().map(String::as_str).collect::<Vec<_>>();
                     if result.is_ok() {
-                        cancel_host_test(&mut tester, &changed);
+                        cancel_host_test(&mut workers.tester, &changed);
                     }
                     let verb = match migrate.plan.direction {
                         adopt::Direction::Adopt => "Adopted",
@@ -533,9 +443,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 // A failure ends the screen too, as its plan may no longer match the files.
                 state.mode = Mode::Browse;
             }
-            UiAction::Test { origin, target } => tester.start(origin, Job::Test(target)),
-            UiAction::CancelTest => tester.cancel(),
-            UiAction::FormEdited => tester.cancel_if(|origin, _| *origin == Origin::Form),
+            UiAction::Test { origin, target } => workers.tester.start(origin, Job::Test(target)),
+            UiAction::CancelTest => workers.tester.cancel(),
+            UiAction::FormEdited => workers
+                .tester
+                .cancel_if(|origin, _| *origin == Origin::Form),
             UiAction::Trust(trusted) => {
                 if let Some(pending) = state.trust.take()
                     && trusted
@@ -544,18 +456,89 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                         target: pending.target,
                         key: pending.key,
                     };
-                    tester.start(pending.origin, job);
+                    workers.tester.start(pending.origin, job);
                 }
             }
         }
         // A form's result is only shown in that form.
         if !state.in_form() {
-            tester.cancel_if(|origin, _| *origin == Origin::Form);
+            workers
+                .tester
+                .cancel_if(|origin, _| *origin == Origin::Form);
         }
 
-        sync_details(&mut state, &mut resolver, inventory_changed);
+        sync_details(&mut state, &mut workers.resolver, inventory_changed);
         redraw = true;
     }
+}
+
+/// Looks after what happens between keys: collects what the workers finished, keeps the
+/// tunnels' statuses fresh, and applies a change of the config files where `r` would be
+/// accepted, announcing it until the form or prompt closes otherwise. Returns whether the screen
+/// needs drawing again.
+fn on_tick(
+    app: &App,
+    state: &mut UiState,
+    workers: &mut Workers,
+    watch: &mut ConfigWatch,
+    now: Instant,
+) -> bool {
+    let mut redraw = false;
+    if let Some((host, loaded)) = workers.resolver.poll() {
+        state.details.insert(host, loaded);
+        state.open_pending_edit();
+        redraw = true;
+    }
+    if let Some(finished) = workers.tester.poll() {
+        state.record_test(finished, local_time());
+        redraw = true;
+    }
+    if let Some((target, result)) = workers.lister.try_finished() {
+        state.containers.finish(target, result);
+        redraw = true;
+    }
+    if let Some((planned, preselect)) = workers.planner.try_finished() {
+        state.finish_plan(planned, &preselect, app.home());
+        redraw = true;
+    }
+    if let Some(built) = workers.indexer.try_finished() {
+        state.finish_identities(built);
+        redraw = true;
+    }
+    // The IdentityFile suggestions draw on every host's identities, built once a form opens.
+    if state.in_form() {
+        workers.indexer.request();
+    }
+    if let Some((name, result)) = workers.starter.poll() {
+        state.tunnels.finish_start(&name, result);
+        state.tunnels.reload(app);
+        redraw = true;
+    }
+    if state.tab == Tab::Tunnels && state.tunnels.is_stale() {
+        state.tunnels.reload(app);
+        redraw = true;
+    }
+    let starting = workers.starter.running().map(str::to_owned);
+    state.tunnels.set_starting(starting);
+    let testing = workers.tester.running().map(str::to_owned);
+    if state.testing != testing {
+        state.testing = testing;
+        redraw = true;
+    }
+    // A change of the config files is applied where `r` would be, and otherwise waits,
+    // announced, for the form or prompt to close.
+    let changed = watch.tick(now);
+    if changed && state.mode == Mode::Browse {
+        let replaced = reload(app, state, workers, watch, Reload::ConfigChanged);
+        sync_details(state, &mut workers.resolver, replaced);
+        redraw = true;
+    }
+    let waiting = changed && state.mode != Mode::Browse;
+    if state.config_changed != waiting {
+        state.config_changed = waiting;
+        redraw = true;
+    }
+    redraw
 }
 
 /// Carries out what the Tunnels tab asked for.
@@ -720,18 +703,19 @@ enum Reload {
 fn reload(
     app: &App,
     state: &mut UiState,
-    indexer: &mut Indexer,
-    tester: &mut Tester,
+    workers: &mut Workers,
     watch: &mut ConfigWatch,
     reason: Reload,
 ) -> bool {
     // Agents and key files may have changed too: ask them again on the next look.
     app.forget_identities();
-    indexer.reset();
+    workers.indexer.reset();
     state.identity_inventory = None;
     let replaced = apply_refresh(state, reason, || app.hosts());
     if replaced {
-        tester.cancel_if(|origin, _| matches!(origin, Origin::Host(_)));
+        workers
+            .tester
+            .cancel_if(|origin, _| matches!(origin, Origin::Host(_)));
     }
     watch.rebase(&state.inputs, Instant::now());
     replaced
@@ -814,6 +798,42 @@ fn sync_details(state: &mut UiState, resolver: &mut Resolver, inventory_changed:
     match state.selected_summary() {
         Some(host) if state.details.get(host).is_none() => resolver.request(host),
         _ => resolver.cancel(),
+    }
+}
+
+/// The background workers of a TUI session, spawned in its thread scope. Host details come
+/// from `ssh -G` and connection tests run `ssh`, so the UI keeps handling keys meanwhile.
+/// Dropping them cancels what runs (the resolver and the tester first, which may be running
+/// `ssh`) before the scope waits for their threads.
+struct Workers {
+    resolver: Resolver,
+    tester: Tester,
+    lister: Lister,
+    planner: Planner,
+    indexer: Indexer,
+    starter: Starter,
+}
+
+impl Workers {
+    fn spawn<'scope>(scope: &'scope thread::Scope<'scope, '_>, app: &'scope App) -> Self {
+        Self {
+            resolver: Resolver::spawn(scope, app),
+            tester: Tester::spawn(scope, app),
+            lister: Lister::spawn(scope, app),
+            planner: Planner::spawn(scope, app),
+            indexer: Indexer::spawn(scope, app),
+            starter: Starter::spawn(scope, app),
+        }
+    }
+
+    /// Whether any worker is running, so its result is looked for more often.
+    fn busy(&self) -> bool {
+        self.resolver.is_pending()
+            || self.tester.running().is_some()
+            || self.lister.is_running()
+            || self.planner.is_running()
+            || self.indexer.is_running()
+            || self.starter.running().is_some()
     }
 }
 
@@ -1383,8 +1403,8 @@ impl DetailsCache {
 struct UiState {
     hosts: Vec<HostSummary>,
     warnings: Vec<DiscoveryWarning>,
-    /// The paths the inventory was read from, which the config watch follows.
-    inputs: Vec<PathBuf>,
+    /// What the inventory was read from, which the config watch follows.
+    inputs: Vec<Input>,
     visible: Vec<usize>,
     selected: Option<usize>,
     filter: TextInput,
