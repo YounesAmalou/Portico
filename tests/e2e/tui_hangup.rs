@@ -9,6 +9,7 @@
 use std::{
     fs,
     io::{self, Read, Write},
+    num::NonZeroU16,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
@@ -111,7 +112,11 @@ impl HangupTerminal {
         Self {
             master: Some(fs::File::from(master)),
             child,
-            parser: vt100::Parser::new(ROWS, COLUMNS, 0),
+            parser: vt100::Parser::new(
+                NonZeroU16::new(ROWS).expect("the screen has rows"),
+                NonZeroU16::new(COLUMNS).expect("the screen has columns"),
+                0,
+            ),
             transcript: Vec::new(),
             answered: false,
         }
