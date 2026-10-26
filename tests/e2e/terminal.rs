@@ -7,6 +7,7 @@
 
 use std::{
     io::{Read, Write},
+    num::NonZeroU16,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
@@ -99,7 +100,11 @@ impl Terminal {
             writer,
             output,
             child,
-            parser: vt100::Parser::new(ROWS, COLUMNS, 0),
+            parser: vt100::Parser::new(
+                NonZeroU16::new(ROWS).expect("the screen has rows"),
+                NonZeroU16::new(COLUMNS).expect("the screen has columns"),
+                0,
+            ),
             transcript: Vec::new(),
             answered: false,
         }
