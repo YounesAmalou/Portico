@@ -248,7 +248,11 @@ def check_terminal(scenario):
                 assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
         elif scenario == "interrupt_connection":
             # Ctrl+C while ssh connects goes to the whole foreground group: ssh ends, Portico stays.
+            left_at = len(transcript)
             os.write(master, b"\r")
+            # Read the switch away from the TUI first: a terminal's Ctrl+C discards output not
+            # yet read, which on macOS can still hold it.
+            read_until(b"\x1b[?1049l", left_at)
             deadline = time.monotonic() + 5
             while not Path(home, "interrupt-ready").exists():
                 assert time.monotonic() < deadline, "connection did not start"
