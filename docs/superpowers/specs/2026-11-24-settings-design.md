@@ -122,7 +122,7 @@ The panel lists a host's containers with `portico containers --json`, which pick
 - `1`–`n` number the visible tabs in order, and Tab and Shift+Tab cycle through them.
 - `T` does nothing when the tunnels tab is off.
 - `c` goes to the last container tab shown if it is still on, otherwise the first one that is on. It does nothing when every backend is off.
-- No lister worker is created for, and no listing is sent to, a backend that is off.
+- No listing is sent to a backend that is off (its idle worker stays, so turning the tab back on lists it).
 - If the tab being shown is turned off, the TUI switches to Hosts.
 - The test that keeps `Tab::ALL` in step with `backend::AUTOMATIC` stays. Visibility is a filter over `Tab::ALL`, not a different list.
 

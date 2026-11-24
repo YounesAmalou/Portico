@@ -46,10 +46,10 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `backend::docker` | The Docker adapter: `docker ps` parsing, and its access decision (`Access`, `decide`, private to this file) |
 | `backend::podman` | The Podman adapter: the listing script (the ssh user's own containers), `podman ps --format json` parsing, and `podman exec` |
 | `backend::proxmox` | The Proxmox VE adapter: the listing script (root or `sudo -n`), `pct list` parsing, and `pct exec` |
-| `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities`, and the settings (their file's location and reading it) |
-| `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`) and the JSON documents (`json`) |
+| `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities`, and the settings (their file's location, reading and writing them) |
+| `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`, `settings`) and the JSON documents (`json`) |
 | `picker` | The inline pickers the CLI opens when a host or container is missing; also used by the TUI |
-| `tui` | The event loop (`mod`, `events`), the terminal session (`terminal`, `hangup`), shared widgets (`text_input`, `dropdown`), the config watch (`watch`, which keeps only its file identity in `platform::fs`), one module per tab (`hosts`, `tunnels`, `containers`, with the hosts tab's form and its tests in `form`), and the workers that keep the interface responsive (`lister`, `tester`, `planner`, `identities`), `init` and `migrate` |
+| `tui` | The event loop (`mod`, `events`), the terminal session (`terminal`, `hangup`), shared widgets (`text_input`, `dropdown`), the config watch (`watch`, which keeps only its file identity in `platform::fs`), one module per tab (`hosts`, `tunnels`, `containers`, with the hosts tab's form and its tests in `form`), and the workers that keep the interface responsive (`lister`, `tester`, `planner`, `identities`), `init`, `migrate` and the `settings` overlay |
 | `desktop` | `portico desktop` plans: the Quickshell panel, the launcher entry and the keybinding; used by the CLI and the TUI's settings overlay |
 
 ## The backend interface
