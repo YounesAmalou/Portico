@@ -238,7 +238,7 @@ impl Proc {
         Some(args)
     }
 
-    pub(crate) fn pids(&self) -> Vec<u32> {
+    pub fn pids(&self) -> Vec<u32> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();
         };

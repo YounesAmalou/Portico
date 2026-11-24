@@ -64,6 +64,9 @@ class Screen:
 
 binary, home, fake_bin, *requested = sys.argv[1:]
 environment = dict(os.environ, HOME=home, PATH=fake_bin + os.pathsep + os.environ["PATH"])
+# macOS runs the fake launcher named here; Linux finds it on `PATH`.
+environment["PORTICO_TERMINAL"] = os.path.join(fake_bin, "xdg-terminal-exec")
+environment.pop("TERM_PROGRAM", None)
 # The developer's own agent must never be asked (a locked 1Password would prompt).
 environment.pop("SSH_AUTH_SOCK", None)
 
@@ -71,6 +74,10 @@ environment.pop("SSH_AUTH_SOCK", None)
 def is_running(pid):
     """Whether `pid` can still run. A zombie is dead: containers whose PID 1 never reaps
     orphans (as in CI) leave killed processes behind as zombies that signals still reach."""
+    if not Path("/proc").is_dir():
+        # macOS: ps prints nothing for a process that is gone.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return state.strip() != "" and not state.strip().startswith("Z")
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except FileNotFoundError:
@@ -202,8 +209,10 @@ def check_terminal(scenario):
                 assert time.monotonic() < deadline, "connection did not start"
                 time.sleep(0.01)
             _, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())
-            assert str(child) not in Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
-            assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
+            # Linux lists children per thread: the connection's child belongs to the worker.
+            if Path("/proc").is_dir():
+                assert str(child) not in Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+                assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
         elif scenario == "interrupt_connection":
             # Ctrl+C while ssh connects goes to the whole foreground group: ssh ends, Portico stays.
             os.write(master, b"\r")

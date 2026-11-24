@@ -21,7 +21,10 @@ use std::{
 
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 const SSHD: &str = "/usr/bin/sshd";
+#[cfg(not(target_os = "linux"))]
+const SSHD: &str = "/usr/sbin/sshd";
 const KEYGEN: &str = "/usr/bin/ssh-keygen";
 
 /// The passphrase of [`Sshd::locked_key`].

@@ -172,7 +172,7 @@ impl HangupTerminal {
 
     /// Processor time Portico has used so far, all its threads together.
     fn cpu_time(&self) -> Duration {
-        cpu_time(self.child.id())
+        crate::procs::cpu_time(self.child.id())
     }
 
     /// Closes the terminal, as closing a terminal emulator's window does.
@@ -206,22 +206,6 @@ impl Drop for HangupTerminal {
             let _ = self.child.wait();
         }
     }
-}
-
-/// The user and system time of process `pid`, from `/proc/<pid>/stat`.
-fn cpu_time(pid: u32) -> Duration {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return Duration::ZERO;
-    };
-    // The command name may hold spaces; the fields after it do not.
-    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..]
-        .split_whitespace()
-        .collect();
-    // utime and stime are the 14th and 15th fields, so the 12th and 13th here.
-    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-    // SAFETY: `sysconf` only reads a configuration value.
-    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    Duration::from_millis(ticks * 1000 / per_second)
 }
 
 #[test]

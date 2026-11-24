@@ -2,7 +2,6 @@
 //! gives it back when the session ends.
 
 use std::{
-    path::Path,
     thread,
     time::{Duration, Instant},
 };
@@ -53,9 +52,8 @@ fn dropping_a_terminal_reaps_its_child() {
     let pid = terminal.pid();
     drop(terminal);
 
-    let stat = format!("/proc/{pid}/stat");
     let deadline = Instant::now() + Duration::from_secs(2);
-    while Path::new(&stat).exists() {
+    while crate::procs::exists(pid) {
         assert!(Instant::now() < deadline, "portico {pid} was not reaped");
         thread::sleep(Duration::from_millis(10));
     }

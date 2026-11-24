@@ -26,6 +26,16 @@ fn main() -> ExitCode {
             &mut io::stderr(),
         );
     };
+    // The desktop integration is Omarchy's panel, a freedesktop launcher entry and a Hyprland
+    // keybinding: Linux only.
+    if cfg!(not(target_os = "linux")) && cli.is_desktop() {
+        return fail(
+            &cli,
+            "the desktop integration (panel, launcher entry and keybinding) needs Linux with Omarchy",
+            &mut io::stdout().lock(),
+            &mut io::stderr(),
+        );
+    }
     let stdin = io::stdin();
     let interactive = stdin.is_terminal();
     let desktop = DesktopEnv::new(
@@ -48,9 +58,11 @@ fn main() -> ExitCode {
     // Bring an installed panel up to this binary; silent, a no-op without a panel, and never
     // from a cargo build, which would rewrite the installed panel on every run.
     // Omarchy's shell only notices the rewrite through its link, which is re-created for it.
-    if panel::refresh(&desktop.panel_dir(), || {
-        std::env::current_exe().is_ok_and(|exe| is_development_binary(&exe))
-    }) {
+    if cfg!(target_os = "linux")
+        && panel::refresh(&desktop.panel_dir(), || {
+            std::env::current_exe().is_ok_and(|exe| is_development_binary(&exe))
+        })
+    {
         let _ = reload_omarchy_panel(&desktop);
     }
     let runtime = RuntimeDir::locate(&home, std::env::var_os("XDG_RUNTIME_DIR").as_deref());

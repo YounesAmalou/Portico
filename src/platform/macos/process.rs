@@ -269,7 +269,7 @@ impl Proc {
         parse_procargs(&buffer[..length.min(buffer.len())])
     }
 
-    pub(crate) fn pids(&self) -> Vec<u32> {
+    pub fn pids(&self) -> Vec<u32> {
         // SAFETY: the buffer and its size come from `list_pids`.
         list_pids(|buffer, size| unsafe { libc::proc_listallpids(buffer, size) })
             .unwrap_or_default()
