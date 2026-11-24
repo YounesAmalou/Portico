@@ -9,6 +9,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Whether `child` has exited, leaving it unreaped so its PID, and so its
+/// process group, cannot be reused before the group is killed.
+pub fn has_exited(child: &std::process::Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
 /// A pidfd: signals reach the process it was opened for, never a later process with its PID.
 pub(crate) struct Pin {
     pidfd: OwnedFd,

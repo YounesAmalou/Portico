@@ -148,6 +148,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: macos-latest
+    # A normal run takes a few minutes. The limits make a hung test fail quickly, with the
+    # log of what was running, instead of after GitHub's default of six hours.
+    timeout-minutes: 30
     env:
       CARGO_HOME: /Users/runner/.cargo
       RUSTUP_HOME: /Users/runner/.rustup
@@ -159,7 +162,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/ci-checks.sh clippy
       - run: scripts/ci-checks.sh test
+        timeout-minutes: 12
       - run: scripts/ci-checks.sh e2e
+        timeout-minutes: 12
 
   msrv:
     needs: changes

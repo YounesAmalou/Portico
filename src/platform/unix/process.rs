@@ -14,24 +14,6 @@ use std::{
 
 use super::super::os::process::{Pin, Proc, children, wait_until_stopped};
 
-/// Whether `child` has exited, leaving it unreaped so its PID, and so its
-/// process group, cannot be reused before the group is killed.
-pub fn has_exited(child: &std::process::Child) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    if unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id(),
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { info.si_pid() } != 0)
-}
-
 pub fn terminate_process_group(child: &mut std::process::Child) {
     kill_process_group(child);
     let _ = child.wait();

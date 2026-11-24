@@ -104,6 +104,15 @@ impl Pin {
     }
 }
 
+/// Whether `child` has exited, leaving it unreaped so its PID, and so its process group,
+/// cannot be reused before the group is killed. An unreaped child that has exited is a zombie,
+/// which libproc no longer describes; `waitid` with `WNOWAIT` is not relied on here.
+pub fn has_exited(child: &std::process::Child) -> io::Result<bool> {
+    let pid = libc::pid_t::try_from(child.id())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid process ID"))?;
+    Ok(bsd_info(pid).is_none_or(|info| info.pbi_status == libc::SZOMB))
+}
+
 /// Fills a buffer of PIDs from a libproc listing call, which returns how many it wrote.
 fn list_pids(list: impl Fn(*mut c_void, libc::c_int) -> libc::c_int) -> io::Result<Vec<u32>> {
     let needed = list(std::ptr::null_mut(), 0);
@@ -337,6 +346,23 @@ mod tests {
         short.extend_from_slice(b"/usr/bin/ssh\0ssh\0");
         assert_eq!(parse_procargs(&short), None);
         assert_eq!(parse_procargs(b"\x01"), None);
+    }
+
+    #[test]
+    fn an_exited_child_is_seen_before_it_is_reaped() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(!has_exited(&child).unwrap());
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !has_exited(&child).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exit was not seen"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Still unreaped: the wait collects it now.
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
