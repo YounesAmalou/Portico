@@ -9,10 +9,7 @@ use std::{
 
 use crate::{
     app::{App, AppError, ContainerError, Ownership},
-    backend::{
-        GroupTool,
-        docker::{ResolveError, resolve},
-    },
+    backend::{GroupTool, ResolveError, resolve},
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
