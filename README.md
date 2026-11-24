@@ -144,6 +144,8 @@ portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
 portico identities              List agents and identity files, and whether each is available
+portico settings [set <key> on|off]
+                                Show or change the preferences
 portico containers [--on [<alias>]] [--backend docker|podman|proxmox]...
                                 List running containers, here or on a host
 portico shell [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [-u <user>] [-n]
@@ -160,7 +162,7 @@ portico tunnel start [<name>...]
 portico tunnel stop [<name>...] [-A|--all]
 ```
 
-`hosts`, `show`, `identities`, `containers`, `tunnels`, `tunnel show`, `tunnel start` and `tunnel stop` also take `--json` (see [Machine-readable output](#machine-readable-output)).
+`hosts`, `show`, `identities`, `containers`, `tunnels`, `settings`, `tunnel show`, `tunnel start` and `tunnel stop` also take `--json` (see [Machine-readable output](#machine-readable-output)).
 
 ### Picking a host
 
@@ -325,6 +327,23 @@ portico containers --on prod-db --json
 
 In JSON mode Portico never opens a picker or asks a question (a missing name is an error), never prompts for a password, writes nothing to stderr, and prints nothing the text output does not show: no key material and no credentials. The documents, their fields, the errors and the versioning rules are in [`docs/json-output.md`](docs/json-output.md).
 
+### Settings
+
+Press `,` in the TUI to open the settings. The overlay lists a checkbox for each tab that can be hidden (Tunnels, Docker, Podman and Proxmox; Hosts is always shown) and the desktop integration. `↑` / `↓` or `j` / `k` move, `Space` or `Enter` toggles a tab or runs an action, and `Esc` or `,` closes it. A hidden tab disappears from the tab bar, and Portico does not run its tool (`docker`, `podman` or `pct`) while it is hidden. The desktop integration shows what `portico desktop status` reports and offers **Install or update** and, once something is installed, **Uninstall**; each runs the same preview and confirmations as `portico desktop install` and `uninstall`. The desktop panel reads the same settings and hides the same tabs.
+
+The settings live in `~/.config/portico/settings.toml` (under `$XDG_CONFIG_HOME` when set). The file is optional: without it, every tab is shown. It is plain TOML, and you can edit it by hand:
+
+```toml
+# Portico's settings. Edit by hand or with portico settings.
+[tabs]
+podman = false
+proxmox = false
+```
+
+`portico settings` prints each setting and whether the file exists, `portico settings set tabs.podman off` changes one (`on`, `off`, `true`, `false`, `yes` and `no` are accepted), and `portico settings --json` prints the same for scripts (see [Machine-readable output](#machine-readable-output)). The keys are `tabs.tunnels`, `tabs.docker`, `tabs.podman` and `tabs.proxmox`. A change keeps the file's comments, order and keys Portico does not know, and a symlinked file is written through, so the link stays. A file that cannot be read as settings is reported with its line and is never overwritten.
+
+The settings only choose what the TUI and the desktop panel show. The CLI is unaffected: `portico containers`, `portico shell` and the other commands work with every backend whatever the file says.
+
 ### Adopt and export hosts
 
 `portico adopt` moves a host from your own SSH configuration into Portico, comments included, so you can edit it there; `ssh <alias>` behaves exactly as before. Only a simple block qualifies: a single concrete alias, declared once, using only `HostName`, `User`, `Port`, `IdentityFile` and `ProxyJump`, in a file you own and can write, where OpenSSH reports the same effective configuration after the move. Every other host is listed with the reason it cannot be adopted.
@@ -397,6 +416,7 @@ The TUI has five tabs, shown at the top with their numbers: **Hosts**, **Tunnels
 | `T` | Show the Tunnels tab |
 | `c` | Show the container tab shown last (Docker at first); on the Hosts tab, for the selected host |
 | `r` / `F5` | Refresh the tab shown |
+| `,` | Open the [settings](#settings) |
 | `q` | Quit (running tunnels keep running) |
 
 These keys work while a tab is browsing its list. In a filter, a form or a picker, digits are typed and `Tab` moves between fields or picks a suggestion; a confirmation, the trust prompt and the adopt and export checklist keep their own keys until you answer them. `Esc` never switches tabs.

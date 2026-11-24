@@ -1,6 +1,6 @@
 # Settings Design
 
-**Status:** Approved; in progress
+**Status:** Approved; implemented
 
 ## Purpose
 

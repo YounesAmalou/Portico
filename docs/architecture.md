@@ -5,7 +5,7 @@ Portico is one crate, `portico-ssh`, whose library is `portico`. Its modules for
 ## Layers
 
 ```
-interfaces   src/tui/, src/cli/            (and src/desktop/, used by the CLI)
+interfaces   src/tui/, src/cli/            (and src/desktop/, used by both)
     |
    app       src/app/                      the operations both interfaces call
     |
@@ -16,7 +16,7 @@ interfaces   src/tui/, src/cli/            (and src/desktop/, used by the CLI)
 
 A layer uses only the layers below it, never the ones above:
 
-- `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files and processes through `platform` and plain `std`, except for a few direct `libc` calls that are Linux-specific code outside `platform`: `bind_v6_only` in `domain/tunnel/runtime.rs`, `clock` (`localtime_r`) in `domain/tunnel/mod.rs`, and `access`, `geteuid` and errno values in `domain/adopt/mod.rs`. A port to another system must revisit them. `domain` never calls `app`, `cli` or `tui`.
+- `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files and processes through `platform` and plain `std`, except for a few direct `libc` calls that are Linux-specific code outside `platform`: `bind_v6_only` in `domain/tunnel/runtime.rs`, `clock` (`localtime_r`) in `domain/tunnel/mod.rs`, and `access`, `geteuid` and errno values in `domain/adopt/mod.rs`. A port to another system must revisit them. One more exception is sideways: `domain::settings` imports `backend::BackendId`, a plain enum, to map a backend to its tab setting, and calls nothing in `backend`. `domain` never calls `app`, `cli` or `tui`.
 - `backend` adapters use `platform` and the domain's host types, never `app` or an interface.
 - `app` is the entry point the interfaces use for anything that reads or changes state.
 - An interface does not call another interface, with two deliberate cases. `portico` with no subcommand starts the TUI: `cli::run` calls `crate::tui::run` (`src/cli/mod.rs`). And `src/picker.rs`, the inline pickers and the fuzzy-ranked rows both interfaces use, sits at the crate root: the CLI and the TUI's hosts, containers, tunnels and migrate screens use it. It is not clean, though: it imports `TextInput` and `display_width` from `crate::tui`, which is a known exception to the rule.
@@ -31,13 +31,14 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 |---|---|
 | `platform::process` | Process control: killing process trees through pidfds, reading `/proc`, stopping a recognised process; `Proc::scan` and `Logged` know how a started tunnel's `ssh` looks (`-E <log>`) |
 | `platform::launcher` | Opening a command in a new terminal window (`xdg-terminal-exec`) |
-| `platform::paths` | The home directory, `~` display, the well-known locations under it, `SYSTEM_SSH_CONFIG` and `runtime_dir` |
+| `platform::paths` | The home directory, `~` display, the well-known locations under it, `SYSTEM_SSH_CONFIG`, `config_dir` and `runtime_dir` |
 | `platform::fs` | Locking, atomic writes, directory sync and file identity (`Stamp`, `stamp`) |
 | `domain::host`, `domain::discovery` | Hosts, and reading the inventory from the OpenSSH configuration |
 | `domain::managed` | The managed host file: store and transactions (`store`), parser (`config`), renderer (`render`), setup of the entry config (`init`) |
 | `domain::openssh` | `ssh -G` resolution (`config`), connection outcomes (`connect`), `known_hosts` and key fetch (`keys`), reading a child's output pipes (`pipes`) |
 | `domain::adopt` | Adoption and export plans: scanning (`scan`) and previews (`diff`) |
 | `domain::tunnel` | Saved port forwards, their store, and the runtime state of started ones (`runtime`, including the `Proc` methods specific to tunnels) |
+| `domain::settings` | The preferences file: reading, defaults, keeping comments on write |
 | `domain::probe` | The connection test: its options and outcomes |
 | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | Identity data, jump-host suggestions, fuzzy matching, failure explanations, configuration errors |
 | `backend` | The `Backend` interface, `BackendId`, `AUTOMATIC` (every backend, in the order they are listed), `Target`, `Via`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
@@ -45,11 +46,11 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `backend::docker` | The Docker adapter: `docker ps` parsing, and its access decision (`Access`, `decide`, private to this file) |
 | `backend::podman` | The Podman adapter: the listing script (the ssh user's own containers), `podman ps --format json` parsing, and `podman exec` |
 | `backend::proxmox` | The Proxmox VE adapter: the listing script (root or `sudo -n`), `pct list` parsing, and `pct exec` |
-| `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities` |
+| `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities`, and the settings (their file's location and reading it) |
 | `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`) and the JSON documents (`json`) |
 | `picker` | The inline pickers the CLI opens when a host or container is missing; also used by the TUI |
 | `tui` | The event loop (`mod`, `events`), the terminal session (`terminal`, `hangup`), shared widgets (`text_input`, `dropdown`), the config watch (`watch`, which keeps only its file identity in `platform::fs`), one module per tab (`hosts`, `tunnels`, `containers`, with the hosts tab's form and its tests in `form`), and the workers that keep the interface responsive (`lister`, `tester`, `planner`, `identities`), `init` and `migrate` |
-| `desktop` | `portico desktop` plans: the Quickshell panel, the launcher entry and the keybinding |
+| `desktop` | `portico desktop` plans: the Quickshell panel, the launcher entry and the keybinding; used by the CLI and the TUI's settings overlay |
 
 ## The backend interface
 
