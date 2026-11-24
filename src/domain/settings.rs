@@ -6,6 +6,7 @@
 
 use std::{
     fs, io,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -13,7 +14,7 @@ use toml_edit::{Document, DocumentMut, Item, Table, Value};
 
 use crate::{
     backend::BackendId,
-    platform::fs::{acquire_lock, open_lock, sync_dir, write_unique},
+    platform::fs::{acquire_lock, open_lock, symlink_target, sync_dir, write_unique},
 };
 
 /// The settings file's name inside the config directory.
@@ -158,7 +159,10 @@ pub fn set(path: &Path, key: Key, value: bool) -> Result<bool, SettingsError> {
         path: path.to_path_buf(),
         source,
     };
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // A symlinked file (a dotfile manager's) is written through: the link stays a link.
+    let target =
+        symlink_target(path).map_err(|(path, source)| SettingsError::Io { path, source })?;
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
     // Fail early without creating anything when the file is already in order.
     let (_, current) = read(path)?;
     if key.get(&current) == value {
@@ -176,14 +180,8 @@ pub fn set(path: &Path, key: Key, value: bool) -> Result<bool, SettingsError> {
     let mut document = if text.is_empty() {
         DocumentMut::new()
     } else {
-        text.parse::<DocumentMut>().map_err(|error| {
-            invalid(
-                path,
-                &text,
-                error.span().map(|span| span.start),
-                error.message(),
-            )
-        })?
+        text.parse::<DocumentMut>()
+            .map_err(|error| invalid(path, &text, error.span(), error.message()))?
     };
     if text.is_empty() {
         document.decor_mut().set_prefix(HEADER);
@@ -191,13 +189,13 @@ pub fn set(path: &Path, key: Key, value: bool) -> Result<bool, SettingsError> {
     let table = document
         .entry("tabs")
         .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
+        .as_table_like_mut()
         .ok_or_else(|| invalid(path, &text, None, "`tabs` must be a table"))?;
     table.insert(key.leaf(), toml_edit::value(value));
 
     let pending =
         write_unique(dir, "settings", document.to_string().as_bytes(), 0o644).map_err(io_error)?;
-    pending.rename_to(path).map_err(io_error)?;
+    pending.rename_to(&target).map_err(io_error)?;
     sync_dir(dir).map_err(io_error)?;
     Ok(true)
 }
@@ -216,24 +214,13 @@ fn read(path: &Path) -> Result<(String, Settings), SettingsError> {
             });
         }
     };
-    let document = Document::parse(text.as_str()).map_err(|error| {
-        invalid(
-            path,
-            &text,
-            error.span().map(|span| span.start),
-            error.message(),
-        )
-    })?;
+    let document = Document::parse(text.as_str())
+        .map_err(|error| invalid(path, &text, error.span(), error.message()))?;
     let mut settings = Settings::default();
     if let Some(tabs) = document.get("tabs") {
-        let table = tabs.as_table().ok_or_else(|| {
-            invalid(
-                path,
-                &text,
-                tabs.span().map(|span| span.start),
-                "`tabs` must be a table",
-            )
-        })?;
+        let table = tabs
+            .as_table_like()
+            .ok_or_else(|| invalid(path, &text, tabs.span(), "`tabs` must be a table"))?;
         for key in Key::ALL {
             let Some(item) = table.get(key.leaf()) else {
                 continue;
@@ -244,7 +231,7 @@ fn read(path: &Path) -> Result<(String, Settings), SettingsError> {
                     return Err(invalid(
                         path,
                         &text,
-                        item.span().map(|span| span.start),
+                        item.span(),
                         &format!("`{}` must be a boolean (true or false)", key.name()),
                     ));
                 }
@@ -254,8 +241,9 @@ fn read(path: &Path) -> Result<(String, Settings), SettingsError> {
     Ok((text, settings))
 }
 
-fn invalid(path: &Path, text: &str, offset: Option<usize>, reason: &str) -> SettingsError {
-    let line = offset.map(|offset| text[..offset.min(text.len())].matches('\n').count() + 1);
+/// An invalid-file error whose line is the one `span` starts on.
+fn invalid(path: &Path, text: &str, span: Option<Range<usize>>, reason: &str) -> SettingsError {
+    let line = span.map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
     SettingsError::Invalid {
         path: path.to_path_buf(),
         line,
@@ -338,6 +326,40 @@ mod tests {
             matches!(error, SettingsError::Invalid { line: Some(1), .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn inline_tabs_table_loads_and_is_edited_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(&dir, "tabs = { podman = false }\n");
+        assert!(!load(&path).unwrap().tabs.podman);
+        assert!(set(&path, Key::TabsDocker, false).unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("tabs = {"), "{text}");
+        assert!(!text.contains("[tabs]"), "{text}");
+        let tabs = load(&path).unwrap().tabs;
+        assert!(!tabs.podman && !tabs.docker && tabs.tunnels);
+    }
+
+    #[test]
+    fn set_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles.toml");
+        fs::write(&real, "[tabs]\ndocker = true\n").unwrap();
+        let link = dir.path().join(FILE_NAME);
+        std::os::unix::fs::symlink("dotfiles.toml", &link).unwrap();
+        assert!(set(&link, Key::TabsDocker, false).unwrap());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "[tabs]\ndocker = false\n"
+        );
+        assert!(!load(&link).unwrap().tabs.docker);
     }
 
     #[test]
