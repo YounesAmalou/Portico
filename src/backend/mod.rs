@@ -90,9 +90,10 @@ pub struct ContainerList {
     pub note: Option<String>,
 }
 
-/// A container backend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A container backend. Docker is the default: the backend of a held shell named without one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum BackendId {
+    #[default]
     Docker,
     Podman,
     Proxmox,
