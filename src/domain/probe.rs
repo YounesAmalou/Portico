@@ -89,7 +89,7 @@ pub enum Failure {
         line: String,
     },
     /// ssh refused the configuration before connecting.
-    ConfigRejected(crate::config_error::ConfigRejection),
+    ConfigRejected(crate::domain::config_error::ConfigRejection),
     Other(String),
 }
 

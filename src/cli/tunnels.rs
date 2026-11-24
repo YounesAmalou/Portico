@@ -8,8 +8,8 @@ use std::{
 use super::{CANCELLED, confirm, host_argument, json::JsonCommand};
 use crate::{
     app::{App, StartOutcome, StopOutcome, TunnelChanges},
+    domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus},
     picker::{Picker, Row},
-    tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus},
 };
 
 #[derive(clap::Subcommand, Debug)]

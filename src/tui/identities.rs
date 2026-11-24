@@ -13,8 +13,8 @@ use std::{
 
 use crate::{
     app::{App, key_files_in},
-    identity::{self, Agent, Availability, HostIdentities, IdentityInventory, PublicKey},
-    suggest::{Candidate, Origin},
+    domain::identity::{self, Agent, Availability, HostIdentities, IdentityInventory, PublicKey},
+    domain::suggest::{Candidate, Origin},
 };
 
 type Built = Result<IdentityInventory, String>;
@@ -286,7 +286,9 @@ pub(super) fn missing_last(ranked: Vec<Candidate>) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{Identity, InventoryAgent, InventoryFile, MissingReason, Provider};
+    use crate::domain::identity::{
+        Identity, InventoryAgent, InventoryFile, MissingReason, Provider,
+    };
 
     fn key(fingerprint: &str, comment: &str) -> PublicKey {
         PublicKey {
@@ -405,7 +407,7 @@ mod tests {
             .map(|candidate| {
                 (
                     candidate.alias.as_str(),
-                    crate::suggest::origin_label(&candidate.origin, None),
+                    crate::domain::suggest::origin_label(&candidate.origin, None),
                 )
             })
             .collect();
@@ -437,7 +439,7 @@ mod tests {
             .map(|candidate| {
                 (
                     candidate.alias,
-                    crate::suggest::origin_label(&candidate.origin, None),
+                    crate::domain::suggest::origin_label(&candidate.origin, None),
                 )
             })
             .collect();

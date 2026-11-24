@@ -27,12 +27,12 @@ use super::{
 };
 use crate::{
     app::{App, AppError, Ownership, StartOutcome, TunnelChanges, TunnelRefusal},
-    fuzzy,
-    picker::HIT,
-    suggest::{self, Candidate},
-    tunnel::{
+    domain::fuzzy,
+    domain::suggest::{self, Candidate},
+    domain::tunnel::{
         Forward, Kind, Tunnel, TunnelError, TunnelField, TunnelReport, TunnelStatus, collisions,
     },
+    picker::HIT,
 };
 
 /// How often the statuses are re-read while the screen is shown.
@@ -1049,7 +1049,7 @@ impl Drop for Starter {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::tunnel::TunnelWarning;
+    use crate::domain::tunnel::TunnelWarning;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

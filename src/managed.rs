@@ -12,9 +12,9 @@ use thiserror::Error;
 #[cfg(test)]
 use std::sync::Arc;
 
-use crate::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
-use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
-use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
+use crate::domain::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
+use crate::domain::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
+use crate::domain::host::{Host, HostChanges, HostError, HostField, parse_port};
 use crate::platform::fs::{
     PendingFile, acquire_lock, create_private_dir, normalize_path, open_lock, read_lossy,
     reject_symlink, symlink_target, sync_dir, write_unique,
@@ -1534,7 +1534,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::host::Change;
+    use crate::domain::host::Change;
     use crate::platform::fs::{
         fail_directory_sync_after, fail_next_directory_sync, fail_next_transaction_rollback_write,
     };
@@ -2658,7 +2658,7 @@ mod tests {
             transact(&|config| config.apply(
                 "host2",
                 HostChanges {
-                    hostname: crate::host::Change::Set("b.example".into()),
+                    hostname: crate::domain::host::Change::Set("b.example".into()),
                     ..HostChanges::default()
                 }
             )),

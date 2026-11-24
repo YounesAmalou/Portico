@@ -16,7 +16,7 @@ use crate::{
         docker::{Container, display_name, group},
         remote_command,
     },
-    fuzzy,
+    domain::fuzzy,
     openssh::ConnectionOutcome,
     picker::{HIT, Outcome, Row, Single, State},
 };
@@ -763,7 +763,7 @@ mod tests {
             BackendId, BackendIssue, Problem,
             docker::{Listing, join_group_offer, start_daemon_offer},
         },
-        explain::{Explanation, Label},
+        domain::explain::{Explanation, Label},
     };
 
     use super::*;

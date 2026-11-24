@@ -18,12 +18,9 @@ use thiserror::Error;
 
 use super::{App, AppError};
 use crate::{
-    explain::{Explanation, Operation},
-    openssh::OpenSshError,
-    platform::fs::{acquire_lock, open_lock},
-    platform::process::{Logged, current_uid, kill_process_tree, stop_process},
-    probe::{Failure, diagnose},
-    tunnel::{
+    domain::explain::{Explanation, Operation},
+    domain::probe::{Failure, diagnose},
+    domain::tunnel::{
         Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
         check_args, collide, collisions, listeners_in_effective_config,
         runtime::{
@@ -31,6 +28,9 @@ use crate::{
         },
         start_args,
     },
+    openssh::OpenSshError,
+    platform::fs::{acquire_lock, open_lock},
+    platform::process::{Logged, current_uid, kill_process_tree, stop_process},
 };
 
 /// Why a tunnel operation was refused before anything changed.
@@ -727,10 +727,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        domain::tunnel::runtime::RuntimeDir,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         platform::process::Proc,
-        tunnel::runtime::RuntimeDir,
     };
 
     /// An app whose runtime directory and `/proc` (with this boot's ID) are temporary.
@@ -752,7 +752,7 @@ mod tests {
     fn cancelling_a_start_kills_ssh_and_its_proxy_child() {
         use std::{sync::Arc, time::Instant};
 
-        use crate::{host::Host, test_executable::write_executable, tunnel::Kind};
+        use crate::{domain::host::Host, domain::tunnel::Kind, test_executable::write_executable};
 
         let dir = tempfile::tempdir().unwrap();
         let child_pid = dir.path().join("child-pid");

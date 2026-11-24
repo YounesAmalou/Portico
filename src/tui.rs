@@ -45,21 +45,21 @@ mod tunnels;
 mod watch;
 
 use crate::{
-    adopt,
     app::{
         App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
     },
     backend::Target,
-    config_error::ConfigRejection,
-    discovery::{DiscoveryWarning, Input},
-    explain::Explanation,
-    fuzzy,
-    host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
-    identity::IdentityInventory,
+    domain::adopt,
+    domain::config_error::ConfigRejection,
+    domain::discovery::{DiscoveryWarning, Input},
+    domain::explain::Explanation,
+    domain::fuzzy,
+    domain::host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
+    domain::identity::IdentityInventory,
+    domain::suggest::{self, Candidate},
     managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     picker::HIT,
-    suggest::{self, Candidate},
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
 use dropdown::{SUGGESTION_ROWS, Suggestions, suggestion_lines};
@@ -670,7 +670,8 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
         AppError::Init(_) => true,
         AppError::Adopt(error) => matches!(
             error,
-            crate::adopt::AdoptError::Io { .. } | crate::adopt::AdoptError::Rollback { .. }
+            crate::domain::adopt::AdoptError::Io { .. }
+                | crate::domain::adopt::AdoptError::Rollback { .. }
         ),
         AppError::Discovery(_)
         | AppError::OpenSsh(_)
@@ -3350,11 +3351,11 @@ mod tests {
     use crate::{
         app::TestReport,
         app::{HostDetails, HostSummary, Ownership},
-        discovery::DiscoveryWarning,
-        host::{Change, Host},
+        domain::discovery::DiscoveryWarning,
+        domain::host::{Change, Host},
+        domain::probe::ProbeResult,
         managed::InitPlan,
         openssh::ResolvedConfig,
-        probe::ProbeResult,
     };
 
     use super::*;
@@ -4988,7 +4989,7 @@ mod tests {
     fn authenticated(alias: &str) -> TestOutcome {
         TestOutcome::Done(report(
             alias,
-            ProbeResult::Authenticated(crate::probe::Authenticated {
+            ProbeResult::Authenticated(crate::domain::probe::Authenticated {
                 host: "10.0.0.5".into(),
                 address: "10.0.0.5".into(),
                 port: 22,
@@ -5129,7 +5130,7 @@ mod tests {
         let unknown_key = TestOutcome::UnknownHostKey {
             report: report(
                 "prod",
-                ProbeResult::Failed(crate::probe::Failure::HostKeyUnknown),
+                ProbeResult::Failed(crate::domain::probe::Failure::HostKeyUnknown),
             ),
             key: crate::openssh::PresentedKey {
                 lines: Vec::new(),
@@ -5258,7 +5259,7 @@ mod tests {
         TestOutcome::UnknownHostKey {
             report: report(
                 alias,
-                ProbeResult::Failed(crate::probe::Failure::HostKeyUnknown),
+                ProbeResult::Failed(crate::domain::probe::Failure::HostKeyUnknown),
             ),
             key: crate::openssh::PresentedKey {
                 lines: b"h ssh-ed25519 AAAA\n".to_vec(),
@@ -5360,16 +5361,18 @@ mod tests {
         let home = std::path::PathBuf::from("/home/me");
         let mut changed = report(
             "dev",
-            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged { known_hosts: None }),
+            ProbeResult::Failed(crate::domain::probe::Failure::HostKeyChanged {
+                known_hosts: None,
+            }),
         );
-        changed.explanation = Some(crate::explain::explain(
-            &crate::probe::Diagnosis {
-                failure: crate::probe::Failure::HostKeyChanged { known_hosts: None },
+        changed.explanation = Some(crate::domain::explain::explain(
+            &crate::domain::probe::Diagnosis {
+                failure: crate::domain::probe::Failure::HostKeyChanged { known_hosts: None },
                 raw: Vec::new(),
             },
-            &crate::explain::Context {
+            &crate::domain::explain::Context {
                 alias: "dev",
-                operation: crate::explain::Operation::Test,
+                operation: crate::domain::explain::Operation::Test,
                 user: None,
                 hostname: Some("dev.example"),
                 port: None,
@@ -5560,10 +5563,14 @@ mod tests {
         assert_eq!(state.form.values[0].as_str(), "xy");
     }
 
-    fn explanation(headline: &str, raw: &[&str], always_raw: bool) -> crate::explain::Explanation {
-        crate::explain::Explanation {
+    fn explanation(
+        headline: &str,
+        raw: &[&str],
+        always_raw: bool,
+    ) -> crate::domain::explain::Explanation {
+        crate::domain::explain::Explanation {
             headline: headline.into(),
-            facts: vec![(crate::explain::Label::User, vec!["u".into()])],
+            facts: vec![(crate::domain::explain::Label::User, vec!["u".into()])],
             next: vec!["try this".into()],
             raw: raw.iter().map(|line| (*line).into()).collect(),
             always_raw,
@@ -5573,7 +5580,9 @@ mod tests {
     fn explained(alias: &str, headline: &str, raw: &[&str], always_raw: bool) -> TestOutcome {
         let mut failed = report(
             alias,
-            ProbeResult::Failed(crate::probe::Failure::HostKeyChanged { known_hosts: None }),
+            ProbeResult::Failed(crate::domain::probe::Failure::HostKeyChanged {
+                known_hosts: None,
+            }),
         );
         failed.explanation = Some(explanation(headline, raw, always_raw));
         TestOutcome::Done(failed)
@@ -5581,7 +5590,7 @@ mod tests {
 
     fn exited_255(
         alias: &str,
-        explanation: Option<crate::explain::Explanation>,
+        explanation: Option<crate::domain::explain::Explanation>,
     ) -> ConnectionOutcome {
         use std::os::unix::process::ExitStatusExt;
         ConnectionOutcome::Exited {
@@ -5905,7 +5914,7 @@ mod tests {
     }
 
     fn identity_inventory() -> IdentityInventory {
-        use crate::identity::{Availability, InventoryFile, MissingReason};
+        use crate::domain::identity::{Availability, InventoryFile, MissingReason};
         let file = |path: &str, availability| InventoryFile {
             configured: path.into(),
             path: None,
@@ -6033,14 +6042,14 @@ mod tests {
         let mut details = details("web", Ownership::Managed);
         let plain = detail_text(&details, Path::new("/home/test"));
         assert!(plain.contains("IdentityFile ~/.ssh/id_ed25519"), "{plain}");
-        details.identities = Some(crate::identity::HostIdentities {
-            agent: crate::identity::Agent::Disabled,
+        details.identities = Some(crate::domain::identity::HostIdentities {
+            agent: crate::domain::identity::Agent::Disabled,
             defaults: false,
-            identities: vec![crate::identity::Identity {
+            identities: vec![crate::domain::identity::Identity {
                 configured: "~/.ssh/id_ed25519".into(),
                 path: None,
                 public_key: None,
-                availability: crate::identity::Availability::KeyFile {
+                availability: crate::domain::identity::Availability::KeyFile {
                     public_key_found: false,
                 },
             }],
@@ -6445,7 +6454,7 @@ mod tests {
     }
 
     fn tunnels_state() -> UiState {
-        use crate::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
+        use crate::domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
         let mut state = test_state(vec![
             summary("dev", Ownership::Managed),
             summary("web", Ownership::External),

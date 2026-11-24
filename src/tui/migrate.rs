@@ -14,8 +14,8 @@ use ratatui::{
 
 use super::{TextInput, display_width, keep_start};
 use crate::{
-    adopt::{Candidate, Direction, MigrationPlan},
-    fuzzy::{highlight, match_fields},
+    domain::adopt::{Candidate, Direction, MigrationPlan},
+    domain::fuzzy::{highlight, match_fields},
     picker::HIT,
 };
 
@@ -344,7 +344,7 @@ mod tests {
         widgets::{Block, Borders, Paragraph},
     };
 
-    use crate::adopt::{Candidate, Direction, MigrationPlan};
+    use crate::domain::adopt::{Candidate, Direction, MigrationPlan};
 
     use super::*;
 

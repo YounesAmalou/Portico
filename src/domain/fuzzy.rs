@@ -3,7 +3,7 @@
 
 use ratatui::{style::Style, text::Span};
 
-use crate::suggest::fold;
+use crate::domain::suggest::fold;
 
 const MATCH: i64 = 16;
 const BOUNDARY: i64 = 8;

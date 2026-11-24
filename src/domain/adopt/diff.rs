@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::suggest::{Origin, origin_label};
+use crate::domain::suggest::{Origin, origin_label};
 
 /// Beyond this many cells the LCS table is not built and the whole middle is reported as changed.
 const MAX_LCS_CELLS: usize = 4_000_000;

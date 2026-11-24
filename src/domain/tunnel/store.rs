@@ -115,7 +115,7 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, sync::Arc, thread};
 
     use super::*;
-    use crate::tunnel::{Forward, Kind, Tunnel};
+    use crate::domain::tunnel::{Forward, Kind, Tunnel};
 
     fn tunnel(name: &str) -> Tunnel {
         Tunnel::new(name, "prod", Forward::parse(Kind::Dynamic, "1080").unwrap()).unwrap()

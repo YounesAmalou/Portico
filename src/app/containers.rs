@@ -17,7 +17,7 @@ use crate::{
         self, BackendId, BackendIssue, ContainerList, GroupTool, ListFailure, Offer, Problem,
         RunFailure, Target, remote_command,
     },
-    explain::Explanation,
+    domain::explain::Explanation,
     openssh::{ConnectionOutcome, OpenSshError},
 };
 
@@ -341,7 +341,7 @@ mod tests {
             SHELL_SCRIPT, exec_words, in_group, join_group_offer, join_group_words, ps_words,
             start_daemon_offer, start_daemon_words,
         },
-        host::Host,
+        domain::host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         test_executable::write_executable,

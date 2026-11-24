@@ -3,8 +3,10 @@
 use std::path::Path;
 
 use crate::{
-    config_error::ConfigRejection,
-    probe::{CONNECT_TIMEOUT_SECS, Diagnosis, Failure, KeySource, OfferedKey, TEST_DEADLINE},
+    domain::config_error::ConfigRejection,
+    domain::probe::{
+        CONNECT_TIMEOUT_SECS, Diagnosis, Failure, KeySource, OfferedKey, TEST_DEADLINE,
+    },
 };
 
 /// The widest a fact or next step runs before it wraps, not counting its label.
@@ -493,8 +495,8 @@ impl Explanation {
 mod tests {
     use super::*;
     use crate::{
-        config_error::ConfigRejection,
-        probe::{Route, diagnose},
+        domain::config_error::ConfigRejection,
+        domain::probe::{Route, diagnose},
     };
     use std::path::PathBuf;
 
@@ -1055,7 +1057,7 @@ mod tests {
             .next
         };
         assert_eq!(
-            next(Some(crate::host::HostField::IdentityFile)),
+            next(Some(crate::domain::host::HostField::IdentityFile)),
             ["correct the identity file field and try again"]
         );
         assert_eq!(next(None), ["correct the IdentityFile field and try again"]);

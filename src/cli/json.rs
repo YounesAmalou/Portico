@@ -16,12 +16,12 @@ use crate::{
         BackendIssue, ContainerList, GroupTool, Target,
         docker::{display_name, group},
     },
-    discovery::DiscoveryWarning,
-    explain::Explanation,
-    identity::{
+    domain::discovery::DiscoveryWarning,
+    domain::explain::Explanation,
+    domain::identity::{
         Agent, Availability, HostIdentities, Identity, IdentityInventory, Provider, PublicKey,
     },
-    tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
+    domain::tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
 };
 
 /// The contract's version: raised only by a breaking change.
@@ -596,8 +596,8 @@ mod tests {
     use crate::{
         app::{HostSummary, Ownership},
         backend::docker::{Container, Listing},
-        identity::MissingReason,
-        tunnel::{Kind, Tunnel},
+        domain::identity::MissingReason,
+        domain::tunnel::{Kind, Tunnel},
     };
 
     fn text(document: Value) -> String {
@@ -721,7 +721,7 @@ mod tests {
         let unavailable = Agent::Unavailable {
             socket,
             provider: Provider::Generic,
-            reason: crate::identity::AgentProblem::NoSuchSocket,
+            reason: crate::domain::identity::AgentProblem::NoSuchSocket,
         };
         assert_eq!(
             Value::Object(agent(&unavailable, false)),
@@ -823,7 +823,7 @@ mod tests {
             &Agent::Unavailable {
                 socket: PathBuf::from("/run/agent.sock"),
                 provider: Provider::Generic,
-                reason: crate::identity::AgentProblem::Refused(
+                reason: crate::domain::identity::AgentProblem::Refused(
                     "error fetching identities:\n\u{1b}[1mcommunication\u{1b}[0m".into(),
                 ),
             },
