@@ -10,6 +10,7 @@ use std::{
 use crate::{
     app::{App, AppError, Ownership},
     backend::{AUTOMATIC, BackendId, Via},
+    desktop::DesktopEnv,
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
@@ -354,11 +355,13 @@ impl Interrupts {
 
 /// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets
 /// `portico test` catch SIGINT, SIGTERM and SIGHUP to stop its `ssh`; only the real program sets
-/// it, so tests never install process-wide handlers.
+/// it, so tests never install process-wide handlers. `desktop` is the environment whose desktop
+/// integration the TUI's settings overlay shows and manages.
 #[allow(clippy::too_many_arguments)]
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,
+    desktop: &DesktopEnv,
     picker: &mut dyn Picker,
     input: &mut I,
     output: &mut O,
@@ -377,6 +380,7 @@ where
     match execute(
         cli,
         app,
+        desktop,
         picker,
         input,
         output,
@@ -429,6 +433,7 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
 fn execute<I: BufRead, O: Write, E: Write>(
     cli: Cli,
     app: &App,
+    desktop: &DesktopEnv,
     picker: &mut dyn Picker,
     input: &mut I,
     output: &mut O,
@@ -437,7 +442,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
     handle_signals: bool,
 ) -> Result<ExitCode, String> {
     match cli.command {
-        None => crate::tui::run(app)
+        None => crate::tui::run(app, desktop)
             .map(|()| ExitCode::SUCCESS)
             .map_err(|error| error.to_string()),
         Some(Command::Init { yes }) => {
@@ -804,6 +809,11 @@ mod tests {
         picker::Row,
     };
 
+    /// A desktop environment the commands under test never touch.
+    fn test_desktop() -> DesktopEnv {
+        DesktopEnv::new("/nonexistent".into(), |_| None, None)
+    }
+
     #[test]
     fn parses_short_host_flags_and_new_terminal() {
         let cli = Cli::try_parse_from([
@@ -857,6 +867,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "init"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b"y\n"),
             &mut output,
@@ -871,6 +882,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b"n\n"),
             &mut output,
@@ -884,6 +896,7 @@ mod tests {
         let _ = run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b"y\n"),
             &mut output,
@@ -910,6 +923,7 @@ mod tests {
             let exit = run(
                 Cli::try_parse_from(["portico", "remove", alias]).unwrap(),
                 &app,
+                &test_desktop(),
                 &mut Scripted::default(),
                 &mut Cursor::new(b"y\n"),
                 &mut output,
@@ -953,6 +967,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "test", "dev"]).unwrap(),
             app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(answer),
             &mut output,
@@ -1059,6 +1074,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "containers"]).unwrap(),
             app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(answer),
             &mut output,
@@ -1180,6 +1196,7 @@ fi
         let exit = run(
             Cli::try_parse_from(["portico", "shell"]).unwrap(),
             app,
+            &test_desktop(),
             picker,
             &mut Cursor::new(b""),
             &mut output,
@@ -1322,6 +1339,7 @@ fi
         let exit = run(
             Cli::try_parse_from(["portico", "shell"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b""),
             &mut Vec::new(),
@@ -1613,6 +1631,7 @@ fi
         let exit = run(
             Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied())).unwrap(),
             app,
+            &test_desktop(),
             picker,
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
@@ -1883,6 +1902,7 @@ fi
             let exit = run(
                 cli,
                 &app,
+                &test_desktop(),
                 &mut Forbidden,
                 // A confirmation would read this.
                 &mut Cursor::new(b"y\n"),

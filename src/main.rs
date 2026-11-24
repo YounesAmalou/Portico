@@ -67,6 +67,7 @@ fn main() -> ExitCode {
     run(
         cli,
         &app,
+        &desktop,
         &mut TerminalPicker,
         &mut stdin.lock(),
         &mut io::stdout().lock(),

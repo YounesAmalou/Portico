@@ -324,6 +324,22 @@ def check_terminal(scenario):
             os.write(master, b"/2")
             read_screen("Hosts /2")
             os.write(master, b"\r")
+        elif scenario == "settings":
+            read_screen("4 Podman")
+            os.write(master, b",")
+            read_screen("Install or update")
+            # Down twice reaches Podman; Space turns it off, written at once.
+            os.write(master, b"\x1b[B\x1b[B ")
+            read_screen("[ ] Podman")
+            os.write(master, b"\x1b[27u")
+            deadline = time.monotonic() + 5
+            while "Install or update" in screen.text():
+                pump(deadline)
+            tab_bar = screen.text().splitlines()[0]
+            assert "Podman" not in tab_bar, tab_bar
+            assert "4 Proxmox" in tab_bar, tab_bar
+            settings = Path(home, ".config/portico/settings.toml").read_text()
+            assert "podman = false" in settings, settings
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")

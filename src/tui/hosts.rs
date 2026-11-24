@@ -224,6 +224,8 @@ impl UiState {
             Mode::ConfirmRemove => self.handle_remove_key(key),
             Mode::ConfirmTrust => self.handle_trust_key(key),
             Mode::Migrate => self.handle_migrate_key(key),
+            // The overlay takes its keys before the tab sees them.
+            Mode::Settings => UiAction::None,
         };
         // Unfolded output belongs to one selection, or to one open form.
         if (selected, in_form) != (self.selected, self.in_form()) {
@@ -233,6 +235,9 @@ impl UiState {
     }
 
     pub(super) fn handle_paste(&mut self, text: &str) -> UiAction {
+        if self.mode == Mode::Settings {
+            return UiAction::None;
+        }
         match self.tab {
             Tab::Hosts => {}
             Tab::Tunnels => {
@@ -261,7 +266,7 @@ impl UiState {
                     migrate.paste(text);
                 }
             }
-            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust => {}
+            Mode::Browse | Mode::ConfirmRemove | Mode::ConfirmTrust | Mode::Settings => {}
         }
         UiAction::None
     }
@@ -720,7 +725,7 @@ pub(super) fn render_hosts(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 )
             },
         ),
-        Mode::Browse | Mode::Filter => {
+        Mode::Browse | Mode::Filter | Mode::Settings => {
             let text = details_text(state);
             (
                 Line::from("Details"),

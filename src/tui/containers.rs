@@ -582,7 +582,7 @@ impl Panel {
             };
             let user = if self.root_only() { "" } else { "  u user" };
             format!(
-                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
             )
         }
     }
@@ -1231,7 +1231,7 @@ mod tests {
         );
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
+            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
@@ -1858,7 +1858,7 @@ mod tests {
         assert_eq!(panel.title().to_string(), "Docker /db");
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
+            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
 
         press(&mut panel, KeyCode::Char('/'));
