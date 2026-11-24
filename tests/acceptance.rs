@@ -2,7 +2,7 @@ mod support;
 
 use std::os::unix::fs::PermissionsExt;
 
-use portico::managed::ManagedConfig;
+use portico::domain::managed::ManagedConfig;
 use support::TestEnv;
 
 #[test]
@@ -132,7 +132,8 @@ fn symlinked_entry_discovery_agrees_with_openssh() {
     )
     .unwrap();
     std::os::unix::fs::symlink(&target, env.ssh_config()).unwrap();
-    let inventory = portico::discovery::discover(&env.ssh_config(), &env.managed_config()).unwrap();
+    let inventory =
+        portico::domain::discovery::discover(&env.ssh_config(), &env.managed_config()).unwrap();
     assert!(inventory.aliases_complete, "{:?}", inventory.warnings);
     assert_eq!(
         inventory
@@ -197,7 +198,7 @@ fn literal_hash_alias_discovery_agrees_with_openssh() {
         );
 
         let discovery =
-            portico::discovery::discover(&env.ssh_config(), &env.managed_config()).unwrap();
+            portico::domain::discovery::discover(&env.ssh_config(), &env.managed_config()).unwrap();
 
         assert!(
             discovery.hosts.iter().any(|host| host.alias == "prod"),

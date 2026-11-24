@@ -7,31 +7,19 @@
 //! half-written.
 
 use std::{
-    fs,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use crate::discovery::{self, Input};
+use crate::{
+    domain::discovery::{self, Input},
+    platform::fs::Stamp,
+};
 
 /// How often the files are looked at while nothing has changed.
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 /// How long a change must stay as it is before it is reported.
 const SETTLE: Duration = Duration::from_millis(300);
-
-/// What tells one version of a path from another. An absent or unreadable path has none.
-///
-/// The inode catches a file renamed into place within one timestamp tick, and the status-change
-/// time a copy that kept the old modification time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Stamp {
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
 
 /// Where stamps come from: the filesystem in the TUI, a map in tests.
 pub(super) trait Metadata {
@@ -45,14 +33,7 @@ pub(super) struct Filesystem;
 
 impl Metadata for Filesystem {
     fn stamp(&self, path: &Path) -> Option<Stamp> {
-        let metadata = fs::metadata(path).ok()?;
-        Some(Stamp {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.size(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        })
+        crate::platform::fs::stamp(path)
     }
 
     fn matches(&self, glob: &str) -> Vec<PathBuf> {
@@ -146,7 +127,7 @@ impl<M: Metadata> ConfigWatch<M> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, os::unix::fs::PermissionsExt};
+    use std::{cell::RefCell, collections::HashMap, fs, os::unix::fs::PermissionsExt};
 
     use super::*;
 

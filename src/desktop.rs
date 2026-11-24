@@ -86,7 +86,7 @@ impl DesktopEnv {
 
     /// A path with the home directory as `~`.
     pub fn show(&self, path: &Path) -> String {
-        crate::home::tilde(path, &self.home)
+        crate::platform::paths::tilde(path, &self.home)
     }
 
     /// `program` on `PATH`.

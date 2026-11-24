@@ -19,11 +19,11 @@ use std::{
 
 use super::{App, AppError};
 use crate::{
-    identity::{
+    domain::identity::{
         self, Agent, AgentProblem, Expansion, FileFacts, HostIdentities, Identity,
         IdentityInventory, InventoryAgent, InventoryFile, PublicKey, Socket,
     },
-    openssh::{OpenSsh, OpenSshError, ResolvedConfig},
+    domain::openssh::{OpenSsh, OpenSshError, ResolvedConfig},
 };
 
 /// How long `ssh-add` or `ssh-keygen` may run before it is killed.
@@ -401,7 +401,10 @@ impl App {
                     None => files.push((
                         key,
                         InventoryFile {
-                            configured: crate::home::tilde_text(&identity.configured, &home),
+                            configured: crate::platform::paths::tilde_text(
+                                &identity.configured,
+                                &home,
+                            ),
                             path: identity.path,
                             public_key: identity.public_key,
                             availability: identity.availability,
@@ -429,7 +432,7 @@ impl App {
             files.push((
                 Some(path.clone()),
                 InventoryFile {
-                    configured: crate::home::tilde(&path, &home),
+                    configured: crate::platform::paths::tilde(&path, &home),
                     path: Some(path.clone()),
                     public_key: facts.public_key,
                     availability: identity::Availability::Missing(
@@ -507,8 +510,8 @@ fn public_keys_in(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::{
-        identity::{Availability, MissingReason},
-        managed::{ConfigPaths, ManagedStore},
+        domain::identity::{Availability, MissingReason},
+        domain::managed::{ConfigPaths, ManagedStore},
         test_executable::write_executable,
     };
     use std::os::unix::net::UnixListener;

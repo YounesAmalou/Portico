@@ -27,7 +27,7 @@ use ratatui::{
 };
 
 use crate::{
-    fuzzy::{Match, highlight, match_fields, rank},
+    domain::fuzzy::{Match, highlight, match_fields, rank},
     tui::{TextInput, display_width},
 };
 

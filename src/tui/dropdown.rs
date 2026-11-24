@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use super::{display_width, keep_end, keep_start};
-use crate::suggest::{self, Candidate};
+use crate::domain::suggest::{self, Candidate};
 
 /// How many suggestions the dropdown shows at once.
 pub(super) const SUGGESTION_ROWS: usize = 5;

@@ -1,6 +1,5 @@
 use std::{
     io::{self, IsTerminal},
-    path::PathBuf,
     process::ExitCode,
 };
 
@@ -9,16 +8,17 @@ use portico::{
     app::App,
     cli::{Cli, fail, run, run_desktop},
     desktop::{DesktopEnv, is_development_binary, panel, reload_omarchy_panel},
-    managed::{ConfigPaths, ManagedStore},
-    openssh::OpenSsh,
+    domain::managed::{ConfigPaths, ManagedStore},
+    domain::openssh::OpenSsh,
+    domain::tunnel::runtime::RuntimeDir,
     picker::TerminalPicker,
-    tunnel::runtime::RuntimeDir,
+    platform,
 };
 
 fn main() -> ExitCode {
     // Parsed first, so a `--json` command reports even this as a document.
     let cli = Cli::parse();
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = platform::paths::home_dir() else {
         return fail(
             &cli,
             "HOME is not set",
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
     let stdin = io::stdin();
     let interactive = stdin.is_terminal();
     let desktop = DesktopEnv::new(
-        PathBuf::from(&home),
+        home.clone(),
         |name| std::env::var_os(name),
         cli.is_desktop()
             .then(|| std::env::current_exe().ok())
@@ -53,10 +53,7 @@ fn main() -> ExitCode {
     }) {
         let _ = reload_omarchy_panel(&desktop);
     }
-    let runtime = RuntimeDir::locate(
-        home.as_ref(),
-        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-    );
+    let runtime = RuntimeDir::locate(&home, std::env::var_os("XDG_RUNTIME_DIR").as_deref());
     let app = App::new(
         ManagedStore::new(ConfigPaths::from_home(home)),
         OpenSsh::system(),

@@ -3,7 +3,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    fmt, io,
+    io,
     path::PathBuf,
     process::{Command, ExitStatus, Output, Stdio},
     sync::atomic::AtomicBool,
@@ -13,77 +13,13 @@ use thiserror::Error;
 
 use super::{App, AppError};
 use crate::{
-    container::{
-        Access, DockerProblem, GroupTool, Listing, PROBE_SCRIPT, Probe, classify, decide,
-        exec_words, in_group, join_group_words, parse_listing, parse_probe, ps_words,
-        remote_command, start_daemon_words,
+    backend::{
+        self, BackendId, BackendIssue, ContainerList, GroupTool, ListFailure, Offer, Problem,
+        RunFailure, Target, remote_command,
     },
-    explain::Explanation,
-    openssh::{ConnectionOutcome, OpenSshError},
+    domain::explain::Explanation,
+    domain::openssh::{ConnectionOutcome, OpenSshError},
 };
-
-/// Where docker runs: on this machine, or through ssh on a host of the inventory.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub enum Target {
-    Local,
-    Host(String),
-}
-
-impl Target {
-    /// `this machine`, or the host's alias.
-    pub fn describe(&self) -> String {
-        match self {
-            Target::Local => "this machine".into(),
-            Target::Host(alias) => alias.clone(),
-        }
-    }
-}
-
-impl fmt::Display for Target {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.describe())
-    }
-}
-
-/// The running containers of a target.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContainerList {
-    pub target: Target,
-    pub listing: Listing,
-    /// The tool docker had to run through to reach the socket, if any.
-    pub via: Option<GroupTool>,
-    /// Said once when `via` is set: other shells still lack the group.
-    pub note: Option<String>,
-}
-
-/// A privileged fix Portico can run in the user's terminal.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Offer {
-    JoinGroup { user: String, socket: String },
-    StartDaemon,
-}
-
-impl Offer {
-    /// The command the fix runs.
-    pub fn words(&self) -> Vec<String> {
-        match self {
-            Offer::JoinGroup { user, socket } => join_group_words(user, socket),
-            Offer::StartDaemon => start_daemon_words(),
-        }
-    }
-}
-
-/// A docker failure, explained.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DockerIssue {
-    pub target: Target,
-    pub problem: DockerProblem,
-    pub headline: String,
-    pub next: Vec<String>,
-    pub offer: Option<Offer>,
-    /// What docker wrote to stderr.
-    pub stderr: String,
-}
 
 /// Why a container command did not run.
 #[derive(Debug, Error)]
@@ -99,7 +35,7 @@ pub enum ContainerError {
     },
     /// Boxed: an issue is much larger than the other variants.
     #[error("{}", .0.headline)]
-    Docker(Box<DockerIssue>),
+    Backend(Box<BackendIssue>),
     #[error("no container matches {reference} on {target}")]
     NoMatch { target: Target, reference: String },
     #[error("{reference} matches several containers on {target}: {}", .candidates.join(", "))]
@@ -110,9 +46,9 @@ pub enum ContainerError {
     },
 }
 
-impl From<DockerIssue> for ContainerError {
-    fn from(issue: DockerIssue) -> Self {
-        ContainerError::Docker(Box::new(issue))
+impl From<BackendIssue> for ContainerError {
+    fn from(issue: BackendIssue) -> Self {
+        ContainerError::Backend(Box::new(issue))
     }
 }
 
@@ -155,51 +91,19 @@ impl App {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ContainerList, ContainerError> {
         let target = self.container_target(target)?;
-        let words = ps_words();
-        let output = self.capture(&target, &words, batch, cancelled)?;
-        if output.status.success() {
-            return Ok(listed(target, &output.stdout, None));
-        }
-        let stderr = lossy(&output.stderr);
-        let problem = classify(output.status.code(), &stderr);
-        if !matches!(
-            problem,
-            DockerProblem::PermissionDenied | DockerProblem::DaemonDown
-        ) {
-            return Err(ContainerError::from(plain_issue(&target, problem, stderr)));
-        }
-        let Some(probe) = self.probe(&target, batch, cancelled)? else {
-            return Err(ContainerError::from(plain_issue(&target, problem, stderr)));
-        };
-        if problem == DockerProblem::DaemonDown {
-            return Err(ContainerError::from(daemon_down(
-                &target,
-                probe.has_systemctl,
-                stderr,
-            )));
-        }
-        let issue = match decide(&probe) {
-            Access::RerunInGroup(tool) => {
-                let output = self.capture(&target, &in_group(tool, &words), batch, cancelled)?;
-                if output.status.success() {
-                    return Ok(listed(target, &output.stdout, Some(tool)));
-                }
-                let stderr = lossy(&output.stderr);
-                plain_issue(&target, classify(output.status.code(), &stderr), stderr)
-            }
-            Access::NeedsLogin => DockerIssue {
-                headline: format!(
-                    "{} is in the docker group on {target}, but this session started before that and sg is not available.",
-                    probe.user
-                ),
-                next: vec!["Log out and back in, then list again.".into()],
-                ..issue(&target, problem, stderr)
-            },
-            // An empty socket is not a local path, so its group cannot be fixed.
-            Access::OfferJoin if !probe.socket.is_empty() => join_offer(&target, &probe, stderr),
-            Access::OfferJoin | Access::NoOffer => no_offer(&target, &probe, stderr),
-        };
-        Err(ContainerError::from(issue))
+        backend::list(BackendId::Docker, &target, &mut |words| {
+            self.capture(&target, words, batch, cancelled)
+                .map_err(|error| match error {
+                    ContainerError::App(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                        RunFailure::Cancelled(error)
+                    }
+                    error => RunFailure::Failed(error),
+                })
+        })
+        .map_err(|failure| match failure {
+            ListFailure::Run(error) => error,
+            ListFailure::Issue(issue) => ContainerError::Backend(issue),
+        })
     }
 
     /// Opens a shell in container `id` of `target`, in this terminal or a new one, running
@@ -221,10 +125,7 @@ impl App {
         in_tui: bool,
     ) -> Result<ConnectionOutcome, ContainerError> {
         let target = self.container_target(target)?;
-        let mut words = exec_words(id, user);
-        if let Some(tool) = via {
-            words = in_group(tool, &words);
-        }
+        let words = backend::shell_words(BackendId::Docker, id, user, via);
         if new_terminal {
             let mut args: Vec<OsString> = vec!["shell".into(), "--hold".into()];
             if let Target::Host(alias) = &target {
@@ -234,7 +135,7 @@ impl App {
                 args.extend(["-u".into(), user.into()]);
             }
             if let Some(tool) = via {
-                args.extend(["--via".into(), tool_name(tool).into()]);
+                args.extend(["--via".into(), tool.as_str().into()]);
             }
             args.extend(["--".into(), id.into()]);
             let fallback = self.direct_words(&target, &words);
@@ -279,16 +180,16 @@ impl App {
 
     /// Runs `offer` on `target` in the user's terminal, through `ssh -t` on a host, and
     /// returns its exit status.
-    pub fn docker_fix(&self, target: &Target, offer: &Offer) -> Result<ExitStatus, ContainerError> {
+    pub fn run_offer(&self, target: &Target, offer: &Offer) -> Result<ExitStatus, ContainerError> {
         let target = self.container_target(target)?;
-        let words = offer.words();
+        let words = &offer.words;
         match &target {
-            Target::Local => self.run_local(&words),
+            Target::Local => self.run_local(words),
             Target::Host(alias) => Ok(self
                 .openssh
                 .connect_mirrored_command(
                     alias,
-                    Some(&remote_command(&words)),
+                    Some(&remote_command(words)),
                     Box::new(io::stderr()),
                     None,
                 )
@@ -349,23 +250,6 @@ impl App {
             });
         }
         Ok(output)
-    }
-
-    /// Runs [`PROBE_SCRIPT`] on `target`; `None` when it fails or reports nothing usable.
-    fn probe(
-        &self,
-        target: &Target,
-        batch: bool,
-        cancelled: Option<&AtomicBool>,
-    ) -> Result<Option<Probe>, ContainerError> {
-        let words = ["sh", "-c", PROBE_SCRIPT].map(String::from);
-        match self.capture(target, &words, batch, cancelled) {
-            Ok(output) if output.status.success() => Ok(parse_probe(&lossy(&output.stdout))),
-            Err(ContainerError::App(AppError::OpenSsh(OpenSshError::Cancelled))) => {
-                Err(AppError::OpenSsh(OpenSshError::Cancelled).into())
-            }
-            _ => Ok(None),
-        }
     }
 
     /// Runs `words` on this machine with the terminal inherited.
@@ -431,9 +315,10 @@ fn local_failure(words: &[String], error: OpenSshError) -> ContainerError {
         && source.kind() == io::ErrorKind::NotFound
         && words[0] == "docker"
     {
-        return ContainerError::from(plain_issue(
+        return ContainerError::from(backend::plain_issue(
+            BackendId::Docker,
             &Target::Local,
-            DockerProblem::NotInstalled,
+            Problem::NotInstalled,
             error.to_string(),
         ));
     }
@@ -444,132 +329,6 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn tool_name(tool: GroupTool) -> &'static str {
-    match tool {
-        GroupTool::Sg => "sg",
-    }
-}
-
-fn listed(target: Target, stdout: &[u8], via: Option<GroupTool>) -> ContainerList {
-    ContainerList {
-        target,
-        listing: parse_listing(&lossy(stdout)),
-        via,
-        note: via.map(|tool| {
-            format!(
-                "Ran docker through `{} docker`: other shells need `newgrp docker` or a new login.",
-                tool_name(tool)
-            )
-        }),
-    }
-}
-
-/// An issue with no headline, advice or offer yet.
-fn issue(target: &Target, problem: DockerProblem, stderr: String) -> DockerIssue {
-    DockerIssue {
-        target: target.clone(),
-        problem,
-        headline: String::new(),
-        next: Vec::new(),
-        offer: None,
-        stderr,
-    }
-}
-
-/// The last line docker wrote to stderr, which carries its message.
-fn docker_message(stderr: &str) -> Option<&str> {
-    stderr.lines().map(str::trim).rfind(|line| !line.is_empty())
-}
-
-fn ask_administrator(target: &Target) -> String {
-    format!("Ask the administrator of {target} for access, or run sudo docker yourself.")
-}
-
-/// A problem explained without what the probe would tell.
-fn plain_issue(target: &Target, problem: DockerProblem, stderr: String) -> DockerIssue {
-    let (headline, next) = match problem {
-        DockerProblem::NotInstalled => (
-            format!(
-                "Docker is not installed on {target}, or it is not on the PATH of a non-interactive shell there."
-            ),
-            vec!["Install Docker from the distribution's packages, then list again.".into()],
-        ),
-        DockerProblem::DaemonDown => return daemon_down(target, false, stderr),
-        DockerProblem::PermissionDenied => (
-            docker_message(&stderr)
-                .unwrap_or("Permission denied")
-                .to_string(),
-            vec![ask_administrator(target)],
-        ),
-        DockerProblem::Other => (
-            match docker_message(&stderr) {
-                Some(message) => format!("docker failed on {target}: {message}"),
-                None => format!("docker failed on {target}."),
-            },
-            Vec::new(),
-        ),
-    };
-    DockerIssue {
-        headline,
-        next,
-        ..issue(target, problem, stderr)
-    }
-}
-
-fn daemon_down(target: &Target, has_systemctl: bool, stderr: String) -> DockerIssue {
-    DockerIssue {
-        headline: format!("The Docker daemon is not running on {target}."),
-        next: vec![if has_systemctl {
-            "Start it with: sudo systemctl start docker".into()
-        } else {
-            "Start the Docker daemon, then list again.".into()
-        }],
-        offer: has_systemctl.then_some(Offer::StartDaemon),
-        ..issue(target, DockerProblem::DaemonDown, stderr)
-    }
-}
-
-fn join_offer(target: &Target, probe: &Probe, stderr: String) -> DockerIssue {
-    let Probe { user, socket, .. } = probe;
-    let sudo_yourself = match target {
-        Target::Local => "Or run sudo docker yourself".to_string(),
-        Target::Host(alias) => format!("Or run sudo docker yourself in portico connect {alias}"),
-    };
-    DockerIssue {
-        headline: format!("{user} cannot use Docker on {target}: permission denied on {socket}."),
-        next: vec![
-            format!(
-                "Add {user} to the docker group (root-equivalent access): {}",
-                remote_command(&join_group_words(user, socket))
-            ),
-            "Or use rootless Docker: https://docs.docker.com/engine/security/rootless/".into(),
-            sudo_yourself,
-        ],
-        offer: Some(Offer::JoinGroup {
-            user: user.clone(),
-            socket: socket.clone(),
-        }),
-        ..issue(target, DockerProblem::PermissionDenied, stderr)
-    }
-}
-
-fn no_offer(target: &Target, probe: &Probe, stderr: String) -> DockerIssue {
-    let headline = match (probe.socket.as_str(), &probe.socket_group) {
-        ("", _) => format!(
-            "Permission denied by the Docker daemon on {target}, whose DOCKER_HOST is not a local unix socket."
-        ),
-        (socket, Some(group)) => {
-            format!("Permission denied on {socket}, which belongs to group {group}.")
-        }
-        (socket, None) => format!("Permission denied on {socket}."),
-    };
-    DockerIssue {
-        headline,
-        next: vec![ask_administrator(target)],
-        ..issue(target, DockerProblem::PermissionDenied, stderr)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
@@ -578,10 +337,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        container::{SHELL_SCRIPT, exec_words, in_group, ps_words, remote_command},
-        host::Host,
-        managed::{ConfigPaths, ManagedStore},
-        openssh::OpenSsh,
+        backend::docker::{
+            SHELL_SCRIPT, exec_words, in_group, join_group_offer, join_group_words, ps_words,
+            start_daemon_offer, start_daemon_words,
+        },
+        domain::host::Host,
+        domain::managed::{ConfigPaths, ManagedStore},
+        domain::openssh::OpenSsh,
         test_executable::write_executable,
     };
 
@@ -682,9 +444,9 @@ mod tests {
         format!("echo '{message}' >&2\nexit 1\n")
     }
 
-    fn docker_issue(result: Result<ContainerList, ContainerError>) -> DockerIssue {
+    fn docker_issue(result: Result<ContainerList, ContainerError>) -> BackendIssue {
         match result {
-            Err(ContainerError::Docker(issue)) => *issue,
+            Err(ContainerError::Backend(issue)) => *issue,
             other => panic!("expected a docker issue, got {other:?}"),
         }
     }
@@ -702,14 +464,13 @@ mod tests {
     #[test]
     fn offers_run_the_container_builders() {
         assert_eq!(
-            Offer::JoinGroup {
-                user: "me".into(),
-                socket: SOCKET.into()
-            }
-            .words(),
+            join_group_offer(&Target::Local, "me", SOCKET).words,
             join_group_words("me", SOCKET)
         );
-        assert_eq!(Offer::StartDaemon.words(), start_daemon_words());
+        assert_eq!(
+            start_daemon_offer(&Target::Local).words,
+            start_daemon_words()
+        );
     }
 
     #[test]
@@ -752,7 +513,7 @@ mod tests {
                 .app
                 .containers(&Target::Local, true, Some(&cancelled)),
             Err(ContainerError::App(AppError::OpenSsh(
-                crate::openssh::OpenSshError::Cancelled
+                crate::domain::openssh::OpenSshError::Cancelled
             )))
         ));
     }
@@ -771,7 +532,7 @@ mod tests {
 
         let issue = docker_issue(app.containers(&Target::Local, false, None));
 
-        assert_eq!(issue.problem, DockerProblem::NotInstalled);
+        assert_eq!(issue.problem, Problem::NotInstalled);
         assert_eq!(
             issue.headline,
             "Docker is not installed on this machine, or it is not on the PATH of a non-interactive shell there."
@@ -823,7 +584,7 @@ mod tests {
 
         let issue = docker_issue(fixture.app.containers(&host(), false, None));
 
-        assert_eq!(issue.problem, DockerProblem::NotInstalled);
+        assert_eq!(issue.problem, Problem::NotInstalled);
         assert_eq!(
             issue.headline,
             "Docker is not installed on dev, or it is not on the PATH of a non-interactive shell there."
@@ -883,7 +644,7 @@ mod tests {
         assert_eq!(list.listing.containers[0].id, "abc123");
         assert_eq!(
             fixture.calls("sh"),
-            call(&["-c", crate::container::PROBE_SCRIPT])
+            call(&["-c", crate::backend::docker::PROBE_SCRIPT])
         );
         assert_eq!(
             fixture.calls("sg"),
@@ -904,14 +665,8 @@ mod tests {
 
         let issue = docker_issue(fixture.app.containers(&host(), false, None));
 
-        assert_eq!(issue.problem, DockerProblem::PermissionDenied);
-        assert_eq!(
-            issue.offer,
-            Some(Offer::JoinGroup {
-                user: "me".into(),
-                socket: SOCKET.into()
-            })
-        );
+        assert_eq!(issue.problem, Problem::PermissionDenied);
+        assert_eq!(issue.offer, Some(join_group_offer(&host(), "me", SOCKET)));
         assert_eq!(
             issue.headline,
             "me cannot use Docker on dev: permission denied on /var/run/docker.sock."
@@ -1010,7 +765,7 @@ mod tests {
 
         let issue = docker_issue(fixture.app.containers(&Target::Local, false, None));
 
-        assert_eq!(issue.problem, DockerProblem::PermissionDenied);
+        assert_eq!(issue.problem, Problem::PermissionDenied);
         assert_eq!(issue.headline, DENIED);
         assert_eq!(issue.offer, None);
         assert_eq!(issue.stderr, format!("{DENIED}\n"));
@@ -1027,13 +782,13 @@ mod tests {
 
         let issue = docker_issue(fixture.app.containers(&Target::Local, false, None));
 
-        assert_eq!(issue.problem, DockerProblem::DaemonDown);
+        assert_eq!(issue.problem, Problem::ServiceDown);
         assert_eq!(
             issue.headline,
             "The Docker daemon is not running on this machine."
         );
         assert_eq!(issue.next, ["Start it with: sudo systemctl start docker"]);
-        assert_eq!(issue.offer, Some(Offer::StartDaemon));
+        assert_eq!(issue.offer, Some(start_daemon_offer(&Target::Local)));
 
         fixture.behave(
             "sh",
@@ -1051,7 +806,7 @@ mod tests {
 
         let issue = docker_issue(fixture.app.containers(&Target::Local, false, None));
 
-        assert_eq!(issue.problem, DockerProblem::Other);
+        assert_eq!(issue.problem, Problem::Other);
         assert_eq!(
             issue.headline,
             "docker failed on this machine: Error response from daemon: boom"
@@ -1272,12 +1027,9 @@ mod tests {
     fn a_local_fix_runs_the_configured_sudo_in_the_terminal() {
         let fixture = fixture();
         fixture.behave("sudo", "exit 4\n");
-        let offer = Offer::JoinGroup {
-            user: "me".into(),
-            socket: SOCKET.into(),
-        };
+        let offer = join_group_offer(&Target::Local, "me", SOCKET);
 
-        let status = fixture.app.docker_fix(&Target::Local, &offer).unwrap();
+        let status = fixture.app.run_offer(&Target::Local, &offer).unwrap();
 
         assert_eq!(status.code(), Some(4));
         assert_eq!(
@@ -1285,7 +1037,7 @@ mod tests {
             call(&[
                 "sh",
                 "-c",
-                crate::container::JOIN_SCRIPT,
+                crate::backend::docker::JOIN_SCRIPT,
                 "sh",
                 "me",
                 SOCKET
@@ -1299,7 +1051,7 @@ mod tests {
 
         let status = fixture
             .app
-            .docker_fix(&host(), &Offer::StartDaemon)
+            .run_offer(&host(), &start_daemon_offer(&host()))
             .unwrap();
 
         assert!(status.success());

@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::{
-    adopt::{Direction, MigrationPlan},
     app::{App, AppError},
+    domain::adopt::{Direction, MigrationPlan},
 };
 
 type Planned = Result<MigrationPlan, AppError>;

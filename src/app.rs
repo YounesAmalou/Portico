@@ -12,31 +12,30 @@ mod identities;
 pub(crate) use identities::key_files_in;
 mod tunnels;
 
-pub use containers::{
-    ContainerError, ContainerList, ContainerPrograms, DockerIssue, Offer, Target,
-};
+pub use containers::{ContainerError, ContainerPrograms};
 pub use tunnels::{StartOutcome, StopOutcome, TunnelChanges, TunnelRefusal};
 
 use crate::{
-    adopt::{AdoptError, Direction, MigrationPlan},
-    config_error::{ConfigFiles, ConfigRejection, interpret},
-    discovery::{Discovery, DiscoveryError, DiscoveryWarning, Input, discover},
-    explain::{Context, Explanation, Operation, explain},
-    host::{Change, Host, HostChanges, HostError},
-    identity::HostIdentities,
-    managed::{
-        InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError, read_lossy,
+    domain::adopt::{AdoptError, Direction, MigrationPlan},
+    domain::config_error::{ConfigFiles, ConfigRejection, interpret},
+    domain::discovery::{Discovery, DiscoveryError, DiscoveryWarning, Input, discover},
+    domain::explain::{Context, Explanation, Operation, explain},
+    domain::host::{Change, Host, HostChanges, HostError},
+    domain::identity::HostIdentities,
+    domain::managed::{
+        InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError,
     },
-    openssh::{
+    domain::openssh::{
         ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
         append_known_hosts,
     },
-    probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
-    tunnel::{
+    domain::probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
+    domain::tunnel::{
         TunnelError,
-        runtime::{Proc, RuntimeDir},
+        runtime::RuntimeDir,
         store::{StoreError, TunnelStore},
     },
+    platform::{fs::read_lossy, process::Proc},
 };
 
 pub struct App {
@@ -961,9 +960,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        host::{Change, Host, HostChanges},
-        managed::{ConfigPaths, ManagedStore},
-        openssh::OpenSsh,
+        domain::host::{Change, Host, HostChanges},
+        domain::managed::{ConfigPaths, ManagedStore},
+        domain::openssh::OpenSsh,
         test_executable::write_executable,
     };
 

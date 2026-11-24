@@ -13,8 +13,8 @@ use std::{
 
 use crate::{
     app::{App, key_files_in},
-    identity::{self, Agent, Availability, HostIdentities, IdentityInventory, PublicKey},
-    suggest::{Candidate, Origin},
+    domain::identity::{self, Agent, Availability, HostIdentities, IdentityInventory, PublicKey},
+    domain::suggest::{Candidate, Origin},
 };
 
 type Built = Result<IdentityInventory, String>;
@@ -138,7 +138,7 @@ pub(super) fn detail_lines(identities: &HostIdentities, home: &Path) -> String {
         .map(|identity| {
             let mut value = format!(
                 "{}  {} {}",
-                crate::home::tilde_text(&identity.configured, home),
+                crate::platform::paths::tilde_text(&identity.configured, home),
                 identity.availability.symbol(),
                 identity.availability.word()
             );
@@ -198,7 +198,7 @@ fn agent_line(agent: &Agent, home: &Path) -> String {
             identity::count(keys.len(), "key"),
             agent
                 .socket()
-                .map(|socket| crate::home::tilde(socket, home))
+                .map(|socket| crate::platform::paths::tilde(socket, home))
                 .unwrap_or_default()
         ),
         _ => agent.describe(home),
@@ -229,7 +229,7 @@ pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> 
                 } else {
                     "key file".into()
                 }),
-                alias: crate::home::tilde(&path, home),
+                alias: crate::platform::paths::tilde(&path, home),
             })
             .collect();
     };
@@ -256,7 +256,7 @@ pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> 
                 ));
             }
             let alias = match &file.path {
-                Some(path) => crate::home::tilde(path, home),
+                Some(path) => crate::platform::paths::tilde(path, home),
                 None => file.configured.clone(),
             };
             (
@@ -286,7 +286,9 @@ pub(super) fn missing_last(ranked: Vec<Candidate>) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{Identity, InventoryAgent, InventoryFile, MissingReason, Provider};
+    use crate::domain::identity::{
+        Identity, InventoryAgent, InventoryFile, MissingReason, Provider,
+    };
 
     fn key(fingerprint: &str, comment: &str) -> PublicKey {
         PublicKey {
@@ -405,7 +407,7 @@ mod tests {
             .map(|candidate| {
                 (
                     candidate.alias.as_str(),
-                    crate::suggest::origin_label(&candidate.origin, None),
+                    crate::domain::suggest::origin_label(&candidate.origin, None),
                 )
             })
             .collect();
@@ -437,7 +439,7 @@ mod tests {
             .map(|candidate| {
                 (
                     candidate.alias,
-                    crate::suggest::origin_label(&candidate.origin, None),
+                    crate::domain::suggest::origin_label(&candidate.origin, None),
                 )
             })
             .collect();

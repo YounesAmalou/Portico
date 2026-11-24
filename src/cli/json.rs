@@ -6,19 +6,19 @@ use std::{io::Write, path::Path, process::ExitCode};
 
 use serde_json::{Map, Value, json};
 
-use super::{format_warning, ownership};
+use super::hosts::{format_warning, ownership};
 use crate::{
     app::{
-        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, HostInventory,
-        StartOutcome, StopOutcome, Target, TunnelRefusal,
+        App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
+        TunnelRefusal,
     },
-    container::{DockerProblem, GroupTool, display_name, group},
-    discovery::DiscoveryWarning,
-    explain::Explanation,
-    identity::{
+    backend::{BackendIssue, ContainerList, GroupTool, Target, display_name, group},
+    domain::discovery::DiscoveryWarning,
+    domain::explain::Explanation,
+    domain::identity::{
         Agent, Availability, HostIdentities, Identity, IdentityInventory, Provider, PublicKey,
     },
-    tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
+    domain::tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
 };
 
 /// The contract's version: raised only by a breaking change.
@@ -46,7 +46,7 @@ pub(super) struct Failure {
     kind: &'static str,
     message: String,
     next: Vec<String>,
-    /// Docker's problem, for kind `docker`.
+    /// The backend's problem, when it names one.
     problem: Option<&'static str>,
 }
 
@@ -116,13 +116,13 @@ impl From<ContainerError> for Failure {
                     },
                 ),
             },
-            ContainerError::Docker(issue) => docker_failure(&issue),
+            ContainerError::Backend(issue) => backend_failure(&issue),
             error => Self::new("other", error.to_string()),
         }
     }
 }
 
-fn docker_failure(issue: &DockerIssue) -> Failure {
+fn backend_failure(issue: &BackendIssue) -> Failure {
     let mut next = issue.next.clone();
     if issue.offer.is_some() {
         let command = match &issue.target {
@@ -134,15 +134,10 @@ fn docker_failure(issue: &DockerIssue) -> Failure {
         ));
     }
     Failure {
-        kind: "docker",
+        kind: issue.backend.as_str(),
         message: issue.headline.clone(),
         next,
-        problem: Some(match issue.problem {
-            DockerProblem::NotInstalled => "not-installed",
-            DockerProblem::DaemonDown => "daemon-down",
-            DockerProblem::PermissionDenied => "permission-denied",
-            DockerProblem::Other => "other",
-        }),
+        problem: Some(issue.problem.as_str()),
     }
 }
 
@@ -538,9 +533,7 @@ pub(super) fn containers(list: &ContainerList) -> Value {
         "note": optional_line(list.note.as_deref()),
         "skipped": list.listing.skipped,
         "target": target,
-        "via": list.via.map(|tool| match tool {
-            GroupTool::Sg => "sg",
-        }),
+        "via": list.via.map(GroupTool::as_str),
     })
 }
 
@@ -597,9 +590,9 @@ mod tests {
     use super::*;
     use crate::{
         app::{HostSummary, Ownership},
-        container::{Container, Listing},
-        identity::MissingReason,
-        tunnel::{Kind, Tunnel},
+        backend::{Container, Listing},
+        domain::identity::MissingReason,
+        domain::tunnel::{Kind, Tunnel},
     };
 
     fn text(document: Value) -> String {
@@ -723,7 +716,7 @@ mod tests {
         let unavailable = Agent::Unavailable {
             socket,
             provider: Provider::Generic,
-            reason: crate::identity::AgentProblem::NoSuchSocket,
+            reason: crate::domain::identity::AgentProblem::NoSuchSocket,
         };
         assert_eq!(
             Value::Object(agent(&unavailable, false)),
@@ -825,7 +818,7 @@ mod tests {
             &Agent::Unavailable {
                 socket: PathBuf::from("/run/agent.sock"),
                 provider: Provider::Generic,
-                reason: crate::identity::AgentProblem::Refused(
+                reason: crate::domain::identity::AgentProblem::Refused(
                     "error fetching identities:\n\u{1b}[1mcommunication\u{1b}[0m".into(),
                 ),
             },
@@ -867,13 +860,16 @@ mod tests {
     }
 
     #[test]
-    fn docker_failures_name_their_problem_and_how_to_be_offered_the_fix() {
-        let failure = docker_failure(&DockerIssue {
+    fn backend_failures_name_their_problem_and_how_to_be_offered_the_fix() {
+        let failure = backend_failure(&BackendIssue {
+            backend: crate::backend::BackendId::Docker,
             target: Target::Host("dev".into()),
-            problem: DockerProblem::PermissionDenied,
+            problem: crate::backend::Problem::PermissionDenied,
             headline: "me cannot use Docker on dev".into(),
             next: vec!["Add me to the docker group".into()],
-            offer: Some(crate::app::Offer::StartDaemon),
+            offer: Some(crate::backend::docker::start_daemon_offer(&Target::Host(
+                "dev".into(),
+            ))),
             stderr: String::new(),
         });
         assert_eq!(
