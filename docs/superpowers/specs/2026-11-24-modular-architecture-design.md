@@ -14,7 +14,8 @@ This slice is v4 slice 1 of `ROADMAP.md`. It reorganizes the crate into layers t
 - **No file-size guideline.** A file is split when it has grown hard to work with or a change needs it, not when it crosses a number. The architecture document records the module map only.
 - **One shape for what a backend needs.** Today's Docker report (`DockerProblem`, `Access`, `DockerIssue`) becomes the backend-neutral `BackendIssue` described below. The TUI, the CLI and the desktop panel show any backend's issue the same way, without knowing which backend produced it.
 - **Platform selection at compile time.** Each platform concern is a module whose functions are implemented once per operating system and chosen with `#[cfg(target_os = ...)]`, the way the standard library does it. No trait objects: only one platform exists in a given binary. v4 has only the Linux implementation; v5 adds `macos` and `windows` beside it.
-- **Backends chosen at run time.** Adapters are compiled in and listed in one registry; the interfaces iterate the registry. This is not a plugin system: nothing is loaded from outside the binary.
+- **Backends chosen at run time.** Adapters are compiled in. The registry is the `BackendId` enum and the dispatch functions in `src/backend/mod.rs` that match on it; registering a backend is one variant and one arm per function. This is not a plugin system: nothing is loaded from outside the binary.
+- **The app runs commands, the adapter decides them.** Running a command on this machine or through `ssh` on a host (with batch mode, cancellation and ssh's own failures explained) stays in `app`, shared by every backend. An adapter says which commands to run and what their output means: the listing, the probe, a rerun inside a group, and the issue to report.
 - **The library is not a supported API.** Module paths inside the crate change in this slice. The supported interfaces stay the CLI and its JSON output (`docs/json-output.md`).
 
 ## Decisions
@@ -46,9 +47,8 @@ The layer is called `domain`, not `core`: a crate-root module named `core` is am
 |---|---|---|---|
 | platform | `platform::process` | spawning, `pidfd` open and signal, killing a process tree, finding a process again | `openssh.rs`, `tunnel/runtime.rs`, `tui/lister.rs`, `tui/tester.rs`, `app/tunnels.rs` |
 | platform | `platform::launcher` | opening a command in a new terminal (`xdg-terminal-exec`) | `openssh.rs`, `app/identities.rs`, `desktop/launcher.rs` |
-| platform | `platform::paths` | home, config and runtime directories, `~` display | `home.rs`, `ConfigPaths` in `managed.rs` |
-| platform | `platform::fs` | private directories, lock files, atomic write, directory sync, lossy reads | the `pub(crate)` helpers of `managed.rs` |
-| platform | `platform::watch` | the polling file watch | `tui/watch.rs` |
+| platform | `platform::paths` | the home directory, the runtime directory, the system `ssh_config` path, `~` display | `home.rs`, `main.rs`, `RuntimeDir::locate` in `tunnel/runtime.rs`, `ConfigPaths::system_config` |
+| platform | `platform::fs` | private directories, lock files, atomic write, directory sync, lossy reads, the file identity (`Stamp`) the config watch compares | the `pub(crate)` helpers of `managed.rs`, `Stamp` in `tui/watch.rs` |
 | domain | `domain::host`, `domain::discovery` | hosts and the inventory read | `host.rs`, `discovery.rs` |
 | domain | `domain::managed` | the managed file: store and transactions, parse, render, initialization | `managed.rs`, split along those four parts |
 | domain | `domain::openssh` | `ssh -G` resolution, `known_hosts`, key fetch, connection outcomes | `openssh.rs`, minus its process helpers |
@@ -57,29 +57,42 @@ The layer is called `domain`, not `core`: a crate-root module named `core` is am
 | domain | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | as today | same files |
 | backend | `backend` | the `Backend` interface, `BackendId`, `Target`, `BackendIssue`, the registry | new, from the shared parts of `container.rs` |
 | backend | `backend::docker` | the Docker adapter | `container.rs`, `probe.rs` (its Docker part) |
-| app | `app` | operations over the domain and the backends | `app.rs`, `app/` (unchanged role) |
+| app | `app` | operations over the domain and the backends, and running a backend's commands locally or over `ssh` | `app.rs`, `app/` (unchanged role) |
 | interface | `cli` | arguments, one module per command group, JSON documents, pickers | `cli.rs`, `cli/`, `picker.rs` |
 | interface | `tui` | event loop, terminal session, shared widgets (text input, form, dropdown), one module per tab (hosts, tunnels, containers) for its state, input and rendering | `tui.rs`, `tui/` |
 | interface | `desktop` | `portico desktop` plans (Omarchy panel, launcher entry, keybinding) | unchanged, reaches the OS through `platform` |
+
+The config watch (`tui/watch.rs`) stays in the TUI: it follows discovery's `Include` inputs, which are domain types, so only its file identity moves down to `platform::fs`.
 
 The map is the target, not a contract: a step may settle a module's exact name or split it further when the code shows a better seam. The architecture document records what was built.
 
 ### The backend interface
 
 ```rust
-pub enum Target {
-    Local,
-    Host(String), // a host alias
-}
+pub enum Target { Local, Host(String) }       // from app/containers.rs
+pub enum BackendId { Docker }                 // podman and proxmox join in their slices
+pub enum GroupTool { Sg }                     // from container.rs; `--via sg` is unchanged
+
+/// How running one command failed, as the app reports it to the adapter.
+pub enum RunFailure<E> { Cancelled(E), Failed(E) }
+/// Why a listing produced no list.
+pub enum ListFailure<E> { Run(E), Issue(BackendIssue) }
 
 pub trait Backend {
-    fn id(&self) -> BackendId;               // docker | podman | proxmox
-    fn list(&self, target: &Target) -> Result<Vec<Openable>, BackendIssue>;
-    fn shell_words(&self, openable: &Openable, user: Option<&str>) -> Vec<String>;
+    fn id(&self) -> BackendId;
+    fn list<E>(
+        &self,
+        target: &Target,
+        run: &mut dyn FnMut(&[String]) -> Result<Output, RunFailure<E>>,
+    ) -> Result<ContainerList, ListFailure<E>>;
+    fn shell_words(&self, id: &str, user: Option<&str>, via: Option<GroupTool>) -> Vec<String>;
+    fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue;
 }
 ```
 
-`Openable` is what the picker shows: an id, a display name, a group (a Compose project for Docker, the node for Proxmox) and the backend it belongs to. The exact fields are settled in step 2 from what Docker needs today; Proxmox and Podman add to it in their own slices.
+`run` is the app's transport: it runs the words on the target and returns the captured output. A `Cancelled` failure always stops the listing; a `Failed` one stops it, except where the adapter treats it as "no answer" (Docker's probe does). `list` is generic, so the trait is not used as a trait object; the registry's dispatch functions call the adapter directly.
+
+What the picker shows stays today's `Container` row and `Listing`, and `ContainerList` (target, listing, `via`, note) moves to `backend`. Proxmox and Podman extend the row in their own slices if they need to.
 
 ### What a backend reports: `BackendIssue`
 
@@ -91,15 +104,19 @@ pub struct BackendIssue {
     pub headline: String,       // one-line summary
     pub next: Vec<String>,      // steps the user can take themselves
     pub offer: Option<Offer>,   // a fix Portico can run after a confirmation
+    pub stderr: String,         // what the tool wrote to stderr
 }
 
 pub struct Offer {
-    pub prompt: String,              // "Add you to the docker group?"
-    pub commands: Vec<Vec<String>>,  // shown in the preview, run after a yes
+    pub key: char,           // the TUI key that runs it: 'g', 's'
+    pub hint: String,        // the TUI footer hint: "add to docker group"
+    pub prompt: String,      // the CLI question, without " [y/N] "
+    pub words: Vec<String>,  // the command, run on the target after a yes
 }
 ```
 
-- Each adapter turns its own fix into a generic offer. Docker's `Access::OfferJoin` and `Access::RerunInGroup(Sg)` become offers whose commands are what Portico runs today; `Access::NeedsLogin` becomes a `next` line; `Access::NoOffer` is `offer: None`. The interfaces preview, confirm and run an offer without knowing the backend.
+- Each adapter turns its own fixes into generic offers. Docker's two offers keep their exact keys, hints, prompts and commands: `g` / "add to docker group" / "Add {user} to the docker group on {target}? Members of the docker group have root-equivalent access. This runs: …", and `s` / "start docker" / "Start the Docker service on {target}? This runs: …". The interfaces show, confirm and run an offer without knowing the backend.
+- What is not an offer stays inside the adapter: a session that predates the user's docker group is still rerun through `sg` automatically (the listing's `via`), and a missing `sg` is still a `next` line asking for a new login.
 - The JSON failure keeps its shape: `kind` is the backend id and `problem` keeps today's strings. Docker still emits `"kind": "docker"` with `not-installed`, `daemon-down`, `permission-denied` or `other` (`ServiceDown` maps to `daemon-down`), and `next` still ends with the "Run … in a terminal to be offered this fix." line when an offer exists. Podman and Proxmox emit their own `kind` with the same fields.
 - A requirement such as Proxmox's `pct` needing root is `PermissionDenied` with `next` lines (connect as root, or configure sudo). No new problem kind is needed for it.
 
@@ -107,7 +124,7 @@ pub struct Offer {
 
 Each step is one pull request of moves and small changes, and leaves the unit, CLI, docs and end-to-end tests passing unchanged (`scripts/ci-checks.sh`). Tests move with the code they test.
 
-1. **Platform.** Create `src/platform/` with its Linux implementation and move process control, the launcher, paths, file helpers and the file watch into it. Callers switch to `platform::…`.
+1. **Platform.** Create `src/platform/` with its Linux implementation and move process control, the launcher, paths, file helpers and the watch's file identity into it. Callers switch to `platform::…`.
 2. **Backend.** Create `src/backend/` with the interface, `BackendIssue`, `Offer` and the registry, and move Docker behind it as `backend::docker`. `DockerIssue`, `DockerProblem` and `Access` are replaced; the JSON output is checked byte for byte by the existing tests.
 3. **Domain.** Create `src/domain/`; split `managed.rs` into store, parse, render and init, split `openssh.rs` along resolution, `known_hosts`, keys and connection outcomes, and move `adopt`, `tunnel`, `host`, `discovery` and the small shared modules in.
 4. **CLI.** Split `cli.rs` into argument definitions and one module per command group; move `picker.rs` under `cli`.
