@@ -140,6 +140,27 @@ jobs:
       # The real binary against a real sshd, through a real pseudo-terminal.
       - run: scripts/ci-container.sh e2e
 
+  # The same Rust checks on macOS (Apple silicon), as the runner's own unprivileged user:
+  # clippy for the macOS code, then the tests and the end-to-end suite against macOS's own
+  # OpenSSH. The workflow's CARGO_HOME and RUSTUP_HOME are the Linux container's, so the
+  # runner's own are named here.
+  macos:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: macos-latest
+    env:
+      CARGO_HOME: /Users/runner/.cargo
+      RUSTUP_HOME: /Users/runner/.rustup
+    steps:
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: scripts/ci-checks.sh clippy
+      - run: scripts/ci-checks.sh test
+      - run: scripts/ci-checks.sh e2e
+
   msrv:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}

@@ -131,6 +131,58 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
 
+  # The macOS artifacts, built on Apple silicon for both architectures (Intel is
+  # cross-compiled): the binary's tarball and a CycloneDX SBOM, attested in the same job.
+  # The arm64 binary is run before it is packaged. The linker signs both ad hoc; they are
+  # not notarized, which Homebrew does not need.
+  build-macos:
+    needs: [verify, checks]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - run: cargo install --locked cargo-cyclonedx
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: build
+        name: Build and package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary=$(scripts/build-release.sh "$VERSION" "$TARGET" dist)
+          if [ "$TARGET" = aarch64-apple-darwin ]; then
+            "$binary" --version | grep -qx "portico $VERSION"
+          fi
+          {
+            echo "binary=$binary"
+            echo "sbom=dist/portico-v$VERSION-$TARGET.cdx.json"
+            echo "carriers<<EOF"
+            echo "$binary"
+            find dist -type f ! -name '*.cdx.json'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*
+            ${{ steps.build.outputs.binary }}
+      - name: Attest the SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: ${{ steps.build.outputs.sbom }}
+          subject-path: ${{ steps.build.outputs.carriers }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
   # Installs each artifact in a clean container of its distribution and runs it, on the
   # architecture it was built for.
   verify-packages:
@@ -152,7 +204,7 @@ jobs:
       - run: scripts/verify-packages.sh "${{ needs.verify.outputs.version }}" dist
 
   checksums:
-    needs: verify-packages
+    needs: [verify-packages, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -223,3 +275,42 @@ jobs:
       - run: scripts/aur-publish.sh "${{ needs.verify.outputs.version }}"
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+  # Pushes the formula of this release (packaging/homebrew/portico.rb) to the Homebrew tap.
+  # It does nothing until the homebrew environment holds HOMEBREW_TAP_TOKEN, a token that
+  # can write the tap repository only.
+  homebrew:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    environment: homebrew
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - name: Push the formula to the tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          TAP: ${{ github.repository_owner }}/homebrew-tap
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set: the Homebrew tap was not updated"
+            exit 0
+          fi
+          scripts/homebrew-formula.sh "$VERSION" dist > portico.rb
+          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/$TAP.git" tap
+          mkdir -p tap/Formula
+          cp portico.rb tap/Formula/portico.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/portico.rb
+          if git diff --cached --quiet; then
+            echo "The tap already has portico $VERSION"
+            exit 0
+          fi
+          git commit -m "portico $VERSION"
+          git push origin HEAD
