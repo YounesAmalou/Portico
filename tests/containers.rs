@@ -437,3 +437,89 @@ fn shell_without_container_needs_a_terminal() {
     );
     assert!(!read_log(&env, "docker").contains("exec"));
 }
+
+/// Fakes for this machine as a Proxmox VE node without docker, reached as root: `pct list`
+/// prints two running CTs and a stopped one, and `pct exec` logs its arguments.
+fn install_proxmox(env: &TestEnv) {
+    env.install_program(
+        "docker",
+        "#!/bin/sh\necho 'sh: 1: docker: not found' >&2\nexit 127\n",
+    );
+    env.install_program(
+        "id",
+        "#!/bin/sh\ncase \"$1\" in -u) echo 0 ;; -un) echo root ;; esac\n",
+    );
+    env.install_program(
+        "pct",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = list ]; then printf 'VMID       Status     Lock         Name                \\n101        running                 web                 \\n102        stopped                 db                  \\n110        running    backup       mail                \\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            log(env, "pct").display()
+        ),
+    );
+}
+
+#[test]
+fn a_proxmox_node_without_docker_lists_its_cts() {
+    let env = TestEnv::new();
+    install_proxmox(&env);
+
+    let result = env.run(["containers"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert_eq!(
+        stdout,
+        "Proxmox containers\n  110  mail  running\n  101  web   running\n"
+    );
+}
+
+#[test]
+fn a_proxmox_shell_opens_by_vmid_or_name_as_root() {
+    let env = TestEnv::new();
+    install_proxmox(&env);
+
+    env.run(["shell", "101"]).assert_success();
+    env.run(["shell", "--backend", "proxmox", "mail"])
+        .assert_success();
+    assert_eq!(
+        read_log(&env, "pct"),
+        format!("exec\n101\n--\nsh\n-c\n{SHELL_SCRIPT}\nexec\n110\n--\nsh\n-c\n{SHELL_SCRIPT}\n")
+    );
+}
+
+#[test]
+fn a_proxmox_shell_refuses_a_user() {
+    let env = TestEnv::new();
+    install_proxmox(&env);
+
+    env.run(["shell", "101", "-u", "deploy"])
+        .assert_exit_code_and_stderr(
+            1,
+            "error: a Proxmox container's shell runs as root; leave out --user and run su inside it\n",
+        );
+    assert_eq!(read_log(&env, "pct"), "");
+}
+
+#[test]
+fn a_held_proxmox_shell_runs_the_vmid_without_listing() {
+    let env = TestEnv::new();
+    install_proxmox(&env);
+
+    env.run(["shell", "--hold", "--backend", "proxmox", "--", "101"])
+        .assert_success();
+    assert_eq!(
+        read_log(&env, "pct"),
+        format!("exec\n101\n--\nsh\n-c\n{SHELL_SCRIPT}\n")
+    );
+}
+
+#[test]
+fn an_explicit_backend_reports_its_own_issue() {
+    let env = TestEnv::new();
+    install_docker(&env, &shop_listing());
+
+    env.run(["containers", "--backend", "proxmox"])
+        .assert_exit_code_and_stderr_contains(
+            1,
+            "error: pct is not available on this machine: it is not a Proxmox VE node.\n",
+        );
+}

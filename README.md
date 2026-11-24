@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
 ## What Portico does
 
@@ -13,7 +13,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
-- Lists the running Docker containers on this machine or a host, grouped by Compose project, and opens a shell in one.
+- Lists the running Docker containers on this machine or a host, grouped by Compose project, or a Proxmox VE node's LXC containers, and opens a shell in one.
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Prints one versioned JSON document per command for scripts and desktop panels.
 - Comes with a desktop panel for Quickshell and Omarchy to open hosts and container shells in a new terminal and to start and stop tunnels.
@@ -30,7 +30,7 @@ Private keys remain where they already live. Portico stores identity-file refere
 - Linux on x86_64 (verified on Arch Linux; other platforms are on the [roadmap](ROADMAP.md))
 - OpenSSH client tools (`ssh`)
 - `xdg-terminal-exec` for the new-terminal option only
-- `docker`, only for container shells, on this machine or on the host (Docker only; Podman is not supported)
+- `docker`, only for container shells, on this machine or on the host (Podman is not supported), or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
 - Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
@@ -144,9 +144,9 @@ portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
 portico identities              List agents and identity files, and whether each is available
-portico containers [--on [<alias>]]
+portico containers [--on [<alias>]] [--backend docker|proxmox]
                                 List running containers, here or on a host
-portico shell [<container>] [--on [<alias>]] [-u <user>] [-n]
+portico shell [<container>] [--on [<alias>]] [--backend docker|proxmox] [-u <user>] [-n]
                                 Open a shell in a container
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
@@ -266,7 +266,9 @@ portico shell 3f9a1c -n
 
 A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
 
-Only Docker is supported, and Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
+Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
+
+**Proxmox VE.** On a host without Docker, Portico lists the node's running LXC containers instead, with `pct list`, under "Proxmox containers": `portico containers --on pve`, then `portico shell 101 --on pve` by VMID or `portico shell web --on pve` by name. `--backend proxmox` (or `--backend docker`) uses only that backend, for a node that has both. `pct` needs root: Portico runs it directly when the ssh user is root and otherwise through `sudo -n`, which never asks for a password. When neither works it says how to give access (connect as root, or allow passwordless sudo for `/usr/sbin/pct`) and changes nothing on the node. The shell runs as root inside the container (bash, or sh), so `-u` is refused there: run `su` inside it. Stopped containers are not listed, and Portico does not start or stop them.
 
 When Docker fails, Portico explains why and, where it can, offers the fix. The full command is shown first and `sudo` prompts in your terminal; Portico never sees a password. Declining prints the options to do it yourself.
 

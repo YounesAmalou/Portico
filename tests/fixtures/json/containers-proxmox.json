@@ -1,0 +1,31 @@
+{
+  "backend": "proxmox",
+  "containers": [
+    {
+      "display_name": "mail",
+      "id": "110",
+      "image": null,
+      "name": "mail",
+      "project": null,
+      "service": null,
+      "status": "running"
+    },
+    {
+      "display_name": "web",
+      "id": "101",
+      "image": null,
+      "name": "web",
+      "project": null,
+      "service": null,
+      "status": "running"
+    }
+  ],
+  "note": null,
+  "schema": 1,
+  "skipped": 0,
+  "target": {
+    "alias": null,
+    "kind": "local"
+  },
+  "via": "sudo"
+}

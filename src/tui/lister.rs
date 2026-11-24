@@ -121,7 +121,7 @@ fn list_worker(
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
         }
-        let result = app.containers(&request.target, true, Some(&request.cancelled));
+        let result = app.containers(&request.target, None, true, Some(&request.cancelled));
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
         }

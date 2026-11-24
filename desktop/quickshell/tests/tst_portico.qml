@@ -25,6 +25,7 @@ TestCase {
 
     function test_every_golden_file_has_the_panel_schema() {
         var files = ["containers-docker-down.json", "containers.json", "containers-on-host.json",
+                     "containers-proxmox.json", "containers-proxmox-denied.json",
                      "error-unknown-host.json", "error-usage.json", "hosts.json", "identities.json",
                      "show.json", "show-unresolved.json", "tunnel-show.json", "tunnels.json",
                      "tunnel-start.json", "tunnel-stop-all.json"]
@@ -98,6 +99,21 @@ TestCase {
         compare(host[1].name, "cache")
         var here = Portico.containerRows(doc("containers.json"), "")
         compare(here[0].key, "container:/4f1c2a9b7d3e")
+    }
+
+    function test_proxmox_containers_are_rows_like_docker_ones() {
+        var rows = Portico.containerRows(doc("containers-proxmox.json"), "")
+        compare(rows.length, 2)
+        compare(rows[1].id, "101")
+        compare(rows[1].name, "web")
+        compare(rows[1].image, "")
+        compare(rows[1].status, "running")
+    }
+
+    function test_a_proxmox_failure_keeps_its_steps() {
+        var error = Portico.documentError(doc("containers-proxmox-denied.json"))
+        compare(error.problem, "permission-denied")
+        compare(Portico.errorLines(error).length, 3)
     }
 
     function test_a_docker_failure_keeps_its_steps() {
