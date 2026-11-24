@@ -20,14 +20,14 @@ use super::{App, AppError};
 use crate::{
     explain::{Explanation, Operation},
     managed::{acquire_lock, open_lock},
-    openssh::{OpenSshError, kill_process_tree},
+    openssh::OpenSshError,
+    platform::process::{Logged, current_uid, kill_process_tree, stop_process},
     probe::{Failure, diagnose},
     tunnel::{
         Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
         check_args, collide, collisions, listeners_in_effective_config,
         runtime::{
-            Bind, Identity, Logged, Record, RunningRecord, current_uid, find_in, log_reason,
-            log_tail, now, stop_process, try_bind,
+            Bind, Identity, Record, RunningRecord, find_in, log_reason, log_tail, now, try_bind,
         },
         start_args,
     },
@@ -729,7 +729,8 @@ mod tests {
     use crate::{
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
-        tunnel::runtime::{Proc, RuntimeDir},
+        platform::process::Proc,
+        tunnel::runtime::RuntimeDir,
     };
 
     /// An app whose runtime directory and `/proc` (with this boot's ID) are temporary.
