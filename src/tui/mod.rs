@@ -360,8 +360,12 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             UiAction::Desktop(run) => {
                 let result = match std::env::current_exe() {
                     Ok(exe) => {
-                        match suspended(terminal, session, signals, || Ok(run_desktop(&exe, run)))?
-                        {
+                        let pause = || {
+                            signals.child_finished();
+                            wait_for_enter(terminated);
+                        };
+                        let child = || Ok(run_desktop(&exe, run, pause));
+                        match suspended(terminal, session, signals, child)? {
                             Ok(result) => result,
                             Err(error) => Err(error.to_string()),
                         }
@@ -546,9 +550,10 @@ fn toggle_setting(app: &App, state: &mut UiState, key: Key) {
     overlay.finish_toggle(key, value, result);
 }
 
-/// Runs `portico desktop install` or `uninstall` with `exe` in the terminal, then waits for
-/// Enter so its output can be read. A child that cannot start or that fails is the error.
-fn run_desktop(exe: &Path, run: DesktopRun) -> Result<(), String> {
+/// Runs `portico desktop install` or `uninstall` with `exe` in the terminal, then asks for Enter
+/// and calls `pause` to wait for it, so the output can be read. A child that cannot start, which
+/// printed nothing and is not waited for, or that fails is the error.
+fn run_desktop(exe: &Path, run: DesktopRun, pause: impl FnOnce()) -> Result<(), String> {
     let command = run.command();
     let failed = |reason: String| format!("portico desktop {command} failed: {reason}");
     let exit = std::process::Command::new(exe)
@@ -557,11 +562,51 @@ fn run_desktop(exe: &Path, run: DesktopRun) -> Result<(), String> {
         .map_err(|error| failed(error.to_string()))?;
     print!("\nPress Enter to return to Portico.");
     let _ = io::Write::flush(&mut io::stdout());
-    let _ = io::stdin().read_line(&mut String::new());
+    pause();
     if exit.success() {
         Ok(())
     } else {
         Err(failed(exit.to_string()))
+    }
+}
+
+/// Waits for a line on the terminal, an end of input, or `terminated` (Ctrl+C, a signal or a
+/// hang-up).
+///
+/// Reads the descriptor directly: `main` holds the lock of `io::stdin()` for the whole session,
+/// so reading through it would wait for ever. One byte at a time, so nothing after the line is
+/// taken from the terminal.
+fn wait_for_enter(terminated: &AtomicBool) {
+    use std::{
+        io::Read,
+        os::fd::{AsFd, AsRawFd},
+    };
+    let Ok(fd) = io::stdin().as_fd().try_clone_to_owned() else {
+        return;
+    };
+    let mut input = std::fs::File::from(fd);
+    let mut byte = [0];
+    while !terminated.load(Ordering::Relaxed) {
+        let mut poll = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes only the one `pollfd` it is given.
+        let ready = unsafe { libc::poll(&mut poll, 1, IDLE_TICK.as_millis() as libc::c_int) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+        if ready <= 0 {
+            continue;
+        }
+        match input.read(&mut byte) {
+            Ok(0) => return,
+            Ok(_) if matches!(byte[0], b'\n' | b'\r') => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 
@@ -1148,6 +1193,15 @@ impl UiState {
         }
     }
 
+    /// The footer of the tab shown, `footer`, or none while the overlay, with its own, is open.
+    fn tab_footer(&self, footer: impl FnOnce() -> String) -> String {
+        if self.mode == Mode::Settings {
+            String::new()
+        } else {
+            footer()
+        }
+    }
+
     /// Opens the settings overlay with the tabs as they are and the desktop's `status`.
     fn open_settings(&mut self, desktop: Status) {
         self.settings = Some(SettingsOverlay::open(self.tabs, desktop));
@@ -1387,7 +1441,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             let content = tab_areas(
                 body,
                 state.tunnels.status_line(),
-                &state.tunnels.footer(),
+                &state.tab_footer(|| state.tunnels.footer()),
                 frame,
             );
             state.tunnels.render(frame, content);
@@ -3309,6 +3363,19 @@ mod tests {
         char(&mut state, '2');
         assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
         state.open_settings(no_desktop());
+        // The tab's footer gives way to the overlay's, on every tab.
+        let text = rendered(&state);
+        assert!(!text.contains("q quit"), "{text}");
+        char(&mut state, ',');
+        char(&mut state, '3');
+        char(&mut state, ',');
+        state.open_settings(no_desktop());
+        let text = rendered(&state);
+        assert!(!text.contains("q quit"), "{text}");
+        char(&mut state, ',');
+        char(&mut state, '2');
+        char(&mut state, ',');
+        state.open_settings(no_desktop());
         assert_eq!(char(&mut state, 's'), UiAction::None);
         assert_eq!(char(&mut state, '1'), UiAction::None);
         assert_eq!(state.tab, Tab::Tunnels);
@@ -3370,7 +3437,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = settings_app(dir.path());
         let mut state = overlay_state(&app);
-        let result = run_desktop(&dir.path().join("missing"), DesktopRun::Install);
+        let result = run_desktop(&dir.path().join("missing"), DesktopRun::Install, || {
+            panic!("a child that never started is not waited for")
+        });
         let error = result.clone().unwrap_err();
         assert!(
             error.starts_with("portico desktop install failed: "),

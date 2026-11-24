@@ -100,6 +100,12 @@ impl Signals {
         Arc::clone(&self.terminated)
     }
 
+    /// Ends the in-place child's hold on the terminal before its scope does, once the child has
+    /// exited but the TUI is still suspended, so Ctrl+C ends the TUI again.
+    pub(super) fn child_finished(&self) {
+        self.child_in_foreground.store(false, Ordering::Relaxed);
+    }
+
     /// Marks an in-place child as owning the terminal until the returned scope is dropped.
     fn foreground_child(&self) -> ForegroundChild<'_> {
         self.child_in_foreground.store(true, Ordering::Relaxed);

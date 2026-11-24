@@ -6,10 +6,10 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use super::keep_start;
+use super::{display_width, keep_start};
 use crate::{
     backend::BackendId,
     desktop::status::Status,
@@ -136,7 +136,8 @@ impl SettingsOverlay {
         self.cursor = self.cursor.min(self.rows().len() - 1);
     }
 
-    /// Draws the overlay centred over `area`, with the settings file's `path`.
+    /// Draws the overlay centred over `area`, with the settings file's `path`. Every line is cut
+    /// or, for the error, wrapped here to the overlay's width, so its height is its line count.
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, path: &str) {
         let width = area.width.min(MAX_WIDTH);
         let inner = usize::from(width.saturating_sub(2));
@@ -180,13 +181,11 @@ impl SettingsOverlay {
         lines.push(Line::from(actions));
         lines.push(Line::raw(""));
         lines.push(Line::raw(keep_start(path, inner)));
-        let mut height = lines.len() + 1;
         if let Some(error) = &self.error {
-            lines.push(Line::raw(error.clone()));
-            height += super::display_width(error).div_ceil(inner.max(1)).max(1);
+            lines.extend(wrap(error, inner).into_iter().map(Line::raw));
         }
-        lines.push(Line::raw(FOOTER));
-        let height = u16::try_from(height + 2)
+        lines.push(Line::raw(keep_start(FOOTER, inner)));
+        let height = u16::try_from(lines.len() + 2)
             .unwrap_or(u16::MAX)
             .min(area.height);
         let overlay = Rect {
@@ -197,12 +196,40 @@ impl SettingsOverlay {
         };
         frame.render_widget(Clear, overlay);
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title("Settings")),
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Settings")),
             overlay,
         );
     }
+}
+
+/// `text` in lines of at most `columns` columns, broken between words where it can be.
+fn wrap(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let joined = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if display_width(&joined) <= columns {
+            line = joined;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        // A word wider than the overlay is broken where it reaches the edge.
+        for character in word.chars() {
+            if display_width(&line) + display_width(&character.to_string()) > columns {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(character);
+        }
+    }
+    lines.push(line);
+    lines
 }
 
 /// The name a toggle shows: its tab's.
@@ -299,6 +326,39 @@ mod tests {
             OverlayAction::Close
         );
         assert_eq!(press(&mut overlay, KeyCode::Char('x')), OverlayAction::None);
+    }
+
+    #[test]
+    fn the_overlay_is_as_tall_as_its_lines_on_a_narrow_terminal() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        overlay.error = Some(
+            "invalid settings file ~/.config/portico/settings.toml: line 1: expected `]`".into(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(30, 30)).unwrap();
+        terminal
+            .draw(|frame| overlay.render(frame, frame.area(), "~/.config/portico/settings.toml"))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..30)
+            .map(|y| (0..30).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let text = rows.join("\n");
+        // Nothing is lost to wrapping: the whole error and the footer's last word are shown.
+        assert!(text.contains("expected `]`"), "{text}");
+        assert!(text.contains("oml: line 1: expected `]`"), "{text}");
+        let bottom = rows.iter().position(|row| row.starts_with('└')).unwrap();
+        assert!(rows[bottom - 1].contains('…'), "the footer is cut: {text}");
+        for row in &rows {
+            assert!(row.chars().count() <= 30);
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_between_words_and_inside_long_ones() {
+        assert_eq!(wrap("ab cd ef", 5), vec!["ab cd", "ef"]);
+        assert_eq!(wrap("abcdefg", 3), vec!["abc", "def", "g"]);
+        assert_eq!(wrap("", 3), vec![""]);
     }
 
     #[test]

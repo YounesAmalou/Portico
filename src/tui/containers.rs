@@ -889,7 +889,7 @@ pub(super) fn render_containers(
     let content = tab_areas(
         area,
         panel.status().map(str::to_owned),
-        &panel.footer(),
+        &state.tab_footer(|| panel.footer()),
         frame,
     );
     let [target, body] = Layout::default()
