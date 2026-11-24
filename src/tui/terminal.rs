@@ -29,7 +29,7 @@ use super::TuiError;
 ///
 /// Unlike `Terminal::clear`, this never asks the terminal for the cursor position: the
 /// cursor is hidden here, and a terminal that is slow to answer must not abort the interface.
-pub(super) fn redraw_from_scratch<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+fn redraw_from_scratch<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
@@ -107,7 +107,7 @@ impl Signals {
     }
 }
 
-pub(super) struct ForegroundChild<'a>(&'a AtomicBool);
+struct ForegroundChild<'a>(&'a AtomicBool);
 
 impl Drop for ForegroundChild<'_> {
     fn drop(&mut self) {
@@ -126,7 +126,7 @@ trait TerminalControl: Send + Sync {
     fn pop_keyboard_flags(&self) -> io::Result<()>;
 }
 
-pub(super) struct CrosstermControl;
+struct CrosstermControl;
 
 impl TerminalControl for CrosstermControl {
     fn enable_raw_mode(&self) -> io::Result<()> {
@@ -286,11 +286,7 @@ impl Drop for PanicHook {
     }
 }
 
-pub(super) fn suspend_for_child<T, L, C, E>(
-    mut leave: L,
-    child: C,
-    mut enter: E,
-) -> Result<T, TuiError>
+fn suspend_for_child<T, L, C, E>(mut leave: L, child: C, mut enter: E) -> Result<T, TuiError>
 where
     L: FnMut() -> Result<(), TuiError>,
     C: FnOnce() -> Result<T, TuiError>,

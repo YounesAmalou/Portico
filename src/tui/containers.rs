@@ -4,11 +4,14 @@ use std::{cell::Cell, collections::HashMap};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use super::{TextInput, TuiError, display_width, explanation_lines};
+use super::{TextInput, TuiError, UiState, display_width, hosts::explanation_lines, tab_areas};
 use crate::{
     app::ContainerError,
     backend::{
@@ -751,6 +754,59 @@ fn failure(error: &ContainerError) -> PanelFailure {
             lines: vec![other.to_string()],
             offer: None,
         },
+    }
+}
+
+/// The Containers tab: the target line, the list with the user line, and the selected
+/// container's details, with the target picker over them while it is open.
+pub(super) fn render_containers(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    let panel = &state.containers;
+    let content = tab_areas(
+        area,
+        panel.status().map(str::to_owned),
+        &panel.footer(),
+        frame,
+    );
+    let [target, body] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .areas(content);
+    frame.render_widget(Paragraph::new(panel.target_line()), target);
+    let [left, right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(body);
+    frame.render_widget(
+        Paragraph::new(panel.lines(
+            true,
+            usize::from(left.height.saturating_sub(2)),
+            usize::from(left.width.saturating_sub(2)),
+        ))
+        .block(Block::default().borders(Borders::ALL).title(panel.title())),
+        left,
+    );
+    let details = panel.details().unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(
+            details
+                .lines()
+                .map(|line| Line::raw(line.to_owned()))
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Container")),
+        right,
+    );
+    if panel.picker_open() {
+        let height = body.height.min(crate::picker::MAX_HEIGHT + 2);
+        let area = Rect { height, ..body };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Containers on");
+        let inner = block.inner(area);
+        frame.render_widget(ratatui::widgets::Clear, area);
+        frame.render_widget(block, area);
+        panel.render_picker(frame, inner);
     }
 }
 
