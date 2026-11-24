@@ -342,7 +342,7 @@ mod tests {
             start_daemon_offer, start_daemon_words,
         },
         domain::host::Host,
-        managed::{ConfigPaths, ManagedStore},
+        domain::managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         test_executable::write_executable,
     };

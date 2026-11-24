@@ -56,8 +56,8 @@ use crate::{
     domain::fuzzy,
     domain::host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     domain::identity::IdentityInventory,
+    domain::managed::{InitPlan, TransactionError},
     domain::suggest::{self, Candidate},
-    managed::{InitPlan, TransactionError},
     openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     picker::HIT,
 };
@@ -3353,8 +3353,8 @@ mod tests {
         app::{HostDetails, HostSummary, Ownership},
         domain::discovery::DiscoveryWarning,
         domain::host::{Change, Host},
+        domain::managed::InitPlan,
         domain::probe::ProbeResult,
-        managed::InitPlan,
         openssh::ResolvedConfig,
     };
 
@@ -3506,8 +3506,8 @@ mod tests {
     fn inventory_warnings_remain_visible_without_resolved_details() {
         for external in ["", "Host legacy\n"] {
             let dir = tempfile::tempdir().unwrap();
-            let paths = crate::managed::ConfigPaths::from_home(dir.path());
-            let store = crate::managed::ManagedStore::new(paths.clone());
+            let paths = crate::domain::managed::ConfigPaths::from_home(dir.path());
+            let store = crate::domain::managed::ManagedStore::new(paths.clone());
             store.apply_init(true, |_, _| Ok(())).unwrap();
             std::fs::write(
                 &paths.entry,
@@ -4745,7 +4745,7 @@ mod tests {
             }),
             AppError::Transaction(TransactionError::Managed {
                 backup: "backup".into(),
-                source: crate::managed::ManagedError::Parse {
+                source: crate::domain::managed::ManagedError::Parse {
                     line: 1,
                     message: "bad".into(),
                 },
@@ -4833,8 +4833,8 @@ mod tests {
 
     /// An app whose `ssh -G` appends its alias to a log, then runs `behaviour`.
     fn logging_app(dir: &std::path::Path, behaviour: &str) -> (App, PathBuf) {
-        let paths = crate::managed::ConfigPaths::from_home(dir);
-        let store = crate::managed::ManagedStore::new(paths.clone());
+        let paths = crate::domain::managed::ConfigPaths::from_home(dir);
+        let store = crate::domain::managed::ManagedStore::new(paths.clone());
         store.apply_init(true, |_, _| Ok(())).unwrap();
         std::fs::write(&paths.entry, "Include ~/.ssh/portico/config\nHost a b c\n").unwrap();
         let log = dir.join("resolved.log");

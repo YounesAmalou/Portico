@@ -3,7 +3,6 @@ pub mod backend;
 pub mod cli;
 pub mod desktop;
 pub mod domain;
-pub mod managed;
 pub mod openssh;
 pub mod picker;
 pub mod platform;

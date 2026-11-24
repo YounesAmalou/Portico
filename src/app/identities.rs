@@ -511,7 +511,7 @@ mod tests {
     use super::*;
     use crate::{
         domain::identity::{Availability, MissingReason},
-        managed::{ConfigPaths, ManagedStore},
+        domain::managed::{ConfigPaths, ManagedStore},
         test_executable::write_executable,
     };
     use std::os::unix::net::UnixListener;

@@ -5,6 +5,7 @@ pub mod explain;
 pub mod fuzzy;
 pub mod host;
 pub mod identity;
+pub mod managed;
 pub mod probe;
 pub mod suggest;
 pub mod tunnel;

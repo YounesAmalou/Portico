@@ -24,7 +24,7 @@ use crate::{
     domain::explain::Explanation,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::identity::{self, Agent, HostIdentities, IdentityInventory},
-    managed::{InitOutcome, InitPlan},
+    domain::managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     picker::{Picker, Row},
 };
@@ -1591,7 +1591,7 @@ mod tests {
             remote_command,
         },
         domain::host::Host,
-        managed::{ConfigPaths, ManagedStore},
+        domain::managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         picker::Row,
     };
