@@ -141,16 +141,20 @@ jobs:
       - run: scripts/ci-container.sh e2e
 
   # The same Rust checks on macOS (Apple silicon), as the runner's own unprivileged user:
-  # clippy for the macOS code, then the tests and the end-to-end suite against macOS's own
-  # OpenSSH. The workflow's CARGO_HOME and RUSTUP_HOME are the Linux container's, so the
-  # runner's own are named here.
+  # clippy for the macOS code, the tests, and the end-to-end suite against macOS's own
+  # OpenSSH. Each check is its own job, as on Linux, so one failing never hides another.
+  # The workflow's CARGO_HOME and RUSTUP_HOME are the Linux container's, so the runner's
+  # own are named here. A normal run takes a few minutes; the limit makes a hung test fail
+  # quickly, with the log of what was running, instead of after GitHub's six hours.
   macos:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: macos-latest
-    # A normal run takes a few minutes. The limits make a hung test fail quickly, with the
-    # log of what was running, instead of after GitHub's default of six hours.
-    timeout-minutes: 30
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [clippy, test, e2e]
     env:
       CARGO_HOME: /Users/runner/.cargo
       RUSTUP_HOME: /Users/runner/.rustup
@@ -160,10 +164,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: scripts/ci-checks.sh clippy
-      - run: scripts/ci-checks.sh test
-        timeout-minutes: 12
-      - run: scripts/ci-checks.sh e2e
+      - run: scripts/ci-checks.sh ${{ matrix.check }}
         timeout-minutes: 12
 
   msrv:
