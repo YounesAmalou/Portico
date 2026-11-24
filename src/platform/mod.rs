@@ -5,4 +5,5 @@ compile_error!(
 #[cfg(target_os = "linux")]
 mod linux;
 
+pub mod fs;
 pub mod process;

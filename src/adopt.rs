@@ -18,9 +18,9 @@ use thiserror::Error;
 
 use crate::discovery::{DiscoveryError, DiscoveryWarning, discover};
 use crate::host::Host;
-use crate::managed::{
-    HostComments, ManagedConfig, ManagedStore, PendingFile, TransactionError, acquire_lock,
-    normalize_path, open_lock, render_host, symlink_target, sync_dir, write_unique,
+use crate::managed::{HostComments, ManagedConfig, ManagedStore, TransactionError, render_host};
+use crate::platform::fs::{
+    PendingFile, acquire_lock, normalize_path, open_lock, symlink_target, sync_dir, write_unique,
 };
 
 /// Whether hosts move into the managed fragment or out of it.

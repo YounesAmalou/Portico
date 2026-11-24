@@ -9,7 +9,7 @@ use std::{
 use thiserror::Error;
 
 use super::{TunnelFileError, TunnelsFile};
-use crate::managed::{acquire_lock, create_private_dir, open_lock, sync_dir, write_unique};
+use crate::platform::fs::{acquire_lock, create_private_dir, open_lock, sync_dir, write_unique};
 
 #[derive(Debug, Error)]
 pub enum StoreError {

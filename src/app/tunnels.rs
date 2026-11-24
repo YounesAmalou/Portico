@@ -19,8 +19,8 @@ use thiserror::Error;
 use super::{App, AppError};
 use crate::{
     explain::{Explanation, Operation},
-    managed::{acquire_lock, open_lock},
     openssh::OpenSshError,
+    platform::fs::{acquire_lock, open_lock},
     platform::process::{Logged, current_uid, kill_process_tree, stop_process},
     probe::{Failure, diagnose},
     tunnel::{
