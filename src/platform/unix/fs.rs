@@ -1,9 +1,12 @@
-//! Linux files: locking, atomic writes and file identity.
+//! Unix files (Linux and macOS): locking, atomic writes and file identity.
 
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::{FromRawFd, OwnedFd, RawFd},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -253,6 +256,68 @@ pub fn fail_directory_sync_after(path: &Path, successful_syncs: usize) {
             .borrow_mut()
             .push_back((path.to_owned(), successful_syncs))
     });
+}
+
+/// A new socket that is closed on `exec`. Linux sets the flag atomically; macOS has no
+/// `SOCK_CLOEXEC`, so it is set straight after (Portico starts no process between the two).
+pub fn cloexec_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    let kind = kind | libc::SOCK_CLOEXEC;
+    // SAFETY: `socket` has no preconditions; a valid descriptor is owned at once.
+    let fd = unsafe { libc::socket(domain, kind, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(not(target_os = "linux"))]
+    set_cloexec(std::os::fd::AsRawFd::as_raw_fd(&socket))?;
+    Ok(socket)
+}
+
+/// A new pipe whose ends are non-blocking and closed on `exec`, as `[read, write]`. Linux
+/// sets the flags atomically with `pipe2`; macOS has none, so they are set straight after.
+pub fn nonblocking_pipe() -> io::Result<[RawFd; 2]> {
+    let mut ends = [-1; 2];
+    #[cfg(target_os = "linux")]
+    // SAFETY: `pipe2` writes two new descriptors into `ends`.
+    let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: `pipe` writes two new descriptors into `ends`.
+    let created = unsafe { libc::pipe(ends.as_mut_ptr()) };
+    if created == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    for end in ends {
+        let flags = set_cloexec(end).and_then(|()| {
+            // SAFETY: `fcntl` on a descriptor owned here.
+            let flags = unsafe { libc::fcntl(end, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(end, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        if let Err(error) = flags {
+            // SAFETY: both descriptors were created above and are not used again.
+            unsafe {
+                libc::close(ends[0]);
+                libc::close(ends[1]);
+            }
+            return Err(error);
+        }
+    }
+    Ok(ends)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fcntl` on a descriptor the caller owns.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// What tells one version of a path from another. An absent or unreadable path has none.

@@ -148,11 +148,7 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
 /// Points `target` at the read end of a pipe that stays empty and open, so reading it fails
 /// with `WouldBlock` instead of returning end of file.
 fn replace_with_quiet_pipe(target: RawFd) -> io::Result<()> {
-    let mut ends = [-1; 2];
-    // SAFETY: `pipe2` writes two new descriptors into `ends`.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    let ends = crate::platform::fs::nonblocking_pipe()?;
     // SAFETY: `dup2` atomically swaps `target` for the pipe; the read end's own descriptor is
     // then closed. The write end is left open for the life of the process, or reads would see
     // end of file.
@@ -234,8 +230,8 @@ mod tests {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
             assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
             (OwnedFd::from_raw_fd(master), File::from_raw_fd(slave))

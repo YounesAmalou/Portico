@@ -71,8 +71,15 @@ pub fn closed_port() -> ClosedPort {
     // SAFETY: plain socket calls on a descriptor this function owns, with
     // properly sized `sockaddr_in` buffers.
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        // macOS has no SOCK_CLOEXEC; the flag is set straight after there.
+        #[cfg(target_os = "linux")]
+        let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let kind = libc::SOCK_STREAM;
+        let fd = libc::socket(libc::AF_INET, kind, 0);
         assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
         let socket = OwnedFd::from_raw_fd(fd);
         let mut address: libc::sockaddr_in = std::mem::zeroed();
         address.sin_family = libc::AF_INET as libc::sa_family_t;

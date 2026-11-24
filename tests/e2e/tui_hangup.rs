@@ -58,8 +58,8 @@ impl HangupTerminal {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                (&raw const size).cast_mut(),
             );
             assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
             (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
@@ -91,7 +91,7 @@ impl HangupTerminal {
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 if block_sighup {

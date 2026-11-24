@@ -6,15 +6,12 @@ use std::{
     ffi::OsStr,
     fs, io,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
 };
 
 use crate::{
-    platform::fs::{create_private_dir, sync_dir, write_unique},
+    platform::fs::{cloexec_socket, create_private_dir, sync_dir, write_unique},
     platform::paths::runtime_dir,
     platform::process::{Logged, Proc},
 };
@@ -311,11 +308,7 @@ fn bind_v6_only(address: std::net::SocketAddrV6) -> io::Result<()> {
     // SAFETY: plain socket calls on a descriptor owned here, with a properly sized
     // `sockaddr_in6` and option values that outlive each call.
     unsafe {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let socket = std::os::fd::OwnedFd::from_raw_fd(fd);
+        let socket = cloexec_socket(libc::AF_INET6, libc::SOCK_STREAM)?;
         let one: libc::c_int = 1;
         for option in [
             (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
@@ -375,11 +368,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::platform::process::Stat;
 
     const BOOT: &str = "3f0d9c1e-0000-4000-8000-000000000001";
+    #[cfg(target_os = "linux")]
     const LOG: &str = "/run/user/1000/portico/tunnels/db.log";
 
+    #[cfg(target_os = "linux")]
     /// A fake `/proc` with a boot ID and a boot time of 1000 seconds.
     fn fake_proc() -> (tempfile::TempDir, Proc) {
         let dir = tempfile::tempdir().unwrap();
@@ -394,11 +390,13 @@ mod tests {
         (dir, proc)
     }
 
+    #[cfg(target_os = "linux")]
     /// Adds a process that leads its own session, as a backgrounded ssh does.
     fn add_process(root: &Path, pid: u32, start: u64, state: char, uid: u32, args: &[&str]) {
         add_in_session(root, pid, pid, start, state, uid, args);
     }
 
+    #[cfg(target_os = "linux")]
     fn add_in_session(
         root: &Path,
         pid: u32,
@@ -428,6 +426,7 @@ mod tests {
         fs::write(dir.join("cmdline"), cmdline).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn tunnel_args() -> Vec<&'static str> {
         vec![
             "/usr/bin/ssh",
@@ -455,6 +454,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stat_reads_state_and_start_after_the_command_name() {
         let (dir, proc) = fake_proc();
@@ -471,6 +471,7 @@ mod tests {
         assert_eq!(proc.stat(42), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_accepts_the_recorded_process() {
         let (dir, proc) = fake_proc();
@@ -481,6 +482,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_another_start_time() {
         let (dir, proc) = fake_proc();
@@ -491,6 +493,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_another_boot() {
         let (dir, proc) = fake_proc();
@@ -500,6 +503,7 @@ mod tests {
         assert_eq!(proc.identify(&old, Path::new(LOG), 1000), Identity::Stale);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_another_uid() {
         let (dir, proc) = fake_proc();
@@ -510,6 +514,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_a_zombie() {
         let (dir, proc) = fake_proc();
@@ -520,6 +525,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_a_command_line_without_the_log() {
         let (dir, proc) = fake_proc();
@@ -542,6 +548,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_finds_the_process_with_the_log_argument() {
         let (dir, proc) = fake_proc();
@@ -557,6 +564,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_ignores_a_foreground_ssh_that_is_still_connecting() {
         let (dir, proc) = fake_proc();
@@ -569,6 +577,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_ignores_older_and_foreign_processes() {
         let (dir, proc) = fake_proc();
@@ -586,6 +595,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rediscovers_a_tunnel_without_a_record() {
         let (dir, proc) = fake_proc();
@@ -604,6 +614,62 @@ mod tests {
             proc.identify(&rebuilt, Path::new(LOG), 1000),
             Identity::Alive
         );
+    }
+
+    /// The real process table on either system: a process whose command line looks like a
+    /// started tunnel's, in its own session as `ssh -f` puts itself.
+    #[test]
+    fn a_live_tunnel_process_is_recognised_rebuilt_and_stopped() {
+        use std::os::unix::process::CommandExt;
+
+        use crate::platform::process::{current_uid, stop_process};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("db.log");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30; :", "ssh", "-E"])
+            .arg(&log)
+            .args(["-L", "5432:db:5432", "--", "prod-db"]);
+        // SAFETY: `setsid` is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let (proc, uid) = (Proc::system(), current_uid());
+
+        let (pid, start) = proc.find_tunnel(&log, uid, None).unwrap();
+        assert_eq!(pid, child.id());
+        assert_eq!(proc.find_tunnel(&log, uid, Some(start + 1)), None);
+        let record = proc.rebuild_record(pid, start).unwrap();
+        assert_eq!(record.host, "prod-db");
+        assert_eq!(record.forward, "-L 5432:db:5432");
+        assert!(record.started.abs_diff(now()) < 60, "{record:?}");
+        assert_eq!(proc.identify(&record, &log, uid), Identity::Alive);
+        let restarted = RunningRecord {
+            start: start + 1,
+            ..record.clone()
+        };
+        assert_eq!(proc.identify(&restarted, &log, uid), Identity::Gone);
+        let rebooted = RunningRecord {
+            boot: "another-boot".into(),
+            ..record.clone()
+        };
+        assert_eq!(proc.identify(&rebooted, &log, uid), Identity::Stale);
+        assert_eq!(
+            proc.identify(&record, &dir.path().join("other.log"), uid),
+            Identity::Gone
+        );
+
+        assert!(stop_process(pid, || proc.is_tunnel(pid, Some(start), &log, uid)).unwrap());
+        child.wait().unwrap();
+        assert_eq!(proc.identify(&record, &log, uid), Identity::Gone);
+        assert_eq!(proc.find_tunnel(&log, uid, None), None);
     }
 
     #[test]
