@@ -382,7 +382,13 @@ def check_terminal(scenario):
         read_until(b"\x1b[?25h", left)
         status = process.wait(timeout=5)
         assert status == 0, f"{scenario}: exit status {status}: {transcript!r}"
-        assert termios.tcgetattr(slave) == before, f"{scenario}: termios was not restored"
+        try:
+            after = termios.tcgetattr(slave)
+        except termios.error:
+            # macOS revokes the slave once the session leader that controlled it exits; the
+            # master side reads the same terminal settings.
+            after = termios.tcgetattr(master)
+        assert after == before, f"{scenario}: termios was not restored"
         assert b"\x1b[?1049l" in transcript[start:]
         if scenario == "blocked_connection":
             shell, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())

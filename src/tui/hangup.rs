@@ -148,7 +148,7 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
             return true;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            if nothing_to_read(tty) {
+            if stays_readable_and_empty(tty) {
                 return true;
             }
             // Input waits for its reader: look again shortly, not at once.
@@ -157,13 +157,35 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     }
 }
 
-/// Whether a terminal that polls readable holds no input: reading it would return end of file,
-/// as a hung-up terminal does.
-fn nothing_to_read(tty: &OwnedFd) -> bool {
-    let mut queued: libc::c_int = 0;
-    // SAFETY: `FIONREAD` writes one `int` to the location given.
-    let read = unsafe { libc::ioctl(tty.as_raw_fd(), libc::FIONREAD as _, &mut queued) };
-    read == -1 || queued == 0
+/// Whether a terminal that polled readable holds no input and stays that way: reading it would
+/// return end of file, as a hung-up terminal does. Input the interface reads between two looks
+/// also leaves the terminal empty, but then no longer readable, so it is looked at a few times.
+fn stays_readable_and_empty(tty: &OwnedFd) -> bool {
+    for _ in 0..3 {
+        let mut poll = libc::pollfd {
+            fd: tty.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` that outlives the call.
+        if unsafe { libc::poll(&mut poll, 1, 0) } == -1 {
+            return false;
+        }
+        if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return true;
+        }
+        if poll.revents & libc::POLLIN == 0 {
+            return false;
+        }
+        let mut queued: libc::c_int = 0;
+        // SAFETY: `FIONREAD` writes one `int` to the location given.
+        let read = unsafe { libc::ioctl(tty.as_raw_fd(), libc::FIONREAD as _, &mut queued) };
+        if read == 0 && queued > 0 {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 /// Points `target` at the read end of a pipe that stays empty and open, so reading it fails
