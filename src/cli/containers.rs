@@ -2,7 +2,9 @@ use std::io::{BufRead, Write};
 
 use crate::{
     app::{App, ContainerError},
-    backend::{BackendIssue, ContainerList, Target, display_name, group, remote_command},
+    backend::{
+        BackendId, BackendIssue, ContainerList, Target, display_name, group, remote_command,
+    },
     picker::{Picker, Row},
 };
 
@@ -63,6 +65,7 @@ pub(super) fn on_argument(
 pub(super) fn list_with_offers<I: BufRead, O: Write, E: Write>(
     app: &App,
     target: &Target,
+    backend: Option<BackendId>,
     input: &mut I,
     output: &mut O,
     error: &mut E,
@@ -70,7 +73,7 @@ pub(super) fn list_with_offers<I: BufRead, O: Write, E: Write>(
 ) -> Result<ContainerList, String> {
     let mut offered = false;
     loop {
-        let issue = match app.containers(target, false, None) {
+        let issue = match app.containers(target, backend, false, None) {
             Ok(list) => return Ok(list),
             Err(ContainerError::Backend(issue)) => issue,
             Err(failure) => return Err(report_container_failure(error, failure)?),
@@ -161,18 +164,24 @@ pub(super) fn print_listing(output: &mut impl Write, list: &ContainerList) -> Re
         text.push_str(&format!("No running containers on {}.\n", list.target));
     }
     for group in group(containers) {
-        text.push_str(group.project.unwrap_or("Other"));
+        text.push_str(group.project.unwrap_or(list.backend.ungrouped_heading()));
         text.push('\n');
-        let rows: Vec<[String; 4]> = group
+        let rows: Vec<Vec<String>> = group
             .containers
             .iter()
-            .map(|container| {
-                [
+            .map(|container| match list.backend {
+                BackendId::Docker => vec![
                     display_name(container, containers),
                     container.name.clone(),
                     container.image.clone(),
                     container.status.clone(),
-                ]
+                ],
+                // A CT has no image and its display name is its name: its VMID instead.
+                BackendId::Proxmox => vec![
+                    container.id.clone(),
+                    container.name.clone(),
+                    container.status.clone(),
+                ],
             })
             .collect();
         let width = |column: usize| {
@@ -181,14 +190,19 @@ pub(super) fn print_listing(output: &mut impl Write, list: &ContainerList) -> Re
                 .max()
                 .unwrap_or(0)
         };
-        let widths = [width(0), width(1), width(2)];
-        for [display, name, image, status] in &rows {
-            text.push_str(&format!(
-                "  {display:<w0$}  {name:<w1$}  {image:<w2$}  {status}\n",
-                w0 = widths[0],
-                w1 = widths[1],
-                w2 = widths[2]
-            ));
+        let columns = rows.first().map_or(0, Vec::len);
+        let widths: Vec<usize> = (0..columns).map(width).collect();
+        for row in &rows {
+            let mut line = String::from(" ");
+            for (column, cell) in row.iter().enumerate() {
+                if column + 1 == columns {
+                    line.push_str(&format!(" {cell}"));
+                } else {
+                    line.push_str(&format!(" {cell:<w$} ", w = widths[column]));
+                }
+            }
+            text.push_str(&line);
+            text.push('\n');
         }
     }
     if let Some(note) = &list.note {
@@ -197,8 +211,9 @@ pub(super) fn print_listing(output: &mut impl Write, list: &ContainerList) -> Re
     }
     if list.listing.skipped > 0 {
         text.push_str(&format!(
-            "Skipped {} lines docker printed that Portico could not read.\n",
-            list.listing.skipped
+            "Skipped {} lines {} printed that Portico could not read.\n",
+            list.listing.skipped,
+            list.backend.program()
         ));
     }
     write!(output, "{text}").map_err(|error| error.to_string())

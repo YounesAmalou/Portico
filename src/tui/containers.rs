@@ -15,7 +15,8 @@ use super::{TextInput, TuiError, UiState, display_width, hosts::explanation_line
 use crate::{
     app::ContainerError,
     backend::{
-        Container, ContainerList, GroupTool, Offer, Target, display_name, group, remote_command,
+        BackendId, Container, ContainerList, Offer, Target, Via, display_name, group,
+        remote_command,
     },
     domain::fuzzy,
     domain::openssh::ConnectionOutcome,
@@ -47,9 +48,10 @@ pub(super) enum PanelAction {
     CancelList,
     Shell {
         target: Target,
+        backend: BackendId,
         id: String,
         user: Option<String>,
-        via: Option<GroupTool>,
+        via: Option<Via>,
         new_terminal: bool,
     },
     Fix {
@@ -239,7 +241,7 @@ impl Panel {
                 self.editing_filter = true;
                 PanelAction::None
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if !self.root_only() => {
                 self.previous_user = self.user.as_str().to_owned();
                 self.editing_user = true;
                 PanelAction::None
@@ -397,7 +399,9 @@ impl Panel {
         }
         if focused {
             let mut user = vec![Span::raw("user: ")];
-            if self.editing_user {
+            if self.root_only() {
+                user.push(Span::raw(ROOT_ONLY));
+            } else if self.editing_user {
                 user.extend(self.user.spans(true));
             } else if let Some(chosen) = self.chosen_user() {
                 user.push(Span::raw(chosen));
@@ -447,8 +451,9 @@ impl Panel {
                 if list.listing.skipped > 0 {
                     lines.extend(wrapped(
                         &format!(
-                            "Skipped {} lines docker printed that Portico could not read.",
-                            list.listing.skipped
+                            "Skipped {} lines {} printed that Portico could not read.",
+                            list.listing.skipped,
+                            list.backend.program()
                         ),
                         dim,
                     ));
@@ -471,7 +476,10 @@ impl Panel {
                         continue;
                     }
                     lines.push(Line::styled(
-                        group.project.unwrap_or("Other").to_owned(),
+                        group
+                            .project
+                            .unwrap_or(list.backend.ungrouped_heading())
+                            .to_owned(),
                         bold,
                     ));
                     for container in shown {
@@ -514,7 +522,11 @@ impl Panel {
     pub(super) fn details(&self) -> Option<String> {
         let container = *self.rows().get(self.selected)?;
         let chosen = self.chosen_user();
-        let user = chosen.as_deref().unwrap_or("image default");
+        let user = if self.root_only() {
+            ROOT_ONLY
+        } else {
+            chosen.as_deref().unwrap_or("image default")
+        };
         let rows = [
             ("name", container.name.as_str()),
             ("id", &container.id),
@@ -555,8 +567,9 @@ impl Panel {
             } else {
                 "  Esc clear filter"
             };
+            let user = if self.root_only() { "" } else { "  u user" };
             format!(
-                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
             )
         }
     }
@@ -585,6 +598,12 @@ impl Panel {
         })
     }
 
+    /// Whether the listing's shells always run as root, so no user can be chosen.
+    fn root_only(&self) -> bool {
+        self.listed()
+            .is_some_and(|list| !list.backend.chooses_user())
+    }
+
     /// The user for the next shell, trimmed; blank means the image's own.
     fn chosen_user(&self) -> Option<String> {
         let user = self.user.as_str().trim();
@@ -599,13 +618,18 @@ impl Panel {
         };
         PanelAction::Shell {
             target: list.target.clone(),
+            backend: list.backend,
             id: container.id.clone(),
-            user: self.chosen_user(),
+            // Kept for when a Docker listing is shown again, but never sent with Proxmox.
+            user: self.chosen_user().filter(|_| !self.root_only()),
             via: list.via,
             new_terminal,
         }
     }
 }
+
+/// The user line and detail of a listing whose shells always run as root.
+const ROOT_ONLY: &str = "root (Proxmox)";
 
 /// `text` wrapped at spaces to `width` columns, breaking a word longer than that. Continuation
 /// lines keep the text's indentation unless it would take more than half the width.
@@ -814,7 +838,7 @@ mod tests {
 
     use crate::{
         backend::{
-            BackendId, BackendIssue, Listing, Problem,
+            BackendIssue, Listing, Problem,
             docker::{join_group_offer, start_daemon_offer},
         },
         domain::explain::{Explanation, Label},
@@ -861,6 +885,7 @@ mod tests {
 
     fn list(target: Target, containers: Vec<Container>) -> ContainerList {
         ContainerList {
+            backend: crate::backend::BackendId::Docker,
             target,
             listing: Listing {
                 containers,
@@ -1042,6 +1067,7 @@ mod tests {
             press(&mut panel, KeyCode::Enter),
             PanelAction::Shell {
                 target: host("dev"),
+                backend: BackendId::Docker,
                 id: "aaaa".into(),
                 user: None,
                 via: None,
@@ -1072,6 +1098,7 @@ mod tests {
             press(&mut panel, KeyCode::Char('n')),
             PanelAction::Shell {
                 target: host("dev"),
+                backend: BackendId::Docker,
                 id: "bbbb".into(),
                 user: Some("root".into()),
                 via: None,
@@ -1181,7 +1208,7 @@ mod tests {
         );
 
         let mut listed = list(host("dev"), containers());
-        listed.via = Some(GroupTool::Sg);
+        listed.via = Some(Via::Sg);
         listed.note = Some("Listed through sg: other shells still lack the docker group.".into());
         listed.listing.skipped = 2;
         panel.finish(host("dev"), Ok(listed));
@@ -1210,6 +1237,80 @@ mod tests {
             ["No running containers on dev."]
         );
         assert_eq!(press(&mut panel, KeyCode::Enter), PanelAction::None);
+    }
+
+    /// A panel showing the Proxmox node `pve`, listed through sudo, after `deploy` was typed
+    /// as the user for an earlier Docker listing.
+    fn proxmox_panel() -> Panel {
+        let mut panel = listed_panel();
+        press(&mut panel, KeyCode::Char('u'));
+        for character in "deploy".chars() {
+            press(&mut panel, KeyCode::Char(character));
+        }
+        press(&mut panel, KeyCode::Enter);
+        let ct = |id: &str, name: &str| Container {
+            id: id.into(),
+            name: name.into(),
+            image: String::new(),
+            command: String::new(),
+            running_for: String::new(),
+            status: "running".into(),
+            ports: String::new(),
+            networks: String::new(),
+            mounts: String::new(),
+            project: None,
+            service: None,
+            number: None,
+            working_dir: None,
+        };
+        let mut listed = list(host("pve"), vec![ct("101", "web"), ct("110", "mail")]);
+        listed.backend = BackendId::Proxmox;
+        listed.via = Some(Via::Sudo);
+        listed.listing.skipped = 1;
+        panel.show(host("pve"));
+        panel.finish(host("pve"), Ok(listed));
+        panel
+    }
+
+    #[test]
+    fn a_proxmox_listing_runs_as_root() {
+        let mut panel = proxmox_panel();
+        assert_eq!(
+            texts(&panel.lines(true, 100, 200)),
+            [
+                "Skipped 1 lines pct printed that Portico could not read.",
+                "Proxmox containers",
+                "> mail  running",
+                "  web  running",
+                "user: root (Proxmox)",
+            ]
+        );
+        assert_eq!(
+            panel.details().unwrap(),
+            "name: mail\nid: 110\nstatus: running\nuser: root (Proxmox)"
+        );
+        assert!(!panel.footer().contains("u user"));
+        // No user can be typed, and the shell carries the backend and sudo, never a user.
+        assert_eq!(press(&mut panel, KeyCode::Char('u')), PanelAction::None);
+        assert!(panel.is_browsing());
+        assert_eq!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell {
+                target: host("pve"),
+                backend: BackendId::Proxmox,
+                id: "110".into(),
+                user: None,
+                via: Some(Via::Sudo),
+                new_terminal: false,
+            }
+        );
+        // The typed user is back with a Docker listing.
+        panel.show(host("dev"));
+        assert_eq!(
+            texts(&panel.lines(true, 100, 200)).last().unwrap(),
+            "user: deploy"
+        );
+        assert!(panel.footer().contains("u user"));
     }
 
     #[test]

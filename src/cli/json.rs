@@ -12,7 +12,7 @@ use crate::{
         App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
         TunnelRefusal,
     },
-    backend::{BackendIssue, ContainerList, GroupTool, Target, display_name, group},
+    backend::{BackendId, BackendIssue, ContainerList, Target, Via, display_name, group},
     domain::discovery::DiscoveryWarning,
     domain::explain::Explanation,
     domain::identity::{
@@ -33,7 +33,7 @@ pub(super) enum JsonCommand {
     Hosts,
     Show(Option<String>),
     Identities,
-    Containers(Option<Option<String>>),
+    Containers(Option<Option<String>>, Option<BackendId>),
     Tunnels,
     TunnelShow(Option<String>),
     TunnelStart(Vec<String>),
@@ -179,14 +179,14 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             success(details(&app.show(&alias)?))
         }
         JsonCommand::Identities => success(inventory(&app.identity_inventory()?)),
-        JsonCommand::Containers(on) => {
+        JsonCommand::Containers(on, backend) => {
             let target = match on {
                 None => Target::Local,
                 Some(Some(alias)) => Target::Host(alias),
                 Some(None) => return Err(Failure::usage("containers --on <alias>")),
             };
             // Batch: ssh must not ask for a password nobody sees.
-            success(containers(&app.containers(&target, true, None)?))
+            success(containers(&app.containers(&target, backend, true, None)?))
         }
         JsonCommand::Tunnels => {
             let reports = app.tunnels()?;
@@ -513,10 +513,15 @@ pub(super) fn containers(list: &ContainerList) -> Value {
         .into_iter()
         .flat_map(|group| group.containers)
         .map(|container| {
+            // A Proxmox container has no image.
+            let image = match list.backend {
+                BackendId::Docker => json!(line(&container.image)),
+                BackendId::Proxmox => Value::Null,
+            };
             json!({
                 "display_name": line(&display_name(container, all)),
                 "id": container.id,
-                "image": line(&container.image),
+                "image": image,
                 "name": line(&container.name),
                 "project": container.project,
                 "service": container.service,
@@ -528,13 +533,18 @@ pub(super) fn containers(list: &ContainerList) -> Value {
         Target::Local => json!({ "alias": null, "kind": "local" }),
         Target::Host(alias) => json!({ "alias": alias, "kind": "host" }),
     };
-    json!({
+    let mut document = json!({
         "containers": containers,
         "note": optional_line(list.note.as_deref()),
         "skipped": list.listing.skipped,
         "target": target,
-        "via": list.via.map(GroupTool::as_str),
-    })
+        "via": list.via.map(Via::as_str),
+    });
+    // Docker's documents predate `backend` and stay as they were: no key means Docker.
+    if list.backend != BackendId::Docker {
+        document["backend"] = json!(list.backend.as_str());
+    }
+    document
 }
 
 fn forward(forward: &Forward) -> Value {
@@ -921,6 +931,7 @@ mod tests {
             working_dir: None,
         };
         let value = containers(&ContainerList {
+            backend: crate::backend::BackendId::Docker,
             target: Target::Local,
             listing: Listing {
                 containers: vec![
@@ -929,7 +940,7 @@ mod tests {
                 ],
                 skipped: 2,
             },
-            via: Some(GroupTool::Sg),
+            via: Some(Via::Sg),
             note: Some("note".into()),
         });
         assert_eq!(value["containers"][0]["id"], "a");

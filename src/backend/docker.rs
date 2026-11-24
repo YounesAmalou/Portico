@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Backend, BackendId, BackendIssue, Container, ContainerList, GroupTool, ListFailure, Listing,
-    Offer, Problem, RunFailure, RunResult, Target, remote_command,
+    Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, Offer,
+    Problem, RunFailure, RunResult, Target, Via, remote_command,
 };
 
 /// The `docker ps --format` template: one flat JSON object of strings per
@@ -161,8 +161,7 @@ fn hex4(chars: &mut Chars) -> Option<u32> {
     Some(value)
 }
 
-/// Runs bash when the container has it, and sh otherwise.
-pub const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+pub use super::SHELL_SCRIPT;
 
 /// The words of the command that opens a shell in a container.
 pub fn exec_words(id: &str, user: Option<&str>) -> Vec<String> {
@@ -252,7 +251,7 @@ pub fn parse_probe(stdout: &str) -> Option<Probe> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Access {
     /// The user is in the group, but this process predates it: rerun inside it.
-    RerunInGroup(GroupTool),
+    RerunInGroup(Via),
     /// Same, but `sg` does not exist: a new login is needed.
     NeedsLogin,
     /// Offer to add the user to the docker group.
@@ -265,7 +264,7 @@ fn decide(probe: &Probe) -> Access {
     let has = |groups: &[String]| groups.iter().any(|group| group == "docker");
     if has(&probe.database_groups) && !has(&probe.process_groups) {
         return if probe.has_sg {
-            Access::RerunInGroup(GroupTool::Sg)
+            Access::RerunInGroup(Via::Sg)
         } else {
             Access::NeedsLogin
         };
@@ -281,15 +280,22 @@ fn decide(probe: &Probe) -> Access {
     }
 }
 
-/// Wraps a command so it runs inside the docker group.
-pub fn in_group(tool: GroupTool, words: &[String]) -> Vec<String> {
-    let GroupTool::Sg = tool;
-    vec![
-        "sg".to_string(),
-        "docker".to_string(),
-        "-c".to_string(),
-        remote_command(words),
-    ]
+/// Wraps a command so it runs through `tool`: inside the docker group with `sg`, which is
+/// what Docker's listing reruns through, or as root with `sudo -n` when asked for.
+pub fn in_group(tool: Via, words: &[String]) -> Vec<String> {
+    match tool {
+        Via::Sg => vec![
+            "sg".to_string(),
+            "docker".to_string(),
+            "-c".to_string(),
+            remote_command(words),
+        ],
+        Via::Sudo => ["sudo", "-n"]
+            .into_iter()
+            .map(String::from)
+            .chain(words.iter().cloned())
+            .collect(),
+    }
 }
 
 /// Creates the group if needed, adds the user, and gives the socket to it
@@ -375,7 +381,7 @@ impl Backend for Docker {
     }
 
     /// `docker exec` into container `id`, through `via` when the listing needed it.
-    fn shell_words(&self, id: &str, user: Option<&str>, via: Option<GroupTool>) -> Vec<String> {
+    fn shell_words(&self, id: &str, user: Option<&str>, via: Option<Via>) -> Vec<String> {
         let words = exec_words(id, user);
         match via {
             Some(tool) => in_group(tool, &words),
@@ -403,8 +409,9 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn listed(target: Target, stdout: &[u8], via: Option<GroupTool>) -> ContainerList {
+fn listed(target: Target, stdout: &[u8], via: Option<Via>) -> ContainerList {
     ContainerList {
+        backend: BackendId::Docker,
         target,
         listing: parse_listing(&lossy(stdout)),
         via,
@@ -720,7 +727,7 @@ mod tests {
     fn decides_rerun_with_sg_then_login() {
         let mut p = probe();
         p.database_groups.push("docker".into());
-        assert_eq!(decide(&p), Access::RerunInGroup(GroupTool::Sg));
+        assert_eq!(decide(&p), Access::RerunInGroup(Via::Sg));
         p.has_sg = false;
         assert_eq!(decide(&p), Access::NeedsLogin);
     }
@@ -777,7 +784,7 @@ mod tests {
     fn in_group_and_join_words() {
         let words = ps_words();
         assert_eq!(
-            in_group(GroupTool::Sg, &words),
+            in_group(Via::Sg, &words),
             ["sg", "docker", "-c", &remote_command(&words)]
         );
         assert_eq!(

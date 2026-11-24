@@ -40,9 +40,10 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `domain::tunnel` | Saved port forwards, their store, and the runtime state of started ones (`runtime`, including the `Proc` methods specific to tunnels) |
 | `domain::probe` | The connection test: its options and outcomes |
 | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | Identity data, jump-host suggestions, fuzzy matching, failure explanations, configuration errors |
-| `backend` | The `Backend` interface, `BackendId`, `Target`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
+| `backend` | The `Backend` interface, `BackendId`, `AUTOMATIC` (the order backends are tried in), `Target`, `Via`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
 | `backend::listing` | The container rows every backend produces (`Container`, `Listing`), grouping by Compose project, display names, and resolving a container reference |
 | `backend::docker` | The Docker adapter: `docker ps` parsing, and its access decision (`Access`, `decide`, private to this file) |
+| `backend::proxmox` | The Proxmox VE adapter: the listing script (root or `sudo -n`), `pct list` parsing, and `pct exec` |
 | `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities` |
 | `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`) and the JSON documents (`json`) |
 | `picker` | The inline pickers the CLI opens when a host or container is missing; also used by the TUI |
@@ -59,8 +60,8 @@ Adapters are compiled in and chosen at run time through the `BackendId` enum. No
 
 1. Add the adapter in `src/backend/<name>.rs`, implementing `Backend`. It produces the shared `backend::Listing` of `backend::Container` rows (`src/backend/listing.rs`), which grouping, naming and lookup already work on.
 2. Add one `BackendId` variant.
-3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str` and the dispatch functions `list`, `shell_words` and `plain_issue`.
-4. Make the app choose it. The app names `BackendId::Docker` itself in `src/app/containers.rs` (listing, opening a shell, and explaining a local spawn failure), and `local_failure` there also checks for the `docker` binary by name. These are the only non-test places that do; a new backend needs its selection added there, or the app never reaches the adapter.
+3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str`, `program`, `chooses_user` and `ungrouped_heading`, and the dispatch functions `list`, `shell_words` and `plain_issue`.
+4. Make the app reach it. Without `--backend`, the app lists with each backend of `backend::AUTOMATIC` in turn and moves on only when one is not installed (Docker, then Proxmox), so add the new id where it belongs in that order. With `--backend`, the CLI maps its `BackendArg` value to the id (`src/cli/mod.rs`): add a value there. The list records its backend (`ContainerList::backend`), and the shell, the CLI's human and JSON output and the TUI read it from there; the JSON adds a `backend` key for every backend but Docker, whose documents predate it.
 
 ### Add a platform
 

@@ -9,7 +9,7 @@ Portico's read commands, and starting and stopping tunnels, print a JSON documen
 | `portico hosts --json` | [The host list](#hosts) |
 | `portico show <alias> --json` | [One host's details and identities](#show) |
 | `portico identities --json` | [Every agent and identity file](#identities) |
-| `portico containers [--on <alias>] --json` | [The running containers of this machine or a host](#containers) |
+| `portico containers [--on <alias>] [--backend docker\|proxmox] --json` | [The running containers of this machine or a host](#containers) |
 | `portico tunnels --json` | [The saved tunnels and their status](#tunnels) |
 | `portico tunnel show <name> --json` | [One tunnel, its command line and its log](#tunnel-show) |
 | `portico tunnel start <name>... --json` | [What each start did](#start-and-stop) |
@@ -29,7 +29,7 @@ Other commands do not accept `--json`. To connect, a consumer runs `portico conn
 - **Paths** are absolute (never shortened with `~`), except where a value is shown as OpenSSH or the user wrote it (`configured`, `identity_file`, `identity_files`). A path that is not valid UTF-8 is converted lossily.
 - **Times** are Unix seconds.
 - **Warnings** are objects with a `message`, the line the human output prints after `Warning:`.
-- **Free text is one line.** Messages, next steps, reasons, warnings, key comments and docker's names, images and statuses never contain a newline, a terminal escape sequence or a control character, so any of them can go in a label as it is. Text from ssh, an agent or docker is cleaned the same way.
+- **Free text is one line.** Messages, next steps, reasons, warnings, key comments and the names, images and statuses of containers never contain a newline, a terminal escape sequence or a control character, so any of them can go in a label as it is. Text from ssh, an agent, docker or pct is cleaned the same way.
 
 ## Errors
 
@@ -56,6 +56,7 @@ A command that fails prints an error document and exits with status 1:
 | `unknown-tunnel` | No tunnel has that name |
 | `ssh` | ssh could not reach or authenticate to the host, or did not establish a tunnel |
 | `docker` | docker failed; `problem` is `not-installed`, `daemon-down`, `permission-denied` or `other` |
+| `proxmox` | Proxmox's `pct` failed; `problem` is `not-installed`, `permission-denied` or `other` |
 | `other` | Anything else, such as an unreadable `~/.ssh/config` or a busy port |
 
 Show `message`; use `kind` to choose an icon or a hint, never parse `message`. A missing name looks like this:
@@ -318,7 +319,7 @@ When the host does not resolve, the command still succeeds:
 
 ## Containers
 
-`portico containers --json` lists the running Docker containers of this machine, and `portico containers --on <alias> --json` those of a host, through `ssh`.
+`portico containers --json` lists the running containers of this machine, and `portico containers --on <alias> --json` those of a host, through `ssh`. Portico lists with Docker, and with Proxmox VE's `pct` when Docker is not installed there (see [Proxmox containers](#proxmox-containers)); `--backend docker` or `--backend proxmox` uses only that one.
 
 <!-- golden: containers-on-host.json -->
 ```json
@@ -419,6 +420,77 @@ Containers' commands, mounts, ports and networks are not included. When docker f
   "schema": 1
 }
 ```
+
+### Proxmox containers
+
+On a Proxmox VE node, the listing is of its running LXC containers, with one more key, `backend`:
+
+<!-- golden: containers-proxmox.json -->
+```json
+{
+  "backend": "proxmox",
+  "containers": [
+    {
+      "display_name": "mail",
+      "id": "110",
+      "image": null,
+      "name": "mail",
+      "project": null,
+      "service": null,
+      "status": "running"
+    },
+    {
+      "display_name": "web",
+      "id": "101",
+      "image": null,
+      "name": "web",
+      "project": null,
+      "service": null,
+      "status": "running"
+    }
+  ],
+  "note": null,
+  "schema": 1,
+  "skipped": 0,
+  "target": {
+    "alias": null,
+    "kind": "local"
+  },
+  "via": "sudo"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `backend` | `proxmox`. Docker's documents have no `backend` key: they are unchanged since before Proxmox, so a document without it is Docker's. This is the one exception to "every documented key is always present" |
+| `containers[].id` | The container's VMID, as a string: what `portico shell <id> [--on <alias>] --backend proxmox` opens |
+| `containers[].display_name`, `.name` | The container's name in Proxmox (its hostname) |
+| `containers[].image` | `null`: a Proxmox container has no image |
+| `containers[].project`, `.service` | `null` |
+| `containers[].status` | `running`: stopped containers are not listed |
+| `via` | `sudo` when `pct` ran through `sudo -n` (the ssh user is not root), otherwise `null` |
+| `note` | `null` |
+| `skipped` | Rows of `pct list` Portico could not read |
+
+`pct` needs root. Portico runs it directly as root and otherwise through `sudo -n`, which never asks for a password; when neither works, the error says how to give it access, and Portico never changes the node's configuration itself:
+
+<!-- golden: containers-proxmox-denied.json -->
+```json
+{
+  "error": {
+    "kind": "proxmox",
+    "message": "pct needs root on this machine, and sudo would ask deploy for a password.",
+    "next": [
+      "Run Portico as root on this machine.",
+      "Or let deploy run pct without a password: add \"deploy ALL=(root) NOPASSWD: /usr/sbin/pct\" with visudo on this machine."
+    ],
+    "problem": "permission-denied"
+  },
+  "schema": 1
+}
+```
+
+A Proxmox shell always runs as root inside the container, so `portico shell` refuses `--user` for one.
 
 ## Tunnels
 
@@ -668,14 +740,14 @@ The exit status is 1 when any result failed. Once names are considered, every fa
 
 ## What is never printed
 
-No key material and no credential: public keys appear only as type, size, fingerprint and comment. No environment variable's value, except the agent socket path. No command line Portico did not build (no `ProxyCommand`, no container command); the one command line printed is the tunnel's own `ssh` invocation. From logs and the output of ssh, agents and docker, only what `portico` prints for people, as one line with terminal control characters removed.
+No key material and no credential: public keys appear only as type, size, fingerprint and comment. No environment variable's value, except the agent socket path. No command line Portico did not build (no `ProxyCommand`, no container command); the one command line printed is the tunnel's own `ssh` invocation. From logs and the output of ssh, agents, docker and pct, only what `portico` prints for people, as one line with terminal control characters removed.
 
 ## Versioning
 
 This contract is public: a consumer may be installed separately from Portico and run against another release. Within `schema` 1, a later Portico may:
 
 - add keys to any object (ignore keys you do not know);
-- add values to `error.kind`, a warning's `kind` and docker's `problem` (treat an unknown value as `other`);
+- add values to `error.kind`, a warning's `kind`, a backend's `problem` and `via` (treat an unknown value as `other`);
 - give `--json` to more commands.
 
 Anything else raises `schema`: removing or renaming a key, changing a value's type or meaning, or adding a value to `status.state`, `outcome`, `availability`, `agent.state`, `ownership`, `target.kind` or `forward.kind`. Portico prints only its current schema. A consumer that finds a `schema` it does not know should say that this Portico is too new (or too old) for it rather than guess.

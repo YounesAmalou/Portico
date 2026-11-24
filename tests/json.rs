@@ -377,6 +377,54 @@ fn docker_offers_are_reported_and_never_run() {
     assert!(!sudo.exists(), "ran sudo");
 }
 
+/// Fakes for a Proxmox VE node reached as `deploy`, whose `sudo -n` either runs `pct` or
+/// refuses with `refusal`.
+fn proxmox_node(fixture: &Fixture, refusal: Option<&str>) {
+    let env = &fixture.env;
+    env.install_program(
+        "id",
+        "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; -un) echo deploy ;; esac\n",
+    );
+    env.install_program(
+        "pct",
+        "#!/bin/sh\nprintf 'VMID       Status     Lock         Name                \\n101        running                 web                 \\n102        stopped                 db                  \\n110        running    backup       mail                \\n'\n",
+    );
+    let sudo = match refusal {
+        Some(message) => format!("#!/bin/sh\necho '{message}' >&2\nexit 1\n"),
+        None => "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n".to_owned(),
+    };
+    env.install_program("sudo", &sudo);
+}
+
+#[test]
+fn proxmox_containers() {
+    let fixture = setup();
+    proxmox_node(&fixture, None);
+    let document = fixture.golden(
+        &["containers", "--backend", "proxmox", "--json"],
+        0,
+        "containers-proxmox.json",
+    );
+    assert_eq!(document["backend"], "proxmox");
+    assert_eq!(document["via"], "sudo");
+    // Sorted by name, as Docker containers outside a project are.
+    assert_eq!(document["containers"][1]["id"], "101");
+    assert_eq!(document["containers"][0]["image"], Value::Null);
+}
+
+#[test]
+fn proxmox_without_root_is_permission_denied() {
+    let fixture = setup();
+    proxmox_node(&fixture, Some("sudo: a password is required"));
+    let document = fixture.golden(
+        &["containers", "--backend", "proxmox", "--json"],
+        1,
+        "containers-proxmox-denied.json",
+    );
+    assert_eq!(document["error"]["kind"], "proxmox");
+    assert_eq!(document["error"]["problem"], "permission-denied");
+}
+
 #[test]
 fn tunnels() {
     let fixture = setup();
