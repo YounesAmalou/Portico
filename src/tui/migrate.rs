@@ -12,9 +12,10 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::{TextInput, display_width, keep_start};
+use super::{Mode, TextInput, UiAction, UiState, display_width, keep_start};
 use crate::{
-    domain::adopt::{Candidate, Direction, MigrationPlan},
+    app::AppError,
+    domain::adopt::{self, Candidate, Direction, MigrationPlan},
     domain::fuzzy::{highlight, match_fields},
     picker::HIT,
 };
@@ -332,6 +333,50 @@ impl MigrateState {
     }
 }
 
+impl UiState {
+    pub(super) fn handle_migrate_key(&mut self, key: KeyEvent) -> UiAction {
+        let Some(migrate) = &mut self.migrate else {
+            // The plan is still being built; only Esc does anything.
+            if key.code != KeyCode::Esc {
+                return UiAction::None;
+            }
+            self.mode = Mode::Browse;
+            return UiAction::CancelPlan;
+        };
+        match migrate.handle_key(key) {
+            MigrateAction::None => {}
+            MigrateAction::Close => {
+                self.mode = Mode::Browse;
+                self.migrate = None;
+            }
+            MigrateAction::Apply(aliases) => return UiAction::Migrate(aliases),
+            MigrateAction::Error(message) => self.status = Some(message),
+        }
+        UiAction::None
+    }
+
+    /// Opens the migrate screen on the plan the worker built, unless it was closed meanwhile.
+    pub(super) fn finish_plan(
+        &mut self,
+        planned: Result<adopt::MigrationPlan, AppError>,
+        preselect: &str,
+        home: &std::path::Path,
+    ) {
+        if self.mode != Mode::Migrate || self.migrate.is_some() {
+            return;
+        }
+        match planned {
+            Ok(plan) => {
+                self.migrate = Some(MigrateState::new(plan, Some(preselect)).with_home(home));
+            }
+            Err(error) => {
+                self.mode = Mode::Browse;
+                self.report_error(&error);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -347,6 +392,11 @@ mod tests {
     use crate::domain::adopt::{Candidate, Direction, MigrationPlan};
 
     use super::*;
+
+    use crate::app::Ownership;
+    use crate::domain::adopt;
+    use crate::tui::tests::{press as press_state, summary, test_state};
+    use crate::tui::{Mode, UiAction, footer_text};
 
     fn candidate(alias: &str, reason: Option<&str>) -> Candidate {
         Candidate {
@@ -772,5 +822,63 @@ mod tests {
         press(&mut state, KeyCode::Enter);
         let preview = pane(&state);
         assert!(preview.contains("  -1: Host web"));
+    }
+
+    #[test]
+    fn the_migrate_screen_waits_for_its_plan_and_esc_cancels_it() {
+        let plan = || {
+            adopt::MigrationPlan::for_tests(
+                adopt::Direction::Adopt,
+                vec![adopt::Candidate {
+                    alias: "web".into(),
+                    source: "/home/test/.ssh/config".into(),
+                    reason: None,
+                }],
+            )
+        };
+        let home = std::path::Path::new("/home/test");
+        let mut state = test_state(vec![summary("web", Ownership::External)]);
+        state.mode = Mode::Migrate;
+        assert_eq!(press_state(&mut state, KeyCode::Char('a')), UiAction::None);
+        assert_eq!(state.mode, Mode::Migrate);
+        state.finish_plan(Ok(plan()), "web", home);
+        assert!(state.migrate.is_some());
+
+        let mut state = test_state(vec![summary("web", Ownership::External)]);
+        state.mode = Mode::Migrate;
+        assert_eq!(press_state(&mut state, KeyCode::Esc), UiAction::CancelPlan);
+        assert_eq!(state.mode, Mode::Browse);
+        state.finish_plan(Ok(plan()), "web", home);
+        assert!(state.migrate.is_none());
+    }
+
+    #[test]
+    fn m_opens_migration_for_the_selected_host() {
+        let mut state = test_state(vec![
+            summary("web", Ownership::External),
+            summary("dev", Ownership::Managed),
+        ]);
+        assert_eq!(
+            press_state(&mut state, KeyCode::Char('m')),
+            UiAction::OpenMigrate {
+                direction: adopt::Direction::Adopt,
+                preselect: "web".into(),
+            }
+        );
+        press_state(&mut state, KeyCode::Down);
+        assert_eq!(
+            press_state(&mut state, KeyCode::Char('m')),
+            UiAction::OpenMigrate {
+                direction: adopt::Direction::Export,
+                preselect: "dev".into(),
+            }
+        );
+        assert!(footer_text(&state).contains("a add  m export  x remove"));
+        press_state(&mut state, KeyCode::Up);
+        assert!(footer_text(&state).contains("a add  m adopt  r refresh"));
+
+        let mut empty = test_state(Vec::new());
+        assert_eq!(press_state(&mut empty, KeyCode::Char('m')), UiAction::None);
+        assert!(!footer_text(&empty).contains("m adopt"));
     }
 }
