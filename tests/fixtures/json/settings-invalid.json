@@ -1,0 +1,8 @@
+{
+  "error": {
+    "kind": "settings",
+    "message": "invalid settings file /home/me/.config/portico/settings.toml: line 1: unclosed table, expected `]`",
+    "next": []
+  },
+  "schema": 1
+}

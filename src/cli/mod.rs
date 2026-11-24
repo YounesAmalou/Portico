@@ -21,6 +21,7 @@ mod desktop;
 mod hosts;
 mod json;
 mod migrate;
+mod settings;
 mod tunnels;
 
 use self::{
@@ -177,6 +178,15 @@ enum Command {
     Tunnel {
         #[command(subcommand)]
         command: tunnels::TunnelCommand,
+    },
+    /// Show Portico's settings, or change one.
+    #[command(args_conflicts_with_subcommands = true)]
+    Settings {
+        #[command(subcommand)]
+        command: Option<settings::SettingsCommand>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
     },
     /// Install the desktop panel, a launcher entry and a keybinding, or show or remove them.
     Desktop {
@@ -405,6 +415,7 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
             json: true,
         } => JsonCommand::Containers(on.clone(), backend.map(BackendId::from)),
         Command::Tunnels { json: true } => JsonCommand::Tunnels,
+        Command::Settings { json: true, .. } => JsonCommand::Settings,
         Command::Tunnel { command } => return tunnels::json_command(command),
         _ => return None,
     })
@@ -673,6 +684,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
         Some(Command::Tunnel { command }) => {
             tunnels::run(command, app, picker, input, output, error, interactive)
         }
+        Some(Command::Settings { command, .. }) => settings::run(command, app, output),
         // `main` runs these through `run_desktop`, with the desktop environment.
         Some(Command::Desktop { .. }) => {
             Err("portico desktop needs the desktop environment".into())

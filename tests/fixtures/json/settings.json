@@ -1,0 +1,11 @@
+{
+  "exists": true,
+  "path": "/home/me/.config/portico/settings.toml",
+  "schema": 1,
+  "tabs": {
+    "docker": true,
+    "podman": false,
+    "proxmox": true,
+    "tunnels": true
+  }
+}

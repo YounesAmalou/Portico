@@ -566,6 +566,38 @@ fn the_desktop_panel_forms_print_documents() {
 }
 
 #[test]
+fn settings() {
+    let fixture = setup();
+    let output = fixture.run(&["settings", "--json"]);
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(document["exists"], false);
+    assert_eq!(
+        document["tabs"],
+        serde_json::json!({ "docker": true, "podman": true, "proxmox": true, "tunnels": true })
+    );
+    let set = fixture.run(&["settings", "set", "tabs.podman", "off"]);
+    assert_eq!(set.status.code(), Some(0));
+    fixture.golden(&["settings", "--json"], 0, "settings.json");
+}
+
+#[test]
+fn an_invalid_settings_file_is_an_error_document() {
+    let fixture = setup();
+    let path = fixture.env.home().join(".config/portico/settings.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "[tabs\n").unwrap();
+    let document = fixture.golden(&["settings", "--json"], 1, "settings-invalid.json");
+    assert_eq!(document["error"]["kind"], "settings");
+    assert!(
+        document["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("line 1")
+    );
+}
+
+#[test]
 fn a_missing_name_is_a_usage_error() {
     let fixture = setup();
     fixture.golden(&["show", "--json"], 1, "error-usage.json");

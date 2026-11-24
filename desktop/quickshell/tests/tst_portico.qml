@@ -28,8 +28,8 @@ TestCase {
                      "containers-podman.json", "containers-podman-missing-subuid.json",
                      "containers-proxmox.json", "containers-proxmox-denied.json",
                      "error-unknown-host.json", "error-usage.json", "hosts.json", "identities.json",
-                     "show.json", "show-unresolved.json", "tunnel-show.json", "tunnels.json",
-                     "tunnel-start.json", "tunnel-stop-all.json"]
+                     "settings.json", "settings-invalid.json", "show.json", "show-unresolved.json",
+                     "tunnel-show.json", "tunnels.json", "tunnel-start.json", "tunnel-stop-all.json"]
         files.forEach(function (file) { doc(file) })
     }
 

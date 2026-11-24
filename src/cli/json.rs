@@ -18,6 +18,7 @@ use crate::{
     domain::identity::{
         Agent, Availability, HostIdentities, Identity, IdentityInventory, Provider, PublicKey,
     },
+    domain::settings::{Key, SettingsError},
     domain::tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
 };
 
@@ -35,6 +36,7 @@ pub(super) enum JsonCommand {
     Identities,
     Containers(Option<Option<String>>, Option<BackendId>),
     Tunnels,
+    Settings,
     TunnelShow(Option<String>),
     TunnelStart(Vec<String>),
     TunnelStop { names: Vec<String>, all: bool },
@@ -92,6 +94,16 @@ impl From<AppError> for Failure {
             }
             AppError::Tunnel(TunnelRefusal::Unknown(_)) => "unknown-tunnel",
             _ => "other",
+        };
+        Self::new(kind, error.to_string())
+    }
+}
+
+impl From<SettingsError> for Failure {
+    fn from(error: SettingsError) -> Self {
+        let kind = match &error {
+            SettingsError::Invalid { .. } => "settings",
+            SettingsError::Io { .. } => "other",
         };
         Self::new(kind, error.to_string())
     }
@@ -191,6 +203,22 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
         JsonCommand::Tunnels => {
             let reports = app.tunnels()?;
             success(json!({ "tunnels": reports.iter().map(report).collect::<Vec<_>>() }))
+        }
+        JsonCommand::Settings => {
+            let settings = app.settings()?;
+            let mut tabs = Map::new();
+            for key in Key::ALL {
+                let leaf = key
+                    .name()
+                    .split_once('.')
+                    .map_or(key.name(), |(_, leaf)| leaf);
+                tabs.insert(leaf.to_owned(), json!(key.get(&settings)));
+            }
+            success(json!({
+                "exists": app.settings_path().exists(),
+                "path": path(app.settings_path()),
+                "tabs": tabs,
+            }))
         }
         JsonCommand::TunnelShow(name) => {
             let name = name.ok_or_else(|| Failure::usage("tunnel show <name>"))?;

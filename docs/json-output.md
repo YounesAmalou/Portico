@@ -1,6 +1,6 @@
 # Machine-readable output
 
-Portico's read commands, and starting and stopping tunnels, print a JSON document when given `--json`. This page is the contract for programs that read it, such as a desktop panel: what each command prints, what every field means, how errors look, and what may change between releases. Every example below is printed by Portico's own test suite, so it is exactly what Portico produces (with the home directory shown as `/home/me`).
+Portico's read commands, its settings, and starting and stopping tunnels, print a JSON document when given `--json`. This page is the contract for programs that read it, such as a desktop panel: what each command prints, what every field means, how errors look, and what may change between releases. Every example below is printed by Portico's own test suite, so it is exactly what Portico produces (with the home directory shown as `/home/me`).
 
 ## Commands
 
@@ -10,6 +10,7 @@ Portico's read commands, and starting and stopping tunnels, print a JSON documen
 | `portico show <alias> --json` | [One host's details and identities](#show) |
 | `portico identities --json` | [Every agent and identity file](#identities) |
 | `portico containers [--on <alias>] [--backend docker\|podman\|proxmox] --json` | [The running containers of this machine or a host](#containers) |
+| `portico settings --json` | [Portico's settings](#settings) |
 | `portico tunnels --json` | [The saved tunnels and their status](#tunnels) |
 | `portico tunnel show <name> --json` | [One tunnel, its command line and its log](#tunnel-show) |
 | `portico tunnel start <name>... --json` | [What each start did](#start-and-stop) |
@@ -58,6 +59,7 @@ A command that fails prints an error document and exits with status 1:
 | `docker` | docker failed; `problem` is `not-installed`, `daemon-down`, `permission-denied` or `other` |
 | `podman` | podman failed; `problem` is `not-installed`, `permission-denied` or `other` |
 | `proxmox` | Proxmox's `pct` failed; `problem` is `not-installed`, `permission-denied` or `other` |
+| `settings` | The settings file exists but is not valid; `message` names the file and the line |
 | `other` | Anything else, such as an unreadable `~/.ssh/config` or a busy port |
 
 Show `message`; use `kind` to choose an icon or a hint, never parse `message`. A missing name looks like this:
@@ -556,6 +558,41 @@ On a Proxmox VE node, the listing is of its running LXC containers, with one mor
 ```
 
 A Proxmox shell always runs as root inside the container, so `portico shell` refuses `--user` for one.
+
+## Settings
+
+`portico settings --json` prints the preferences Portico reads from its settings file. It touches nothing else. A setting missing from the file, or a missing file, reads as its default, so every tab is `true` then. `exists` says whether the file is there; `path` is where it is or would be.
+
+<!-- golden: settings.json -->
+```json
+{
+  "exists": true,
+  "path": "/home/me/.config/portico/settings.toml",
+  "schema": 1,
+  "tabs": {
+    "docker": true,
+    "podman": false,
+    "proxmox": true,
+    "tunnels": true
+  }
+}
+```
+
+`tabs` has one boolean per tab of the app and the panel: `tunnels`, `docker`, `podman` and `proxmox`; `false` means the tab is hidden. A file that cannot be read as settings gives an error of kind `settings` (exit status 1), and Portico never overwrites it:
+
+<!-- golden: settings-invalid.json -->
+```json
+{
+  "error": {
+    "kind": "settings",
+    "message": "invalid settings file /home/me/.config/portico/settings.toml: line 1: unclosed table, expected `]`",
+    "next": []
+  },
+  "schema": 1
+}
+```
+
+`portico settings set <key> <on|off>` changes a setting and does not take `--json`.
 
 ## Tunnels
 
