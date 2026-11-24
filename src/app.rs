@@ -30,6 +30,7 @@ use crate::{
         append_known_hosts,
     },
     domain::probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
+    domain::settings::{self, Key, Settings, SettingsError},
     domain::tunnel::{
         TunnelError,
         runtime::RuntimeDir,
@@ -45,6 +46,7 @@ pub struct App {
     identities: identities::IdentityState,
     tunnels: TunnelStore,
     runtime: RuntimeDir,
+    settings_path: PathBuf,
     proc: Proc,
 }
 
@@ -208,6 +210,9 @@ impl App {
             // Without `with_runtime_dir`, records stay under the home: tests never reach the
             // user's real runtime directory.
             runtime: RuntimeDir::locate(&home, None),
+            // Without `with_settings_path`, the file sits under the home: tests never reach the
+            // user's real preferences.
+            settings_path: home.join(".config/portico").join(settings::FILE_NAME),
             proc: Proc::system(),
         }
     }
@@ -216,6 +221,25 @@ impl App {
     pub fn with_runtime_dir(mut self, runtime: RuntimeDir) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    /// Replaces the path of Portico's settings file.
+    pub fn with_settings_path(mut self, path: PathBuf) -> Self {
+        self.settings_path = path;
+        self
+    }
+
+    pub fn settings_path(&self) -> &Path {
+        &self.settings_path
+    }
+
+    pub fn settings(&self) -> Result<Settings, SettingsError> {
+        settings::load(&self.settings_path)
+    }
+
+    /// Writes one setting; `Ok(true)` when the file changed.
+    pub fn set_setting(&self, key: Key, value: bool) -> Result<bool, SettingsError> {
+        settings::set(&self.settings_path, key, value)
     }
 
     /// Replaces the programs container commands run on this machine.
@@ -988,6 +1012,18 @@ mod tests {
 
     fn test_app_with_external(contents: &str) -> TestApp {
         test_app(Some(contents), None)
+    }
+
+    #[test]
+    fn settings_default_under_the_home_and_round_trip() {
+        let t = test_app(None, None);
+        let home = t._dir.path();
+        assert_eq!(
+            t.app.settings_path(),
+            home.join(".config/portico/settings.toml")
+        );
+        assert!(t.app.set_setting(Key::TabsProxmox, false).unwrap());
+        assert!(!t.app.settings().unwrap().tabs.proxmox);
     }
 
     fn test_app(
