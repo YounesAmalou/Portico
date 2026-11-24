@@ -67,7 +67,7 @@ fi
 case "$1" in
     fmt) cargo fmt --check ;;
     clippy) cargo clippy --all-targets --all-features -- -D warnings ;;
-    test) cargo test --all-targets ;;
+    test) cargo test --all-targets --no-fail-fast ;;
     e2e) cargo test --test e2e -- --ignored ;;
     docs) cargo test --test docs ;;
     msrv) msrv ;;

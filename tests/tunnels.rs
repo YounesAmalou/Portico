@@ -36,11 +36,17 @@ if [ "$1" = -f ]; then
     printf '\033[31mError: remote port forwarding failed for listen port 8080\033[0m\a\n' >> "$elog"
     exit 255
   fi
-  # Like ssh -f, the background process leads its own session. macOS has no setsid command.
+  # Like ssh -f, the background process leads its own session. macOS has no setsid command,
+  # so Perl forks it there, and returns only once it leads its session and carries the
+  # arguments (the exec closes the pipe), as the setsid command has done by the time Portico
+  # looks.
   if command -v setsid >/dev/null; then
     setsid sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1 &
   else
-    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1 &
+    perl -MPOSIX -e 'pipe(my $r, my $w) or die; defined(my $pid = fork) or die;
+      if ($pid) {{ close $w; sysread($r, my $b, 1); exit 0 }}
+      close $r; POSIX::setsid(); exec @ARGV or die' \
+      sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1
   fi
   exit 0
 fi
