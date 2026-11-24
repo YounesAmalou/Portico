@@ -97,7 +97,8 @@ pub enum ResolveError {
 
 /// Finds the container a user means. The first form that matches anything
 /// decides: the exact name, `project/service` or `project/service#n`, a bare
-/// service name, `service#n`, then an ID prefix of at least four hex digits.
+/// service name, `service#n`, the exact ID (a Proxmox VMID), then an ID prefix of at
+/// least four hex digits.
 pub fn resolve<'a>(
     reference: &str,
     containers: &'a [Container],
@@ -135,6 +136,10 @@ pub fn resolve<'a>(
         if !found.is_empty() {
             return pick(found);
         }
+    }
+    let by_id = matching(containers, |c| c.id == reference);
+    if !by_id.is_empty() {
+        return pick(by_id);
     }
     let is_id_prefix = reference.len() >= 4 && reference.chars().all(|c| c.is_ascii_hexdigit());
     if is_id_prefix {
@@ -186,6 +191,18 @@ mod tests {
             number: service.map(|_| number),
             working_dir: None,
         }
+    }
+
+    #[test]
+    fn resolves_an_exact_short_id() {
+        let mut ct = container("web", None, None, 0);
+        ct.id = "101".into();
+        let mut other = container("db", None, None, 0);
+        other.id = "1010".into();
+        let all = vec![ct, other];
+        assert_eq!(resolve("101", &all).unwrap().name, "web");
+        assert_eq!(resolve("1010", &all).unwrap().name, "db");
+        assert_eq!(resolve("10", &all), Err(ResolveError::NotFound));
     }
 
     #[test]

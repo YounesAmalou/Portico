@@ -222,6 +222,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }
             UiAction::Containers(PanelAction::Shell {
                 target,
+                backend,
                 id,
                 user,
                 via,
@@ -229,7 +230,16 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             }) => {
                 let shell = |cancelled| {
                     let user = user.as_deref();
-                    app.container_shell(&target, &id, user, via, new_terminal, cancelled, true)
+                    app.container_shell(
+                        &target,
+                        backend,
+                        &id,
+                        user,
+                        via,
+                        new_terminal,
+                        cancelled,
+                        true,
+                    )
                 };
                 let result = if new_terminal {
                     Ok(shell(None))
@@ -2269,6 +2279,7 @@ mod tests {
 
     fn shop_list(target: Target) -> ContainerList {
         ContainerList {
+            backend: crate::backend::BackendId::Docker,
             target,
             listing: crate::backend::Listing {
                 containers: ["web", "db"]

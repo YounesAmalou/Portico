@@ -1,0 +1,12 @@
+{
+  "error": {
+    "kind": "proxmox",
+    "message": "pct needs root on this machine, and sudo would ask deploy for a password.",
+    "next": [
+      "Run Portico as root on this machine.",
+      "Or let deploy run pct without a password: add \"deploy ALL=(root) NOPASSWD: /usr/sbin/pct\" with visudo on this machine."
+    ],
+    "problem": "permission-denied"
+  },
+  "schema": 1
+}

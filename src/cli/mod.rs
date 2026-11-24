@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     app::{App, AppError, ContainerError, Ownership},
-    backend::{GroupTool, ResolveError, resolve},
+    backend::{BackendId, ResolveError, Via, resolve},
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
@@ -135,6 +135,10 @@ enum Command {
         /// List on this host; without an alias, choose one.
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
+        /// List with this backend only; without it, Docker, then Proxmox when Docker is not
+        /// installed.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
         /// Print one JSON document instead of text (see docs/json-output.md).
         #[arg(long)]
         json: bool,
@@ -144,6 +148,11 @@ enum Command {
         /// Open the shell on this host; without an alias, choose one.
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
+        /// List with this backend only; with --hold, the backend of the given ID (Docker by
+        /// default).
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
+        /// Run the shell as this user (Docker only: a Proxmox container's shell runs as root).
         #[arg(short = 'u', long)]
         user: Option<String>,
         #[arg(short = 'n', long = "new-terminal")]
@@ -152,9 +161,9 @@ enum Command {
         /// failure; used in a new terminal.
         #[arg(long, hide = true)]
         hold: bool,
-        /// Run docker inside the docker group, as the listing before the new terminal did.
+        /// Run the backend's tool through sg or sudo, as the listing before the new terminal did.
         #[arg(long, hide = true, value_enum)]
-        via: Option<Via>,
+        via: Option<ViaArg>,
     },
     /// List saved tunnels and their status.
     Tunnels {
@@ -204,16 +213,34 @@ pub fn run_desktop(
     }
 }
 
-/// `--via`: the tool that runs docker inside the docker group.
+/// `--backend`: the container backend to use.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
-enum Via {
-    Sg,
+enum BackendArg {
+    Docker,
+    Proxmox,
 }
 
-impl From<Via> for GroupTool {
-    fn from(via: Via) -> Self {
+impl From<BackendArg> for BackendId {
+    fn from(backend: BackendArg) -> Self {
+        match backend {
+            BackendArg::Docker => BackendId::Docker,
+            BackendArg::Proxmox => BackendId::Proxmox,
+        }
+    }
+}
+
+/// `--via`: the tool the backend's command ran through in the listing.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+enum ViaArg {
+    Sg,
+    Sudo,
+}
+
+impl From<ViaArg> for Via {
+    fn from(via: ViaArg) -> Self {
         match via {
-            Via::Sg => GroupTool::Sg,
+            ViaArg::Sg => Via::Sg,
+            ViaArg::Sudo => Via::Sudo,
         }
     }
 }
@@ -368,7 +395,11 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
         Command::Hosts { json: true } => JsonCommand::Hosts,
         Command::Show { alias, json: true } => JsonCommand::Show(alias.clone()),
         Command::Identities { json: true } => JsonCommand::Identities,
-        Command::Containers { on, json: true } => JsonCommand::Containers(on.clone()),
+        Command::Containers {
+            on,
+            backend,
+            json: true,
+        } => JsonCommand::Containers(on.clone(), backend.map(BackendId::from)),
         Command::Tunnels { json: true } => JsonCommand::Tunnels,
         Command::Tunnel { command } => return tunnels::json_command(command),
         _ => return None,
@@ -536,30 +567,34 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 .map_err(|error| error.to_string())?;
             finish_connection(outcome, hold, input, error)
         }
-        Some(Command::Containers { on, .. }) => {
+        Some(Command::Containers { on, backend, .. }) => {
             let Some(target) = on_argument(on, app, picker, interactive, "containers")? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
-            let list = list_with_offers(app, &target, input, output, error, interactive)?;
+            let backend = backend.map(BackendId::from);
+            let list = list_with_offers(app, &target, backend, input, output, error, interactive)?;
             print_listing(output, &list)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Shell {
             container,
             on,
+            backend,
             user,
             new_terminal,
             hold,
             via,
         }) => {
+            let backend = backend.map(BackendId::from);
             let Some(target) = on_argument(on, app, picker, interactive, "shell")? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
             // A held shell was resolved before its terminal was opened.
-            let (id, via) = match container {
-                Some(id) if hold => (id, via.map(GroupTool::from)),
+            let (backend, id, via) = match container {
+                Some(id) if hold => (backend.unwrap_or(BackendId::Docker), id, via.map(Via::from)),
                 container => {
-                    let list = list_with_offers(app, &target, input, output, error, interactive)?;
+                    let list =
+                        list_with_offers(app, &target, backend, input, output, error, interactive)?;
                     let containers = &list.listing.containers;
                     if containers.is_empty() {
                         writeln!(error, "No running containers on {}.", list.target)
@@ -597,11 +632,12 @@ fn execute<I: BufRead, O: Write, E: Write>(
                             return Err("choose a container: portico shell <container> (no terminal for the picker)".into());
                         }
                     };
-                    (id, list.via)
+                    (list.backend, id, list.via)
                 }
             };
             let outcome = match app.container_shell(
                 &target,
+                backend,
                 &id,
                 user.as_deref(),
                 via,
@@ -935,6 +971,7 @@ mod tests {
             sudo: program("sudo"),
             sg: program("sg"),
             sh: program("sh"),
+            pct: program("pct"),
         });
         (dir, app)
     }
@@ -1484,7 +1521,8 @@ fi
                 user: Some(user),
                 new_terminal: false,
                 hold: true,
-                via: Some(Via::Sg),
+                via: Some(ViaArg::Sg),
+                backend: None,
             }) if container == "abcd" && on.as_deref() == Some("dev") && user == "root"
         ));
     }

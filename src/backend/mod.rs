@@ -2,10 +2,12 @@
 
 pub mod docker;
 pub mod listing;
+pub mod proxmox;
 
 use std::{fmt, process::Output};
 
 use docker::Docker;
+use proxmox::Proxmox;
 
 pub use listing::{Container, Group, Listing, ResolveError, display_name, group, resolve};
 
@@ -32,20 +34,26 @@ impl fmt::Display for Target {
     }
 }
 
-/// The tool that runs a command inside the docker group. `newgrp` cannot: it takes no command.
+/// The tool a backend's command had to run through: `sg` runs docker inside the docker group
+/// (`newgrp` cannot: it takes no command), `sudo -n` runs Proxmox's `pct` as root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum GroupTool {
+pub enum Via {
     Sg,
+    Sudo,
 }
 
-impl GroupTool {
+impl Via {
     /// The name `--via` takes for the tool.
     pub fn as_str(self) -> &'static str {
         match self {
-            GroupTool::Sg => "sg",
+            Via::Sg => "sg",
+            Via::Sudo => "sudo",
         }
     }
 }
+
+/// Runs bash when the container has it, and sh otherwise.
+pub const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
 
 /// Quotes one word for a POSIX shell: words made only of safe characters
 /// stay as they are, anything else is single-quoted.
@@ -70,10 +78,12 @@ pub fn remote_command<S: AsRef<str>>(words: &[S]) -> String {
 /// The running containers of a target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerList {
+    /// The backend that listed them.
+    pub backend: BackendId,
     pub target: Target,
     pub listing: Listing,
-    /// The tool docker had to run through to reach the socket, if any.
-    pub via: Option<GroupTool>,
+    /// The tool the backend had to run through (docker to reach the socket, pct to be root).
+    pub via: Option<Via>,
     /// Said once when `via` is set: other shells still lack the group.
     pub note: Option<String>,
 }
@@ -82,13 +92,43 @@ pub struct ContainerList {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendId {
     Docker,
+    Proxmox,
 }
+
+/// The backends Portico tries, in order, when none is named: the next one is tried only when
+/// the previous one is not installed on the target.
+pub const AUTOMATIC: [BackendId; 2] = [BackendId::Docker, BackendId::Proxmox];
 
 impl BackendId {
     /// The id as the JSON output spells it.
     pub fn as_str(self) -> &'static str {
         match self {
             BackendId::Docker => "docker",
+            BackendId::Proxmox => "proxmox",
+        }
+    }
+
+    /// The program the backend runs, as messages name it.
+    pub fn program(self) -> &'static str {
+        match self {
+            BackendId::Docker => "docker",
+            BackendId::Proxmox => "pct",
+        }
+    }
+
+    /// Whether its shells can run as a user the caller chooses.
+    pub fn chooses_user(self) -> bool {
+        match self {
+            BackendId::Docker => true,
+            BackendId::Proxmox => false,
+        }
+    }
+
+    /// The heading of the containers that belong to no Compose project.
+    pub fn ungrouped_heading(self) -> &'static str {
+        match self {
+            BackendId::Docker => "Other",
+            BackendId::Proxmox => "Proxmox containers",
         }
     }
 }
@@ -180,7 +220,7 @@ pub trait Backend {
 
     /// The command that opens a shell in container `id`, as `user` when given, through `via`
     /// when the listing needed it.
-    fn shell_words(&self, id: &str, user: Option<&str>, via: Option<GroupTool>) -> Vec<String>;
+    fn shell_words(&self, id: &str, user: Option<&str>, via: Option<Via>) -> Vec<String>;
 
     /// `problem` explained without asking the target anything more.
     fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue;
@@ -194,6 +234,7 @@ pub fn list<E>(
 ) -> Result<ContainerList, ListFailure<E>> {
     match backend {
         BackendId::Docker => Docker.list(target, run),
+        BackendId::Proxmox => Proxmox.list(target, run),
     }
 }
 
@@ -202,10 +243,11 @@ pub fn shell_words(
     backend: BackendId,
     id: &str,
     user: Option<&str>,
-    via: Option<GroupTool>,
+    via: Option<Via>,
 ) -> Vec<String> {
     match backend {
         BackendId::Docker => Docker.shell_words(id, user, via),
+        BackendId::Proxmox => Proxmox.shell_words(id, user, via),
     }
 }
 
@@ -218,6 +260,7 @@ pub fn plain_issue(
 ) -> BackendIssue {
     match backend {
         BackendId::Docker => Docker.plain_issue(target, problem, stderr),
+        BackendId::Proxmox => Proxmox.plain_issue(target, problem, stderr),
     }
 }
 
@@ -250,6 +293,9 @@ mod tests {
     #[test]
     fn ids_and_problems_keep_the_json_strings() {
         assert_eq!(BackendId::Docker.as_str(), "docker");
+        assert_eq!(BackendId::Proxmox.as_str(), "proxmox");
+        assert_eq!(Via::Sg.as_str(), "sg");
+        assert_eq!(Via::Sudo.as_str(), "sudo");
         assert_eq!(Problem::NotInstalled.as_str(), "not-installed");
         assert_eq!(Problem::ServiceDown.as_str(), "daemon-down");
         assert_eq!(Problem::PermissionDenied.as_str(), "permission-denied");
