@@ -62,7 +62,7 @@ FocusScope {
     // A host row and the container rows under it, or nothing when the filter hides it.
     function hostItem(key, target, title, external, hostMatches, query) {
         let open = model.containersOn && !!model.expanded[target]
-        let shown = Portico.hostView(hostMatches, model.containers[target], query, open)
+        let shown = Portico.hostView(hostMatches, model.containersOn ? model.containers[target] : undefined, query, open)
         if (!shown.show)
             return []
         let item = { type: "host", key: key, target: target, title: title, external: external,
@@ -359,7 +359,7 @@ FocusScope {
                             id: marker
                             width: 16
                             text: row.item.type === "tunnel" ? "●"
-                                : row.item.type === "host" ? (row.item.expanded ? "▾" : "▸")
+                                : row.item.type === "host" ? (!view.model.containersOn ? "" : row.item.expanded ? "▾" : "▸")
                                 : "›"
                             textFormat: Text.PlainText
                             color: row.item.type === "tunnel"
@@ -371,7 +371,7 @@ FocusScope {
                             MouseArea {
                                 anchors.fill: parent
                                 anchors.margins: -4
-                                enabled: row.item.type === "host"
+                                enabled: row.item.type === "host" && view.model.containersOn
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     view.currentKey = row.item.key

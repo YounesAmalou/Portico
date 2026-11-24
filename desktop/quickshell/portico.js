@@ -324,8 +324,11 @@ function enabledBackends(tabs) {
 }
 
 // `backends` is the enabled list: all three (or null) adds no --backend flag.
+// An empty list is null (no command): no flag would mean every backend.
 function containersCommand(program, target, backends) {
     var flags = []
+    if (backends && backends.length === 0)
+        return null
     if (backends && backends.length < BACKENDS.length)
         flags = BACKENDS.filter(function (name) { return backends.indexOf(name) >= 0 })
                         .map(function (name) { return "--backend=" + name })

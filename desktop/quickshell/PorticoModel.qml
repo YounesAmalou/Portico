@@ -126,7 +126,13 @@ Item {
         run(Portico.settingsCommand(program), function (stdout, stderr, exitCode) {
             if (current !== session || stdout === null)
                 return
+            let before = Portico.enabledBackends(model.tabs).join()
             model.tabs = exitCode === 0 ? Portico.parseSettings(stdout) : Portico.parseSettings("")
+            // Listings of a backend that is now off must not outlive it.
+            if (Portico.enabledBackends(model.tabs).join() !== before || !model.containersOn) {
+                model.containers = ({})
+                model.expanded = ({})
+            }
             if (!model.tabs.tunnels) {
                 model.tunnels = []
                 model.tunnelsError = null
@@ -221,12 +227,12 @@ Item {
     }
 
     function loadContainers(target) {
-        let backends = Portico.enabledBackends(tabs)
-        if (program === "" || backends.length === 0)
+        let command = Portico.containersCommand(program, target, Portico.enabledBackends(tabs))
+        if (program === "" || command === null)
             return
         let current = session
         containers = assign(containers, target, { state: "loading", rows: [], error: null })
-        run(Portico.containersCommand(program, target, backends), function (stdout, stderr, exitCode) {
+        run(command, function (stdout, stderr, exitCode) {
             if (current !== session || stdout === null)
                 return
             let parsed = Portico.parse(stdout, exitCode)

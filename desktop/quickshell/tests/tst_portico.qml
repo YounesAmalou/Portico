@@ -109,6 +109,7 @@ TestCase {
         compare(rows[1].name, "web")
         compare(rows[1].image, "")
         compare(rows[1].status, "running")
+        compare(rows[1].backend, "proxmox")
     }
 
     function test_podman_containers_are_rows_like_docker_ones() {
@@ -117,6 +118,8 @@ TestCase {
         compare(rows[0].name, "web")
         compare(rows[1].name, "toolbox")
         compare(rows[1].image, "registry.fedoraproject.org/fedora:41")
+        compare(rows[1].backend, "podman")
+        compare(Portico.containerRows(doc("containers.json"), "")[0].backend, "docker")
     }
 
     function test_a_podman_failure_keeps_its_steps() {
@@ -302,6 +305,7 @@ TestCase {
     function test_containers_and_shell_commands_follow_the_backends() {
         compare(Portico.containersCommand("/p", "", ["docker", "podman", "proxmox"]), ["/p", "containers", "--json"])
         compare(Portico.containersCommand("/p", "", null), ["/p", "containers", "--json"])
+        compare(Portico.containersCommand("/p", "", []), null)
         compare(Portico.containersCommand("/p", "", ["podman", "proxmox"]),
                 ["/p", "containers", "--json", "--backend=podman", "--backend=proxmox"])
         compare(Portico.containersCommand("/p", "dev", ["docker"]),
