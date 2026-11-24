@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         assert!(app.show("dev").is_ok());
 
-        run(
+        let _ = run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
             &mut Scripted::default(),
@@ -2096,7 +2096,7 @@ fi
         two_containers(&dir);
         let mut picker = Scripted::new(&[None]);
 
-        run_shell(&app, &mut picker, true);
+        let _ = run_shell(&app, &mut picker, true);
 
         assert_eq!(
             picker.seen,
@@ -2206,7 +2206,7 @@ fi
         let (_dir, app) = two_hosts();
         for args in [&["edit", "-u", "x"][..], &["remove"]] {
             let mut picker = Scripted::new(&[None]);
-            run_picking(&app, args, "", true, &mut picker);
+            let _ = run_picking(&app, args, "", true, &mut picker);
             assert_eq!(picker.labels(0), ["dev"], "{args:?}");
         }
     }

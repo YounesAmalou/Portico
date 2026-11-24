@@ -4318,8 +4318,8 @@ mod tests {
                 "bastion",
             ]
         );
-        for index in 2..6 {
-            state.form.values[index] = TextInput::default();
+        for value in &mut state.form.values[2..6] {
+            *value = TextInput::default();
         }
 
         let UiAction::Edit { alias, changes } = press(&mut state, KeyCode::Enter) else {
