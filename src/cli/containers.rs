@@ -170,7 +170,7 @@ pub(super) fn print_listing(output: &mut impl Write, list: &ContainerList) -> Re
             .containers
             .iter()
             .map(|container| match list.backend {
-                BackendId::Docker => vec![
+                BackendId::Docker | BackendId::Podman => vec![
                     display_name(container, containers),
                     container.name.clone(),
                     container.image.clone(),

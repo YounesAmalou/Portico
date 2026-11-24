@@ -972,6 +972,7 @@ mod tests {
             sg: program("sg"),
             sh: program("sh"),
             pct: program("pct"),
+            podman: program("podman"),
         });
         (dir, app)
     }

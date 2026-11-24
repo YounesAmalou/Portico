@@ -2,11 +2,13 @@
 
 pub mod docker;
 pub mod listing;
+pub mod podman;
 pub mod proxmox;
 
 use std::{fmt, process::Output};
 
 use docker::Docker;
+use podman::Podman;
 use proxmox::Proxmox;
 
 pub use listing::{Container, Group, Listing, ResolveError, display_name, group, resolve};
@@ -92,18 +94,21 @@ pub struct ContainerList {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendId {
     Docker,
+    Podman,
     Proxmox,
 }
 
-/// The backends Portico tries, in order, when none is named: the next one is tried only when
-/// the previous one is not installed on the target.
-pub const AUTOMATIC: [BackendId; 2] = [BackendId::Docker, BackendId::Proxmox];
+/// Every backend, in the order Portico lists them: the TUI's tabs and the CLI's sections. A
+/// command that shows one backend's list without being told which (the JSON output) takes the
+/// first one installed on the target.
+pub const AUTOMATIC: [BackendId; 3] = [BackendId::Docker, BackendId::Podman, BackendId::Proxmox];
 
 impl BackendId {
     /// The id as the JSON output spells it.
     pub fn as_str(self) -> &'static str {
         match self {
             BackendId::Docker => "docker",
+            BackendId::Podman => "podman",
             BackendId::Proxmox => "proxmox",
         }
     }
@@ -112,6 +117,7 @@ impl BackendId {
     pub fn program(self) -> &'static str {
         match self {
             BackendId::Docker => "docker",
+            BackendId::Podman => "podman",
             BackendId::Proxmox => "pct",
         }
     }
@@ -119,15 +125,24 @@ impl BackendId {
     /// Whether its shells can run as a user the caller chooses.
     pub fn chooses_user(self) -> bool {
         match self {
-            BackendId::Docker => true,
+            BackendId::Docker | BackendId::Podman => true,
             BackendId::Proxmox => false,
+        }
+    }
+
+    /// The backend's name, as tab titles and section headings show it.
+    pub fn title(self) -> &'static str {
+        match self {
+            BackendId::Docker => "Docker",
+            BackendId::Podman => "Podman",
+            BackendId::Proxmox => "Proxmox",
         }
     }
 
     /// The heading of the containers that belong to no Compose project.
     pub fn ungrouped_heading(self) -> &'static str {
         match self {
-            BackendId::Docker => "Other",
+            BackendId::Docker | BackendId::Podman => "Other",
             BackendId::Proxmox => "Proxmox containers",
         }
     }
@@ -234,6 +249,7 @@ pub fn list<E>(
 ) -> Result<ContainerList, ListFailure<E>> {
     match backend {
         BackendId::Docker => Docker.list(target, run),
+        BackendId::Podman => Podman.list(target, run),
         BackendId::Proxmox => Proxmox.list(target, run),
     }
 }
@@ -247,6 +263,7 @@ pub fn shell_words(
 ) -> Vec<String> {
     match backend {
         BackendId::Docker => Docker.shell_words(id, user, via),
+        BackendId::Podman => Podman.shell_words(id, user, via),
         BackendId::Proxmox => Proxmox.shell_words(id, user, via),
     }
 }
@@ -260,6 +277,7 @@ pub fn plain_issue(
 ) -> BackendIssue {
     match backend {
         BackendId::Docker => Docker.plain_issue(target, problem, stderr),
+        BackendId::Podman => Podman.plain_issue(target, problem, stderr),
         BackendId::Proxmox => Proxmox.plain_issue(target, problem, stderr),
     }
 }
@@ -293,6 +311,7 @@ mod tests {
     #[test]
     fn ids_and_problems_keep_the_json_strings() {
         assert_eq!(BackendId::Docker.as_str(), "docker");
+        assert_eq!(BackendId::Podman.as_str(), "podman");
         assert_eq!(BackendId::Proxmox.as_str(), "proxmox");
         assert_eq!(Via::Sg.as_str(), "sg");
         assert_eq!(Via::Sudo.as_str(), "sudo");
