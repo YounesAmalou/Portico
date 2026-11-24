@@ -258,7 +258,8 @@ def check_terminal(scenario):
             assert "alpha" in screen.text()
             time.sleep(0.2)
             assert process.poll() is None, "Ctrl+C during the connection quit the TUI"
-            assert b"\x1b[?1049h" in transcript[transcript.rindex(b"\x1b[?1049l"):]
+            assert b"\x1b[?1049l" in transcript, f"{scenario}: the TUI never left the screen: {bytes(transcript)!r}"
+            assert b"\x1b[?1049h" in transcript[transcript.rindex(b"\x1b[?1049l"):], f"{scenario}: {bytes(transcript)!r}"
         elif scenario == "input_rules":
             # Whitespace never enters a field, however it arrives; the saved host proves it.
             os.write(master, b"a")
