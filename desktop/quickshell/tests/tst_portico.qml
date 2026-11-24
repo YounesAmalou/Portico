@@ -278,11 +278,39 @@ TestCase {
         compare(Portico.containersCommand("/p", ""), ["/p", "containers", "--json"])
         compare(Portico.containersCommand("/p", "-dash"), ["/p", "containers", "--json", "--on=-dash"])
         compare(Portico.connectCommand("/p", "-dash"), ["/p", "connect", "--new-terminal", "--", "-dash"])
-        compare(Portico.shellCommand("/p", "", "aaaa1111"), ["/p", "shell", "--new-terminal", "--", "aaaa1111"])
-        compare(Portico.shellCommand("/p", "dev", "aaaa1111"), ["/p", "shell", "--new-terminal", "--on=dev", "--", "aaaa1111"])
+        compare(Portico.shellCommand("/p", "", "aaaa1111"), ["/p", "shell", "--new-terminal", "--backend=docker", "--", "aaaa1111"])
+        compare(Portico.shellCommand("/p", "dev", "aaaa1111"), ["/p", "shell", "--new-terminal", "--on=dev", "--backend=docker", "--", "aaaa1111"])
         compare(Portico.actionCommand("/p", "start", "db", false), ["/p", "tunnel", "start", "--json", "--", "db"])
         compare(Portico.actionCommand("/p", "stop", "db", true),
                 ["setsid", "--fork", "--wait", "/p", "tunnel", "stop", "--json", "--", "db"])
+    }
+
+    function test_settings_turn_tabs_off_and_anything_unreadable_leaves_them_on() {
+        var all = { tunnels: true, docker: true, podman: true, proxmox: true }
+        compare(Portico.settingsCommand("/p"), ["/p", "settings", "--json"])
+        var tabs = Portico.parseSettings('{"schema":1,"tabs":{"tunnels":false,"docker":true,"podman":false,"proxmox":true}}')
+        compare(tabs.tunnels, false)
+        compare(tabs.docker, true)
+        compare(tabs.podman, false)
+        compare(tabs.proxmox, true)
+        compare(Portico.parseSettings('{"schema":1,"error":{"kind":"settings"}}'), all)
+        compare(Portico.parseSettings("garbage"), all)
+        compare(Portico.parseSettings(""), all)
+        compare(Portico.parseSettings('{"schema":1,"tabs":{"podman":false}}').docker, true)
+    }
+
+    function test_containers_and_shell_commands_follow_the_backends() {
+        compare(Portico.containersCommand("/p", "", ["docker", "podman", "proxmox"]), ["/p", "containers", "--json"])
+        compare(Portico.containersCommand("/p", "", null), ["/p", "containers", "--json"])
+        compare(Portico.containersCommand("/p", "", ["podman", "proxmox"]),
+                ["/p", "containers", "--json", "--backend=podman", "--backend=proxmox"])
+        compare(Portico.containersCommand("/p", "dev", ["docker"]),
+                ["/p", "containers", "--json", "--on=dev", "--backend=docker"])
+        compare(Portico.shellCommand("/p", "dev", "abc", "podman"),
+                ["/p", "shell", "--new-terminal", "--on=dev", "--backend=podman", "--", "abc"])
+        compare(Portico.shellCommand("/p", "dev", "abc"),
+                ["/p", "shell", "--new-terminal", "--on=dev", "--backend=docker", "--", "abc"])
+        compare(Portico.enabledBackends({ docker: false, podman: true, proxmox: true }), ["podman", "proxmox"])
     }
 
     function test_a_start_without_json_is_the_row_error() {

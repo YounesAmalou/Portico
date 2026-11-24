@@ -10,6 +10,8 @@ $XDG_RUNTIME_DIR or /tmp), so a start shows as running on the next listing.
 FAKE_PORTICO_DELAY sets how long start and stop take (seconds, default 2).
 FAKE_PORTICO_MARKER, when set, names a file that each start and stop appends
 to once it finishes, to show that an action outlives a reloaded panel.
+FAKE_SETTINGS names a file whose contents answer `settings --json`; without
+it every tab is on.
 Docker is down on `legacy` until a file named FAKE_PORTICO_STATE + ".docker-up"
 exists, to show that a failed listing is listed again.
 """
@@ -89,11 +91,18 @@ def act(verb, name):
 def main(argv):
     args = [a for a in argv if a != "--"]
     line = " ".join(args)
+    if line == "settings --json":
+        path = os.environ.get("FAKE_SETTINGS")
+        if path and os.path.exists(path):
+            with open(path) as f:
+                print(f.read())
+            sys.exit(0)
+        send(golden("settings.json"))
     if line == "hosts --json":
         send(golden("hosts.json"))
     if line == "tunnels --json":
         send(tunnels())
-    if line == "containers --json":
+    if line.startswith("containers --json") and "--on=" not in line:
         send(golden("containers.json"))
     if line.startswith("containers --json --on="):
         time.sleep(1)

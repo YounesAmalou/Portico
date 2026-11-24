@@ -61,7 +61,7 @@ FocusScope {
 
     // A host row and the container rows under it, or nothing when the filter hides it.
     function hostItem(key, target, title, external, hostMatches, query) {
-        let open = !!model.expanded[target]
+        let open = model.containersOn && !!model.expanded[target]
         let shown = Portico.hostView(hostMatches, model.containers[target], query, open)
         if (!shown.show)
             return []
@@ -78,8 +78,11 @@ FocusScope {
             return [message(model.problem)]
         let query = filter.text
         let list = model.versionBanner ? [{ type: "message", lines: [model.versionBanner] }] : []
-        list.push({ type: "section", text: "Tunnels" })
-        if (model.tunnelsError) {
+        if (model.tabs.tunnels)
+            list.push({ type: "section", text: "Tunnels" })
+        if (!model.tabs.tunnels) {
+            // Turned off in the settings: no section, nothing listed.
+        } else if (model.tunnelsError) {
             list.push(message(model.tunnelsError))
         } else if (!model.tunnelsLoaded) {
             list.push(hint("Reading tunnels…"))
@@ -165,7 +168,7 @@ FocusScope {
             else
                 model.connect(item.target)
         } else if (item.type === "container") {
-            model.openShell(item.target, item.row.id)
+            model.openShell(item.target, item.row.id, item.row.backend)
         }
     }
 
@@ -179,6 +182,16 @@ FocusScope {
             model.setExpanded(item.target, false)
             currentKey = host
         }
+    }
+
+    // The footer names only what the settings leave on.
+    function footerHint() {
+        let parts = [model.tabs.tunnels ? "Enter connects or starts" : "Enter connects"]
+        if (model.containersOn)
+            parts.push("→ containers (↻ lists them again)")
+        parts.push("F5 lists all again", "Esc closes")
+        parts.push(model.tabs.tunnels ? "manage hosts and tunnels in portico" : "manage hosts in portico")
+        return parts.join(" · ")
     }
 
     function current() {
@@ -244,7 +257,7 @@ FocusScope {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
                     visible: filter.text === ""
-                    text: "Filter tunnels and hosts"
+                    text: model.tabs.tunnels ? "Filter tunnels and hosts" : "Filter hosts"
                     color: view.dim
                     font: filter.font
                 }
@@ -493,7 +506,7 @@ FocusScope {
 
         Text {
             width: parent.width
-            text: "Enter connects or starts · → containers (↻ lists them again) · F5 lists all again · Esc closes · manage hosts and tunnels in portico"
+            text: view.footerHint()
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             color: view.dim
