@@ -3259,7 +3259,7 @@ fn declared_in_effect(declared: &DetailRow, effective: &DetailRow, home: &Path) 
         effective
             .values
             .iter()
-            .any(|used| used == value || *used == crate::home::expand(value, home))
+            .any(|used| used == value || *used == crate::platform::paths::expand(value, home))
     })
 }
 

@@ -434,7 +434,7 @@ fn with_address(parts: Parts, context: &Context<'_>) -> Parts {
 
 /// Shows a path under `home` with `~`.
 fn shorten(path: &str, home: &Path) -> String {
-    crate::home::tilde(Path::new(path), home)
+    crate::platform::paths::tilde(Path::new(path), home)
 }
 
 /// Breaks `text` into lines of at most `width` columns at spaces; a longer word keeps its own line.

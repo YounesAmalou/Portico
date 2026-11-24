@@ -68,7 +68,7 @@ impl fmt::Display for ConfigRejection {
             } => write!(
                 f,
                 "line {line} of {}: {message}",
-                crate::home::tilde(path, home)
+                crate::platform::paths::tilde(path, home)
             ),
             Self::Internal { raw } | Self::Unrecognised { raw } => f.write_str(raw),
         }

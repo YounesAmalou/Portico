@@ -7,7 +7,6 @@ pub mod desktop;
 pub mod discovery;
 pub mod explain;
 pub mod fuzzy;
-pub mod home;
 pub mod host;
 pub mod identity;
 pub mod managed;

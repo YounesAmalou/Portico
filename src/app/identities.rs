@@ -401,7 +401,10 @@ impl App {
                     None => files.push((
                         key,
                         InventoryFile {
-                            configured: crate::home::tilde_text(&identity.configured, &home),
+                            configured: crate::platform::paths::tilde_text(
+                                &identity.configured,
+                                &home,
+                            ),
                             path: identity.path,
                             public_key: identity.public_key,
                             availability: identity.availability,
@@ -429,7 +432,7 @@ impl App {
             files.push((
                 Some(path.clone()),
                 InventoryFile {
-                    configured: crate::home::tilde(&path, &home),
+                    configured: crate::platform::paths::tilde(&path, &home),
                     path: Some(path.clone()),
                     public_key: facts.public_key,
                     availability: identity::Availability::Missing(

@@ -455,7 +455,7 @@ fn expand(value: &str, home: &Path) -> String {
     let value = value
         .strip_prefix("$HOME")
         .map_or_else(|| value.to_string(), |rest| format!("~{rest}"));
-    crate::home::expand(&value, Path::new(home.as_ref()))
+    crate::platform::paths::expand(&value, Path::new(home.as_ref()))
 }
 
 /// Candidate files that may hold Portico's block, for `status` and `uninstall`.

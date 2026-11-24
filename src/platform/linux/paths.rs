@@ -1,9 +1,39 @@
-//! The home directory as Portico shows it: paths under it start with `~`.
+//! The home directory as Portico shows it (paths under it start with `~`), and the well-known
+//! locations Portico uses under it.
 //!
 //! The home always comes from the caller, ultimately from `App::home()`; only `main` reads
-//! `HOME` from the environment.
+//! `HOME` from the environment, through `home_dir`.
 
-use std::path::Path;
+use std::{
+    ffi::OsStr,
+    fs,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
+
+/// The system-wide ssh client configuration.
+pub const SYSTEM_SSH_CONFIG: &str = "/etc/ssh/ssh_config";
+
+/// The home directory from `HOME`, if it is set.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `$XDG_RUNTIME_DIR/portico/tunnels` when `xdg_runtime_dir` is an absolute path to a
+/// directory the current user owns, otherwise `~/.ssh/portico/run/tunnels`.
+pub fn runtime_dir(home: &Path, xdg_runtime_dir: Option<&OsStr>) -> PathBuf {
+    let usable = xdg_runtime_dir.map(Path::new).filter(|path| {
+        path.is_absolute()
+            && fs::metadata(path).is_ok_and(|metadata| {
+                // SAFETY: `getuid` has no preconditions.
+                metadata.is_dir() && metadata.uid() == unsafe { libc::getuid() }
+            })
+    });
+    match usable {
+        Some(path) => path.join("portico/tunnels"),
+        None => home.join(".ssh/portico/run/tunnels"),
+    }
+}
 
 /// `path` with a leading `home` shown as `~`.
 pub fn tilde(path: &Path, home: &Path) -> String {
@@ -40,6 +70,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_dir_falls_back_under_the_home_without_a_usable_xdg_dir() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            runtime_dir(home, None),
+            home.join(".ssh/portico/run/tunnels")
+        );
+        assert_eq!(
+            runtime_dir(home, Some(OsStr::new("relative"))),
+            home.join(".ssh/portico/run/tunnels")
+        );
+    }
+
+    #[test]
     fn shortens_paths_under_home() {
         let home = Path::new("/home/me");
         assert_eq!(tilde(Path::new("/home/me/.ssh/a"), home), "~/.ssh/a");
@@ -67,11 +110,12 @@ mod tests {
     }
 
     /// Code that reads `HOME` itself would disagree with `App::home()` in tests and in
-    /// `--json` output; `main` is the one place that reads it.
+    /// `--json` output; `main` is the one place that reads it, through `home_dir`.
     #[test]
     fn only_main_reads_home_from_the_environment() {
         let patterns = ["var", "var_os"].map(|call| format!("{call}(\"{}\")", "HOME"));
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let paths = src.join("platform/linux/paths.rs");
         let mut offenders = Vec::new();
         let mut pending = vec![src.clone()];
         while let Some(dir) = pending.pop() {
@@ -79,9 +123,7 @@ mod tests {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     pending.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs")
-                    && path != src.join("main.rs")
-                {
+                } else if path.extension().is_some_and(|ext| ext == "rs") && path != paths {
                     let text = std::fs::read_to_string(&path).unwrap();
                     if patterns.iter().any(|pattern| text.contains(pattern)) {
                         offenders.push(path.display().to_string());
@@ -91,7 +133,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "HOME read outside main.rs: {offenders:?}"
+            "HOME read outside platform::paths::home_dir: {offenders:?}"
         );
     }
 }

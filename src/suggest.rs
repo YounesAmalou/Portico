@@ -141,7 +141,7 @@ pub fn origin_label(origin: &Origin, home: Option<&Path>) -> String {
     match origin {
         Origin::Managed => "managed".into(),
         Origin::External(path) => match home {
-            Some(home) => crate::home::tilde(path, home),
+            Some(home) => crate::platform::paths::tilde(path, home),
             None => path.display().to_string(),
         },
         Origin::Note(note) => note.clone(),

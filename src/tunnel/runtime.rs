@@ -8,13 +8,14 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
+        unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
 };
 
 use crate::{
     platform::fs::{create_private_dir, sync_dir, write_unique},
+    platform::paths::runtime_dir,
     platform::process::{Logged, Proc},
 };
 
@@ -28,18 +29,9 @@ impl RuntimeDir {
     /// `$XDG_RUNTIME_DIR/portico/tunnels` when `xdg_runtime_dir` is an absolute path to a
     /// directory the current user owns, otherwise `~/.ssh/portico/run/tunnels`.
     pub fn locate(home: &Path, xdg_runtime_dir: Option<&OsStr>) -> Self {
-        let usable = xdg_runtime_dir.map(Path::new).filter(|path| {
-            path.is_absolute()
-                && fs::metadata(path).is_ok_and(|metadata| {
-                    // SAFETY: `getuid` has no preconditions.
-                    metadata.is_dir() && metadata.uid() == unsafe { libc::getuid() }
-                })
-        });
-        let dir = match usable {
-            Some(path) => path.join("portico/tunnels"),
-            None => home.join(".ssh/portico/run/tunnels"),
-        };
-        Self { dir }
+        Self {
+            dir: runtime_dir(home, xdg_runtime_dir),
+        }
     }
 
     pub fn at(dir: impl Into<PathBuf>) -> Self {
