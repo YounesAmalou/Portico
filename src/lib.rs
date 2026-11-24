@@ -13,6 +13,7 @@ pub mod identity;
 pub mod managed;
 pub mod openssh;
 pub mod picker;
+pub mod platform;
 pub mod probe;
 pub mod suggest;
 pub mod tui;

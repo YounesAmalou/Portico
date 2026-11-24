@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     managed::{create_private_dir, sync_dir, write_unique},
-    openssh::{open_pidfd, signal_pidfd},
+    platform::process::{Logged, Proc},
 };
 
 /// The directory holding the records and logs of started tunnels.
@@ -192,99 +192,17 @@ impl Record {
     }
 }
 
-/// A process as `/proc/<pid>/stat` describes it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Stat {
-    pub start: u64,
-    pub state: char,
-    /// The session ID (field 6). `ssh -f` calls `setsid`, so a backgrounded tunnel leads its
-    /// own session, while the foreground ssh that is still connecting does not.
-    pub session: u32,
-}
-
-/// Reads processes from a `proc` filesystem, normally `/proc`; tests pass a fake one.
-#[derive(Clone, Debug)]
-pub struct Proc {
-    root: PathBuf,
+/// The newest of `processes` that logs to `log`, started no earlier than `since` when given.
+pub fn find_in(processes: &[Logged], log: &Path, since: Option<u64>) -> Option<(u32, u64)> {
+    processes
+        .iter()
+        .filter(|process| process.log == log)
+        .filter(|process| since.is_none_or(|since| process.start >= since))
+        .max_by_key(|process| process.start)
+        .map(|process| (process.pid, process.start))
 }
 
 impl Proc {
-    pub fn system() -> Self {
-        Self::at("/proc")
-    }
-
-    pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    pub fn boot_id(&self) -> Option<String> {
-        let id = fs::read_to_string(self.root.join("sys/kernel/random/boot_id")).ok()?;
-        Some(id.trim().to_owned()).filter(|id| !id.is_empty())
-    }
-
-    /// Boot time in Unix seconds (`btime` in `/proc/stat`).
-    fn boot_time(&self) -> Option<u64> {
-        fs::read_to_string(self.root.join("stat"))
-            .ok()?
-            .lines()
-            .find_map(|line| line.strip_prefix("btime "))
-            .and_then(|value| value.trim().parse().ok())
-    }
-
-    /// Unix seconds at which a process with `start` (clock ticks after boot) started.
-    pub fn started_at(&self, start: u64) -> Option<u64> {
-        // SAFETY: `sysconf` has no preconditions.
-        let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
-            .ok()
-            .filter(|ticks| *ticks > 0)?;
-        Some(self.boot_time()? + start / ticks)
-    }
-
-    pub fn stat(&self, pid: u32) -> Option<Stat> {
-        let text = fs::read_to_string(self.root.join(format!("{pid}/stat"))).ok()?;
-        // The command name is in parentheses and may contain anything, so read after the last.
-        let rest = &text[text.rfind(')')? + 1..];
-        let mut fields = rest.split_whitespace();
-        let state = fields.next()?.chars().next()?;
-        // `rest` starts at field 3 (state); the session is field 6 and the start time field 22.
-        let session = fields.nth(2)?.parse().ok()?;
-        let start = fields.nth(15)?.parse().ok()?;
-        Some(Stat {
-            start,
-            state,
-            session,
-        })
-    }
-
-    /// The real UID of `pid`.
-    pub fn uid(&self, pid: u32) -> Option<u32> {
-        fs::read_to_string(self.root.join(format!("{pid}/status")))
-            .ok()?
-            .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))
-            .and_then(|ids| ids.split_whitespace().next())
-            .and_then(|uid| uid.parse().ok())
-    }
-
-    pub fn cmdline(&self, pid: u32) -> Option<Vec<Vec<u8>>> {
-        let bytes = fs::read(self.root.join(format!("{pid}/cmdline"))).ok()?;
-        let mut args: Vec<Vec<u8>> = bytes.split(|byte| *byte == 0).map(<[u8]>::to_vec).collect();
-        if args.last().is_some_and(Vec::is_empty) {
-            args.pop();
-        }
-        Some(args)
-    }
-
-    fn pids(&self) -> Vec<u32> {
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
-            .collect()
-    }
-
     /// Whether `pid` is a live process of `uid` whose command line names `log` after `-E`, and,
     /// when `start` is given, that started at that time.
     pub fn is_tunnel(&self, pid: u32, start: Option<u64>, log: &Path, uid: u32) -> bool {
@@ -303,53 +221,6 @@ impl Proc {
         find_in(&self.scan(uid), log, since)
     }
 
-    /// Every live process of `uid` that leads its own session (as `ssh -f` does once it has put
-    /// itself in the background) and whose command line has `-E <path>`: what a status listing
-    /// searches for tunnels without a record, read once however many tunnels it lists.
-    pub fn scan(&self, uid: u32) -> Vec<Logged> {
-        self.pids()
-            .into_iter()
-            .filter_map(|pid| {
-                // The command line rejects nearly every process, so it is read first.
-                let args = self.cmdline(pid)?;
-                let log = args
-                    .windows(2)
-                    .find(|pair| pair[0] == b"-E")
-                    .map(|pair| PathBuf::from(OsStr::from_bytes(&pair[1])))?;
-                let stat = self.stat(pid)?;
-                // Only a backgrounded ssh counts: a foreground one may still fail to connect.
-                (!matches!(stat.state, 'Z' | 'X' | 'x')
-                    && stat.session == pid
-                    && self.uid(pid) == Some(uid))
-                .then_some(Logged {
-                    pid,
-                    start: stat.start,
-                    log,
-                })
-            })
-            .collect()
-    }
-}
-
-/// A process that logs to a file with `-E`, as every started tunnel does.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Logged {
-    pub pid: u32,
-    pub start: u64,
-    pub log: PathBuf,
-}
-
-/// The newest of `processes` that logs to `log`, started no earlier than `since` when given.
-pub fn find_in(processes: &[Logged], log: &Path, since: Option<u64>) -> Option<(u32, u64)> {
-    processes
-        .iter()
-        .filter(|process| process.log == log)
-        .filter(|process| since.is_none_or(|since| process.start >= since))
-        .max_by_key(|process| process.start)
-        .map(|process| (process.pid, process.start))
-}
-
-impl Proc {
     /// Rebuilds the record of a tunnel process found without one.
     pub fn rebuild_record(&self, pid: u32, start: u64) -> Option<RunningRecord> {
         let args = self.cmdline(pid)?;
@@ -405,12 +276,6 @@ pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-/// The current user's real UID.
-pub fn current_uid() -> u32 {
-    // SAFETY: `getuid` has no preconditions.
-    unsafe { libc::getuid() }
 }
 
 /// Whether a local address can be listened on now.
@@ -492,43 +357,6 @@ fn bind_v6_only(address: std::net::SocketAddrV6) -> io::Result<()> {
     }
 }
 
-/// How long a tunnel has to exit after SIGTERM before it is killed.
-const TERM_GRACE_MS: i32 = 3000;
-
-/// Stops `pid` if `verify` still recognises it once a pidfd pins it. Returns whether a signal
-/// was sent. Because the pidfd is opened before `verify` runs, and a PID is not reused while its
-/// process lives, a process that passes `verify` is the one the pidfd refers to.
-pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool> {
-    let Ok(raw) = libc::pid_t::try_from(pid) else {
-        return Ok(false);
-    };
-    let pidfd = match open_pidfd(raw) {
-        Ok(pidfd) => pidfd,
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if !verify() {
-        return Ok(false);
-    }
-    for (signal, wait) in [(libc::SIGTERM, TERM_GRACE_MS), (libc::SIGKILL, 2000)] {
-        match signal_pidfd(&pidfd, signal) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
-            Err(error) => return Err(error),
-        }
-        let mut poll = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid `pollfd` that outlives the call.
-        if unsafe { libc::poll(&mut poll, 1, wait) } > 0 {
-            return Ok(true);
-        }
-    }
-    Ok(true)
-}
-
 /// The last line of a tunnel's log that says something, debug output left out.
 pub fn log_reason(log: &Path) -> Option<String> {
     log_tail(log, 1).pop()
@@ -552,9 +380,10 @@ pub fn log_tail(log: &Path, count: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::platform::process::Stat;
 
     const BOOT: &str = "3f0d9c1e-0000-4000-8000-000000000001";
     const LOG: &str = "/run/user/1000/portico/tunnels/db.log";
@@ -881,19 +710,6 @@ mod tests {
             assert_eq!(try_bind("::1", port), Bind::InUse);
             assert_eq!(try_bind("::", port), Bind::InUse);
         }
-    }
-
-    #[test]
-    fn stop_process_signals_only_a_verified_process() {
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        assert!(!stop_process(child.id(), || false).unwrap());
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "an unverified process was signalled"
-        );
-        assert!(stop_process(child.id(), || true).unwrap());
-        let status = child.wait().unwrap();
-        assert!(!status.success());
     }
 
     #[test]

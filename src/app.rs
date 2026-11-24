@@ -31,10 +31,11 @@ use crate::{
         ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
         append_known_hosts,
     },
+    platform::process::Proc,
     probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
     tunnel::{
         TunnelError,
-        runtime::{Proc, RuntimeDir},
+        runtime::RuntimeDir,
         store::{StoreError, TunnelStore},
     },
 };
