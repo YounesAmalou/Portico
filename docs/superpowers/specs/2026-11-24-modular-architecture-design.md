@@ -1,6 +1,6 @@
 # Modular Architecture Design
 
-**Status:** Approved; not implemented
+**Status:** Approved; implemented (see "As built" at the end, and `docs/architecture.md`)
 
 ## Purpose
 
@@ -76,7 +76,7 @@ pub enum GroupTool { Sg }                     // from container.rs; `--via sg` i
 /// How running one command failed, as the app reports it to the adapter.
 pub enum RunFailure<E> { Cancelled(E), Failed(E) }
 /// Why a listing produced no list.
-pub enum ListFailure<E> { Run(E), Issue(BackendIssue) }
+pub enum ListFailure<E> { Run(E), Issue(Box<BackendIssue>) }
 
 pub trait Backend {
     fn id(&self) -> BackendId;
@@ -138,3 +138,14 @@ Steps 1 and 2 come first because Proxmox, Podman and v5 build on them; steps 3 t
 - Proxmox, Podman, settings and the remembered container user (v4 slices 2 to 5).
 - Any macOS or Windows implementation of `platform` (v5).
 - A compiler- or CI-enforced layer check. Review keeps the dependency rule; a check can be added later if violations appear.
+
+## As built
+
+The slice shipped as specified, with these differences. `docs/architecture.md` describes the code as it is.
+
+- `ListFailure::Issue` holds `Box<BackendIssue>`, and `Backend::list` takes `run: &mut dyn FnMut(&[String]) -> RunResult<E>` with `type RunResult<E> = Result<Output, RunFailure<E>>`; both satisfy clippy's `result_large_err` and `type_complexity`.
+- The listing row types (`Container`, `Listing`, `group`, `display_name`, `resolve`) live in `backend::listing`, shared by every adapter; Docker keeps only the parsing of `docker ps`.
+- `remote_command` and `quote` live in `backend` (the app's transport uses them); `Access` and `decide` are private to the Docker adapter.
+- `picker.rs` stays at the crate root: the CLI and the TUI both use it, and it imports `TextInput` from the TUI. With no subcommand, the CLI starts the TUI. Both are recorded as the exceptions to "an interface never calls another".
+- `Proc`'s tunnel-specific methods stay in `domain::tunnel::runtime`; the `/proc` readers are in `platform::process`.
+- A few direct `libc` calls remain in `domain` (`tunnel::runtime`, `tunnel`, `adopt`); a macOS or Windows port must revisit them.
