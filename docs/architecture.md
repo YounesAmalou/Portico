@@ -40,9 +40,10 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `domain::tunnel` | Saved port forwards, their store, and the runtime state of started ones (`runtime`, including the `Proc` methods specific to tunnels) |
 | `domain::probe` | The connection test: its options and outcomes |
 | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | Identity data, jump-host suggestions, fuzzy matching, failure explanations, configuration errors |
-| `backend` | The `Backend` interface, `BackendId`, `AUTOMATIC` (the order backends are tried in), `Target`, `Via`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
+| `backend` | The `Backend` interface, `BackendId`, `AUTOMATIC` (every backend, in the order they are listed), `Target`, `Via`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
 | `backend::listing` | The container rows every backend produces (`Container`, `Listing`), grouping by Compose project, display names, and resolving a container reference |
 | `backend::docker` | The Docker adapter: `docker ps` parsing, and its access decision (`Access`, `decide`, private to this file) |
+| `backend::podman` | The Podman adapter: the listing script (the ssh user's own containers), `podman ps --format json` parsing, and `podman exec` |
 | `backend::proxmox` | The Proxmox VE adapter: the listing script (root or `sudo -n`), `pct list` parsing, and `pct exec` |
 | `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities` |
 | `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`) and the JSON documents (`json`) |
@@ -60,8 +61,8 @@ Adapters are compiled in and chosen at run time through the `BackendId` enum. No
 
 1. Add the adapter in `src/backend/<name>.rs`, implementing `Backend`. It produces the shared `backend::Listing` of `backend::Container` rows (`src/backend/listing.rs`), which grouping, naming and lookup already work on.
 2. Add one `BackendId` variant.
-3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str`, `program`, `chooses_user` and `ungrouped_heading`, and the dispatch functions `list`, `shell_words` and `plain_issue`.
-4. Make the app reach it. Without `--backend`, the app lists with each backend of `backend::AUTOMATIC` in turn and moves on only when one is not installed (Docker, then Proxmox), so add the new id where it belongs in that order. With `--backend`, the CLI maps its `BackendArg` value to the id (`src/cli/mod.rs`): add a value there. The list records its backend (`ContainerList::backend`), and the shell, the CLI's human and JSON output and the TUI read it from there; the JSON adds a `backend` key for every backend but Docker, whose documents predate it.
+3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str`, `program`, `title`, `chooses_user` and `ungrouped_heading`, and the dispatch functions `list`, `shell_words` and `plain_issue`.
+4. Make the interfaces reach it: add the new id where it belongs in `backend::AUTOMATIC` (Docker, Podman, Proxmox). Every backend is listed in that order: the TUI has one tab per backend (`Tab::ALL` in `src/tui/mod.rs`, which a test keeps in step with `AUTOMATIC`), each with its own panel and listing worker, and the CLI's human listing and `portico shell` walk `AUTOMATIC` themselves. `App::containers` without a backend returns the first one installed, which only the JSON output uses. With `--backend`, the CLI maps its `BackendArg` value to the id (`src/cli/mod.rs`): add a value there. The list records its backend (`ContainerList::backend`), and the shell, the CLI's human and JSON output and the TUI read it from there; the JSON adds a `backend` key for every backend but Docker, whose documents predate it.
 
 ### Add a platform
 

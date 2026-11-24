@@ -25,6 +25,7 @@ TestCase {
 
     function test_every_golden_file_has_the_panel_schema() {
         var files = ["containers-docker-down.json", "containers.json", "containers-on-host.json",
+                     "containers-podman.json", "containers-podman-missing-subuid.json",
                      "containers-proxmox.json", "containers-proxmox-denied.json",
                      "error-unknown-host.json", "error-usage.json", "hosts.json", "identities.json",
                      "show.json", "show-unresolved.json", "tunnel-show.json", "tunnels.json",
@@ -108,6 +109,22 @@ TestCase {
         compare(rows[1].name, "web")
         compare(rows[1].image, "")
         compare(rows[1].status, "running")
+    }
+
+    function test_podman_containers_are_rows_like_docker_ones() {
+        var rows = Portico.containerRows(doc("containers-podman.json"), "")
+        compare(rows.length, 2)
+        compare(rows[0].name, "web")
+        compare(rows[1].name, "toolbox")
+        compare(rows[1].image, "registry.fedoraproject.org/fedora:41")
+    }
+
+    function test_a_podman_failure_keeps_its_steps() {
+        var error = Portico.documentError(doc("containers-podman-missing-subuid.json"))
+        // The panel predates Podman: an unknown kind reads as other, the steps are kept.
+        compare(error.kind, "other")
+        compare(error.problem, "other")
+        compare(Portico.errorLines(error).length, 2)
     }
 
     function test_a_proxmox_failure_keeps_its_steps() {

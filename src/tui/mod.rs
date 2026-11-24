@@ -39,7 +39,7 @@ mod watch;
 
 use crate::{
     app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestTarget},
-    backend::Target,
+    backend::{AUTOMATIC, BackendId, Target},
     domain::adopt,
     domain::config_error::ConfigRejection,
     domain::discovery::{DiscoveryWarning, Input},
@@ -49,7 +49,9 @@ use crate::{
     domain::managed::TransactionError,
     domain::suggest,
 };
-use containers::{Panel, PanelAction, fix_status, render_containers, shell_status, show_fix};
+use containers::{
+    ContainerTabs, PanelAction, fix_status, render_containers, shell_status, show_fix,
+};
 use events::{Step, TerminalEvents};
 use form::{FORM_FIELDS, FormState, IDENTITY_FILE, PROXY_JUMP};
 use hangup::HangupWatch;
@@ -214,20 +216,32 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 };
                 state.finish_connect(&alias, result);
             }
-            UiAction::Containers(PanelAction::List(target)) => {
-                workers.lister.list(&mut state.containers, target);
+            UiAction::ListContainers(lists) => {
+                for (backend, target) in lists {
+                    workers
+                        .lister(backend)
+                        .list(state.containers.panel_mut(backend), target);
+                }
             }
-            UiAction::Containers(PanelAction::CancelList) => {
-                workers.lister.cancel();
+            UiAction::Containers(backend, PanelAction::List(target)) => {
+                workers
+                    .lister(backend)
+                    .list(state.containers.panel_mut(backend), target);
             }
-            UiAction::Containers(PanelAction::Shell {
-                target,
-                backend,
-                id,
-                user,
-                via,
-                new_terminal,
-            }) => {
+            UiAction::Containers(backend, PanelAction::CancelList) => {
+                workers.lister(backend).cancel();
+            }
+            UiAction::Containers(
+                panel,
+                PanelAction::Shell {
+                    target,
+                    backend,
+                    id,
+                    user,
+                    via,
+                    new_terminal,
+                },
+            ) => {
                 let shell = |cancelled| {
                     let user = user.as_deref();
                     app.container_shell(
@@ -248,17 +262,19 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 };
                 state
                     .containers
+                    .panel_mut(panel)
                     .set_status(Some(shell_status(&target, result)));
             }
-            UiAction::Containers(PanelAction::Fix { target, offer }) => {
+            UiAction::Containers(backend, PanelAction::Fix { target, offer }) => {
                 let result = suspended(terminal, session, signals, || {
                     show_fix(&mut io::stdout(), &target, &offer)?;
                     Ok(app.run_offer(&target, &offer))
                 })?;
-                state.containers.set_status(fix_status(&offer, result));
-                workers.lister.list(&mut state.containers, target);
+                let panel = state.containers.panel_mut(backend);
+                panel.set_status(fix_status(&offer, result));
+                workers.lister(backend).list(panel, target);
             }
-            UiAction::Containers(_) => {}
+            UiAction::Containers(..) => {}
             UiAction::Refresh => {
                 let reason = Reload::Requested;
                 inventory_changed = reload(app, &mut state, &mut workers, &mut watch, reason);
@@ -399,9 +415,11 @@ fn on_tick(
         state.record_test(finished, local_time());
         redraw = true;
     }
-    if let Some((target, result)) = workers.lister.try_finished() {
-        state.containers.finish(target, result);
-        redraw = true;
+    for (backend, lister) in &mut workers.listers {
+        if let Some((target, result)) = lister.try_finished() {
+            state.containers.panel_mut(*backend).finish(target, result);
+            redraw = true;
+        }
     }
     if let Some((planned, preselect)) = workers.planner.try_finished() {
         state.finish_plan(planned, &preselect, app.home());
@@ -691,7 +709,8 @@ fn sync_details(state: &mut UiState, resolver: &mut Resolver, inventory_changed:
 struct Workers {
     resolver: Resolver,
     tester: Tester,
-    lister: Lister,
+    /// One per container backend, in the order of `backend::AUTOMATIC`.
+    listers: Vec<(BackendId, Lister)>,
     planner: Planner,
     indexer: Indexer,
     starter: Starter,
@@ -702,18 +721,29 @@ impl Workers {
         Self {
             resolver: Resolver::spawn(scope, app),
             tester: Tester::spawn(scope, app),
-            lister: Lister::spawn(scope, app),
+            listers: AUTOMATIC
+                .into_iter()
+                .map(|backend| (backend, Lister::spawn(scope, app, backend)))
+                .collect(),
             planner: Planner::spawn(scope, app),
             indexer: Indexer::spawn(scope, app),
             starter: Starter::spawn(scope, app),
         }
     }
 
+    /// The listing worker of `backend`.
+    fn lister(&mut self, backend: BackendId) -> &mut Lister {
+        self.listers
+            .iter_mut()
+            .find_map(|(listing, lister)| (*listing == backend).then_some(lister))
+            .expect("a lister for every backend")
+    }
+
     /// Whether any worker is running, so its result is looked for more often.
     fn busy(&self) -> bool {
         self.resolver.is_pending()
             || self.tester.running().is_some()
-            || self.lister.is_running()
+            || self.listers.iter().any(|(_, lister)| lister.is_running())
             || self.planner.is_running()
             || self.indexer.is_running()
             || self.starter.running().is_some()
@@ -860,23 +890,30 @@ enum Mode {
     Migrate,
 }
 
-/// The tabs, in the order the tab bar shows them and Tab cycles them.
+/// The tabs, in the order the tab bar shows them and Tab cycles them: one per container
+/// backend, in the order of `backend::AUTOMATIC`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Tab {
     #[default]
     Hosts,
     Tunnels,
-    Containers,
+    Containers(BackendId),
 }
 
 impl Tab {
-    const ALL: [Self; 3] = [Self::Hosts, Self::Tunnels, Self::Containers];
+    const ALL: [Self; 5] = [
+        Self::Hosts,
+        Self::Tunnels,
+        Self::Containers(BackendId::Docker),
+        Self::Containers(BackendId::Podman),
+        Self::Containers(BackendId::Proxmox),
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Hosts => "Hosts",
             Self::Tunnels => "Tunnels",
-            Self::Containers => "Containers",
+            Self::Containers(backend) => backend.title(),
         }
     }
 
@@ -922,7 +959,9 @@ struct UiState {
     trust: Option<PendingTrust>,
     /// Set while a change of the config files waits for the open form or prompt to close.
     config_changed: bool,
-    containers: Panel,
+    containers: ContainerTabs,
+    /// The container tab shown last, which `c` shows again.
+    container_tab: BackendId,
     /// The tab shown and receiving keys.
     tab: Tab,
     /// The migrate screen while in `Mode::Migrate`.
@@ -964,7 +1003,10 @@ enum UiAction {
     FormEdited,
     /// The answer to the trust prompt; on `true` the key to trust is in `UiState::trust`.
     Trust(bool),
-    Containers(PanelAction),
+    /// An action of the container tab of a backend.
+    Containers(BackendId, PanelAction),
+    /// Lists targets with backends, each on its backend's worker.
+    ListContainers(Vec<(BackendId, Target)>),
     /// Opens the migrate screen of every host owned like the selected one.
     OpenMigrate {
         direction: adopt::Direction,
@@ -1005,7 +1047,8 @@ impl UiState {
             show_raw: false,
             trust: None,
             config_changed: false,
-            containers: Panel::default(),
+            containers: ContainerTabs::default(),
+            container_tab: BackendId::Docker,
             tab: Tab::Hosts,
             migrate: None,
             identity_inventory: None,
@@ -1026,30 +1069,33 @@ impl UiState {
                 TunnelAction::Quit => UiAction::Quit,
                 action => UiAction::Tunnels(action),
             },
-            Tab::Containers => match self.containers.handle_key(key) {
-                PanelAction::Quit => UiAction::Quit,
-                PanelAction::ChooseTarget => {
-                    let hosts = self
-                        .hosts
-                        .iter()
-                        .map(|host| {
-                            let origin = match host.ownership {
-                                Ownership::Managed => suggest::Origin::Managed,
-                                Ownership::External => {
-                                    suggest::Origin::External(host.source.clone())
-                                }
-                            };
-                            (
-                                host.alias.clone(),
-                                suggest::origin_label(&origin, Some(&self.home)),
-                            )
-                        })
-                        .collect();
-                    self.containers.choose_target(hosts);
-                    UiAction::None
+            Tab::Containers(backend) => {
+                let before = self.containers.target();
+                match self.containers.panel_mut(backend).handle_key(key) {
+                    PanelAction::Quit => UiAction::Quit,
+                    PanelAction::ChooseTarget => {
+                        let hosts = self
+                            .hosts
+                            .iter()
+                            .map(|host| {
+                                let origin = match host.ownership {
+                                    Ownership::Managed => suggest::Origin::Managed,
+                                    Ownership::External => {
+                                        suggest::Origin::External(host.source.clone())
+                                    }
+                                };
+                                (
+                                    host.alias.clone(),
+                                    suggest::origin_label(&origin, Some(&self.home)),
+                                )
+                            })
+                            .collect();
+                        self.containers.panel_mut(backend).choose_target(hosts);
+                        UiAction::None
+                    }
+                    action => self.containers.after_key(backend, &before, action),
                 }
-                action => UiAction::Containers(action),
-            },
+            }
         }
     }
 
@@ -1059,12 +1105,13 @@ impl UiState {
         match self.tab {
             Tab::Hosts => self.mode == Mode::Browse,
             Tab::Tunnels => self.tunnels.is_browsing(),
-            Tab::Containers => self.containers.is_browsing(),
+            Tab::Containers(backend) => self.containers.panel(backend).is_browsing(),
         }
     }
 
-    /// The keys shared by every browsing tab: `1` `2` `3`, Tab and Shift+Tab switch tabs, `T`
-    /// shows the tunnels and `c` the containers, of the selected host when on the hosts.
+    /// The keys shared by every browsing tab: `1` to `5`, Tab and Shift+Tab switch tabs, `T`
+    /// shows the tunnels and `c` the container tab shown last, for the selected host when on
+    /// the hosts.
     fn handle_tab_key(&mut self, key: KeyEvent) -> Option<UiAction> {
         if !self.browsing()
             || key
@@ -1073,10 +1120,9 @@ impl UiState {
         {
             return None;
         }
+        let containers = Tab::Containers(self.container_tab);
         let tab = match key.code {
-            KeyCode::Char('1') => Tab::Hosts,
-            KeyCode::Char('2') => Tab::Tunnels,
-            KeyCode::Char('3') => Tab::Containers,
+            KeyCode::Char(digit @ '1'..='5') => Tab::ALL[digit as usize - '1' as usize],
             KeyCode::Tab => self.tab.cycled(1),
             KeyCode::BackTab => self.tab.cycled(-1),
             // Terminals report Shift+T as `T`, with or without the Shift modifier.
@@ -1086,21 +1132,32 @@ impl UiState {
                     && let Some(alias) = self.selected_alias()
                 {
                     let target = Target::Host(alias.to_owned());
-                    self.tab = Tab::Containers;
-                    return Some(UiAction::Containers(self.containers.show(target)));
+                    self.tab = containers;
+                    return Some(list_containers(self.containers.show(&target)));
                 }
-                Tab::Containers
+                containers
             }
             _ => return None,
         };
-        let entered = tab != self.tab;
+        let from = self.tab;
         self.tab = tab;
-        // A target is listed once its tab is shown, never before.
-        if entered && tab == Tab::Containers {
-            let target = self.containers.target();
-            return Some(UiAction::Containers(self.containers.show(target)));
+        // A target is listed once a container tab is shown, never before: coming from another
+        // tab, with every backend at once; from another container tab, with its backend.
+        let Tab::Containers(backend) = tab else {
+            return Some(UiAction::None);
+        };
+        self.container_tab = backend;
+        if from == tab {
+            return Some(UiAction::None);
         }
-        Some(UiAction::None)
+        let target = self.containers.target();
+        Some(match from {
+            Tab::Containers(_) => match self.containers.panel_mut(backend).show(target) {
+                PanelAction::List(target) => UiAction::ListContainers(vec![(backend, target)]),
+                _ => UiAction::None,
+            },
+            _ => list_containers(self.containers.show(&target)),
+        })
     }
 
     fn in_form(&self) -> bool {
@@ -1167,7 +1224,16 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             );
             state.tunnels.render(frame, content);
         }
-        Tab::Containers => render_containers(frame, body, state),
+        Tab::Containers(backend) => render_containers(frame, body, state, backend),
+    }
+}
+
+/// Starts `lists`, or nothing when there are none.
+fn list_containers(lists: Vec<(BackendId, Target)>) -> UiAction {
+    if lists.is_empty() {
+        UiAction::None
+    } else {
+        UiAction::ListContainers(lists)
     }
 }
 
@@ -1262,7 +1328,7 @@ fn footer_text(state: &UiState) -> String {
                 ""
             };
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  c containers  Tab/1-3 tabs  q quit"
+                "{output}t test  Enter connect  {new_terminal}  c containers  Tab/1-5 tabs  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -1287,7 +1353,7 @@ fn footer_text(state: &UiState) -> String {
                 Some(Ownership::External) => {
                     format!("↑↓ move  / filter{clear_filter}  a add  m adopt  {refresh}  {connect}")
                 }
-                None => format!("/ filter{clear_filter}  a add  {refresh}  Tab/1-3 tabs  q quit"),
+                None => format!("/ filter{clear_filter}  a add  {refresh}  Tab/1-5 tabs  q quit"),
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -2307,13 +2373,28 @@ mod tests {
         }
     }
 
+    const DOCKER: Tab = Tab::Containers(BackendId::Docker);
+
+    /// Listing `target` with every backend, as showing it does.
+    fn every_backend(target: Target) -> UiAction {
+        UiAction::ListContainers(
+            AUTOMATIC
+                .into_iter()
+                .map(|backend| (backend, target.clone()))
+                .collect(),
+        )
+    }
+
     fn char(state: &mut UiState, character: char) -> UiAction {
         press(state, KeyCode::Char(character))
     }
 
     fn dev_listed(state: &mut UiState) {
         let dev = Target::Host("dev".into());
-        state.containers.finish(dev.clone(), Ok(shop_list(dev)));
+        state
+            .containers
+            .panel_mut(BackendId::Docker)
+            .finish(dev.clone(), Ok(shop_list(dev)));
     }
 
     fn tunnels_state() -> UiState {
@@ -2339,18 +2420,20 @@ mod tests {
         assert_eq!(state.tab, Tab::Tunnels);
         assert_eq!(
             char(&mut state, '3'),
-            UiAction::Containers(PanelAction::List(Target::Local)),
+            every_backend(Target::Local),
             "the Containers tab lists its target when first shown"
         );
-        assert_eq!(state.tab, Tab::Containers);
+        assert_eq!(state.tab, DOCKER);
         assert_eq!(char(&mut state, '1'), UiAction::None);
         assert_eq!(state.tab, Tab::Hosts);
 
-        for expected in [Tab::Tunnels, Tab::Containers, Tab::Hosts] {
+        let podman = Tab::Containers(BackendId::Podman);
+        let proxmox = Tab::Containers(BackendId::Proxmox);
+        for expected in [Tab::Tunnels, DOCKER, podman, proxmox, Tab::Hosts] {
             press(&mut state, KeyCode::Tab);
             assert_eq!(state.tab, expected);
         }
-        for expected in [Tab::Containers, Tab::Tunnels, Tab::Hosts] {
+        for expected in [proxmox, podman, DOCKER, Tab::Tunnels, Tab::Hosts] {
             press(&mut state, KeyCode::BackTab);
             assert_eq!(state.tab, expected);
         }
@@ -2362,8 +2445,10 @@ mod tests {
             UiAction::None
         );
         assert_eq!(state.tab, Tab::Tunnels, "Shift+T is T");
+        char(&mut state, '4');
+        char(&mut state, 'T');
         char(&mut state, 'c');
-        assert_eq!(state.tab, Tab::Containers);
+        assert_eq!(state.tab, podman, "c shows the container tab shown last");
         assert_eq!(
             state.containers.target(),
             Target::Local,
@@ -2377,6 +2462,85 @@ mod tests {
             "Ctrl+C is the main loop's"
         );
         assert_eq!(state.tab, Tab::Tunnels);
+    }
+
+    #[test]
+    fn the_container_tabs_follow_the_backend_order() {
+        let tabs: Vec<Tab> = Tab::ALL[2..].to_vec();
+        let expected: Vec<Tab> = AUTOMATIC.into_iter().map(Tab::Containers).collect();
+        assert_eq!(tabs, expected);
+    }
+
+    #[test]
+    fn the_container_tabs_share_one_target_and_list_it_with_every_backend() {
+        let mut state = test_state(vec![
+            summary("dev", Ownership::Managed),
+            summary("web", Ownership::External),
+        ]);
+        let web = Target::Host("web".into());
+        assert_eq!(char(&mut state, '3'), every_backend(Target::Local));
+        for backend in AUTOMATIC {
+            state
+                .containers
+                .panel_mut(backend)
+                .finish(Target::Local, Ok(shop_list(Target::Local)));
+        }
+        // Another container tab lists only what it has not listed.
+        assert_eq!(char(&mut state, '4'), UiAction::None);
+        assert_eq!(
+            state
+                .containers
+                .panel(BackendId::Podman)
+                .title()
+                .to_string(),
+            "Podman /"
+        );
+
+        char(&mut state, 'h');
+        type_text(&mut state, "web");
+        assert_eq!(
+            press(&mut state, KeyCode::Enter),
+            every_backend(web.clone())
+        );
+        assert_eq!(state.containers.panel(BackendId::Docker).target(), web);
+        assert_eq!(state.containers.panel(BackendId::Proxmox).target(), web);
+
+        // `r` and Esc are the shown tab's own.
+        state
+            .containers
+            .panel_mut(BackendId::Podman)
+            .finish(web.clone(), Ok(shop_list(web.clone())));
+        assert_eq!(
+            char(&mut state, 'r'),
+            UiAction::ListContainers(vec![(BackendId::Podman, web.clone())])
+        );
+        state
+            .containers
+            .panel_mut(BackendId::Podman)
+            .set_listing(web.clone());
+        assert_eq!(
+            press(&mut state, KeyCode::Esc),
+            UiAction::Containers(BackendId::Podman, PanelAction::CancelList)
+        );
+
+        // A shown container tab lists again only its own failed or missing listing.
+        state
+            .containers
+            .panel_mut(BackendId::Proxmox)
+            .set_listing(web.clone());
+        assert_eq!(
+            char(&mut state, '5'),
+            UiAction::None,
+            "Proxmox's listing of web is running"
+        );
+        state
+            .containers
+            .panel_mut(BackendId::Docker)
+            .abandon(web.clone());
+        assert_eq!(
+            char(&mut state, '3'),
+            UiAction::ListContainers(vec![(BackendId::Docker, web)])
+        );
     }
 
     #[test]
@@ -2394,29 +2558,25 @@ mod tests {
         ]);
         press(&mut state, KeyCode::Down);
         let web = Target::Host("web".into());
-        assert_eq!(
-            char(&mut state, 'c'),
-            UiAction::Containers(PanelAction::List(web.clone()))
-        );
-        assert_eq!(state.tab, Tab::Containers);
+        assert_eq!(char(&mut state, 'c'), every_backend(web.clone()));
+        assert_eq!(state.tab, DOCKER);
         assert_eq!(state.containers.target(), web);
-        state.containers.set_listing(web.clone());
+        for backend in AUTOMATIC {
+            state.containers.panel_mut(backend).set_listing(web.clone());
+        }
         char(&mut state, '1');
         assert_eq!(
             char(&mut state, 'c'),
-            UiAction::Containers(PanelAction::None),
+            UiAction::None,
             "a listing already running or kept is not started again"
         );
         char(&mut state, '1');
-        assert_eq!(
-            char(&mut state, '3'),
-            UiAction::Containers(PanelAction::None)
-        );
+        assert_eq!(char(&mut state, '3'), UiAction::None);
 
         let mut empty = test_state(Vec::new());
         assert_eq!(
             char(&mut empty, 'c'),
-            UiAction::Containers(PanelAction::List(Target::Local)),
+            every_backend(Target::Local),
             "without a host, c only shows the tab"
         );
         assert_eq!(empty.containers.target(), Target::Local);
@@ -2428,7 +2588,7 @@ mod tests {
         for code in [KeyCode::Down, KeyCode::Char('2'), KeyCode::Char('1')] {
             assert!(!matches!(
                 press(&mut state, code),
-                UiAction::Containers(PanelAction::List(_))
+                UiAction::ListContainers(_)
             ));
         }
         assert!(!rendered(&state).contains("Target:"));
@@ -2471,7 +2631,7 @@ mod tests {
             char(&mut state, opener);
             char(&mut state, '1');
             press(&mut state, KeyCode::Tab);
-            assert_eq!(state.tab, Tab::Containers, "after {opener}");
+            assert_eq!(state.tab, DOCKER, "after {opener}");
             press(&mut state, KeyCode::Esc);
         }
     }
@@ -2510,10 +2670,13 @@ mod tests {
         press(&mut state, KeyCode::Enter);
         char(&mut state, '3');
         dev_listed(&mut state);
-        state.containers.show(Target::Host("dev".into()));
+        state
+            .containers
+            .panel_mut(BackendId::Docker)
+            .show(Target::Host("dev".into()));
         dev_listed(&mut state);
         char(&mut state, 'j');
-        let details = state.containers.details();
+        let details = state.containers.panel(BackendId::Docker).details();
 
         char(&mut state, '1');
         assert_eq!(state.filter.as_str(), "w");
@@ -2521,7 +2684,7 @@ mod tests {
         char(&mut state, '2');
         assert!(render_text_at(&state, 100).contains("Tunnels /d"));
         char(&mut state, '3');
-        assert_eq!(state.containers.details(), details);
+        assert_eq!(state.containers.panel(BackendId::Docker).details(), details);
         assert_eq!(state.containers.target(), Target::Host("dev".into()));
     }
 
@@ -2551,23 +2714,26 @@ mod tests {
         char(&mut state, '3');
         state
             .containers
+            .panel_mut(BackendId::Docker)
             .finish(Target::Local, Ok(shop_list(Target::Local)));
         assert_eq!(
             char(&mut state, 'r'),
-            UiAction::Containers(PanelAction::List(Target::Local))
+            UiAction::ListContainers(vec![(BackendId::Docker, Target::Local)])
         );
         state
             .containers
+            .panel_mut(BackendId::Docker)
             .finish(Target::Local, Ok(shop_list(Target::Local)));
         assert_eq!(
             press(&mut state, KeyCode::F(5)),
-            UiAction::Containers(PanelAction::List(Target::Local))
+            UiAction::ListContainers(vec![(BackendId::Docker, Target::Local)])
         );
         state
             .containers
+            .panel_mut(BackendId::Docker)
             .finish(Target::Local, Ok(shop_list(Target::Local)));
         press(&mut state, KeyCode::Esc);
-        assert_eq!(state.tab, Tab::Containers, "Esc never switches");
+        assert_eq!(state.tab, DOCKER, "Esc never switches");
         assert_eq!(char(&mut state, 'q'), UiAction::Quit);
         char(&mut state, '1');
         assert_eq!(char(&mut state, 'q'), UiAction::Quit);
@@ -2596,7 +2762,7 @@ mod tests {
         let line = tab_bar(Tab::Tunnels, 100);
         assert_eq!(
             line.to_string(),
-            " 1 Hosts \u{2502} 2 Tunnels \u{2502} 3 Containers"
+            " 1 Hosts \u{2502} 2 Tunnels \u{2502} 3 Docker \u{2502} 4 Podman \u{2502} 5 Proxmox"
         );
         let active = line
             .spans
@@ -2605,18 +2771,18 @@ mod tests {
             .unwrap();
         assert!(active.style.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(
-            tab_bar(Tab::Containers, 30).to_string(),
-            " 1 \u{2502} 2 \u{2502} 3 Containers"
+            tab_bar(DOCKER, 30).to_string(),
+            " 1 \u{2502} 2 \u{2502} 3 Docker \u{2502} 4 \u{2502} 5"
         );
-        assert_eq!(tab_bar(Tab::Containers, 14).to_string(), " 3 Containers");
+        assert_eq!(tab_bar(DOCKER, 14).to_string(), " 3 Docker");
 
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         char(&mut state, '3');
-        for width in [40, 30, 20, 12] {
+        for width in [60, 30, 20, 12] {
             let text = render_text_at(&state, width);
             let first = text.lines().next().unwrap();
-            assert!(first.contains("3 Contain"), "{width}: {first}");
-            if width >= 40 {
+            assert!(first.contains("3 Docker"), "{width}: {first}");
+            if width >= 60 {
                 assert!(first.contains("1 Hosts"), "{first}");
             }
         }
@@ -2627,15 +2793,21 @@ mod tests {
         let state = test_state(vec![summary("dev", Ownership::Managed)]);
         let footer = footer_text(&state);
         assert!(
-            footer.contains("c containers  Tab/1-3 tabs  q quit"),
+            footer.contains("c containers  Tab/1-5 tabs  q quit"),
             "{footer}"
         );
         assert!(!footer.contains("T tunnels"));
         let state = test_state(Vec::new());
-        assert!(footer_text(&state).contains("Tab/1-3 tabs"));
+        assert!(footer_text(&state).contains("Tab/1-5 tabs"));
         let state = tunnels_state();
-        assert!(state.tunnels.footer().contains("Tab/1-3 tabs  q quit"));
-        assert!(state.containers.footer().contains("h target"));
+        assert!(state.tunnels.footer().contains("Tab/1-5 tabs  q quit"));
+        assert!(
+            state
+                .containers
+                .panel(BackendId::Docker)
+                .footer()
+                .contains("h target")
+        );
     }
 
     #[test]
@@ -2648,7 +2820,7 @@ mod tests {
             text.contains("Target: dev   h change  L this machine"),
             "{text}"
         );
-        assert!(text.contains("Containers /"), "{text}");
+        assert!(text.contains("Docker /"), "{text}");
         assert!(text.contains("shop"), "{text}");
         assert!(text.contains("> db"), "{text}");
         assert!(text.contains("image: db:latest"), "{text}");
@@ -2664,7 +2836,7 @@ mod tests {
         ]);
         char(&mut state, '3');
         assert_eq!(char(&mut state, 'h'), UiAction::None);
-        assert!(state.containers.picker_open());
+        assert!(state.containers.panel(BackendId::Docker).picker_open());
         let text = rendered(&state);
         assert!(text.contains("this machine"), "{text}");
         assert!(text.contains("web"), "{text}");
@@ -2673,15 +2845,15 @@ mod tests {
         state.handle_paste("we");
         assert_eq!(
             press(&mut state, KeyCode::Enter),
-            UiAction::Containers(PanelAction::List(Target::Host("web".into())))
+            every_backend(Target::Host("web".into()))
         );
-        assert!(!state.containers.picker_open());
+        assert!(!state.containers.panel(BackendId::Docker).picker_open());
         assert_eq!(state.containers.target(), Target::Host("web".into()));
 
         char(&mut state, 'h');
         type_text(&mut state, "dev");
         press(&mut state, KeyCode::Esc);
-        assert!(!state.containers.picker_open());
+        assert!(!state.containers.panel(BackendId::Docker).picker_open());
         assert_eq!(
             state.containers.target(),
             Target::Host("web".into()),
@@ -2691,12 +2863,12 @@ mod tests {
         type_text(&mut state, "this");
         assert_eq!(
             press(&mut state, KeyCode::Enter),
-            UiAction::Containers(PanelAction::List(Target::Local))
+            every_backend(Target::Local)
         );
     }
 
     fn footer_text_of(state: &UiState) -> String {
-        state.containers.footer()
+        state.containers.panel(BackendId::Docker).footer()
     }
 
     #[test]
@@ -2709,9 +2881,14 @@ mod tests {
         state.handle_paste("root\n");
         press(&mut state, KeyCode::Enter);
         assert!(
-            state.containers.details().unwrap().ends_with("user: root"),
+            state
+                .containers
+                .panel(BackendId::Docker)
+                .details()
+                .unwrap()
+                .ends_with("user: root"),
             "{:?}",
-            state.containers.details()
+            state.containers.panel(BackendId::Docker).details()
         );
     }
 
@@ -2722,6 +2899,7 @@ mod tests {
         dev_listed(&mut state);
         state
             .containers
+            .panel_mut(BackendId::Docker)
             .set_status(Some("Shell on dev ended".into()));
         assert!(rendered(&state).contains("Shell on dev ended"));
         char(&mut state, 'j');
@@ -2749,7 +2927,7 @@ mod tests {
             offer: Some(offer),
             stderr: String::new(),
         };
-        state.containers.finish(
+        state.containers.panel_mut(BackendId::Docker).finish(
             Target::Host("dev".into()),
             Err(crate::app::ContainerError::from(issue)),
         );
@@ -2781,7 +2959,7 @@ mod tests {
         assert!(text.contains("socks 1080"), "{text}");
         assert!(text.contains("running"), "{text}");
         assert!(text.contains("keep running after q"), "{text}");
-        assert!(text.contains("Tab/1-3 tabs"), "{text}");
+        assert!(text.contains("Tab/1-5 tabs"), "{text}");
         assert_eq!(char(&mut state, 'T'), UiAction::None);
         assert_eq!(state.tab, Tab::Tunnels);
     }

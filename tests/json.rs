@@ -425,6 +425,59 @@ fn proxmox_without_root_is_permission_denied() {
     assert_eq!(document["error"]["problem"], "permission-denied");
 }
 
+/// Fakes for a Podman host reached as `deploy`, whose `podman ps` prints a Compose service, a
+/// lone container and a pod's infra container, or fails with `failure`.
+fn podman_host(fixture: &Fixture, failure: Option<&str>) {
+    let env = &fixture.env;
+    env.install_program(
+        "id",
+        "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; -un) echo deploy ;; esac\n",
+    );
+    let podman = match failure {
+        Some(message) => format!("#!/bin/sh\necho '{message}' >&2\nexit 125\n"),
+        None => format!("#!/bin/sh\ncat <<'EOF'\n{PODMAN_PS}\nEOF\n"),
+    };
+    env.install_program("podman", &podman);
+}
+
+const PODMAN_PS: &str = r#"[
+  {"Id": "6f1c0a3c9e2b4d5f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f", "Names": ["shop_web_1"], "Image": "docker.io/library/nginx:latest", "Status": "Up 2 hours", "State": "running", "IsInfra": false,
+   "Labels": {"com.docker.compose.project": "shop", "com.docker.compose.service": "web", "com.docker.compose.container-number": "1"}},
+  {"Id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b", "Names": ["toolbox"], "Image": "registry.fedoraproject.org/fedora:41", "Status": "Up 5 minutes", "State": "running", "IsInfra": false, "Labels": null},
+  {"Id": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0", "Names": ["a1b2c3d4-infra"], "Image": "localhost/podman-pause:5.2.0", "Status": "Up 3 hours", "State": "running", "IsInfra": true}
+]"#;
+
+#[test]
+fn podman_containers() {
+    let fixture = setup();
+    podman_host(&fixture, None);
+    let document = fixture.golden(
+        &["containers", "--backend", "podman", "--json"],
+        0,
+        "containers-podman.json",
+    );
+    assert_eq!(document["backend"], "podman");
+    assert_eq!(document["via"], Value::Null);
+    assert_eq!(document["containers"].as_array().unwrap().len(), 2);
+    assert_eq!(document["containers"][0]["project"], "shop");
+}
+
+#[test]
+fn podman_without_subordinate_ids_says_how_to_add_them() {
+    let fixture = setup();
+    podman_host(
+        &fixture,
+        Some("Error: cannot set up namespace using \"/usr/bin/newuidmap\": exit status 1"),
+    );
+    let document = fixture.golden(
+        &["containers", "--backend", "podman", "--json"],
+        1,
+        "containers-podman-missing-subuid.json",
+    );
+    assert_eq!(document["error"]["kind"], "podman");
+    assert_eq!(document["error"]["problem"], "other");
+}
+
 #[test]
 fn tunnels() {
     let fixture = setup();

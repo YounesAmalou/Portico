@@ -9,7 +9,7 @@ Portico's read commands, and starting and stopping tunnels, print a JSON documen
 | `portico hosts --json` | [The host list](#hosts) |
 | `portico show <alias> --json` | [One host's details and identities](#show) |
 | `portico identities --json` | [Every agent and identity file](#identities) |
-| `portico containers [--on <alias>] [--backend docker\|proxmox] --json` | [The running containers of this machine or a host](#containers) |
+| `portico containers [--on <alias>] [--backend docker\|podman\|proxmox] --json` | [The running containers of this machine or a host](#containers) |
 | `portico tunnels --json` | [The saved tunnels and their status](#tunnels) |
 | `portico tunnel show <name> --json` | [One tunnel, its command line and its log](#tunnel-show) |
 | `portico tunnel start <name>... --json` | [What each start did](#start-and-stop) |
@@ -56,6 +56,7 @@ A command that fails prints an error document and exits with status 1:
 | `unknown-tunnel` | No tunnel has that name |
 | `ssh` | ssh could not reach or authenticate to the host, or did not establish a tunnel |
 | `docker` | docker failed; `problem` is `not-installed`, `daemon-down`, `permission-denied` or `other` |
+| `podman` | podman failed; `problem` is `not-installed`, `permission-denied` or `other` |
 | `proxmox` | Proxmox's `pct` failed; `problem` is `not-installed`, `permission-denied` or `other` |
 | `other` | Anything else, such as an unreadable `~/.ssh/config` or a busy port |
 
@@ -319,7 +320,7 @@ When the host does not resolve, the command still succeeds:
 
 ## Containers
 
-`portico containers --json` lists the running containers of this machine, and `portico containers --on <alias> --json` those of a host, through `ssh`. Portico lists with Docker, and with Proxmox VE's `pct` when Docker is not installed there (see [Proxmox containers](#proxmox-containers)); `--backend docker` or `--backend proxmox` uses only that one.
+`portico containers --json` lists the running containers of this machine, and `portico containers --on <alias> --json` those of a host, through `ssh`. The document holds one backend's listing: the first of Docker, Podman (see [Podman containers](#podman-containers)) and Proxmox VE's `pct` (see [Proxmox containers](#proxmox-containers)) installed there. `--backend docker`, `--backend podman` or `--backend proxmox` uses that one, for a target that has several. (Without `--json`, `portico containers` prints every installed backend's listing.)
 
 <!-- golden: containers-on-host.json -->
 ```json
@@ -421,6 +422,70 @@ Containers' commands, mounts, ports and networks are not included. When docker f
 }
 ```
 
+### Podman containers
+
+Podman's listing is a containers document with one more key, `backend`, like Proxmox's below:
+
+<!-- golden: containers-podman.json -->
+```json
+{
+  "backend": "podman",
+  "containers": [
+    {
+      "display_name": "web",
+      "id": "6f1c0a3c9e2b4d5f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f",
+      "image": "docker.io/library/nginx:latest",
+      "name": "shop_web_1",
+      "project": "shop",
+      "service": "web",
+      "status": "Up 2 hours"
+    },
+    {
+      "display_name": "toolbox",
+      "id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "image": "registry.fedoraproject.org/fedora:41",
+      "name": "toolbox",
+      "project": null,
+      "service": null,
+      "status": "Up 5 minutes"
+    }
+  ],
+  "note": null,
+  "schema": 1,
+  "skipped": 0,
+  "target": {
+    "alias": null,
+    "kind": "local"
+  },
+  "via": null
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `backend` | `podman` |
+| `containers[]` | As for Docker: Podman's containers carry the same Compose labels. A pod's infra container is not listed |
+| `via` | `null` |
+| `note` | When the listing is empty and the ssh user is not root: `Podman lists <user>'s own containers; connect as root to list root's.` Otherwise `null` |
+| `skipped` | Entries of `podman ps` Portico could not read |
+
+Podman runs as the ssh user: a rootless user's own containers, or root's when connecting as root. It has no daemon, so `daemon-down` never occurs, and no failure has an offer. A rootless user without subordinate IDs gets the steps to add them:
+
+<!-- golden: containers-podman-missing-subuid.json -->
+```json
+{
+  "error": {
+    "kind": "podman",
+    "message": "Error: cannot set up namespace using \"/usr/bin/newuidmap\": exit status 1",
+    "next": [
+      "Give deploy subordinate IDs on this machine: add a range for them to /etc/subuid and /etc/subgid, then run podman system migrate."
+    ],
+    "problem": "other"
+  },
+  "schema": 1
+}
+```
+
 ### Proxmox containers
 
 On a Proxmox VE node, the listing is of its running LXC containers, with one more key, `backend`:
@@ -462,7 +527,7 @@ On a Proxmox VE node, the listing is of its running LXC containers, with one mor
 
 | Field | Meaning |
 |---|---|
-| `backend` | `proxmox`. Docker's documents have no `backend` key: they are unchanged since before Proxmox, so a document without it is Docker's. This is the one exception to "every documented key is always present" |
+| `backend` | `proxmox`. Docker's documents have no `backend` key: they are unchanged since before Proxmox and Podman, so a document without it is Docker's. This is the one exception to "every documented key is always present" |
 | `containers[].id` | The container's VMID, as a string: what `portico shell <id> [--on <alias>] --backend proxmox` opens |
 | `containers[].display_name`, `.name` | The container's name in Proxmox (its hostname) |
 | `containers[].image` | `null`: a Proxmox container has no image |

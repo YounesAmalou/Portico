@@ -311,7 +311,7 @@ def check_terminal(scenario):
             assert "Testing dev" not in screen.text()
         elif scenario == "tabs":
             read_screen("1 Hosts")
-            # The Containers tab lists this machine only once it is shown.
+            # The container tabs list this machine only once one is shown.
             time.sleep(0.3)
             assert not Path(home, "docker-called").exists(), "listed before the tab was shown"
             os.write(master, b"2")
@@ -320,9 +320,12 @@ def check_terminal(scenario):
             read_screen("Target: this machine")
             deadline = time.monotonic() + 5
             while not Path(home, "docker-called").exists():
-                assert time.monotonic() < deadline, "the Containers tab listed nothing"
+                assert time.monotonic() < deadline, "the Docker tab listed nothing"
                 time.sleep(0.01)
+            # Tab goes on through the Podman and Proxmox tabs, then back to Hosts.
             os.write(master, b"\t")
+            read_screen("Podman /")
+            os.write(master, b"\t\t")
             read_screen("Hosts /")
             # A digit in the filter is text, not a tab switch.
             os.write(master, b"/2")

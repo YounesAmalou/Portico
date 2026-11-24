@@ -239,8 +239,8 @@ impl UiState {
                 self.tunnels.paste(text);
                 return UiAction::None;
             }
-            Tab::Containers => {
-                self.containers.paste(text);
+            Tab::Containers(backend) => {
+                self.containers.panel_mut(backend).paste(text);
                 return UiAction::None;
             }
         }

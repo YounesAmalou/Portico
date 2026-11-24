@@ -1,0 +1,31 @@
+{
+  "backend": "podman",
+  "containers": [
+    {
+      "display_name": "web",
+      "id": "6f1c0a3c9e2b4d5f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f",
+      "image": "docker.io/library/nginx:latest",
+      "name": "shop_web_1",
+      "project": "shop",
+      "service": "web",
+      "status": "Up 2 hours"
+    },
+    {
+      "display_name": "toolbox",
+      "id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "image": "registry.fedoraproject.org/fedora:41",
+      "name": "toolbox",
+      "project": null,
+      "service": null,
+      "status": "Up 5 minutes"
+    }
+  ],
+  "note": null,
+  "schema": 1,
+  "skipped": 0,
+  "target": {
+    "alias": null,
+    "kind": "local"
+  },
+  "via": null
+}
