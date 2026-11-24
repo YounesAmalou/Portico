@@ -12,10 +12,11 @@ use std::{
 use crate::{
     adopt::{Candidate, Direction},
     app::{
-        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, HostSummary, Offer,
-        Ownership, Target, TestOutcome, TestReport, TestTarget,
+        App, AppError, ContainerError, DockerIssue, HostDetails, HostSummary, Offer, Ownership,
+        TestOutcome, TestReport, TestTarget,
     },
-    container::{GroupTool, ResolveError, display_name, group, remote_command, resolve},
+    backend::{ContainerList, GroupTool, Target},
+    container::{ResolveError, display_name, group, remote_command, resolve},
     discovery::DiscoveryWarning,
     explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},

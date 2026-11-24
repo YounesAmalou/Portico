@@ -10,7 +10,10 @@ use std::{
 };
 
 use super::containers::Panel;
-use crate::app::{App, ContainerError, ContainerList, Target};
+use crate::{
+    app::{App, ContainerError},
+    backend::{ContainerList, Target},
+};
 
 type Listed = (Target, Result<ContainerList, ContainerError>);
 

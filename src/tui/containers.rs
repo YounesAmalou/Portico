@@ -10,8 +10,9 @@ use ratatui::{
 
 use super::{TextInput, TuiError, display_width, explanation_lines};
 use crate::{
-    app::{ContainerError, ContainerList, Offer, Target},
-    container::{Container, GroupTool, display_name, group, remote_command},
+    app::{ContainerError, Offer},
+    backend::{ContainerList, GroupTool, Target},
+    container::{Container, display_name, group, remote_command},
     fuzzy,
     openssh::ConnectionOutcome,
     picker::{HIT, Outcome, Row, Single, State},
