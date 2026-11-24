@@ -2,7 +2,7 @@ mod support;
 
 use std::os::unix::fs::PermissionsExt;
 
-use portico::managed::ManagedConfig;
+use portico::domain::managed::ManagedConfig;
 use support::TestEnv;
 
 #[test]

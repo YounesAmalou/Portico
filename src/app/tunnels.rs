@@ -727,8 +727,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        domain::managed::{ConfigPaths, ManagedStore},
         domain::tunnel::runtime::RuntimeDir,
-        managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         platform::process::Proc,
     };

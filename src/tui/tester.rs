@@ -193,8 +193,8 @@ mod tests {
     };
 
     use crate::{
+        domain::managed::{ConfigPaths, ManagedStore},
         domain::probe::ProbeResult,
-        managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         test_executable::write_executable,
     };

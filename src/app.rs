@@ -22,13 +22,15 @@ use crate::{
     domain::explain::{Context, Explanation, Operation, explain},
     domain::host::{Change, Host, HostChanges, HostError},
     domain::identity::HostIdentities,
+    domain::managed::{
+        InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError,
+    },
     domain::probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
     domain::tunnel::{
         TunnelError,
         runtime::RuntimeDir,
         store::{StoreError, TunnelStore},
     },
-    managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
     openssh::{
         ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
         append_known_hosts,
@@ -959,7 +961,7 @@ mod tests {
 
     use crate::{
         domain::host::{Change, Host, HostChanges},
-        managed::{ConfigPaths, ManagedStore},
+        domain::managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         test_executable::write_executable,
     };

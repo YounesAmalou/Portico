@@ -18,7 +18,9 @@ use thiserror::Error;
 
 use crate::domain::discovery::{DiscoveryError, DiscoveryWarning, discover};
 use crate::domain::host::Host;
-use crate::managed::{HostComments, ManagedConfig, ManagedStore, TransactionError, render_host};
+use crate::domain::managed::{
+    HostComments, ManagedConfig, ManagedStore, TransactionError, render_host,
+};
 use crate::platform::fs::{
     PendingFile, acquire_lock, normalize_path, open_lock, symlink_target, sync_dir, write_unique,
 };
@@ -1072,7 +1074,7 @@ impl MigrationPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed::{ConfigPaths, ManagedStore};
+    use crate::domain::managed::{ConfigPaths, ManagedStore};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};

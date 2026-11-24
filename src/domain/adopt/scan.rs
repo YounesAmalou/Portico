@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use crate::domain::discovery::{ConfigDirective, parse_directive, split_comment};
 use crate::domain::host::{Host, HostField, parse_port};
-use crate::managed::{HostComments, ManagedError, parse_value};
+use crate::domain::managed::{HostComments, ManagedError, parse_value};
 
 /// One `Host` block of an external file and what adopting it would move.
 #[derive(Clone, Debug)]
