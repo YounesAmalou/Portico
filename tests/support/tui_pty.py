@@ -85,6 +85,18 @@ def is_running(pid):
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def report_hang(pid):
+    """Prints what a Portico that does not exit is doing, for the CI log."""
+    commands = [["ps", "-axo", "pid,ppid,pgid,stat,command"]]
+    if sys.platform == "darwin":
+        commands.append(["sample", str(pid), "1"])
+    else:
+        commands.append(["cat", f"/proc/{pid}/stack"])
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True)
+        print(f"$ {' '.join(command)}\n{result.stdout}{result.stderr}", file=sys.stderr)
+
+
 def check_terminal(scenario):
     scenario_home = Path(home, "uninitialized") if scenario == "blocked_init_lock" else Path(home)
     held_lock = None
@@ -383,7 +395,11 @@ def check_terminal(scenario):
         else:
             assert b"\x1b[<1u" not in transcript
         read_until(b"\x1b[?25h", left)
-        status = process.wait(timeout=5)
+        try:
+            status = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            report_hang(process.pid)
+            raise
         assert status == 0, f"{scenario}: exit status {status}: {transcript!r}"
         try:
             after = termios.tcgetattr(slave)
