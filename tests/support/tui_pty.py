@@ -85,6 +85,27 @@ def is_running(pid):
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def wait_draining(process, master, transcript, timeout):
+    """Waits for Portico to exit while reading what it still writes: macOS holds an exiting
+    process that controls the terminal until its last output has been read."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = process.poll()
+        if status is not None:
+            return status
+        if time.monotonic() >= deadline:
+            report_hang(process.pid)
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        if select.select([master], [], [], 0.05)[0]:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                time.sleep(0.01)
+            transcript.extend(data)
+
+
 def report_hang(pid):
     """Prints what a Portico that does not exit is doing, for the CI log."""
     commands = [["ps", "-axo", "pid,ppid,pgid,stat,command"]]
@@ -395,11 +416,7 @@ def check_terminal(scenario):
         else:
             assert b"\x1b[<1u" not in transcript
         read_until(b"\x1b[?25h", left)
-        try:
-            status = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            report_hang(process.pid)
-            raise
+        status = wait_draining(process, master, transcript, 5)
         assert status == 0, f"{scenario}: exit status {status}: {transcript!r}"
         try:
             after = termios.tcgetattr(slave)
