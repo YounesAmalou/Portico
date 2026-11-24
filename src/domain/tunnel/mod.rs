@@ -12,7 +12,7 @@ use std::{ffi::OsString, fmt, path::Path};
 
 use thiserror::Error;
 
-use crate::host::{HostField, parse_port};
+use crate::domain::host::{HostField, parse_port};
 
 /// The kind of forward a tunnel opens.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

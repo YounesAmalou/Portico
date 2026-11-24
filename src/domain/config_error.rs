@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::host::HostField;
+use crate::domain::host::HostField;
 
 /// A configuration error reported by OpenSSH, tied to whatever wrote the line.
 #[derive(Clone, Debug, Eq, PartialEq)]

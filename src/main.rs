@@ -8,11 +8,11 @@ use portico::{
     app::App,
     cli::{Cli, fail, run, run_desktop},
     desktop::{DesktopEnv, is_development_binary, panel, reload_omarchy_panel},
+    domain::tunnel::runtime::RuntimeDir,
     managed::{ConfigPaths, ManagedStore},
     openssh::OpenSsh,
     picker::TerminalPicker,
     platform,
-    tunnel::runtime::RuntimeDir,
 };
 
 fn main() -> ExitCode {

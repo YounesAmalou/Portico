@@ -10,7 +10,6 @@ use std::{
 };
 
 use crate::{
-    adopt::{Candidate, Direction},
     app::{
         App, AppError, ContainerError, HostDetails, HostSummary, Ownership, TestOutcome,
         TestReport, TestTarget,
@@ -20,10 +19,11 @@ use crate::{
         docker::{ResolveError, display_name, group, resolve},
         remote_command,
     },
-    discovery::DiscoveryWarning,
-    explain::Explanation,
-    host::{Change, ClearField, Host, HostChanges},
-    identity::{self, Agent, HostIdentities, IdentityInventory},
+    domain::adopt::{Candidate, Direction},
+    domain::discovery::DiscoveryWarning,
+    domain::explain::Explanation,
+    domain::host::{Change, ClearField, Host, HostChanges},
+    domain::identity::{self, Agent, HostIdentities, IdentityInventory},
     managed::{InitOutcome, InitPlan},
     openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     picker::{Picker, Row},
@@ -1590,7 +1590,7 @@ mod tests {
             docker::{SHELL_SCRIPT, join_group_words},
             remote_command,
         },
-        host::Host,
+        domain::host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,
         picker::Row,

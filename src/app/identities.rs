@@ -19,7 +19,7 @@ use std::{
 
 use super::{App, AppError};
 use crate::{
-    identity::{
+    domain::identity::{
         self, Agent, AgentProblem, Expansion, FileFacts, HostIdentities, Identity,
         IdentityInventory, InventoryAgent, InventoryFile, PublicKey, Socket,
     },
@@ -510,7 +510,7 @@ fn public_keys_in(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::{
-        identity::{Availability, MissingReason},
+        domain::identity::{Availability, MissingReason},
         managed::{ConfigPaths, ManagedStore},
         test_executable::write_executable,
     };

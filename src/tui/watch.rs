@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    discovery::{self, Input},
+    domain::discovery::{self, Input},
     platform::fs::Stamp,
 };
 

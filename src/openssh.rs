@@ -18,14 +18,14 @@ use std::{
 
 use thiserror::Error;
 
-use crate::explain::Explanation;
-use crate::platform::fs::write_unique;
-use crate::platform::launcher::{DEFAULT_LAUNCHER, Launch, launch};
-use crate::platform::process::{has_exited, terminate_process_group, terminate_process_tree};
-use crate::probe::{
+use crate::domain::explain::Explanation;
+use crate::domain::probe::{
     Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, TEST_STDERR_LIMIT, authenticated,
     classify, diagnose, fetch_key_args, test_args,
 };
+use crate::platform::fs::write_unique;
+use crate::platform::launcher::{DEFAULT_LAUNCHER, Launch, launch};
+use crate::platform::process::{has_exited, terminate_process_group, terminate_process_tree};
 
 #[derive(Clone, Debug)]
 pub struct OpenSsh {
@@ -962,8 +962,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::domain::probe::{Authenticated, KeySource, OfferedKey, test_args};
     use crate::platform::process::fail_pidfd_open_after;
-    use crate::probe::{Authenticated, KeySource, OfferedKey, test_args};
     use crate::test_executable::write_executable;
 
     struct FakeProgram {
