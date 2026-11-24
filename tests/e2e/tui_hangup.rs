@@ -58,8 +58,8 @@ impl HangupTerminal {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                (&raw const size).cast_mut(),
             );
             assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
             (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
@@ -91,7 +91,7 @@ impl HangupTerminal {
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 if block_sighup {
@@ -172,7 +172,7 @@ impl HangupTerminal {
 
     /// Processor time Portico has used so far, all its threads together.
     fn cpu_time(&self) -> Duration {
-        cpu_time(self.child.id())
+        crate::procs::cpu_time(self.child.id())
     }
 
     /// Closes the terminal, as closing a terminal emulator's window does.
@@ -206,22 +206,6 @@ impl Drop for HangupTerminal {
             let _ = self.child.wait();
         }
     }
-}
-
-/// The user and system time of process `pid`, from `/proc/<pid>/stat`.
-fn cpu_time(pid: u32) -> Duration {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return Duration::ZERO;
-    };
-    // The command name may hold spaces; the fields after it do not.
-    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..]
-        .split_whitespace()
-        .collect();
-    // utime and stime are the 14th and 15th fields, so the 12th and 13th here.
-    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-    // SAFETY: `sysconf` only reads a configuration value.
-    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    Duration::from_millis(ticks * 1000 / per_second)
 }
 
 #[test]

@@ -97,7 +97,12 @@ exec /usr/bin/ssh -F "$flat" "$@"
 
     /// Where Portico keeps the records and logs of started tunnels.
     pub fn tunnel_runtime(&self) -> PathBuf {
-        self.runtime().join("portico/tunnels")
+        if cfg!(target_os = "linux") {
+            self.runtime().join("portico/tunnels")
+        } else {
+            // macOS has no runtime directory: records stay under the temporary home.
+            self.home.join(".ssh/portico/run/tunnels")
+        }
     }
 
     pub fn known_hosts(&self) -> PathBuf {

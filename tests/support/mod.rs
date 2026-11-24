@@ -149,7 +149,10 @@ impl TestEnv {
             .env("HOME", &self.home)
             .env("PATH", path)
             .env_remove("SSH_AUTH_SOCK")
-            .env_remove("XDG_RUNTIME_DIR");
+            .env_remove("XDG_RUNTIME_DIR")
+            // macOS runs the fake launcher named here; Linux finds it on `PATH`.
+            .env("PORTICO_TERMINAL", self.bin.join("xdg-terminal-exec"))
+            .env_remove("TERM_PROGRAM");
         command
     }
 

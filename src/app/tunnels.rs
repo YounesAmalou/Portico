@@ -733,6 +733,7 @@ mod tests {
         platform::process::Proc,
     };
 
+    #[cfg(target_os = "linux")]
     /// An app whose runtime directory and `/proc` (with this boot's ID) are temporary.
     fn app(dir: &std::path::Path) -> App {
         let proc = dir.join("proc");
@@ -802,10 +803,15 @@ mod tests {
             matches!(result, Err(AppError::OpenSsh(OpenSshError::Cancelled))),
             "{result:?}"
         );
-        let pid = fs::read_to_string(&child_pid).unwrap().trim().to_owned();
+        let pid: u32 = fs::read_to_string(&child_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while fs::read_to_string(format!("/proc/{pid}/stat"))
-            .is_ok_and(|stat| !stat.contains(") Z"))
+        while Proc::system()
+            .stat(pid)
+            .is_some_and(|stat| stat.state != 'Z')
         {
             assert!(
                 Instant::now() < deadline,
@@ -815,6 +821,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_record_from_another_boot_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
@@ -835,6 +842,7 @@ mod tests {
         assert!(!record.exists(), "the stale record was kept");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn nothing_is_rediscovered_while_a_start_holds_the_lock() {
         let dir = tempfile::tempdir().unwrap();

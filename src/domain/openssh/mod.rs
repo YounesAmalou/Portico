@@ -358,6 +358,8 @@ mod tests {
         assert_eq!(output.stderr, b"oops");
     }
 
+    /// Reads a descriptor's target from `/proc/self/fd`, which macOS lacks.
+    #[cfg(target_os = "linux")]
     #[test]
     fn run_remote_inherits_stdin_unless_batch() {
         let fake = fake_ssh();

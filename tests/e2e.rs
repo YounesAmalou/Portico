@@ -12,6 +12,8 @@ mod executable;
 
 #[path = "e2e/client.rs"]
 mod client;
+#[path = "e2e/procs.rs"]
+mod procs;
 #[path = "e2e/sshd.rs"]
 mod sshd;
 #[path = "e2e/terminal.rs"]

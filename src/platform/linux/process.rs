@@ -1,13 +1,9 @@
-//! Linux process control: killing process trees through pidfds, reading `/proc`, and stopping a
-//! recognised process.
+//! Linux process control: pidfds pin a process's identity, and `/proc` lists children and
+//! describes processes.
 
 use std::{
-    ffi::OsStr,
     fs, io,
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
-    },
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -31,220 +27,57 @@ pub fn has_exited(child: &std::process::Child) -> io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-pub fn terminate_process_group(child: &mut std::process::Child) {
-    kill_process_group(child);
-    let _ = child.wait();
+/// A pidfd: signals reach the process it was opened for, never a later process with its PID.
+pub(crate) struct Pin {
+    pidfd: OwnedFd,
 }
 
-pub fn terminate_process_tree(child: &mut std::process::Child) -> io::Result<()> {
-    if let Err(error) = kill_process_tree(child.id()) {
-        let _ = kill_direct_child(child);
-        let _ = reap_child_bounded(child);
-        return Err(error);
-    }
-    match reap_child_bounded(child) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = kill_direct_child(child);
-            let _ = reap_child_bounded(child);
-            Err(error)
+impl Pin {
+    /// Opens a pidfd for `pid`; `ESRCH` when it is gone.
+    pub(crate) fn open(pid: libc::pid_t) -> io::Result<Self> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                pidfd: unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) },
+            })
         }
     }
-}
 
-pub fn kill_direct_child(child: &mut std::process::Child) -> io::Result<()> {
-    match child.kill() {
-        Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-pub fn reap_child_bounded(child: &mut std::process::Child) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        match child.try_wait()? {
-            Some(_) => return Ok(()),
-            None if Instant::now() >= deadline => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out reaping child process",
-                ));
-            }
-            None => thread::sleep(Duration::from_millis(5)),
+    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
-}
 
-/// Stops, then kills, `root` and all of its descendants.
-///
-/// Every process is stopped before its children are read so it cannot fork
-/// faster than the walk, and nothing is killed until the whole tree has been
-/// collected. Failures never abandon the walk: each process that could be
-/// reached is still killed, and the first error is reported afterwards. Only
-/// failures that can leave a process alive are errors: a slow stop or a
-/// missing pidfd does not prevent the kill, so neither is reported.
-pub fn kill_process_tree(root: u32) -> io::Result<()> {
-    let mut first_error = None;
-    let mut stopped = Vec::new();
-    let mut pending = vec![(root, None)];
-    while let Some((pid, parent)) = pending.pop() {
-        let Some(process) = stop_tree_member(pid, parent, &mut first_error) else {
-            continue;
+    /// Whether the process exits within `wait` milliseconds (or already has).
+    pub(crate) fn wait_exit(&self, wait: i32) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
         };
-        let children = note(&mut first_error, process_children(process.pid));
-        pending.extend(
-            children
-                .into_iter()
-                .flatten()
-                .map(|child| (child, Some(process.pid))),
-        );
-        stopped.push(process);
-    }
-    for process in &stopped {
-        match process.signal(libc::SIGKILL) {
-            Err(error) if error.raw_os_error() != Some(libc::ESRCH) => {
-                first_error.get_or_insert(error);
-            }
-            _ => {}
-        }
-    }
-    first_error.map_or(Ok(()), Err)
-}
-
-/// Records the error of a best-effort step and yields its value on success.
-fn note<T>(first_error: &mut Option<io::Error>, result: io::Result<T>) -> Option<T> {
-    match result {
-        Ok(value) => Some(value),
-        Err(error) => {
-            first_error.get_or_insert(error);
-            None
-        }
-    }
-}
-
-struct Process {
-    pid: libc::pid_t,
-    /// Pins the identity of the process; absent when no descriptor was available.
-    pidfd: Option<OwnedFd>,
-}
-
-impl Process {
-    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
-        match &self.pidfd {
-            Some(pidfd) => signal_pidfd(pidfd, signal),
-            // Without a descriptor the PID is still safe to signal: the
-            // process is `root`, which the caller has not reaped, or a child
-            // of a stopped process that therefore cannot have reaped it.
-            None if unsafe { libc::kill(self.pid, signal) } == 0 => Ok(()),
-            None => Err(io::Error::last_os_error()),
-        }
-    }
-}
-
-/// Stops `pid` and returns a handle to kill it, or `None` when it is gone or
-/// (for a descendant) no longer a child of `parent`. Errors that can leave
-/// the process alive are recorded.
-fn stop_tree_member(
-    pid: u32,
-    parent: Option<libc::pid_t>,
-    first_error: &mut Option<io::Error>,
-) -> Option<Process> {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        first_error.get_or_insert(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid process ID",
-        ));
-        return None;
-    };
-    let pidfd = match open_pidfd(pid) {
-        Ok(pidfd) => Some(pidfd),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return None,
-        Err(_) => None,
-    };
-    let process = Process { pid, pidfd };
-    if let Some(parent) = parent
-        && !note(first_error, process_children(parent))?.contains(&(pid as u32))
-    {
-        return None;
-    }
-    match process.signal(libc::SIGSTOP) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return None,
-        Err(error) => {
-            first_error.get_or_insert(error);
-            return None;
-        }
-    }
-    wait_until_stopped(pid);
-    Some(process)
-}
-
-pub fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
-    #[cfg(test)]
-    if FAIL_PIDFD_OPEN.with(|countdown| match countdown.get() {
-        Some(0) => {
-            countdown.set(None);
-            true
-        }
-        Some(remaining) => {
-            countdown.set(Some(remaining - 1));
-            false
-        }
-        None => false,
-    }) {
-        PIDFD_OPEN_FAILED.with(|failed| failed.set(true));
-        return Err(io::Error::from_raw_os_error(libc::EMFILE));
-    }
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_PIDFD_OPEN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-    static PIDFD_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Makes the pidfd open after `skipped` successful ones fail with `EMFILE`.
-#[cfg(test)]
-pub fn fail_pidfd_open_after(skipped: u32) {
-    PIDFD_OPEN_FAILED.with(|failed| failed.set(false));
-    FAIL_PIDFD_OPEN.with(|countdown| countdown.set(Some(skipped)));
-}
-
-/// Whether the failure `fail_pidfd_open_after` armed has been injected, so a test can prove it
-/// exercised the path without a pidfd rather than passing through the normal one.
-#[cfg(test)]
-pub fn pidfd_open_failure_injected() -> bool {
-    PIDFD_OPEN_FAILED.with(std::cell::Cell::get)
-}
-
-pub fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {
-    if unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        // SAFETY: one valid `pollfd` that outlives the call.
+        unsafe { libc::poll(&mut poll, 1, wait) > 0 }
     }
 }
 
 /// Waits briefly for every thread of `pid` to stop. This only narrows the
 /// window in which the process can fork ahead of the walk, so a process that
 /// is slow to stop is still killed and its children read.
-fn wait_until_stopped(pid: libc::pid_t) {
+pub(crate) fn wait_until_stopped(pid: libc::pid_t) {
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
         let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
@@ -271,7 +104,7 @@ fn wait_until_stopped(pid: libc::pid_t) {
     }
 }
 
-fn process_children(pid: libc::pid_t) -> io::Result<Vec<u32>> {
+pub(crate) fn children(pid: libc::pid_t) -> io::Result<Vec<u32>> {
     process_children_in(Path::new("/proc"), pid)
 }
 
@@ -338,17 +171,6 @@ fn children_by_parent_scan(proc: &Path, parent: libc::pid_t) -> io::Result<Vec<u
     }
     children.sort_unstable();
     Ok(children)
-}
-
-pub fn kill_process_group(child: &mut std::process::Child) {
-    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
-        let _ = child.kill();
-        return;
-    };
-    // The child was placed in a process group whose ID is its PID above.
-    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-        let _ = child.kill();
-    }
 }
 
 /// A process as `/proc/<pid>/stat` describes it.
@@ -434,7 +256,7 @@ impl Proc {
         Some(args)
     }
 
-    fn pids(&self) -> Vec<u32> {
+    pub fn pids(&self) -> Vec<u32> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();
         };
@@ -445,90 +267,8 @@ impl Proc {
     }
 }
 
-impl Proc {
-    /// Every live process of `uid` that leads its own session (as `ssh -f` does once it has put
-    /// itself in the background) and whose command line has `-E <path>`: what a status listing
-    /// searches for tunnels without a record, read once however many tunnels it lists.
-    pub fn scan(&self, uid: u32) -> Vec<Logged> {
-        self.pids()
-            .into_iter()
-            .filter_map(|pid| {
-                // The command line rejects nearly every process, so it is read first.
-                let args = self.cmdline(pid)?;
-                let log = args
-                    .windows(2)
-                    .find(|pair| pair[0] == b"-E")
-                    .map(|pair| PathBuf::from(OsStr::from_bytes(&pair[1])))?;
-                let stat = self.stat(pid)?;
-                // Only a backgrounded ssh counts: a foreground one may still fail to connect.
-                (!matches!(stat.state, 'Z' | 'X' | 'x')
-                    && stat.session == pid
-                    && self.uid(pid) == Some(uid))
-                .then_some(Logged {
-                    pid,
-                    start: stat.start,
-                    log,
-                })
-            })
-            .collect()
-    }
-}
-
-/// A process that logs to a file with `-E`, as every started tunnel does.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Logged {
-    pub pid: u32,
-    pub start: u64,
-    pub log: PathBuf,
-}
-
-/// The current user's real UID.
-pub fn current_uid() -> u32 {
-    // SAFETY: `getuid` has no preconditions.
-    unsafe { libc::getuid() }
-}
-
-/// How long a tunnel has to exit after SIGTERM before it is killed.
-pub const TERM_GRACE_MS: i32 = 3000;
-
-/// Stops `pid` if `verify` still recognises it once a pidfd pins it. Returns whether a signal
-/// was sent. Because the pidfd is opened before `verify` runs, and a PID is not reused while its
-/// process lives, a process that passes `verify` is the one the pidfd refers to.
-pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool> {
-    let Ok(raw) = libc::pid_t::try_from(pid) else {
-        return Ok(false);
-    };
-    let pidfd = match open_pidfd(raw) {
-        Ok(pidfd) => pidfd,
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if !verify() {
-        return Ok(false);
-    }
-    for (signal, wait) in [(libc::SIGTERM, TERM_GRACE_MS), (libc::SIGKILL, 2000)] {
-        match signal_pidfd(&pidfd, signal) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
-            Err(error) => return Err(error),
-        }
-        let mut poll = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid `pollfd` that outlives the call.
-        if unsafe { libc::poll(&mut poll, 1, wait) } > 0 {
-            return Ok(true);
-        }
-    }
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use super::*;
 
     fn fake_proc_task(proc: &Path, pid: u32, children: Option<&str>) {
@@ -577,18 +317,5 @@ mod tests {
         let proc = tempfile::tempdir().unwrap();
 
         assert!(process_children_in(proc.path(), 100).unwrap().is_empty());
-    }
-
-    #[test]
-    fn stop_process_signals_only_a_verified_process() {
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        assert!(!stop_process(child.id(), || false).unwrap());
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "an unverified process was signalled"
-        );
-        assert!(stop_process(child.id(), || true).unwrap());
-        let status = child.wait().unwrap();
-        assert!(!status.success());
     }
 }

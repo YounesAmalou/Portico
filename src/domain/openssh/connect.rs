@@ -357,7 +357,7 @@ mod tests {
         FakeProgram, fake_failure, fake_ssh, fixture_path, wait_for_contents,
     };
     use crate::domain::probe::{Failure, KeySource, OfferedKey};
-    use crate::platform::process::{fail_pidfd_open_after, pidfd_open_failure_injected};
+    use crate::platform::process::{fail_pin_after, pin_failure_injected};
     use crate::test_executable::write_executable;
 
     #[test]
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_without_a_pidfd_still_kills_and_reports_cancelled() {
+    fn cancellation_without_a_pin_still_kills_and_reports_cancelled() {
         let fake = fake_ssh();
         let marker = fake.log.with_file_name("connection-started");
         write_executable(
@@ -536,7 +536,7 @@ mod tests {
                 signal.store(true, Ordering::Relaxed);
             }
         });
-        fail_pidfd_open_after(0);
+        fail_pin_after(0);
         let started = Instant::now();
 
         let result = openssh.connect_mirrored("dev", Box::new(io::sink()), Some(&cancelled));
@@ -549,12 +549,12 @@ mod tests {
             started.elapsed()
         );
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
-        assert!(pidfd_open_failure_injected(), "ssh's pidfd opened");
+        assert!(pin_failure_injected(), "ssh's pin opened");
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]
-    fn cancellation_without_a_descendant_pidfd_still_kills_the_whole_tree() {
+    fn cancellation_without_a_descendant_pin_still_kills_the_whole_tree() {
         let fake = fake_ssh();
         let marker = fake.log.with_file_name("tree-started");
         write_executable(
@@ -579,16 +579,13 @@ mod tests {
             }
         });
         // The root's descriptor opens; the first descendant's does not.
-        fail_pidfd_open_after(1);
+        fail_pin_after(1);
 
         let result = openssh.connect_mirrored("dev", Box::new(io::sink()), Some(&cancelled));
 
         cancel.join().unwrap();
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
-        assert!(
-            pidfd_open_failure_injected(),
-            "every descendant's pidfd opened"
-        );
+        assert!(pin_failure_injected(), "every descendant's pin opened");
         for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
             assert_dies(pid);
         }

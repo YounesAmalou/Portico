@@ -5,16 +5,19 @@
 //! another test thread duplicates it, and the copy lives until that child
 //! reaches `exec`. The only reliable signal is the kernel's own: a read lease
 //! cannot be taken while the file has a writer, so the script is handed out
-//! once the lease succeeds.
+//! once the lease succeeds. macOS refuses to execute a file only while it is
+//! being written as swap, so there the script is handed out at once.
 
 use std::{
     fs,
-    io::{self, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{OpenOptionsExt, PermissionsExt},
-    },
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    io,
+    os::fd::AsRawFd,
     thread,
     time::{Duration, Instant},
 };
@@ -36,6 +39,10 @@ pub fn write_executable(path: impl AsRef<Path>, contents: &str) {
     wait_until_no_writers(path);
 }
 
+#[cfg(not(target_os = "linux"))]
+fn wait_until_no_writers(_path: &Path) {}
+
+#[cfg(target_os = "linux")]
 fn wait_until_no_writers(path: &Path) {
     let file = fs::File::open(path).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -58,6 +65,7 @@ fn wait_until_no_writers(path: &Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn set_lease(file: &fs::File, lease: libc::c_int) -> io::Result<()> {
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, lease) } == 0 {
         Ok(())

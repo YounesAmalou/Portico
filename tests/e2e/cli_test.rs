@@ -82,8 +82,10 @@ fn portico_test_against_a_real_sshd() {
         locked_text.contains("the key needs a passphrase"),
         "{locked_text}"
     );
+    // A long temporary path (macOS's) wraps the hint over two lines.
+    let unwrapped = locked_text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        locked_text.contains(&format!("`ssh-add {}`", sshd.locked_key().display())),
+        unwrapped.contains(&format!("`ssh-add {}`", sshd.locked_key().display())),
         "{locked_text}"
     );
 

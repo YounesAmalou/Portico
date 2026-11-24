@@ -21,7 +21,10 @@ use std::{
 
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 const SSHD: &str = "/usr/bin/sshd";
+#[cfg(not(target_os = "linux"))]
+const SSHD: &str = "/usr/sbin/sshd";
 const KEYGEN: &str = "/usr/bin/ssh-keygen";
 
 /// The passphrase of [`Sshd::locked_key`].
@@ -54,10 +57,12 @@ pub fn current_user() -> (String, PathBuf) {
 }
 
 /// A port of `127.0.0.1` that refuses connections for as long as this value
-/// lives: it is bound but never listened on, so no other test's server can
-/// be given it in the meantime.
+/// lives. On Linux it is bound but never listened on, so no other test's
+/// server can be given it in the meantime. macOS lets a connection to such a
+/// port time out instead of refusing it, so there the port is released at
+/// once and only refuses until something else takes it.
 pub struct ClosedPort {
-    _socket: OwnedFd,
+    _socket: Option<OwnedFd>,
     port: u16,
 }
 
@@ -71,8 +76,15 @@ pub fn closed_port() -> ClosedPort {
     // SAFETY: plain socket calls on a descriptor this function owns, with
     // properly sized `sockaddr_in` buffers.
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        // macOS has no SOCK_CLOEXEC; the flag is set straight after there.
+        #[cfg(target_os = "linux")]
+        let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let kind = libc::SOCK_STREAM;
+        let fd = libc::socket(libc::AF_INET, kind, 0);
         assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
         let socket = OwnedFd::from_raw_fd(fd);
         let mut address: libc::sockaddr_in = std::mem::zeroed();
         address.sin_family = libc::AF_INET as libc::sa_family_t;
@@ -83,7 +95,7 @@ pub fn closed_port() -> ClosedPort {
         let named = libc::getsockname(socket.as_raw_fd(), (&raw mut address).cast(), &mut length);
         assert_eq!(named, 0, "getsockname: {}", std::io::Error::last_os_error());
         ClosedPort {
-            _socket: socket,
+            _socket: cfg!(target_os = "linux").then_some(socket),
             port: u16::from_be(address.sin_port),
         }
     }
@@ -291,8 +303,11 @@ fn a_closed_port_refuses_connections_and_stays_reserved() {
     let closed = closed_port();
     let error = TcpStream::connect((Ipv4Addr::LOCALHOST, closed.port())).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
-    assert!(
-        TcpListener::bind((Ipv4Addr::LOCALHOST, closed.port())).is_err(),
-        "another server could take the closed port"
-    );
+    // Only Linux keeps the port reserved (see `ClosedPort`).
+    if cfg!(target_os = "linux") {
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, closed.port())).is_err(),
+            "another server could take the closed port"
+        );
+    }
 }

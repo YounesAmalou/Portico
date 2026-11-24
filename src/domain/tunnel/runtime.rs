@@ -6,15 +6,12 @@ use std::{
     ffi::OsStr,
     fs, io,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
 };
 
 use crate::{
-    platform::fs::{create_private_dir, sync_dir, write_unique},
+    platform::fs::{cloexec_socket, create_private_dir, sync_dir, write_unique},
     platform::paths::runtime_dir,
     platform::process::{Logged, Proc},
 };
@@ -279,9 +276,13 @@ pub enum Bind {
     Denied,
 }
 
-/// Binds `address:port` and closes it at once, as ssh would bind it (`SO_REUSEADDR`, which the
-/// standard library sets). A name is resolved and every address it yields is tried. Addresses
-/// this machine does not have (no IPv6, say) count as free: ssh skips them too.
+/// Binds `address:port` and closes it at once, as ssh would bind it. A name is resolved and
+/// every address it yields is tried. Addresses this machine does not have (no IPv6, say) count
+/// as free: ssh skips them too.
+///
+/// On Linux the probe sets `SO_REUSEADDR`, as ssh does (and the standard library's listener).
+/// macOS lets a second `SO_REUSEADDR` socket bind an address another socket listens on, so
+/// there the probe goes without it and finds the listener.
 pub fn try_bind(address: &str, port: u16) -> Bind {
     let addresses: Vec<SocketAddr> = match address.parse::<IpAddr>() {
         Ok(ip) => vec![SocketAddr::new(ip, port)],
@@ -292,8 +293,8 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
     };
     for address in addresses {
         let bound = match address {
-            SocketAddr::V4(_) => TcpListener::bind(address).map(drop),
-            SocketAddr::V6(address) => bind_v6_only(address),
+            SocketAddr::V4(_) if cfg!(target_os = "linux") => TcpListener::bind(address).map(drop),
+            _ => bind_probe(address),
         };
         match bound {
             Ok(()) => {}
@@ -305,22 +306,27 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
     Bind::Free
 }
 
-/// Binds an IPv6 address with `IPV6_V6ONLY`, as ssh listens, and closes it again; the
-/// standard library's listener is dual-stack and would also collide with IPv4 listeners.
-fn bind_v6_only(address: std::net::SocketAddrV6) -> io::Result<()> {
-    // SAFETY: plain socket calls on a descriptor owned here, with a properly sized
-    // `sockaddr_in6` and option values that outlive each call.
-    unsafe {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+/// Binds `address` and closes it again: an IPv6 address with `IPV6_V6ONLY`, as ssh listens
+/// (the standard library's listener is dual-stack and would also collide with IPv4
+/// listeners), and `SO_REUSEADDR` on Linux only (see `try_bind`).
+fn bind_probe(address: SocketAddr) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    let mut options = Vec::new();
+    let domain = match address {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => {
+            options.push((libc::IPPROTO_IPV6, libc::IPV6_V6ONLY));
+            libc::AF_INET6
         }
-        let socket = std::os::fd::OwnedFd::from_raw_fd(fd);
-        let one: libc::c_int = 1;
-        for option in [
-            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
-            (libc::SOL_SOCKET, libc::SO_REUSEADDR),
-        ] {
+    };
+    if cfg!(target_os = "linux") {
+        options.push((libc::SOL_SOCKET, libc::SO_REUSEADDR));
+    }
+    // SAFETY: plain socket calls on a descriptor owned here, with properly sized socket
+    // addresses and option values that outlive each call.
+    unsafe {
+        let socket = cloexec_socket(domain, libc::SOCK_STREAM)?;
+        for option in options {
             if libc::setsockopt(
                 socket.as_raw_fd(),
                 option.0,
@@ -332,17 +338,32 @@ fn bind_v6_only(address: std::net::SocketAddrV6) -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
         }
-        let mut raw: libc::sockaddr_in6 = std::mem::zeroed();
-        raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        raw.sin6_port = address.port().to_be();
-        raw.sin6_addr.s6_addr = address.ip().octets();
-        raw.sin6_scope_id = address.scope_id();
-        if libc::bind(
-            socket.as_raw_fd(),
-            (&raw const raw).cast(),
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        ) != 0
-        {
+        let bound = match address {
+            SocketAddr::V4(address) => {
+                let mut raw: libc::sockaddr_in = std::mem::zeroed();
+                raw.sin_family = libc::AF_INET as libc::sa_family_t;
+                raw.sin_port = address.port().to_be();
+                raw.sin_addr.s_addr = u32::from(*address.ip()).to_be();
+                libc::bind(
+                    socket.as_raw_fd(),
+                    (&raw const raw).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(address) => {
+                let mut raw: libc::sockaddr_in6 = std::mem::zeroed();
+                raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                raw.sin6_port = address.port().to_be();
+                raw.sin6_addr.s6_addr = address.ip().octets();
+                raw.sin6_scope_id = address.scope_id();
+                libc::bind(
+                    socket.as_raw_fd(),
+                    (&raw const raw).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        };
+        if bound != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -375,11 +396,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::platform::process::Stat;
 
     const BOOT: &str = "3f0d9c1e-0000-4000-8000-000000000001";
+    #[cfg(target_os = "linux")]
     const LOG: &str = "/run/user/1000/portico/tunnels/db.log";
 
+    #[cfg(target_os = "linux")]
     /// A fake `/proc` with a boot ID and a boot time of 1000 seconds.
     fn fake_proc() -> (tempfile::TempDir, Proc) {
         let dir = tempfile::tempdir().unwrap();
@@ -394,11 +418,13 @@ mod tests {
         (dir, proc)
     }
 
+    #[cfg(target_os = "linux")]
     /// Adds a process that leads its own session, as a backgrounded ssh does.
     fn add_process(root: &Path, pid: u32, start: u64, state: char, uid: u32, args: &[&str]) {
         add_in_session(root, pid, pid, start, state, uid, args);
     }
 
+    #[cfg(target_os = "linux")]
     fn add_in_session(
         root: &Path,
         pid: u32,
@@ -428,6 +454,7 @@ mod tests {
         fs::write(dir.join("cmdline"), cmdline).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn tunnel_args() -> Vec<&'static str> {
         vec![
             "/usr/bin/ssh",
@@ -455,6 +482,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stat_reads_state_and_start_after_the_command_name() {
         let (dir, proc) = fake_proc();
@@ -471,6 +499,7 @@ mod tests {
         assert_eq!(proc.stat(42), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_accepts_the_recorded_process() {
         let (dir, proc) = fake_proc();
@@ -481,6 +510,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_another_start_time() {
         let (dir, proc) = fake_proc();
@@ -491,6 +521,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_another_boot() {
         let (dir, proc) = fake_proc();
@@ -500,6 +531,7 @@ mod tests {
         assert_eq!(proc.identify(&old, Path::new(LOG), 1000), Identity::Stale);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_another_uid() {
         let (dir, proc) = fake_proc();
@@ -510,6 +542,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_a_zombie() {
         let (dir, proc) = fake_proc();
@@ -520,6 +553,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_rejects_a_command_line_without_the_log() {
         let (dir, proc) = fake_proc();
@@ -542,6 +576,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_finds_the_process_with_the_log_argument() {
         let (dir, proc) = fake_proc();
@@ -557,6 +592,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_ignores_a_foreground_ssh_that_is_still_connecting() {
         let (dir, proc) = fake_proc();
@@ -569,6 +605,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_ignores_older_and_foreign_processes() {
         let (dir, proc) = fake_proc();
@@ -586,6 +623,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rediscovers_a_tunnel_without_a_record() {
         let (dir, proc) = fake_proc();
@@ -604,6 +642,62 @@ mod tests {
             proc.identify(&rebuilt, Path::new(LOG), 1000),
             Identity::Alive
         );
+    }
+
+    /// The real process table on either system: a process whose command line looks like a
+    /// started tunnel's, in its own session as `ssh -f` puts itself.
+    #[test]
+    fn a_live_tunnel_process_is_recognised_rebuilt_and_stopped() {
+        use std::os::unix::process::CommandExt;
+
+        use crate::platform::process::{current_uid, stop_process};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("db.log");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30; :", "ssh", "-E"])
+            .arg(&log)
+            .args(["-L", "5432:db:5432", "--", "prod-db"]);
+        // SAFETY: `setsid` is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let (proc, uid) = (Proc::system(), current_uid());
+
+        let (pid, start) = proc.find_tunnel(&log, uid, None).unwrap();
+        assert_eq!(pid, child.id());
+        assert_eq!(proc.find_tunnel(&log, uid, Some(start + 1)), None);
+        let record = proc.rebuild_record(pid, start).unwrap();
+        assert_eq!(record.host, "prod-db");
+        assert_eq!(record.forward, "-L 5432:db:5432");
+        assert!(record.started.abs_diff(now()) < 60, "{record:?}");
+        assert_eq!(proc.identify(&record, &log, uid), Identity::Alive);
+        let restarted = RunningRecord {
+            start: start + 1,
+            ..record.clone()
+        };
+        assert_eq!(proc.identify(&restarted, &log, uid), Identity::Gone);
+        let rebooted = RunningRecord {
+            boot: "another-boot".into(),
+            ..record.clone()
+        };
+        assert_eq!(proc.identify(&rebooted, &log, uid), Identity::Stale);
+        assert_eq!(
+            proc.identify(&record, &dir.path().join("other.log"), uid),
+            Identity::Gone
+        );
+
+        assert!(stop_process(pid, || proc.is_tunnel(pid, Some(start), &log, uid)).unwrap());
+        child.wait().unwrap();
+        assert_eq!(proc.identify(&record, &log, uid), Identity::Gone);
+        assert_eq!(proc.find_tunnel(&log, uid, None), None);
     }
 
     #[test]
@@ -638,6 +732,8 @@ mod tests {
         assert_eq!(Record::read(&path), None);
     }
 
+    /// macOS has no runtime directory: its `runtime_dir` is tested in `platform::macos`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn runtime_dir_falls_back_without_a_usable_xdg_runtime_dir() {
         let dir = tempfile::tempdir().unwrap();
