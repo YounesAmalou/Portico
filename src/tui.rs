@@ -347,7 +347,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             UiAction::Containers(PanelAction::Fix { target, offer }) => {
                 let result = suspended(terminal, session, signals, || {
                     show_fix(&mut io::stdout(), &target, &offer)?;
-                    Ok(app.docker_fix(&target, &offer))
+                    Ok(app.run_offer(&target, &offer))
                 })?;
                 state.containers.set_status(fix_status(&offer, result));
                 workers.lister.list(&mut state.containers, target);
@@ -6409,10 +6409,10 @@ mod tests {
     fn shop_list(target: Target) -> ContainerList {
         ContainerList {
             target,
-            listing: crate::container::Listing {
+            listing: crate::backend::docker::Listing {
                 containers: ["web", "db"]
                     .into_iter()
-                    .map(|service| crate::container::Container {
+                    .map(|service| crate::backend::docker::Container {
                         id: format!("{service}-id"),
                         name: format!("shop-{service}-1"),
                         image: format!("{service}:latest"),
@@ -6862,14 +6862,16 @@ mod tests {
     fn a_narrow_containers_tab_wraps_the_fix_command_in_full() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         char(&mut state, 'c');
-        let offer = crate::app::Offer::JoinGroup {
-            user: "deploy".into(),
-            socket: "/var/run/docker.sock".into(),
-        };
-        let command = crate::container::remote_command(&offer.words());
-        let issue = crate::app::DockerIssue {
+        let offer = crate::backend::docker::join_group_offer(
+            &Target::Host("dev".into()),
+            "deploy",
+            "/var/run/docker.sock",
+        );
+        let command = crate::backend::docker::remote_command(&offer.words);
+        let issue = crate::backend::BackendIssue {
+            backend: crate::backend::BackendId::Docker,
             target: Target::Host("dev".into()),
-            problem: crate::container::DockerProblem::PermissionDenied,
+            problem: crate::backend::Problem::PermissionDenied,
             headline: "deploy cannot use Docker on dev.".into(),
             next: vec![format!("Add deploy to the docker group: {command}")],
             offer: Some(offer),

@@ -10,9 +10,11 @@ use ratatui::{
 
 use super::{TextInput, TuiError, display_width, explanation_lines};
 use crate::{
-    app::{ContainerError, Offer},
-    backend::{ContainerList, GroupTool, Target},
-    container::{Container, display_name, group, remote_command},
+    app::ContainerError,
+    backend::{
+        ContainerList, GroupTool, Offer, Target,
+        docker::{Container, display_name, group, remote_command},
+    },
     fuzzy,
     openssh::ConnectionOutcome,
     picker::{HIT, Outcome, Row, Single, State},
@@ -255,11 +257,7 @@ impl Panel {
             KeyCode::Char('n') => self.shell(true),
             KeyCode::Char(character @ ('g' | 's')) => match state {
                 PanelState::Failed(failure) => match &failure.offer {
-                    Some(offer @ Offer::JoinGroup { .. }) if character == 'g' => PanelAction::Fix {
-                        target,
-                        offer: offer.clone(),
-                    },
-                    Some(offer @ Offer::StartDaemon) if character == 's' => PanelAction::Fix {
+                    Some(offer) if offer.key == character => PanelAction::Fix {
                         target,
                         offer: offer.clone(),
                     },
@@ -429,14 +427,13 @@ impl Panel {
                     .iter()
                     .flat_map(|line| wrapped(line, Style::default()))
                     .collect();
-                let hint = match failure.offer {
-                    Some(Offer::JoinGroup { .. }) => Some("g add to docker group"),
-                    Some(Offer::StartDaemon) => Some("s start docker"),
-                    None => None,
-                };
+                let hint = failure
+                    .offer
+                    .as_ref()
+                    .map(|offer| format!("{} {}", offer.key, offer.hint));
                 lines.extend(
                     hint.into_iter()
-                        .flat_map(|hint| wrapped(hint, Style::default())),
+                        .flat_map(|hint| wrapped(&hint, Style::default())),
                 );
                 lines
             }
@@ -668,7 +665,7 @@ pub(super) fn show_fix(
     target: &Target,
     offer: &Offer,
 ) -> std::io::Result<()> {
-    let command = remote_command(&offer.words());
+    let command = remote_command(&offer.words);
     match target {
         Target::Local => writeln!(out, "This runs: {command}"),
         Target::Host(alias) => writeln!(out, "This runs on {alias}: {command}"),
@@ -712,7 +709,7 @@ pub(super) fn fix_status(
         Ok(Ok(status)) if status.success() => None,
         Ok(Ok(status)) => Some(format!(
             "{} exited with {status}",
-            remote_command(&offer.words())
+            remote_command(&offer.words)
         )),
         Ok(Err(error)) => Some(error.to_string()),
         Err(error) => Some(error.to_string()),
@@ -743,7 +740,7 @@ fn failure(error: &ContainerError) -> PanelFailure {
                 .collect(),
             offer: None,
         },
-        ContainerError::Docker(issue) => PanelFailure {
+        ContainerError::Backend(issue) => PanelFailure {
             lines: std::iter::once(issue.headline.clone())
                 .chain(issue.next.iter().cloned())
                 .collect(),
@@ -761,8 +758,10 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     use crate::{
-        app::DockerIssue,
-        container::{DockerProblem, Listing},
+        backend::{
+            BackendId, BackendIssue, Problem,
+            docker::{Listing, join_group_offer, start_daemon_offer},
+        },
         explain::{Explanation, Label},
     };
 
@@ -842,9 +841,10 @@ mod tests {
     }
 
     fn issue(offer: Option<Offer>) -> ContainerError {
-        ContainerError::from(DockerIssue {
+        ContainerError::from(BackendIssue {
+            backend: BackendId::Docker,
             target: host("dev"),
-            problem: DockerProblem::DaemonDown,
+            problem: Problem::ServiceDown,
             headline: "The docker daemon is not running on dev.".into(),
             next: vec!["Start it with: sudo systemctl start docker".into()],
             offer,
@@ -1051,20 +1051,20 @@ mod tests {
     fn offer_keys_only_for_matching_offer() {
         let mut panel = Panel::default();
         panel.show(host("dev"));
-        panel.finish(host("dev"), Err(issue(Some(Offer::StartDaemon))));
+        panel.finish(
+            host("dev"),
+            Err(issue(Some(start_daemon_offer(&host("dev"))))),
+        );
         assert_eq!(press(&mut panel, KeyCode::Char('g')), PanelAction::None);
         assert_eq!(
             press(&mut panel, KeyCode::Char('s')),
             PanelAction::Fix {
                 target: host("dev"),
-                offer: Offer::StartDaemon,
+                offer: start_daemon_offer(&host("dev")),
             }
         );
 
-        let join = Offer::JoinGroup {
-            user: "deploy".into(),
-            socket: "/var/run/docker.sock".into(),
-        };
+        let join = join_group_offer(&host("dev"), "deploy", "/var/run/docker.sock");
         panel.finish(host("dev"), Err(issue(Some(join.clone()))));
         assert_eq!(press(&mut panel, KeyCode::Char('s')), PanelAction::None);
         assert_eq!(
@@ -1202,7 +1202,10 @@ mod tests {
             ["ssh to dev failed", "ssh: Could not resolve hostname dev"]
         );
 
-        panel.finish(host("dev"), Err(issue(Some(Offer::StartDaemon))));
+        panel.finish(
+            host("dev"),
+            Err(issue(Some(start_daemon_offer(&host("dev"))))),
+        );
         assert_eq!(
             texts(&panel.lines(false, 100, 200)),
             [
@@ -1212,10 +1215,7 @@ mod tests {
             ]
         );
 
-        let join = Offer::JoinGroup {
-            user: "deploy".into(),
-            socket: "/var/run/docker.sock".into(),
-        };
+        let join = join_group_offer(&host("dev"), "deploy", "/var/run/docker.sock");
         panel.finish(host("dev"), Err(issue(Some(join))));
         assert_eq!(
             texts(&panel.lines(false, 100, 200)).last().unwrap(),
@@ -1376,13 +1376,16 @@ mod tests {
             "The docker daemon is not running on dev."
         );
 
-        assert_eq!(fix_status(&Offer::StartDaemon, Ok(Ok(ok))), None);
-        let line = fix_status(&Offer::StartDaemon, Ok(Ok(failed))).unwrap();
+        assert_eq!(
+            fix_status(&start_daemon_offer(&host("dev")), Ok(Ok(ok))),
+            None
+        );
+        let line = fix_status(&start_daemon_offer(&host("dev")), Ok(Ok(failed))).unwrap();
         assert_eq!(
             line,
             format!(
                 "{} exited with exit status: 1",
-                remote_command(&Offer::StartDaemon.words())
+                remote_command(&start_daemon_offer(&host("dev")).words)
             )
         );
         assert!(line.contains("sudo"), "{line}");
@@ -1411,18 +1414,15 @@ mod tests {
         );
         assert_eq!(wrap("abc", 1), ["a", "b", "c"]);
 
-        let join = Offer::JoinGroup {
-            user: "deploy".into(),
-            socket: "/var/run/docker.sock".into(),
-        };
-        let command = remote_command(&join.words());
+        let join = join_group_offer(&host("dev"), "deploy", "/var/run/docker.sock");
+        let command = remote_command(&join.words);
         let mut panel = Panel::default();
         panel.show(host("dev"));
-        let ContainerError::Docker(mut issue) = issue(Some(join)) else {
+        let ContainerError::Backend(mut issue) = issue(Some(join)) else {
             unreachable!()
         };
         issue.next = vec![format!("Add deploy to the docker group: {command}")];
-        panel.finish(host("dev"), Err(ContainerError::Docker(issue)));
+        panel.finish(host("dev"), Err(ContainerError::Backend(issue)));
         let lines = texts(&panel.lines(false, 100, 20));
         assert!(
             lines.iter().all(|line| line.chars().count() <= 20),
@@ -1439,16 +1439,21 @@ mod tests {
     #[test]
     fn a_fix_shows_its_command_first() {
         let mut out = Vec::new();
-        show_fix(&mut out, &host("dev"), &Offer::StartDaemon).unwrap();
+        show_fix(&mut out, &host("dev"), &start_daemon_offer(&host("dev"))).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
                 "This runs on dev: {}\n",
-                remote_command(&Offer::StartDaemon.words())
+                remote_command(&start_daemon_offer(&host("dev")).words)
             )
         );
         let mut out = Vec::new();
-        show_fix(&mut out, &Target::Local, &Offer::StartDaemon).unwrap();
+        show_fix(
+            &mut out,
+            &Target::Local,
+            &start_daemon_offer(&Target::Local),
+        )
+        .unwrap();
         assert!(
             String::from_utf8(out)
                 .unwrap()

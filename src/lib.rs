@@ -3,7 +3,6 @@ pub mod app;
 pub mod backend;
 pub mod cli;
 pub mod config_error;
-pub mod container;
 pub mod desktop;
 pub mod discovery;
 pub mod explain;

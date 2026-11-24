@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::backend::GroupTool;
+use super::{
+    Backend, BackendId, BackendIssue, ContainerList, GroupTool, ListFailure, Offer, Problem,
+    RunFailure, RunResult, Target,
+};
 
 /// The `docker ps --format` template: one flat JSON object of strings per
 /// container, with the Compose labels that group and name it.
@@ -349,27 +352,18 @@ pub fn exec_words(id: &str, user: Option<&str>) -> Vec<String> {
     words.into_iter().map(String::from).collect()
 }
 
-/// What went wrong when a docker command failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DockerProblem {
-    NotInstalled,
-    DaemonDown,
-    PermissionDenied,
-    Other,
-}
-
 /// Recognises a docker failure from its exit status and stderr; over ssh the
 /// same text arrives from the remote shell.
-pub fn classify(code: Option<i32>, stderr: &str) -> DockerProblem {
+pub fn classify(code: Option<i32>, stderr: &str) -> Problem {
     let stderr = stderr.to_lowercase();
     if code == Some(127) && stderr.contains("not found") {
-        DockerProblem::NotInstalled
+        Problem::NotInstalled
     } else if stderr.contains("cannot connect to the docker daemon") {
-        DockerProblem::DaemonDown
+        Problem::ServiceDown
     } else if stderr.contains("permission denied while trying to connect to the docker") {
-        DockerProblem::PermissionDenied
+        Problem::PermissionDenied
     } else {
-        DockerProblem::Other
+        Problem::Other
     }
 }
 
@@ -497,8 +491,256 @@ pub fn start_daemon_words() -> Vec<String> {
         .collect()
 }
 
+/// The Docker adapter.
+pub struct Docker;
+
+impl Backend for Docker {
+    fn id(&self) -> BackendId {
+        BackendId::Docker
+    }
+
+    /// Runs `docker ps`. When the socket is refused or the daemon is down, the probe tells
+    /// why; a session that predates the user's docker group is rerun inside the group.
+    fn list<E>(
+        &self,
+        target: &Target,
+        run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    ) -> Result<ContainerList, ListFailure<E>> {
+        let words = ps_words();
+        let output = run(&words).map_err(stopped)?;
+        if output.status.success() {
+            return Ok(listed(target.clone(), &output.stdout, None));
+        }
+        let stderr = lossy(&output.stderr);
+        let problem = classify(output.status.code(), &stderr);
+        if !matches!(problem, Problem::PermissionDenied | Problem::ServiceDown) {
+            return Err(failed(plain_issue(target, problem, stderr)));
+        }
+        // A probe that fails is no answer; only a cancellation stops the listing.
+        let probe = match run(&["sh", "-c", PROBE_SCRIPT].map(String::from)) {
+            Ok(output) if output.status.success() => parse_probe(&lossy(&output.stdout)),
+            Err(RunFailure::Cancelled(error)) => return Err(ListFailure::Run(error)),
+            _ => None,
+        };
+        let Some(probe) = probe else {
+            return Err(failed(plain_issue(target, problem, stderr)));
+        };
+        if problem == Problem::ServiceDown {
+            return Err(failed(daemon_down(target, probe.has_systemctl, stderr)));
+        }
+        let issue = match decide(&probe) {
+            Access::RerunInGroup(tool) => {
+                let output = run(&in_group(tool, &words)).map_err(stopped)?;
+                if output.status.success() {
+                    return Ok(listed(target.clone(), &output.stdout, Some(tool)));
+                }
+                let stderr = lossy(&output.stderr);
+                plain_issue(target, classify(output.status.code(), &stderr), stderr)
+            }
+            Access::NeedsLogin => BackendIssue {
+                headline: format!(
+                    "{} is in the docker group on {target}, but this session started before that and sg is not available.",
+                    probe.user
+                ),
+                next: vec!["Log out and back in, then list again.".into()],
+                ..issue(target, problem, stderr)
+            },
+            // An empty socket is not a local path, so its group cannot be fixed.
+            Access::OfferJoin if !probe.socket.is_empty() => join_offer(target, &probe, stderr),
+            Access::OfferJoin | Access::NoOffer => no_offer(target, &probe, stderr),
+        };
+        Err(failed(issue))
+    }
+
+    /// `docker exec` into container `id`, through `via` when the listing needed it.
+    fn shell_words(&self, id: &str, user: Option<&str>, via: Option<GroupTool>) -> Vec<String> {
+        let words = exec_words(id, user);
+        match via {
+            Some(tool) => in_group(tool, &words),
+            None => words,
+        }
+    }
+
+    fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue {
+        plain_issue(target, problem, stderr)
+    }
+}
+
+/// A command that did not run, whether cancelled or failed, stops the listing.
+fn stopped<E>(failure: RunFailure<E>) -> ListFailure<E> {
+    match failure {
+        RunFailure::Cancelled(error) | RunFailure::Failed(error) => ListFailure::Run(error),
+    }
+}
+
+fn failed<E>(issue: BackendIssue) -> ListFailure<E> {
+    ListFailure::Issue(Box::new(issue))
+}
+
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The name `--via` takes for `tool`.
+pub fn tool_name(tool: GroupTool) -> &'static str {
+    match tool {
+        GroupTool::Sg => "sg",
+    }
+}
+
+fn listed(target: Target, stdout: &[u8], via: Option<GroupTool>) -> ContainerList {
+    ContainerList {
+        target,
+        listing: parse_listing(&lossy(stdout)),
+        via,
+        note: via.map(|tool| {
+            format!(
+                "Ran docker through `{} docker`: other shells need `newgrp docker` or a new login.",
+                tool_name(tool)
+            )
+        }),
+    }
+}
+
+/// An issue with no headline, advice or offer yet.
+fn issue(target: &Target, problem: Problem, stderr: String) -> BackendIssue {
+    BackendIssue {
+        backend: BackendId::Docker,
+        target: target.clone(),
+        problem,
+        headline: String::new(),
+        next: Vec::new(),
+        offer: None,
+        stderr,
+    }
+}
+
+/// The last line docker wrote to stderr, which carries its message.
+fn docker_message(stderr: &str) -> Option<&str> {
+    stderr.lines().map(str::trim).rfind(|line| !line.is_empty())
+}
+
+fn ask_administrator(target: &Target) -> String {
+    format!("Ask the administrator of {target} for access, or run sudo docker yourself.")
+}
+
+/// A problem explained without what the probe would tell.
+fn plain_issue(target: &Target, problem: Problem, stderr: String) -> BackendIssue {
+    let (headline, next) = match problem {
+        Problem::NotInstalled => (
+            format!(
+                "Docker is not installed on {target}, or it is not on the PATH of a non-interactive shell there."
+            ),
+            vec!["Install Docker from the distribution's packages, then list again.".into()],
+        ),
+        Problem::ServiceDown => return daemon_down(target, false, stderr),
+        Problem::PermissionDenied => (
+            docker_message(&stderr)
+                .unwrap_or("Permission denied")
+                .to_string(),
+            vec![ask_administrator(target)],
+        ),
+        Problem::Other => (
+            match docker_message(&stderr) {
+                Some(message) => format!("docker failed on {target}: {message}"),
+                None => format!("docker failed on {target}."),
+            },
+            Vec::new(),
+        ),
+    };
+    BackendIssue {
+        headline,
+        next,
+        ..issue(target, problem, stderr)
+    }
+}
+
+/// The offer to add `user` to the docker group on `target` and give it `socket`.
+pub fn join_group_offer(target: &Target, user: &str, socket: &str) -> Offer {
+    let words = join_group_words(user, socket);
+    Offer {
+        key: 'g',
+        hint: "add to docker group".into(),
+        prompt: format!(
+            "Add {user} to the docker group on {target}? Members of the docker group have root-equivalent access. This runs: {}",
+            remote_command(&words)
+        ),
+        words,
+    }
+}
+
+/// The offer to start the Docker service on `target`.
+pub fn start_daemon_offer(target: &Target) -> Offer {
+    let words = start_daemon_words();
+    Offer {
+        key: 's',
+        hint: "start docker".into(),
+        prompt: format!(
+            "Start the Docker service on {target}? This runs: {}",
+            remote_command(&words)
+        ),
+        words,
+    }
+}
+
+fn daemon_down(target: &Target, has_systemctl: bool, stderr: String) -> BackendIssue {
+    BackendIssue {
+        headline: format!("The Docker daemon is not running on {target}."),
+        next: vec![if has_systemctl {
+            "Start it with: sudo systemctl start docker".into()
+        } else {
+            "Start the Docker daemon, then list again.".into()
+        }],
+        offer: has_systemctl.then(|| start_daemon_offer(target)),
+        ..issue(target, Problem::ServiceDown, stderr)
+    }
+}
+
+fn join_offer(target: &Target, probe: &Probe, stderr: String) -> BackendIssue {
+    let Probe { user, socket, .. } = probe;
+    let sudo_yourself = match target {
+        Target::Local => "Or run sudo docker yourself".to_string(),
+        Target::Host(alias) => format!("Or run sudo docker yourself in portico connect {alias}"),
+    };
+    BackendIssue {
+        headline: format!("{user} cannot use Docker on {target}: permission denied on {socket}."),
+        next: vec![
+            format!(
+                "Add {user} to the docker group (root-equivalent access): {}",
+                remote_command(&join_group_words(user, socket))
+            ),
+            "Or use rootless Docker: https://docs.docker.com/engine/security/rootless/".into(),
+            sudo_yourself,
+        ],
+        offer: Some(join_group_offer(target, user, socket)),
+        ..issue(target, Problem::PermissionDenied, stderr)
+    }
+}
+
+fn no_offer(target: &Target, probe: &Probe, stderr: String) -> BackendIssue {
+    let headline = match (probe.socket.as_str(), &probe.socket_group) {
+        ("", _) => format!(
+            "Permission denied by the Docker daemon on {target}, whose DOCKER_HOST is not a local unix socket."
+        ),
+        (socket, Some(group)) => {
+            format!("Permission denied on {socket}, which belongs to group {group}.")
+        }
+        (socket, None) => format!("Permission denied on {socket}."),
+    };
+    BackendIssue {
+        headline,
+        next: vec![ask_administrator(target)],
+        ..issue(target, Problem::PermissionDenied, stderr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        os::unix::process::ExitStatusExt,
+        process::{ExitStatus, Output},
+    };
+
     use super::*;
 
     fn container(
@@ -797,7 +1039,7 @@ mod tests {
 
     #[test]
     fn classifies_docker_messages() {
-        let not_installed = DockerProblem::NotInstalled;
+        let not_installed = Problem::NotInstalled;
         assert_eq!(
             classify(Some(127), "bash: docker: command not found"),
             not_installed
@@ -811,25 +1053,25 @@ mod tests {
                 Some(1),
                 "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
             ),
-            DockerProblem::DaemonDown
+            Problem::ServiceDown
         );
         assert_eq!(
             classify(
                 Some(1),
                 "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get \"x\""
             ),
-            DockerProblem::PermissionDenied
+            Problem::PermissionDenied
         );
         assert_eq!(
             classify(
                 Some(1),
                 "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
             ),
-            DockerProblem::PermissionDenied
+            Problem::PermissionDenied
         );
         assert_eq!(
             classify(Some(1), "Error response from daemon: x"),
-            DockerProblem::Other
+            Problem::Other
         );
     }
 
@@ -945,6 +1187,85 @@ mod tests {
         assert_eq!(
             start_daemon_words(),
             ["sudo", "systemctl", "start", "docker"]
+        );
+    }
+
+    /// A transport that answers each command with the next scripted reply.
+    fn scripted(
+        replies: Vec<RunResult<&'static str>>,
+    ) -> impl FnMut(&[String]) -> RunResult<&'static str> {
+        let mut replies = replies.into_iter();
+        move |_| replies.next().expect("no reply scripted for this command")
+    }
+
+    fn exited(code: i32, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    const DENIED: &str = "permission denied while trying to connect to the docker daemon socket at unix:///var/run/docker.sock";
+
+    #[test]
+    fn a_cancelled_probe_stops_the_listing() {
+        let mut run = scripted(vec![
+            Ok(exited(1, "", DENIED)),
+            Err(RunFailure::Cancelled("cancelled")),
+        ]);
+        assert!(matches!(
+            Docker.list(&Target::Local, &mut run),
+            Err(ListFailure::Run("cancelled"))
+        ));
+    }
+
+    #[test]
+    fn a_failed_probe_reports_the_plain_issue() {
+        let mut run = scripted(vec![
+            Ok(exited(1, "", DENIED)),
+            Err(RunFailure::Failed("ssh hiccup")),
+        ]);
+        let Err(ListFailure::Issue(issue)) = Docker.list(&Target::Local, &mut run) else {
+            panic!("expected an issue");
+        };
+        assert_eq!(issue.problem, Problem::PermissionDenied);
+        assert_eq!(issue.offer, None);
+    }
+
+    #[test]
+    fn join_offer_keeps_its_key_hint_and_prompt() {
+        let probe = "user=me\nprocess=me\ndatabase=me wheel\ngroup=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\nsg=yes\nsystemctl=yes\n";
+        let mut run = scripted(vec![Ok(exited(1, "", DENIED)), Ok(exited(0, probe, ""))]);
+        let Err(ListFailure::Issue(issue)) = Docker.list(&Target::Local, &mut run) else {
+            panic!("expected an issue");
+        };
+        let offer = issue.offer.unwrap();
+        assert_eq!(
+            (offer.key, offer.hint.as_str()),
+            ('g', "add to docker group")
+        );
+        assert_eq!(offer.words, join_group_words("me", "/var/run/docker.sock"));
+        assert!(offer.prompt.starts_with(
+            "Add me to the docker group on this machine? Members of the docker group have root-equivalent access. This runs: "
+        ));
+    }
+
+    #[test]
+    fn start_offer_keeps_its_key_hint_and_prompt() {
+        let stopped = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+        let probe = "user=me\nprocess=me docker\ndatabase=me docker\ngroup=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\nsg=yes\nsystemctl=yes\n";
+        let mut run = scripted(vec![Ok(exited(1, "", stopped)), Ok(exited(0, probe, ""))]);
+        let Err(ListFailure::Issue(issue)) = Docker.list(&Target::Local, &mut run) else {
+            panic!("expected an issue");
+        };
+        let offer = issue.offer.unwrap();
+        assert_eq!((offer.key, offer.hint.as_str()), ('s', "start docker"));
+        assert_eq!(offer.words, start_daemon_words());
+        assert!(
+            offer
+                .prompt
+                .starts_with("Start the Docker service on this machine? This runs: ")
         );
     }
 }
