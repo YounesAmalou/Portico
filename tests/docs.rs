@@ -11,12 +11,18 @@ fn required_project_documents_exist() {
         "CONTRIBUTING.md",
         "SECURITY.md",
         "ROADMAP.md",
+        "docs/architecture.md",
         ".github/ISSUE_TEMPLATE/bug_report.md",
         ".github/ISSUE_TEMPLATE/feature_request.md",
         ".github/pull_request_template.md",
     ] {
         assert!(!read(path).trim().is_empty(), "{path} is empty");
     }
+}
+
+#[test]
+fn contributing_links_the_architecture_document() {
+    assert!(read("CONTRIBUTING.md").contains("docs/architecture.md"));
 }
 
 #[test]

@@ -59,6 +59,7 @@ If the release automation fails, fix it and run it again rather than tagging by 
 - Pull requests are squash-merged, so each one lands on `main` as a single commit named after its title. A linear history is what lets release-plz see every change since the last release: with merge commits it follows only one merged branch and leaves the others out of the changelog.
 - Name the branch after the same type, then a short kebab-case description of the change: `feat/jump-host-suggestions`, `fix/rich-error-followups`, `docs/release-plz-spec`, `ci/leaner-ci`. Avoid generic or tool-generated names (`patch-1`, `claude/...`, `worktree-...`); rename the branch before pushing. Only the release automation's `release-plz-*` branches use another scheme.
 - Larger features follow the project's spec, plan, implementation flow in `docs/superpowers/`.
+- `docs/architecture.md` describes the layers and the dependency rule; read it before adding a backend or a platform.
 
 ## Licensing
 
