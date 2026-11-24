@@ -12,11 +12,13 @@ use std::{
 use crate::{
     adopt::{Candidate, Direction},
     app::{
-        App, AppError, ContainerError, DockerIssue, HostDetails, HostSummary, Offer, Ownership,
-        TestOutcome, TestReport, TestTarget,
+        App, AppError, ContainerError, HostDetails, HostSummary, Ownership, TestOutcome,
+        TestReport, TestTarget,
     },
-    backend::{ContainerList, GroupTool, Target},
-    container::{ResolveError, display_name, group, remote_command, resolve},
+    backend::{
+        BackendIssue, ContainerList, GroupTool, Target,
+        docker::{ResolveError, display_name, group, remote_command, resolve},
+    },
     discovery::DiscoveryWarning,
     explain::Explanation,
     host::{Change, ClearField, Host, HostChanges},
@@ -906,7 +908,7 @@ fn list_with_offers<I: BufRead, O: Write, E: Write>(
     loop {
         let issue = match app.containers(target, false, None) {
             Ok(list) => return Ok(list),
-            Err(ContainerError::Docker(issue)) => issue,
+            Err(ContainerError::Backend(issue)) => issue,
             Err(failure) => return Err(report_container_failure(error, failure)?),
         };
         let offer = match &issue.offer {
@@ -917,43 +919,29 @@ fn list_with_offers<I: BufRead, O: Write, E: Write>(
             }
         };
         print_docker_issue(error, &issue, false)?;
-        let prompt = format!("{} [y/N] ", offer_prompt(&issue.target, offer));
+        let prompt = format!("{} [y/N] ", offer.prompt);
         if !confirm(input, output, &prompt)? {
             print_docker_issue_next(error, &issue)?;
             return Err(String::new());
         }
-        let status = match app.docker_fix(target, offer) {
+        let status = match app.run_offer(target, offer) {
             Ok(status) => status,
             Err(failure) => return Err(report_container_failure(error, failure)?),
         };
         if !status.success() {
             return Err(format!(
                 "{} exited with {status}",
-                remote_command(&offer.words())
+                remote_command(&offer.words)
             ));
         }
         offered = true;
     }
 }
 
-/// The question asked before running `offer` on `target`.
-fn offer_prompt(target: &Target, offer: &Offer) -> String {
-    match offer {
-        Offer::JoinGroup { user, .. } => format!(
-            "Add {user} to the docker group on {target}? Members of the docker group have root-equivalent access. This runs: {}",
-            remote_command(&offer.words())
-        ),
-        Offer::StartDaemon => format!(
-            "Start the Docker service on {target}? This runs: {}",
-            remote_command(&offer.words())
-        ),
-    }
-}
-
 /// Prints the issue's headline, and with `next` what to do about it.
 fn print_docker_issue(
     error: &mut impl Write,
-    issue: &DockerIssue,
+    issue: &BackendIssue,
     next: bool,
 ) -> Result<(), String> {
     writeln!(error, "error: {}", issue.headline).map_err(|error| error.to_string())?;
@@ -963,7 +951,7 @@ fn print_docker_issue(
     Ok(())
 }
 
-fn print_docker_issue_next(error: &mut impl Write, issue: &DockerIssue) -> Result<(), String> {
+fn print_docker_issue_next(error: &mut impl Write, issue: &BackendIssue) -> Result<(), String> {
     for line in &issue.next {
         writeln!(error, "  {line}").map_err(|error| error.to_string())?;
     }
@@ -977,7 +965,7 @@ fn report_container_failure(
     failure: ContainerError,
 ) -> Result<String, String> {
     match failure {
-        ContainerError::Docker(issue) => {
+        ContainerError::Backend(issue) => {
             print_docker_issue(error, &issue, true)?;
             Ok(String::new())
         }
@@ -1597,7 +1585,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{App, ContainerPrograms},
-        container::{SHELL_SCRIPT, join_group_words, remote_command},
+        backend::docker::{SHELL_SCRIPT, join_group_words, remote_command},
         host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,

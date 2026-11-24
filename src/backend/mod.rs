@@ -1,8 +1,10 @@
 //! The interface between the app and the tools that run containers.
 
+pub mod docker;
+
 use std::{fmt, process::Output};
 
-use crate::container::Listing;
+use docker::{Docker, Listing};
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -132,15 +134,57 @@ pub enum ListFailure<E> {
 pub trait Backend {
     fn id(&self) -> BackendId;
 
+    /// Lists the running containers of `target`, running each command it needs through `run`.
+    /// A `RunFailure::Cancelled` always stops the listing as `ListFailure::Run`; a
+    /// `RunFailure::Failed` stops it the same way, except where the adapter treats it as no
+    /// answer (Docker's probe does). A tool that ran and refused is a `ListFailure::Issue`.
     fn list<E>(
         &self,
         target: &Target,
         run: &mut dyn FnMut(&[String]) -> RunResult<E>,
     ) -> Result<ContainerList, ListFailure<E>>;
 
+    /// The command that opens a shell in container `id`, as `user` when given, through `via`
+    /// when the listing needed it.
     fn shell_words(&self, id: &str, user: Option<&str>, via: Option<GroupTool>) -> Vec<String>;
 
+    /// `problem` explained without asking the target anything more.
     fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue;
+}
+
+/// Lists the running containers of `target` with `backend`; see [`Backend::list`].
+pub fn list<E>(
+    backend: BackendId,
+    target: &Target,
+    run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+) -> Result<ContainerList, ListFailure<E>> {
+    match backend {
+        BackendId::Docker => Docker.list(target, run),
+    }
+}
+
+/// The command that opens a shell in a container of `backend`; see [`Backend::shell_words`].
+pub fn shell_words(
+    backend: BackendId,
+    id: &str,
+    user: Option<&str>,
+    via: Option<GroupTool>,
+) -> Vec<String> {
+    match backend {
+        BackendId::Docker => Docker.shell_words(id, user, via),
+    }
+}
+
+/// `problem` explained by `backend`; see [`Backend::plain_issue`].
+pub fn plain_issue(
+    backend: BackendId,
+    target: &Target,
+    problem: Problem,
+    stderr: String,
+) -> BackendIssue {
+    match backend {
+        BackendId::Docker => Docker.plain_issue(target, problem, stderr),
+    }
 }
 
 #[cfg(test)]

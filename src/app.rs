@@ -12,7 +12,7 @@ mod identities;
 pub(crate) use identities::key_files_in;
 mod tunnels;
 
-pub use containers::{ContainerError, ContainerPrograms, DockerIssue, Offer};
+pub use containers::{ContainerError, ContainerPrograms};
 pub use tunnels::{StartOutcome, StopOutcome, TunnelChanges, TunnelRefusal};
 
 use crate::{

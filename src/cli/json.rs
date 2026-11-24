@@ -9,11 +9,13 @@ use serde_json::{Map, Value, json};
 use super::{format_warning, ownership};
 use crate::{
     app::{
-        App, AppError, ContainerError, DockerIssue, HostDetails, HostInventory, StartOutcome,
-        StopOutcome, TunnelRefusal,
+        App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
+        TunnelRefusal,
     },
-    backend::{ContainerList, GroupTool, Target},
-    container::{DockerProblem, display_name, group},
+    backend::{
+        BackendIssue, ContainerList, GroupTool, Target,
+        docker::{display_name, group},
+    },
     discovery::DiscoveryWarning,
     explain::Explanation,
     identity::{
@@ -117,13 +119,13 @@ impl From<ContainerError> for Failure {
                     },
                 ),
             },
-            ContainerError::Docker(issue) => docker_failure(&issue),
+            ContainerError::Backend(issue) => docker_failure(&issue),
             error => Self::new("other", error.to_string()),
         }
     }
 }
 
-fn docker_failure(issue: &DockerIssue) -> Failure {
+fn docker_failure(issue: &BackendIssue) -> Failure {
     let mut next = issue.next.clone();
     if issue.offer.is_some() {
         let command = match &issue.target {
@@ -138,12 +140,7 @@ fn docker_failure(issue: &DockerIssue) -> Failure {
         kind: "docker",
         message: issue.headline.clone(),
         next,
-        problem: Some(match issue.problem {
-            DockerProblem::NotInstalled => "not-installed",
-            DockerProblem::DaemonDown => "daemon-down",
-            DockerProblem::PermissionDenied => "permission-denied",
-            DockerProblem::Other => "other",
-        }),
+        problem: Some(issue.problem.as_str()),
     }
 }
 
@@ -598,7 +595,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{HostSummary, Ownership},
-        container::{Container, Listing},
+        backend::docker::{Container, Listing},
         identity::MissingReason,
         tunnel::{Kind, Tunnel},
     };
@@ -869,12 +866,15 @@ mod tests {
 
     #[test]
     fn docker_failures_name_their_problem_and_how_to_be_offered_the_fix() {
-        let failure = docker_failure(&DockerIssue {
+        let failure = docker_failure(&BackendIssue {
+            backend: crate::backend::BackendId::Docker,
             target: Target::Host("dev".into()),
-            problem: DockerProblem::PermissionDenied,
+            problem: crate::backend::Problem::PermissionDenied,
             headline: "me cannot use Docker on dev".into(),
             next: vec!["Add me to the docker group".into()],
-            offer: Some(crate::app::Offer::StartDaemon),
+            offer: Some(crate::backend::docker::start_daemon_offer(&Target::Host(
+                "dev".into(),
+            ))),
             stderr: String::new(),
         });
         assert_eq!(
