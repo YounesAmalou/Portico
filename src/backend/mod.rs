@@ -1,10 +1,13 @@
 //! The interface between the app and the tools that run containers.
 
 pub mod docker;
+pub mod listing;
 
 use std::{fmt, process::Output};
 
-use docker::{Docker, Listing};
+use docker::Docker;
+
+pub use listing::{Container, Group, Listing, ResolveError, display_name, group, resolve};
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -114,7 +117,9 @@ impl Problem {
 /// A fix Portico can run on the target after a confirmation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Offer {
-    /// The TUI key that runs it.
+    /// The TUI key that runs it. It must not be a key the containers panel already binds
+    /// (`q`, `L`, `h`, `r`, `/`, `u`, `k`, `j`, `n`, the arrows, Enter, Esc): the offer arm
+    /// comes after every fixed key, so a colliding key would never fire.
     pub key: char,
     /// The TUI footer hint.
     pub hint: String,

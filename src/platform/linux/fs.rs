@@ -193,7 +193,7 @@ pub fn fail_next_transaction_rollback_write() {
     FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.set(true));
 }
 
-pub fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

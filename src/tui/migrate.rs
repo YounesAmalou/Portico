@@ -43,7 +43,7 @@ pub(super) struct MigrateState {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum MigrateAction {
+enum MigrateAction {
     None,
     Close,
     Apply(Vec<String>),
@@ -105,7 +105,7 @@ impl MigrateState {
         self
     }
 
-    pub(super) fn handle_key(&mut self, key: KeyEvent) -> MigrateAction {
+    fn handle_key(&mut self, key: KeyEvent) -> MigrateAction {
         if let Some((preview, scroll)) = &mut self.preview {
             let last = preview.lines().count().saturating_sub(1);
             match key.code {

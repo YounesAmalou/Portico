@@ -2270,10 +2270,10 @@ mod tests {
     fn shop_list(target: Target) -> ContainerList {
         ContainerList {
             target,
-            listing: crate::backend::docker::Listing {
+            listing: crate::backend::Listing {
                 containers: ["web", "db"]
                     .into_iter()
-                    .map(|service| crate::backend::docker::Container {
+                    .map(|service| crate::backend::Container {
                         id: format!("{service}-id"),
                         name: format!("shop-{service}-1"),
                         image: format!("{service}:latest"),

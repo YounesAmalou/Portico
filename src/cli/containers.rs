@@ -2,11 +2,7 @@ use std::io::{BufRead, Write};
 
 use crate::{
     app::{App, ContainerError},
-    backend::{
-        BackendIssue, ContainerList, Target,
-        docker::{display_name, group},
-        remote_command,
-    },
+    backend::{BackendIssue, ContainerList, Target, display_name, group, remote_command},
     picker::{Picker, Row},
 };
 

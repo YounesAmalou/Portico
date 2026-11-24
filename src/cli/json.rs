@@ -12,10 +12,7 @@ use crate::{
         App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
         TunnelRefusal,
     },
-    backend::{
-        BackendIssue, ContainerList, GroupTool, Target,
-        docker::{display_name, group},
-    },
+    backend::{BackendIssue, ContainerList, GroupTool, Target, display_name, group},
     domain::discovery::DiscoveryWarning,
     domain::explain::Explanation,
     domain::identity::{
@@ -536,9 +533,7 @@ pub(super) fn containers(list: &ContainerList) -> Value {
         "note": optional_line(list.note.as_deref()),
         "skipped": list.listing.skipped,
         "target": target,
-        "via": list.via.map(|tool| match tool {
-            GroupTool::Sg => "sg",
-        }),
+        "via": list.via.map(GroupTool::as_str),
     })
 }
 
@@ -595,7 +590,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{HostSummary, Ownership},
-        backend::docker::{Container, Listing},
+        backend::{Container, Listing},
         domain::identity::MissingReason,
         domain::tunnel::{Kind, Tunnel},
     };

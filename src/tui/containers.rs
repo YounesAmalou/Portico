@@ -15,9 +15,7 @@ use super::{TextInput, TuiError, UiState, display_width, hosts::explanation_line
 use crate::{
     app::ContainerError,
     backend::{
-        ContainerList, GroupTool, Offer, Target,
-        docker::{Container, display_name, group},
-        remote_command,
+        Container, ContainerList, GroupTool, Offer, Target, display_name, group, remote_command,
     },
     domain::fuzzy,
     domain::openssh::ConnectionOutcome,
@@ -816,8 +814,8 @@ mod tests {
 
     use crate::{
         backend::{
-            BackendId, BackendIssue, Problem,
-            docker::{Listing, join_group_offer, start_daemon_offer},
+            BackendId, BackendIssue, Listing, Problem,
+            docker::{join_group_offer, start_daemon_offer},
         },
         domain::explain::{Explanation, Label},
     };
