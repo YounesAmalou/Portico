@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    app::{App, AppError, ContainerError, Ownership},
-    backend::{BackendId, ResolveError, Via, resolve},
+    app::{App, AppError, Ownership},
+    backend::{BackendId, Via},
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
@@ -25,7 +25,8 @@ mod tunnels;
 
 use self::{
     containers::{
-        container_rows, list_with_offers, on_argument, print_listing, report_container_failure,
+        Chosen, every_container_row, list_every, list_with_offers, on_argument, print_listings,
+        report_container_failure, resolve_in,
     },
     hosts::{
         field_change, finish_connection, format_warning, host_argument, ownership, print_details,
@@ -135,8 +136,8 @@ enum Command {
         /// List on this host; without an alias, choose one.
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
-        /// List with this backend only; without it, Docker, then Proxmox when Docker is not
-        /// installed.
+        /// List with this backend only; without it, every installed one (with --json, the first
+        /// installed of Docker, Podman and Proxmox).
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
         /// Print one JSON document instead of text (see docs/json-output.md).
@@ -148,11 +149,12 @@ enum Command {
         /// Open the shell on this host; without an alias, choose one.
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
-        /// List with this backend only; with --hold, the backend of the given ID (Docker by
-        /// default).
+        /// List with this backend only, instead of every installed one; with --hold, the
+        /// backend of the given ID (Docker by default).
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
-        /// Run the shell as this user (Docker only: a Proxmox container's shell runs as root).
+        /// Run the shell as this user (Docker and Podman: a Proxmox container's shell runs as
+        /// root).
         #[arg(short = 'u', long)]
         user: Option<String>,
         #[arg(short = 'n', long = "new-terminal")]
@@ -217,6 +219,7 @@ pub fn run_desktop(
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
 enum BackendArg {
     Docker,
+    Podman,
     Proxmox,
 }
 
@@ -224,6 +227,7 @@ impl From<BackendArg> for BackendId {
     fn from(backend: BackendArg) -> Self {
         match backend {
             BackendArg::Docker => BackendId::Docker,
+            BackendArg::Podman => BackendId::Podman,
             BackendArg::Proxmox => BackendId::Proxmox,
         }
     }
@@ -571,10 +575,30 @@ fn execute<I: BufRead, O: Write, E: Write>(
             let Some(target) = on_argument(on, app, picker, interactive, "containers")? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
-            let backend = backend.map(BackendId::from);
-            let list = list_with_offers(app, &target, backend, input, output, error, interactive)?;
-            print_listing(output, &list)?;
-            Ok(ExitCode::SUCCESS)
+            let (lists, failed) = match backend.map(BackendId::from) {
+                Some(backend) => (
+                    vec![list_with_offers(
+                        app,
+                        &target,
+                        Some(backend),
+                        input,
+                        output,
+                        error,
+                        interactive,
+                    )?],
+                    false,
+                ),
+                None => {
+                    let every = list_every(app, &target, input, output, error, interactive)?;
+                    (every.lists, every.failed)
+                }
+            };
+            print_listings(output, &lists)?;
+            Ok(if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Some(Command::Shell {
             container,
@@ -590,57 +614,52 @@ fn execute<I: BufRead, O: Write, E: Write>(
                 return Ok(ExitCode::from(CANCELLED));
             };
             // A held shell was resolved before its terminal was opened.
-            let (backend, id, via) = match container {
-                Some(id) if hold => (backend.unwrap_or(BackendId::Docker), id, via.map(Via::from)),
+            let chosen = match container {
+                Some(id) if hold => Chosen {
+                    backend: backend.unwrap_or(BackendId::Docker),
+                    id,
+                    via: via.map(Via::from),
+                },
                 container => {
-                    let list =
-                        list_with_offers(app, &target, backend, input, output, error, interactive)?;
-                    let containers = &list.listing.containers;
-                    if containers.is_empty() {
-                        writeln!(error, "No running containers on {}.", list.target)
+                    let lists = match backend {
+                        Some(backend) => vec![list_with_offers(
+                            app,
+                            &target,
+                            Some(backend),
+                            input,
+                            output,
+                            error,
+                            interactive,
+                        )?],
+                        None => list_every(app, &target, input, output, error, interactive)?.lists,
+                    };
+                    if lists.iter().all(|list| list.listing.containers.is_empty()) {
+                        writeln!(error, "No running containers on {target}.")
                             .map_err(|error| error.to_string())?;
                         return Ok(ExitCode::FAILURE);
                     }
-                    let id = match container {
-                        Some(reference) => match resolve(&reference, containers) {
-                            Ok(container) => container.id.clone(),
-                            Err(ResolveError::NotFound) => {
-                                return Err(ContainerError::NoMatch {
-                                    target: list.target,
-                                    reference,
-                                }
-                                .to_string());
-                            }
-                            Err(ResolveError::Ambiguous(candidates)) => {
-                                return Err(ContainerError::Ambiguous {
-                                    target: list.target,
-                                    reference,
-                                    candidates,
-                                }
-                                .to_string());
-                            }
-                        },
+                    match container {
+                        Some(reference) => resolve_in(&target, &reference, &lists)?,
                         None if interactive && picker.available() => {
-                            let (ids, rows): (Vec<String>, Vec<Row>) =
-                                container_rows(&list).into_iter().unzip();
+                            let (mut chosen, rows): (Vec<Chosen>, Vec<Row>) =
+                                every_container_row(&lists).into_iter().unzip();
                             match picker.pick_one("container", rows)? {
-                                Some(index) => ids[index].clone(),
+                                Some(index) => chosen.swap_remove(index),
                                 None => return Ok(ExitCode::from(CANCELLED)),
                             }
                         }
                         None => {
                             return Err("choose a container: portico shell <container> (no terminal for the picker)".into());
                         }
-                    };
-                    (list.backend, id, list.via)
+                    }
                 }
             };
             let outcome = match app.container_shell(
                 &target,
-                backend,
-                &id,
+                chosen.backend,
+                &chosen.id,
                 user.as_deref(),
-                via,
+                chosen.via,
                 new_terminal && !hold,
                 None,
                 false,
@@ -948,15 +967,21 @@ mod tests {
 
     /// An app whose local container programs are fakes in a temporary directory. Each fake
     /// appends its arguments to `<name>.calls`, one call per line as `[arg][arg]…`, then
-    /// sources `<name>.behaviour` when it exists.
+    /// sources `<name>.behaviour` when it exists. Podman and Proxmox are not installed: `sh`
+    /// answers their listing scripts as a machine without `podman` and `pct` does.
     fn container_app() -> (TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
         for name in ["docker", "sudo", "sg", "sh", "ssh"] {
             let base = dir.path().join(name);
+            let missing = if name == "sh" {
+                "case \"$2\" in *'podman ps'*) echo 'sh: 2: exec: podman: not found' >&2; exit 127 ;; *'pct list'*) echo 'portico: no pct' >&2; exit 127 ;; esac\n"
+            } else {
+                ""
+            };
             write_executable(
                 &base,
                 &format!(
-                    "#!/bin/sh\nprintf '[%s]' \"$@\" >> '{base}.calls'\necho >> '{base}.calls'\nif [ -f '{base}.behaviour' ]; then . '{base}.behaviour'; fi\nexit 0\n",
+                    "#!/bin/sh\n{missing}printf '[%s]' \"$@\" >> '{base}.calls'\necho >> '{base}.calls'\nif [ -f '{base}.behaviour' ]; then . '{base}.behaviour'; fi\nexit 0\n",
                     base = base.display()
                 ),
             );

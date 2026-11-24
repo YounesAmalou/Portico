@@ -49,6 +49,13 @@ impl TestEnv {
             ),
         );
 
+        // A machine's own podman (CI runners have one) must not answer for the tests: this
+        // one fails as a missing podman does, until a test installs another.
+        write_executable(
+            bin.join("podman"),
+            "#!/bin/sh\necho 'sh: 2: exec: podman: not found' >&2\nexit 127\n",
+        );
+
         Self {
             _dir: dir,
             home,

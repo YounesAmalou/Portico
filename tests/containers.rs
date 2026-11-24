@@ -86,8 +86,13 @@ fn install_probe(env: &TestEnv, database: &str) {
     env.install_program("stat", "#!/bin/sh\necho docker\n");
 }
 
+/// The lines of an ssh fake that answer Podman's and Proxmox's listing scripts as a host
+/// without `podman` and `pct` does; `$last` is the remote command.
+const NO_PODMAN_NO_PCT: &str = "case $last in *'podman ps'*) echo 'sh: 2: exec: podman: not found' >&2; exit 127 ;; *'pct list'*) echo 'portico: no pct' >&2; exit 127 ;; esac\n";
+
 /// An initialised environment with the host `dev`, whose ssh logs its arguments and prints
-/// `listing` for any remote command.
+/// `listing` for any remote command but Podman's and Proxmox's listings: the host has
+/// neither.
 fn env_with_dev(listing: &str) -> TestEnv {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();
@@ -96,7 +101,7 @@ fn env_with_dev(listing: &str) -> TestEnv {
     env.install_program(
         "ssh",
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser u\\nport 22\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\ncat <<'EOF'\n{listing}\nEOF\n",
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser u\\nport 22\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\nfor a; do last=$a; done\n{NO_PODMAN_NO_PCT}cat <<'EOF'\n{listing}\nEOF\n",
             log(&env, "ssh").display()
         ),
     );
@@ -347,7 +352,7 @@ fn shell_ssh_255_is_explained() {
     env.install_program(
         "ssh",
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser user\\nport 22\\n'; exit 0; fi\nfor a; do last=$a; done\ncase $last in 'docker ps'*)\ncat <<'EOF'\n{}\nEOF\nexit 0 ;;\nesac\nprintf 'user@h: Permission denied (publickey).\\n' >&2\nexit 255\n",
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser user\\nport 22\\n'; exit 0; fi\nfor a; do last=$a; done\n{NO_PODMAN_NO_PCT}case $last in 'docker ps'*)\ncat <<'EOF'\n{}\nEOF\nexit 0 ;;\nesac\nprintf 'user@h: Permission denied (publickey).\\n' >&2\nexit 255\n",
             shop_listing()
         ),
     );
@@ -522,4 +527,134 @@ fn an_explicit_backend_reports_its_own_issue() {
             1,
             "error: pct is not available on this machine: it is not a Proxmox VE node.\n",
         );
+}
+
+/// One `podman ps --format json` listing: a `shop` web container and `toolbox`.
+const PODMAN_LISTING: &str = r#"[{"Id":"dddd4444","Names":["shop_web_1"],"Image":"docker.io/library/nginx","Status":"Up 3 hours","Labels":{"com.docker.compose.project":"shop","com.docker.compose.service":"web","com.docker.compose.container-number":"1"}},{"Id":"eeee5555","Names":["toolbox"],"Image":"fedora","Status":"Up 1 minute","Labels":null}]"#;
+
+/// A `podman` on this machine that prints `listing` for `ps` and logs every other call's
+/// arguments, one per line.
+fn install_podman(env: &TestEnv, listing: &str) {
+    env.install_program(
+        "podman",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = ps ]; then\ncat <<'EOF'\n{listing}\nEOF\nexit 0\nfi\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            log(env, "podman").display()
+        ),
+    );
+}
+
+#[test]
+fn a_podman_machine_without_docker_lists_its_containers() {
+    let env = TestEnv::new();
+    env.install_program(
+        "docker",
+        "#!/bin/sh\necho 'sh: 1: docker: not found' >&2\nexit 127\n",
+    );
+    install_podman(&env, PODMAN_LISTING);
+
+    let result = env.run(["containers"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert_eq!(
+        stdout,
+        "shop\n  web  shop_web_1  docker.io/library/nginx  Up 3 hours\nOther\n  toolbox  toolbox  fedora  Up 1 minute\n"
+    );
+}
+
+#[test]
+fn every_installed_backend_is_listed_in_its_own_section() {
+    let env = TestEnv::new();
+    install_docker(&env, &shop_listing());
+    install_podman(&env, PODMAN_LISTING);
+
+    let result = env.run(["containers"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert_eq!(
+        stdout,
+        "Docker\n\
+         shop\n  db   shop-db-1   postgres  Up 2 hours\n  web  shop-web-1  nginx     Up 2 hours\n\
+         Other\n  cache  cache  redis  Up 5 minutes\n\
+         \n\
+         Podman\n\
+         shop\n  web  shop_web_1  docker.io/library/nginx  Up 3 hours\n\
+         Other\n  toolbox  toolbox  fedora  Up 1 minute\n"
+    );
+}
+
+#[test]
+fn a_failing_backend_is_reported_while_the_others_are_listed() {
+    let env = TestEnv::new();
+    install_failing_docker(&env, "error during connect: something broke");
+    install_podman(&env, PODMAN_LISTING);
+
+    let result = env.run(["containers"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    assert!(stdout.contains("toolbox"), "{stdout}");
+    result.assert_exit_code_and_stderr(
+        1,
+        "error: docker failed on this machine: error during connect: something broke\n",
+    );
+}
+
+#[test]
+fn json_keeps_the_first_installed_backend() {
+    let env = TestEnv::new();
+    install_docker(&env, &shop_listing());
+    install_podman(&env, PODMAN_LISTING);
+
+    let result = env.run(["containers", "--json"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert!(!stdout.contains("\"backend\""), "{stdout}");
+    assert!(!stdout.contains("toolbox"), "{stdout}");
+
+    let result = env.run(["containers", "--json", "--backend", "podman"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert!(stdout.contains("\"backend\": \"podman\""), "{stdout}");
+}
+
+#[test]
+fn a_shell_reference_is_resolved_in_every_backend() {
+    let env = TestEnv::new();
+    install_shell_docker(&env, &shop_listing());
+    install_podman(&env, PODMAN_LISTING);
+
+    env.run(["shell", "toolbox", "-u", "app"]).assert_success();
+    assert_eq!(
+        read_log(&env, "podman"),
+        format!("exec\n-it\n-u\napp\neeee5555\nsh\n-c\n{SHELL_SCRIPT}\n")
+    );
+
+    env.run(["shell", "web"]).assert_exit_code_and_stderr(
+        1,
+        "error: web matches several containers on this machine: shop-web-1 (docker), shop_web_1 (podman); choose one with --backend\n",
+    );
+
+    env.run(["shell", "web", "--backend", "podman"])
+        .assert_success();
+    assert!(read_log(&env, "podman").ends_with(&format!("dddd4444\nsh\n-c\n{SHELL_SCRIPT}\n")));
+}
+
+#[test]
+fn a_podman_shell_in_a_new_terminal_names_its_backend() {
+    let env = env_with_dev("");
+    env.install_program(
+        "ssh",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = '-G' ]; then printf 'hostname h\\nuser u\\nport 22\\n'; exit 0; fi\nfor a; do last=$a; done\ncase $last in *'docker ps'*) echo 'sh: 1: docker: not found' >&2; exit 127 ;; *'podman ps'*) printf 'portico-user=deploy\\n%s\\n' '{PODMAN_LISTING}'; exit 0 ;; *'pct list'*) echo 'portico: no pct' >&2; exit 127 ;; esac\n"
+        ),
+    );
+
+    env.run(["shell", "toolbox", "--on", "dev", "-n"])
+        .assert_success();
+    assert_eq!(
+        fs::read_to_string(env.connection_log()).unwrap(),
+        format!(
+            "{}\nshell\n--hold\n--on\ndev\n--backend\npodman\n--\neeee5555\n",
+            env!("CARGO_BIN_EXE_portico")
+        )
+    );
 }
