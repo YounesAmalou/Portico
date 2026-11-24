@@ -226,6 +226,7 @@ mod tests {
         .unwrap();
         fs::write(&icon, launcher::icon_file()).unwrap();
         add_binding(&env);
+        std::os::unix::fs::symlink(env.panel_dir(), Target::Omarchy.link(&env)).unwrap();
         let s = status(&env);
         assert!(s.installed);
         assert!(
@@ -233,7 +234,20 @@ mod tests {
             "{:?}",
             s.lines
         );
-        assert!(s.lines.iter().any(|l| l.label == "Launcher"));
+        assert!(
+            s.lines
+                .iter()
+                .any(|l| l.label == "Launcher" && l.text.contains("runs ")),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            s.lines.iter().any(|l| l.label.is_empty()
+                && l.text.starts_with("  Omarchy")
+                && l.text.contains("->")),
+            "{:?}",
+            s.lines
+        );
         assert!(
             s.lines
                 .iter()
