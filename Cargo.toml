@@ -6,7 +6,6 @@ rust-version = "1.88"
 description = "Keyboard-first terminal UI and CLI for managing OpenSSH hosts without taking over OpenSSH"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/YounesAmalou/Portico"
-homepage = "https://github.com/YounesAmalou/Portico"
 readme = "README.md"
 authors = ["Younes A. Amalou (Yousen)"]
 keywords = ["ssh", "tui", "openssh", "cli", "config"]
