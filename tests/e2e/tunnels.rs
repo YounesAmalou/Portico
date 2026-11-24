@@ -5,7 +5,6 @@ use std::{
     fs,
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    path::Path,
     process::{Child, Command},
     thread,
     time::{Duration, Instant},
@@ -86,9 +85,7 @@ fn pid_of(client: &Client, name: &str) -> u32 {
 
 fn wait_gone(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Path::new(&format!("/proc/{pid}")).exists()
-        && !fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(") Z"))
-    {
+    while crate::procs::running(pid) {
         assert!(Instant::now() < deadline, "process {pid} is still running");
         thread::sleep(Duration::from_millis(20));
     }
@@ -297,14 +294,7 @@ fn stop_never_signals_a_stranger() {
     );
     let mut stranger = Stranger(Command::new("sleep").arg("30").spawn().unwrap());
     let pid = stranger.0.id();
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let start: u64 = stat[stat.rfind(')').unwrap() + 2..]
-        .split_whitespace()
-        .nth(19)
-        .unwrap()
-        .parse()
-        .unwrap();
-    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let (start, boot) = crate::procs::start_and_boot(pid);
     fs::create_dir_all(client.tunnel_runtime()).unwrap();
     // The PID now belongs to another process (a wrong start time), and then a process that
     // matches the PID and start time but is not the tunnel (no log in its command line).
@@ -397,20 +387,12 @@ fn the_tui_adds_starts_and_stops_a_tunnel() {
 /// started before the tunnel backgrounds itself is not its child but a sibling, so they are
 /// found by their command line.
 fn proxies_to(port: u16) -> Vec<u32> {
-    fs::read_dir("/proc")
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-                let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
-                args.contains(&b"-W".as_slice())
-                    && args
-                        .iter()
-                        .any(|arg| String::from_utf8_lossy(arg).contains(&port.to_string()))
-            })
-        })
-        .collect()
+    crate::procs::with_args(|args| {
+        args.iter().any(|arg| arg == b"-W")
+            && args
+                .iter()
+                .any(|arg| String::from_utf8_lossy(arg).contains(&port.to_string()))
+    })
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Portico
 
-Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
+Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux and macOS. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
 Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker and Podman containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
@@ -9,14 +9,14 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Lists Portico-managed and existing OpenSSH hosts in one inventory.
 - Adds, edits, inspects, renames, and removes managed hosts.
 - Shows the effective configuration reported by `ssh -G`.
-- Connects in the current terminal or through `xdg-terminal-exec`.
+- Connects in the current terminal or in a new terminal window (`xdg-terminal-exec` on Linux; Terminal, iTerm2, Ghostty, WezTerm, kitty or Alacritty on macOS).
 - Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
 - Lists the running Docker and Podman containers on this machine or a host, grouped by Compose project, and a Proxmox VE node's LXC containers, and opens a shell in one.
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Prints one versioned JSON document per command for scripts and desktop panels.
-- Comes with a desktop panel for Quickshell and Omarchy to open hosts and container shells in a new terminal and to start and stop tunnels.
+- Comes with a desktop panel for Quickshell and Omarchy (Linux) to open hosts and container shells in a new terminal and to start and stop tunnels.
 - Provides a TUI with Hosts and Tunnels tabs and a tab per container backend (Docker, Podman, Proxmox) when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
@@ -27,11 +27,11 @@ Private keys remain where they already live. Portico stores identity-file refere
 
 ## Requirements
 
-- Linux on x86_64 (verified on Arch Linux; other platforms are on the [roadmap](ROADMAP.md))
+- Linux on x86_64 or aarch64 (verified on Arch Linux), or macOS on Apple silicon or Intel (Windows is on the [roadmap](ROADMAP.md))
 - OpenSSH client tools (`ssh`)
-- `xdg-terminal-exec` for the new-terminal option only
+- `xdg-terminal-exec` for the new-terminal option only, on Linux
 - Only for container shells, on this machine or on the host: `docker`, `podman`, or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
-- Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel)
+- Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel) (Linux only)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
 
@@ -44,6 +44,14 @@ yay -S portico
 ```
 
 The package builds from the tagged source; `cargo` is only a build dependency and is installed and removed for you.
+
+### macOS (Homebrew)
+
+```sh
+brew install younesamalou/tap/portico
+```
+
+The formula installs the release's prebuilt binary for Apple silicon or Intel. macOS ships the OpenSSH client Portico needs. The release tarballs (`portico-vX.Y.Z-aarch64-apple-darwin.tar.gz`, `…-x86_64-apple-darwin.tar.gz`) hold the same binary; it is not notarized, so a copy downloaded with a browser must have its quarantine removed (`xattr -d com.apple.quarantine portico`) before macOS runs it.
 
 ### Release packages and binaries
 
@@ -220,7 +228,9 @@ portico connect development
 portico connect development --new-terminal
 ```
 
-New-terminal connections are handed to `xdg-terminal-exec` in the background, so the CLI returns without waiting for the session and the TUI remains usable. If the launcher fails right away (for example no terminal is available) its exit status is reported; once it has started, Portico can only report that the launch was requested, not whether the SSH session succeeds.
+New-terminal connections are handed to `xdg-terminal-exec` (on macOS, see below) in the background, so the CLI returns without waiting for the session and the TUI remains usable. If the launcher fails right away (for example no terminal is available) its exit status is reported; once it has started, Portico can only report that the launch was requested, not whether the SSH session succeeds.
+
+On macOS, a new terminal window opens in the terminal named by `PORTICO_TERMINAL` (`Terminal`, `iTerm2`, `Ghostty`, `WezTerm`, `kitty` or `Alacritty`, or the path of a launcher program that takes the command as its arguments, like `xdg-terminal-exec`), otherwise in the terminal Portico itself runs in, otherwise in Terminal. Terminal and iTerm2 are handed a private, self-deleting `.command` script, so no Automation permission is asked for.
 
 Test a connection:
 
@@ -313,7 +323,7 @@ portico tunnel stop db
 
 `stop` signals only the process Portico started: it recognises it by its PID together with its start time, the boot and its command line, so a PID reused by another process is never signalled. `start` and `stop` succeed when the tunnel is already in that state, so scripts can call them directly. A running tunnel cannot be edited or removed; stop it first. Without a name, `show`, `edit`, `remove`, `start` and `stop` pick a tunnel with the picker.
 
-Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory; if the record is lost while the tunnel runs, Portico finds the process again.
+Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory (always, on macOS); if the record is lost while the tunnel runs, Portico finds the process again.
 
 ### Machine-readable output
 
@@ -329,7 +339,7 @@ In JSON mode Portico never opens a picker or asks a question (a missing name is 
 
 ### Settings
 
-Press `,` in the TUI to open the settings. The overlay lists a checkbox for each tab that can be hidden (Tunnels, Docker, Podman and Proxmox; Hosts is always shown) and the desktop integration. `↑` / `↓` or `j` / `k` move, `Space` or `Enter` toggles a tab or runs an action, and `Esc` or `,` closes it. A hidden tab disappears from the tab bar, and neither the TUI nor the desktop panel runs its tool (`docker`, `podman` or `pct`) while it is hidden. The desktop integration shows what `portico desktop status` reports and offers **Install or update** and, once something is installed, **Uninstall**; each runs the same preview and confirmations as `portico desktop install` and `uninstall`. The desktop panel reads the same settings and hides the same tabs.
+Press `,` in the TUI to open the settings. The overlay lists a checkbox for each tab that can be hidden (Tunnels, Docker, Podman and Proxmox; Hosts is always shown) and, on Linux, the desktop integration. `↑` / `↓` or `j` / `k` move, `Space` or `Enter` toggles a tab or runs an action, and `Esc` or `,` closes it. A hidden tab disappears from the tab bar, and neither the TUI nor the desktop panel runs its tool (`docker`, `podman` or `pct`) while it is hidden. On Linux, the desktop integration shows what `portico desktop status` reports and offers **Install or update** and, once something is installed, **Uninstall**; each runs the same preview and confirmations as `portico desktop install` and `uninstall`. The desktop panel reads the same settings and hides the same tabs.
 
 The settings live in `~/.config/portico/settings.toml` (under `$XDG_CONFIG_HOME` when set). The file is optional: without it, every tab is shown. It is plain TOML, and you can edit it by hand:
 
@@ -363,6 +373,8 @@ Use `portico <command> --help` for the authoritative options for a command.
 ## Desktop panel
 
 ![The desktop panel, with saved tunnels and an expanded host](desktop/quickshell/preview.png)
+
+The desktop panel and `portico desktop` need Linux; on macOS the command is hidden and refused.
 
 `desktop/quickshell/` is a small Quickshell panel: the saved tunnels with their status and a Start or Stop button, and the hosts to connect to in a new terminal, each expandable to its running containers to open a shell in. It runs `portico` with `--json` when it opens and lists the tunnels again every 5 seconds while it stays open; nothing runs while it is closed. Containers are listed only when you expand a host (`→`), and the panel never runs `portico show`. It manages nothing: hosts and tunnels are added, edited and removed in the CLI and the TUI. Typing filters tunnels by name or host, hosts by alias, and the containers already listed by name, image or ID (a host whose listed containers match stays visible, showing only those), `↑` / `↓` move, `Enter` connects, opens the shell or starts or stops the tunnel, `←` collapses, `F5` lists again and `Esc` closes.
 

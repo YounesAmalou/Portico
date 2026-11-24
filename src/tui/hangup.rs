@@ -114,11 +114,16 @@ impl Drop for HangupWatch {
 /// Sleeps until `tty` hangs up (true) or `stopped`'s peer is dropped (false).
 fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     // Hang-ups and errors are always reported, so the terminal asks for no events: its
-    // ordinary input must not wake the watcher.
+    // ordinary input must not wake the watcher. macOS reports a terminal's hang-up only to a
+    // poll for input, so there input wakes the watcher too, which tells the two apart.
     let mut fds = [
         libc::pollfd {
             fd: tty.as_raw_fd(),
-            events: 0,
+            events: if cfg!(target_os = "macos") {
+                libc::POLLIN
+            } else {
+                0
+            },
             revents: 0,
         },
         libc::pollfd {
@@ -142,17 +147,51 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             return true;
         }
+        if fds[0].revents & libc::POLLIN != 0 {
+            if stays_readable_and_empty(tty) {
+                return true;
+            }
+            // Input waits for its reader: look again shortly, not at once.
+            thread::sleep(Duration::from_millis(50));
+        }
     }
+}
+
+/// Whether a terminal that polled readable holds no input and stays that way: reading it would
+/// return end of file, as a hung-up terminal does. Input the interface reads between two looks
+/// also leaves the terminal empty, but then no longer readable, so it is looked at a few times.
+fn stays_readable_and_empty(tty: &OwnedFd) -> bool {
+    for _ in 0..3 {
+        let mut poll = libc::pollfd {
+            fd: tty.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` that outlives the call.
+        if unsafe { libc::poll(&mut poll, 1, 0) } == -1 {
+            return false;
+        }
+        if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return true;
+        }
+        if poll.revents & libc::POLLIN == 0 {
+            return false;
+        }
+        let mut queued: libc::c_int = 0;
+        // SAFETY: `FIONREAD` writes one `int` to the location given.
+        let read = unsafe { libc::ioctl(tty.as_raw_fd(), libc::FIONREAD as _, &mut queued) };
+        if read == 0 && queued > 0 {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
 }
 
 /// Points `target` at the read end of a pipe that stays empty and open, so reading it fails
 /// with `WouldBlock` instead of returning end of file.
 fn replace_with_quiet_pipe(target: RawFd) -> io::Result<()> {
-    let mut ends = [-1; 2];
-    // SAFETY: `pipe2` writes two new descriptors into `ends`.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    let ends = crate::platform::fs::nonblocking_pipe()?;
     // SAFETY: `dup2` atomically swaps `target` for the pipe; the read end's own descriptor is
     // then closed. The write end is left open for the life of the process, or reads would see
     // end of file.
@@ -234,8 +273,8 @@ mod tests {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
             assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
             (OwnedFd::from_raw_fd(master), File::from_raw_fd(slave))

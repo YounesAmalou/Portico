@@ -465,14 +465,10 @@ fn external_hosts_can_be_tested() {
 }
 
 fn alive(pid: libc::pid_t) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+    u32::try_from(pid)
         .ok()
-        .and_then(|stat| {
-            stat.rsplit(')')
-                .next()
-                .map(|rest| rest.trim_start().to_owned())
-        })
-        .is_some_and(|state| !state.starts_with('Z'))
+        .and_then(|pid| portico::platform::process::Proc::system().stat(pid))
+        .is_some_and(|stat| stat.state != 'Z')
 }
 
 #[test]
@@ -958,4 +954,15 @@ fn settings_reports_an_invalid_file() {
     std::fs::write(settings_file(&env), "[tabs\n").unwrap();
     env.run(["settings"])
         .assert_exit_code_and_stderr_contains(1, "line 1");
+}
+
+/// The desktop integration is Omarchy's: other systems refuse it and keep it out of the help.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn the_desktop_integration_is_refused_outside_linux() {
+    let env = TestEnv::new();
+    env.run(["desktop", "status"])
+        .assert_exit_code_and_stderr_contains(1, "needs Linux with Omarchy");
+    let help = env.run(["--help"]);
+    assert!(!String::from_utf8_lossy(&help.0.stdout).contains("desktop"));
 }

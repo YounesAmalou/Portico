@@ -381,6 +381,8 @@ fn settings_overlay_hides_a_tab() {
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
+/// The desktop integration is Omarchy's, so only Linux offers it in the overlay.
+#[cfg(target_os = "linux")]
 #[test]
 fn settings_overlay_runs_a_desktop_action_and_comes_back() {
     let env = TestEnv::new();

@@ -89,7 +89,7 @@ fn security_policy_names_a_private_reporting_channel() {
 #[test]
 fn manual_runs_never_release_or_publish() {
     let workflow = read(".github/workflows/release.yml");
-    for job in ["release", "crates", "aur"] {
+    for job in ["release", "crates", "aur", "homebrew"] {
         let section = workflow
             .split(&format!("\n  {job}:\n"))
             .nth(1)
@@ -354,6 +354,21 @@ fn release_artifacts_are_built_verified_checksummed_and_attested() {
     }
     assert_eq!(build.matches("uses: actions/attest@").count(), 2);
 
+    let macos = release_job("build-macos");
+    for expected in [
+        "target: [aarch64-apple-darwin, x86_64-apple-darwin]",
+        "runs-on: macos-latest",
+        "scripts/build-release.sh",
+        "sbom-path:",
+    ] {
+        assert!(
+            macos.contains(expected),
+            "the build-macos job lacks {expected}"
+        );
+    }
+    assert_eq!(macos.matches("uses: actions/attest@").count(), 2);
+    assert!(release_job("checksums").contains("needs: [verify-packages, build-macos]"));
+
     let verify = release_job("verify-packages");
     assert!(verify.contains("runner: ubuntu-24.04-arm"));
     assert!(verify.contains("scripts/verify-packages.sh"));
@@ -374,6 +389,7 @@ fn release_artifacts_are_built_verified_checksummed_and_attested() {
         "release",
         "crates",
         "aur",
+        "homebrew",
     ] {
         let section = release_job(job);
         assert!(
@@ -381,7 +397,7 @@ fn release_artifacts_are_built_verified_checksummed_and_attested() {
             "{job} must not be able to attest"
         );
     }
-    for job in ["build", "checksums"] {
+    for job in ["build", "build-macos", "checksums"] {
         let section = release_job(job);
         assert!(
             section.contains("id-token: write") && section.contains("attestations: write"),
@@ -637,6 +653,32 @@ fn readme_documents_the_desktop_panel() {
         assert!(
             section.contains(needle),
             "README's Desktop panel section lacks {needle}"
+        );
+    }
+}
+
+#[test]
+fn the_homebrew_tap_is_updated_with_its_own_secret_only_after_the_release() {
+    let homebrew = release_job("homebrew");
+    for expected in [
+        "needs: [verify, release]",
+        "environment: homebrew",
+        "HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}",
+        "scripts/homebrew-formula.sh",
+    ] {
+        assert!(
+            homebrew.contains(expected),
+            "the homebrew job lacks {expected}"
+        );
+    }
+    for other in [
+        "CARGO_REGISTRY_TOKEN",
+        "AUR_SSH_PRIVATE_KEY",
+        "contents: write",
+    ] {
+        assert!(
+            !homebrew.contains(other),
+            "the homebrew job must not use {other}"
         );
     }
 }

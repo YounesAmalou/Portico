@@ -191,6 +191,7 @@ enum Command {
         json: bool,
     },
     /// Install the desktop panel, a launcher entry and a keybinding, or show or remove them.
+    #[cfg_attr(not(target_os = "linux"), command(hide = true))]
     Desktop {
         #[command(subcommand)]
         command: desktop::DesktopCommand,

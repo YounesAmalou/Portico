@@ -20,5 +20,11 @@ install -m 0755 "$binary" "$stage/$name/portico"
 install -m 0644 "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/README.md" "$stage/$name/"
 
 outdir=$(readlink -f "$outdir")
-tar -C "$stage" --owner=0 --group=0 -czf "$outdir/$name.tar.gz" "$name"
+# GNU tar (Linux) and bsdtar (macOS) spell "owned by root" differently.
+if tar --version 2>/dev/null | grep -q GNU; then
+    owner=(--owner=0 --group=0)
+else
+    owner=(--uid 0 --gid 0)
+fi
+tar -C "$stage" "${owner[@]}" -czf "$outdir/$name.tar.gz" "$name"
 echo "$outdir/$name.tar.gz"

@@ -1,6 +1,8 @@
 //! `portico desktop` against fake `omarchy-shell`, `omarchy`, `qs`, `hyprctl` and `swaymsg`, in a
 //! temporary home. Nothing here reads or writes the real `~/.config`.
 
+#![cfg(target_os = "linux")]
+
 #[path = "support/executable.rs"]
 mod executable;
 

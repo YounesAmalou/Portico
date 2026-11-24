@@ -66,13 +66,14 @@ pub(super) struct SettingsOverlay {
     cursor: usize,
     /// The tabs as written, applied when the overlay closes.
     pub(super) tabs: Tabs,
-    pub(super) desktop: Status,
+    /// The desktop integration's status, or `None` where it is not offered (outside Linux).
+    pub(super) desktop: Option<Status>,
     /// The last toggle's or action's failure, as one line.
     pub(super) error: Option<String>,
 }
 
 impl SettingsOverlay {
-    pub(super) fn open(tabs: Tabs, desktop: Status) -> Self {
+    pub(super) fn open(tabs: Tabs, desktop: Option<Status>) -> Self {
         Self {
             cursor: 0,
             tabs,
@@ -84,9 +85,11 @@ impl SettingsOverlay {
     /// The toggles in `Key::ALL` order, then the desktop actions on offer.
     pub(super) fn rows(&self) -> Vec<Row> {
         let mut rows = Key::ALL.into_iter().map(Row::Toggle).collect::<Vec<_>>();
-        rows.push(Row::Run(DesktopRun::Install));
-        if self.desktop.installed {
-            rows.push(Row::Run(DesktopRun::Uninstall));
+        if let Some(desktop) = &self.desktop {
+            rows.push(Row::Run(DesktopRun::Install));
+            if desktop.installed {
+                rows.push(Row::Run(DesktopRun::Uninstall));
+            }
         }
         rows
     }
@@ -131,7 +134,7 @@ impl SettingsOverlay {
 
     /// Records a desktop action's outcome and the status read after it.
     pub(super) fn finish_run(&mut self, result: Result<(), String>, desktop: Status) {
-        self.desktop = desktop;
+        self.desktop = Some(desktop);
         self.error = result.err();
         self.cursor = self.cursor.min(self.rows().len() - 1);
     }
@@ -158,32 +161,34 @@ impl SettingsOverlay {
             let check = if on { "x" } else { " " };
             lines.push(Line::raw(format!("{marker} [{check}] {}", label(key))));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("Desktop integration", bold));
-        for line in &self.desktop.lines {
-            lines.push(Line::raw(keep_start(
-                &format!("  {}", line.render()),
-                inner,
-            )));
-        }
-        let on_action = matches!(cursor, Some(Row::Run(_)));
-        if on_action {
-            cursor_line = lines.len();
-        }
-        let mut actions = vec![Span::raw(if on_action { "> " } else { "  " })];
-        for row in &rows {
-            let Row::Run(run) = *row else { continue };
-            if actions.len() > 1 {
-                actions.push(Span::raw("  "));
+        if let Some(desktop) = &self.desktop {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Desktop integration", bold));
+            for line in &desktop.lines {
+                lines.push(Line::raw(keep_start(
+                    &format!("  {}", line.render()),
+                    inner,
+                )));
             }
-            let text = format!("[{}]", run.label());
-            actions.push(if cursor == Some(*row) {
-                Span::styled(text, selected)
-            } else {
-                Span::raw(text)
-            });
+            let on_action = matches!(cursor, Some(Row::Run(_)));
+            if on_action {
+                cursor_line = lines.len();
+            }
+            let mut actions = vec![Span::raw(if on_action { "> " } else { "  " })];
+            for row in &rows {
+                let Row::Run(run) = *row else { continue };
+                if actions.len() > 1 {
+                    actions.push(Span::raw("  "));
+                }
+                let text = format!("[{}]", run.label());
+                actions.push(if cursor == Some(*row) {
+                    Span::styled(text, selected)
+                } else {
+                    Span::raw(text)
+                });
+            }
+            lines.push(Line::from(actions));
         }
-        lines.push(Line::from(actions));
         lines.push(Line::raw(""));
         lines.push(Line::raw(keep_start(path, inner)));
         if let Some(error) = &self.error {
@@ -276,8 +281,17 @@ mod tests {
     }
 
     #[test]
+    fn without_the_desktop_integration_only_the_toggles_are_rows() {
+        let overlay = SettingsOverlay::open(Tabs::default(), None);
+        assert_eq!(
+            overlay.rows(),
+            Key::ALL.into_iter().map(Row::Toggle).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rows_without_an_installation_have_no_uninstall() {
-        let overlay = SettingsOverlay::open(Tabs::default(), status(false));
+        let overlay = SettingsOverlay::open(Tabs::default(), Some(status(false)));
         assert_eq!(
             overlay.rows(),
             vec![
@@ -288,7 +302,7 @@ mod tests {
                 Row::Run(DesktopRun::Install),
             ]
         );
-        let overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        let overlay = SettingsOverlay::open(Tabs::default(), Some(status(true)));
         assert_eq!(
             overlay.rows().last(),
             Some(&Row::Run(DesktopRun::Uninstall))
@@ -297,7 +311,7 @@ mod tests {
 
     #[test]
     fn enter_on_a_toggle_asks_to_toggle_it() {
-        let mut overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        let mut overlay = SettingsOverlay::open(Tabs::default(), Some(status(true)));
         press(&mut overlay, KeyCode::Down);
         press(&mut overlay, KeyCode::Char('j'));
         assert_eq!(
@@ -331,7 +345,7 @@ mod tests {
 
     #[test]
     fn esc_and_comma_close() {
-        let mut overlay = SettingsOverlay::open(Tabs::default(), status(false));
+        let mut overlay = SettingsOverlay::open(Tabs::default(), Some(status(false)));
         assert_eq!(press(&mut overlay, KeyCode::Esc), OverlayAction::Close);
         assert_eq!(
             press(&mut overlay, KeyCode::Char(',')),
@@ -343,7 +357,7 @@ mod tests {
     #[test]
     fn the_overlay_is_as_tall_as_its_lines_on_a_narrow_terminal() {
         use ratatui::{Terminal, backend::TestBackend};
-        let mut overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        let mut overlay = SettingsOverlay::open(Tabs::default(), Some(status(true)));
         overlay.error = Some(
             "invalid settings file ~/.config/portico/settings.toml: line 1: expected `]`".into(),
         );
@@ -369,7 +383,7 @@ mod tests {
     #[test]
     fn a_short_terminal_scrolls_to_the_cursor() {
         use ratatui::{Terminal, backend::TestBackend};
-        let mut overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        let mut overlay = SettingsOverlay::open(Tabs::default(), Some(status(true)));
         let draw = |overlay: &SettingsOverlay| {
             let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
             terminal
@@ -400,7 +414,7 @@ mod tests {
 
     #[test]
     fn a_refreshed_status_keeps_the_cursor_on_a_row() {
-        let mut overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        let mut overlay = SettingsOverlay::open(Tabs::default(), Some(status(true)));
         for _ in 0..10 {
             press(&mut overlay, KeyCode::Down);
         }

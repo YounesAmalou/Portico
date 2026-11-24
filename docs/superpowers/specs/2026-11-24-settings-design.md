@@ -13,6 +13,7 @@ This slice adds a settings overlay to the TUI and `portico settings` for scripts
 - Turn the tunnels tab and each container backend's tab on or off, from the TUI and from the CLI. The hosts tab is always on.
 - A turned-off tab is hidden from the TUI and from the desktop panel. Neither the TUI nor the panel ever runs a turned-off backend's tool (`docker`, `podman`, `pct`); the CLI, run by hand, does what it is told.
 - The desktop integration's status (installed, out of date, missing pieces) and its install, update and uninstall actions are reachable from the TUI, with exactly the previews and confirmations of `portico desktop install | uninstall`.
+- On macOS, where `portico desktop` is refused (macOS support shipped alongside this slice), the overlay leaves the desktop integration out and shows only the tabs.
 - Portico works without the file, and its defaults match today's behaviour: everything on.
 
 ## Non-goals

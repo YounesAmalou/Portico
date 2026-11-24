@@ -64,6 +64,9 @@ class Screen:
 
 binary, home, fake_bin, *requested = sys.argv[1:]
 environment = dict(os.environ, HOME=home, PATH=fake_bin + os.pathsep + os.environ["PATH"])
+# macOS runs the fake launcher named here; Linux finds it on `PATH`.
+environment["PORTICO_TERMINAL"] = os.path.join(fake_bin, "xdg-terminal-exec")
+environment.pop("TERM_PROGRAM", None)
 # The developer's own agent must never be asked (a locked 1Password would prompt).
 environment.pop("SSH_AUTH_SOCK", None)
 # Settings come from the temporary home, never the developer's own.
@@ -73,11 +76,48 @@ environment.pop("XDG_CONFIG_HOME", None)
 def is_running(pid):
     """Whether `pid` can still run. A zombie is dead: containers whose PID 1 never reaps
     orphans (as in CI) leave killed processes behind as zombies that signals still reach."""
+    if not Path("/proc").is_dir():
+        # macOS: ps prints nothing for a process that is gone.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return state.strip() != "" and not state.strip().startswith("Z")
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except FileNotFoundError:
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def wait_draining(process, master, transcript, timeout):
+    """Waits for Portico to exit while reading what it still writes: macOS holds an exiting
+    process that controls the terminal until its last output has been read."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = process.poll()
+        if status is not None:
+            return status
+        if time.monotonic() >= deadline:
+            report_hang(process.pid)
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        if select.select([master], [], [], 0.05)[0]:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                time.sleep(0.01)
+            transcript.extend(data)
+
+
+def report_hang(pid):
+    """Prints what a Portico that does not exit is doing, for the CI log."""
+    commands = [["ps", "-axo", "pid,ppid,pgid,stat,command"]]
+    if sys.platform == "darwin":
+        commands.append(["sample", str(pid), "1"])
+    else:
+        commands.append(["cat", f"/proc/{pid}/stack"])
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True)
+        print(f"$ {' '.join(command)}\n{result.stdout}{result.stderr}", file=sys.stderr)
 
 
 def check_terminal(scenario):
@@ -210,11 +250,17 @@ def check_terminal(scenario):
                 assert time.monotonic() < deadline, "connection did not start"
                 time.sleep(0.01)
             _, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())
-            assert str(child) not in Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
-            assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
+            # Linux lists children per thread: the connection's child belongs to the worker.
+            if Path("/proc").is_dir():
+                assert str(child) not in Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+                assert str(child) in Path(f"/proc/{parent}/task/{worker}/children").read_text().split()
         elif scenario == "interrupt_connection":
             # Ctrl+C while ssh connects goes to the whole foreground group: ssh ends, Portico stays.
+            left_at = len(transcript)
             os.write(master, b"\r")
+            # Read the switch away from the TUI first: a terminal's Ctrl+C discards output not
+            # yet read, which on macOS can still hold it.
+            read_until(b"\x1b[?1049l", left_at)
             deadline = time.monotonic() + 5
             while not Path(home, "interrupt-ready").exists():
                 assert time.monotonic() < deadline, "connection did not start"
@@ -224,7 +270,8 @@ def check_terminal(scenario):
             assert "alpha" in screen.text()
             time.sleep(0.2)
             assert process.poll() is None, "Ctrl+C during the connection quit the TUI"
-            assert b"\x1b[?1049h" in transcript[transcript.rindex(b"\x1b[?1049l"):]
+            assert b"\x1b[?1049l" in transcript, f"{scenario}: the TUI never left the screen: {bytes(transcript)!r}"
+            assert b"\x1b[?1049h" in transcript[transcript.rindex(b"\x1b[?1049l"):], f"{scenario}: {bytes(transcript)!r}"
         elif scenario == "input_rules":
             # Whitespace never enters a field, however it arrives; the saved host proves it.
             os.write(master, b"a")
@@ -425,9 +472,15 @@ def check_terminal(scenario):
         else:
             assert b"\x1b[<1u" not in transcript
         read_until(b"\x1b[?25h", left)
-        status = process.wait(timeout=5)
+        status = wait_draining(process, master, transcript, 5)
         assert status == 0, f"{scenario}: exit status {status}: {transcript!r}"
-        assert termios.tcgetattr(slave) == before, f"{scenario}: termios was not restored"
+        try:
+            after = termios.tcgetattr(slave)
+        except termios.error:
+            # macOS revokes the slave once the session leader that controlled it exits; the
+            # master side reads the same terminal settings.
+            after = termios.tcgetattr(master)
+        assert after == before, f"{scenario}: termios was not restored"
         assert b"\x1b[?1049l" in transcript[start:]
         if scenario == "blocked_connection":
             shell, parent, worker, child = map(int, Path(home, "connection-started").read_text().split())

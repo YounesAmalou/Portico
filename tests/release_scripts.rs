@@ -118,3 +118,66 @@ fn package_release_requires_the_target() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("<target>"));
 }
+
+#[test]
+fn homebrew_formula_names_both_macos_tarballs_with_their_checksums() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path()
+            .join("portico-v1.2.3-aarch64-apple-darwin.tar.gz"),
+        "arm",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("portico-v1.2.3-x86_64-apple-darwin.tar.gz"),
+        "intel",
+    )
+    .unwrap();
+    let output = Command::new(script("homebrew-formula.sh"))
+        .arg("1.2.3")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let formula = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        formula.starts_with("class Portico < Formula\n"),
+        "{formula}"
+    );
+    assert!(!formula.contains('@'), "a placeholder is left: {formula}");
+    for expected in [
+        "version \"1.2.3\"",
+        "/releases/download/v1.2.3/portico-v1.2.3-aarch64-apple-darwin.tar.gz\"",
+        "/releases/download/v1.2.3/portico-v1.2.3-x86_64-apple-darwin.tar.gz\"",
+        // SHA-256 of "arm" and of "intel".
+        "sha256 \"ddf7ff5ebd9d66ce161466c1c0262430fa04de32b0e420ee3f489e2e2112e386\"",
+        "sha256 \"96eebba49dbbf422d245f02290f9d4ed0eb02da9daa6bbceefb162800ff42481\"",
+    ] {
+        assert!(
+            formula.contains(expected),
+            "the formula lacks {expected}:\n{formula}"
+        );
+    }
+}
+
+#[test]
+fn homebrew_formula_requires_both_tarballs() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path()
+            .join("portico-v1.2.3-aarch64-apple-darwin.tar.gz"),
+        "arm",
+    )
+    .unwrap();
+    let output = Command::new(script("homebrew-formula.sh"))
+        .arg("1.2.3")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("x86_64-apple-darwin.tar.gz"));
+}

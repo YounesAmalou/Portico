@@ -355,7 +355,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 }
             }
             UiAction::CancelPlan => workers.planner.cancel(),
-            UiAction::OpenSettings => state.open_settings(status(desktop)),
+            // The desktop integration is Omarchy's, so other systems leave it out of the overlay.
+            UiAction::OpenSettings => {
+                state.open_settings(cfg!(target_os = "linux").then(|| status(desktop)));
+            }
             UiAction::Setting(key) => toggle_setting(app, &mut state, key),
             UiAction::Desktop(run) => {
                 let result = match std::env::current_exe() {
@@ -1225,8 +1228,9 @@ impl UiState {
         }
     }
 
-    /// Opens the settings overlay with the tabs as they are and the desktop's `status`.
-    fn open_settings(&mut self, desktop: Status) {
+    /// Opens the settings overlay with the tabs as they are and the desktop's status, if the
+    /// desktop integration is offered here.
+    fn open_settings(&mut self, desktop: Option<Status>) {
         self.settings = Some(SettingsOverlay::open(self.tabs, desktop));
         self.mode = Mode::Settings;
     }
@@ -3383,7 +3387,7 @@ mod tests {
         state.home = app.home().to_owned();
         state.settings_path = app.settings_path().to_owned();
         assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
-        state.open_settings(no_desktop());
+        state.open_settings(Some(no_desktop()));
         state
     }
 
@@ -3391,7 +3395,7 @@ mod tests {
     fn comma_opens_the_overlay_only_while_browsing() {
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
-        state.open_settings(no_desktop());
+        state.open_settings(Some(no_desktop()));
         assert_eq!(state.mode, Mode::Settings);
         let text = rendered(&state);
         assert!(text.contains("Settings"), "{text}");
@@ -3410,20 +3414,20 @@ mod tests {
         let mut state = tunnels_state();
         char(&mut state, '2');
         assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
-        state.open_settings(no_desktop());
+        state.open_settings(Some(no_desktop()));
         // The tab's footer gives way to the overlay's, on every tab.
         let text = rendered(&state);
         assert!(!text.contains("q quit"), "{text}");
         char(&mut state, ',');
         char(&mut state, '3');
         char(&mut state, ',');
-        state.open_settings(no_desktop());
+        state.open_settings(Some(no_desktop()));
         let text = rendered(&state);
         assert!(!text.contains("q quit"), "{text}");
         char(&mut state, ',');
         char(&mut state, '2');
         char(&mut state, ',');
-        state.open_settings(no_desktop());
+        state.open_settings(Some(no_desktop()));
         assert_eq!(char(&mut state, 's'), UiAction::None);
         assert_eq!(char(&mut state, '1'), UiAction::None);
         assert_eq!(state.tab, Tab::Tunnels);
