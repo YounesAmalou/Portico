@@ -6,7 +6,7 @@ use std::{io::Write, path::Path, process::ExitCode};
 
 use serde_json::{Map, Value, json};
 
-use super::{format_warning, ownership};
+use super::hosts::{format_warning, ownership};
 use crate::{
     app::{
         App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
