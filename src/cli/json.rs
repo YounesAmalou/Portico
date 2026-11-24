@@ -49,7 +49,7 @@ pub(super) struct Failure {
     kind: &'static str,
     message: String,
     next: Vec<String>,
-    /// Docker's problem, for kind `docker`.
+    /// The backend's problem, when it names one.
     problem: Option<&'static str>,
 }
 
@@ -119,13 +119,13 @@ impl From<ContainerError> for Failure {
                     },
                 ),
             },
-            ContainerError::Backend(issue) => docker_failure(&issue),
+            ContainerError::Backend(issue) => backend_failure(&issue),
             error => Self::new("other", error.to_string()),
         }
     }
 }
 
-fn docker_failure(issue: &BackendIssue) -> Failure {
+fn backend_failure(issue: &BackendIssue) -> Failure {
     let mut next = issue.next.clone();
     if issue.offer.is_some() {
         let command = match &issue.target {
@@ -137,7 +137,7 @@ fn docker_failure(issue: &BackendIssue) -> Failure {
         ));
     }
     Failure {
-        kind: "docker",
+        kind: issue.backend.as_str(),
         message: issue.headline.clone(),
         next,
         problem: Some(issue.problem.as_str()),
@@ -865,8 +865,8 @@ mod tests {
     }
 
     #[test]
-    fn docker_failures_name_their_problem_and_how_to_be_offered_the_fix() {
-        let failure = docker_failure(&BackendIssue {
+    fn backend_failures_name_their_problem_and_how_to_be_offered_the_fix() {
+        let failure = backend_failure(&BackendIssue {
             backend: crate::backend::BackendId::Docker,
             target: Target::Host("dev".into()),
             problem: crate::backend::Problem::PermissionDenied,

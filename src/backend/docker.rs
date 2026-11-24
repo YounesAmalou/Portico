@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::{
     Backend, BackendId, BackendIssue, ContainerList, GroupTool, ListFailure, Offer, Problem,
-    RunFailure, RunResult, Target,
+    RunFailure, RunResult, Target, remote_command,
 };
 
 /// The `docker ps --format` template: one flat JSON object of strings per
@@ -319,26 +319,6 @@ fn pick(mut found: Vec<&Container>) -> Result<&Container, ResolveError> {
     }
 }
 
-/// Quotes one word for a POSIX shell: words made only of safe characters
-/// stay as they are, anything else is single-quoted.
-pub fn quote(word: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
-    if !word.is_empty() && word.chars().all(safe) {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
-/// The words quoted and joined into the one string ssh runs remotely.
-pub fn remote_command<S: AsRef<str>>(words: &[S]) -> String {
-    words
-        .iter()
-        .map(|word| quote(word.as_ref()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Runs bash when the container has it, and sh otherwise.
 pub const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
 
@@ -428,7 +408,7 @@ pub fn parse_probe(stdout: &str) -> Option<Probe> {
 
 /// What to do about a refused docker socket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Access {
+enum Access {
     /// The user is in the group, but this process predates it: rerun inside it.
     RerunInGroup(GroupTool),
     /// Same, but `sg` does not exist: a new login is needed.
@@ -439,7 +419,7 @@ pub enum Access {
 }
 
 /// Decides the fix for a permission failure from the probe.
-pub fn decide(probe: &Probe) -> Access {
+fn decide(probe: &Probe) -> Access {
     let has = |groups: &[String]| groups.iter().any(|group| group == "docker");
     if has(&probe.database_groups) && !has(&probe.process_groups) {
         return if probe.has_sg {
@@ -581,13 +561,6 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The name `--via` takes for `tool`.
-pub fn tool_name(tool: GroupTool) -> &'static str {
-    match tool {
-        GroupTool::Sg => "sg",
-    }
-}
-
 fn listed(target: Target, stdout: &[u8], via: Option<GroupTool>) -> ContainerList {
     ContainerList {
         target,
@@ -596,7 +569,7 @@ fn listed(target: Target, stdout: &[u8], via: Option<GroupTool>) -> ContainerLis
         note: via.map(|tool| {
             format!(
                 "Ran docker through `{} docker`: other shells need `newgrp docker` or a new login.",
-                tool_name(tool)
+                tool.as_str()
             )
         }),
     }
@@ -991,28 +964,6 @@ mod tests {
         assert_eq!(resolved("nope", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("nope/web", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("web", &[]), Err(ResolveError::NotFound));
-    }
-
-    #[test]
-    fn quotes_only_when_needed() {
-        assert_eq!(quote("web"), "web");
-        assert_eq!(quote("a b"), "'a b'");
-        assert_eq!(quote("o'brien"), "'o'\\''brien'");
-        assert_eq!(quote(""), "''");
-    }
-
-    #[test]
-    fn remote_command_round_trips_through_sh() {
-        let words = ["printf", "%s|", "a b", "o'brien", "", "$HOME"];
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(remote_command(&words))
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "a b|o'brien||$HOME|"
-        );
     }
 
     #[test]
