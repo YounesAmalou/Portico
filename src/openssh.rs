@@ -19,7 +19,7 @@ use std::{
 use thiserror::Error;
 
 use crate::explain::Explanation;
-use crate::managed::write_unique;
+use crate::platform::fs::write_unique;
 use crate::platform::process::{has_exited, terminate_process_group, terminate_process_tree};
 use crate::probe::{
     Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, TEST_STDERR_LIMIT, authenticated,

@@ -24,14 +24,12 @@ use crate::{
     explain::{Context, Explanation, Operation, explain},
     host::{Change, Host, HostChanges, HostError},
     identity::HostIdentities,
-    managed::{
-        InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError, read_lossy,
-    },
+    managed::{InitError, InitOutcome, InitPlan, ManagedConfig, ManagedStore, TransactionError},
     openssh::{
         ConnectionOutcome, KeyFetch, OpenSsh, OpenSshError, PresentedKey, ResolvedConfig,
         append_known_hosts,
     },
-    platform::process::Proc,
+    platform::{fs::read_lossy, process::Proc},
     probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
     tunnel::{
         TunnelError,

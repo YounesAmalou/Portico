@@ -1,16 +1,12 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    mem,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    fs::{self, File},
+    io, mem,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
-use fs2::FileExt;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -19,6 +15,10 @@ use std::sync::Arc;
 use crate::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
 use crate::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
 use crate::host::{Host, HostChanges, HostError, HostField, parse_port};
+use crate::platform::fs::{
+    PendingFile, acquire_lock, create_private_dir, normalize_path, open_lock, read_lossy,
+    reject_symlink, symlink_target, sync_dir, write_unique,
+};
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
 const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
@@ -435,7 +435,7 @@ impl ManagedStore {
         let change_entry = plan.create_entry || plan.insert_include || plan.reposition_include;
         let final_entry = analyze_entry(&entry_contents, &self.paths)?.normalized;
         let backup = if plan.backup_entry {
-            let mut backup = write_unique(
+            let backup = write_unique(
                 &self.paths.ssh_dir,
                 "config.portico-backup",
                 &entry_contents,
@@ -445,7 +445,7 @@ impl ManagedStore {
                     .mode(),
             )
             .map_err(|source| init_io(&self.paths.entry, source))?;
-            let path = backup.path.take().expect("backup has a path");
+            let path = backup.keep();
             sync_dir(&self.paths.ssh_dir).map_err(|source| init_io(&self.paths.ssh_dir, source))?;
             Some(path)
         } else {
@@ -1294,123 +1294,6 @@ fn is_managed_include(argument: &str, paths: &ConfigPaths) -> bool {
     normalize_path(&path) == normalize_path(&paths.managed)
 }
 
-/// Follows the symbolic link chain at `path` to the file a write must replace, which may not
-/// exist yet. An error names the path it occurred at.
-pub(crate) fn symlink_target(start: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
-    let mut path = start.to_path_buf();
-    for _ in 0..40 {
-        match fs::read_link(&path) {
-            Ok(target) => path = path.parent().unwrap_or(Path::new("")).join(target),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
-                ) =>
-            {
-                return Ok(path);
-            }
-            Err(source) => return Err((path, source)),
-        }
-    }
-    Err((
-        path,
-        io::Error::other(format!(
-            "too many levels of symbolic links from {}",
-            start.display()
-        )),
-    ))
-}
-
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
-}
-
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
-    match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn reject_symlink(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "managed path is a symbolic link",
-        )),
-        Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "managed path is not a file",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn open_lock(path: &Path) -> io::Result<File> {
-    reject_symlink(path)?;
-    match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(file) => {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            file.sync_all()?;
-            Ok(file)
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            OpenOptions::new().read(true).write(true).open(path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<()> {
-    let Some(cancelled) = cancelled else {
-        return FileExt::lock_exclusive(file);
-    };
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "operation cancelled",
-            ));
-        }
-        match FileExt::try_lock_exclusive(file) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// Reads a managed config for mapping OpenSSH's line numbers back to hosts.
-///
-/// A read failure yields empty text: the line then maps to no host, so the rejection degrades
-/// to an unmapped one, which is still reported verbatim. Nothing depends on the text otherwise.
-pub(crate) fn read_lossy(path: &Path) -> String {
-    fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
-}
-
 /// Interprets ssh's stderr against the managed config at `managed` and the entry Portico staged
 /// at `entry`, if any, showing files under `home` with `~`.
 fn interpret_rejection(
@@ -1442,137 +1325,6 @@ struct Staged {
     /// The lines of the validation entry Portico wrote rather than copied from the user's.
     portico_lines: Vec<u32>,
     changed_aliases: Vec<String>,
-}
-
-pub(crate) struct PendingFile {
-    path: Option<PathBuf>,
-}
-
-impl PendingFile {
-    pub(crate) fn path(&self) -> &Path {
-        self.path.as_deref().expect("pending file has a path")
-    }
-
-    pub(crate) fn rename_to(mut self, destination: &Path) -> io::Result<()> {
-        fs::rename(self.path(), destination)?;
-        self.path = None;
-        Ok(())
-    }
-
-    /// Keeps the file instead of removing it when dropped, and returns its path.
-    pub(crate) fn keep(mut self) -> PathBuf {
-        self.path.take().expect("pending file has a path")
-    }
-}
-
-impl Drop for PendingFile {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-pub(crate) fn write_unique(
-    dir: &Path,
-    stem: &str,
-    contents: &[u8],
-    mode: u32,
-) -> io::Result<PendingFile> {
-    #[cfg(test)]
-    if stem == ".config.portico-rollback"
-        && FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.replace(false))
-    {
-        return Err(io::Error::other("injected rollback write failure"));
-    }
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?
-        .as_nanos();
-    for attempt in 0..1000 {
-        let path = dir.join(format!("{stem}-{}-{nonce}-{attempt}", std::process::id()));
-        match write_named_new(&path, contents, mode) {
-            Ok(()) => return Ok(PendingFile { path: Some(path) }),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a unique temporary file",
-    ))
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_TRANSACTION_ROLLBACK_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn fail_next_transaction_rollback_write() {
-    FAIL_TRANSACTION_ROLLBACK_WRITE.with(|fail| fail.set(true));
-}
-
-fn write_named_new(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)?;
-    let result = (|| {
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.write_all(contents)?;
-        file.sync_all()
-    })();
-    if result.is_err() {
-        drop(file);
-        let _ = fs::remove_file(path);
-    }
-    result
-}
-
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    if DIRECTORY_SYNC_FAILURES.with(|failures| {
-        let mut failures = failures.borrow_mut();
-        let Some((target, remaining)) = failures.front_mut() else {
-            return false;
-        };
-        if target != path {
-            return false;
-        }
-        if *remaining > 0 {
-            *remaining -= 1;
-            return false;
-        }
-        failures.pop_front();
-        true
-    }) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "injected directory sync failure",
-        ));
-    }
-    File::open(path)?.sync_all()
-}
-
-#[cfg(test)]
-thread_local! {
-    static DIRECTORY_SYNC_FAILURES: std::cell::RefCell<std::collections::VecDeque<(PathBuf, usize)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
-}
-
-#[cfg(test)]
-fn fail_next_directory_sync(path: &Path) {
-    fail_directory_sync_after(path, 0);
-}
-
-#[cfg(test)]
-fn fail_directory_sync_after(path: &Path, successful_syncs: usize) {
-    DIRECTORY_SYNC_FAILURES.with(|failures| {
-        failures
-            .borrow_mut()
-            .push_back((path.to_owned(), successful_syncs))
-    });
 }
 
 fn init_io(path: &Path, source: io::Error) -> InitError {
@@ -1774,8 +1526,17 @@ pub(crate) fn quote_path(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::Duration,
+    };
+
     use super::*;
     use crate::host::Change;
+    use crate::platform::fs::{
+        fail_directory_sync_after, fail_next_directory_sync, fail_next_transaction_rollback_write,
+    };
     use tempfile::TempDir;
 
     struct InitializedStore {
@@ -3349,18 +3110,5 @@ mod tests {
 
         saved.expect("a save during the test is not blocked by the preview");
         assert!(fixture.store.load().unwrap().find("saved").is_some());
-    }
-    #[test]
-    fn a_symbolic_link_loop_names_the_path_it_started_from() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        std::os::unix::fs::symlink(&second, &first).unwrap();
-        std::os::unix::fs::symlink(&first, &second).unwrap();
-        let (_, error) = symlink_target(&first).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("too many levels of symbolic links from {}", first.display())
-        );
     }
 }

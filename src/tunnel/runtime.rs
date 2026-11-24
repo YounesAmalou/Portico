@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    managed::{create_private_dir, sync_dir, write_unique},
+    platform::fs::{create_private_dir, sync_dir, write_unique},
     platform::process::{Logged, Proc},
 };
 
