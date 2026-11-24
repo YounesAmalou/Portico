@@ -19,6 +19,7 @@ use crate::platform::fs::{
     PendingFile, acquire_lock, create_private_dir, normalize_path, open_lock, read_lossy,
     reject_symlink, symlink_target, sync_dir, write_unique,
 };
+use crate::platform::paths::SYSTEM_SSH_CONFIG;
 
 const HEADER: &str = "# Managed by Portico. Do not edit manually.";
 const PORTICO_INCLUDE: &str = "Include ~/.ssh/portico/config";
@@ -99,7 +100,7 @@ impl ConfigPaths {
             managed: portico_dir.join("config"),
             backup: portico_dir.join("config.bak"),
             lock: portico_dir.join("config.lock"),
-            system_config: PathBuf::from("/etc/ssh/ssh_config"),
+            system_config: PathBuf::from(SYSTEM_SSH_CONFIG),
             ssh_dir,
             entry,
             portico_dir,

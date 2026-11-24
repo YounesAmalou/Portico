@@ -303,7 +303,7 @@ impl MigrateState {
         match self.plan.direction {
             Direction::Export => "managed".into(),
             Direction::Adopt => match self.home.as_deref() {
-                Some(home) => crate::home::tilde(&candidate.source, home),
+                Some(home) => crate::platform::paths::tilde(&candidate.source, home),
                 None => candidate.source.display().to_string(),
             },
         }

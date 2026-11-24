@@ -100,7 +100,7 @@ impl Agent {
             } => format!(
                 "{}, {}, unavailable: {}",
                 provider.name(),
-                crate::home::tilde(socket, home),
+                crate::platform::paths::tilde(socket, home),
                 reason.describe()
             ),
             Agent::Listed {
@@ -110,7 +110,7 @@ impl Agent {
             } => format!(
                 "{}, {}, {}",
                 provider.name(),
-                crate::home::tilde(socket, home),
+                crate::platform::paths::tilde(socket, home),
                 count(keys.len(), "key")
             ),
         }

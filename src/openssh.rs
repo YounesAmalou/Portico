@@ -20,14 +20,12 @@ use thiserror::Error;
 
 use crate::explain::Explanation;
 use crate::platform::fs::write_unique;
+use crate::platform::launcher::{DEFAULT_LAUNCHER, Launch, launch};
 use crate::platform::process::{has_exited, terminate_process_group, terminate_process_tree};
 use crate::probe::{
     Authenticated, Failure, ProbeResult, Route, TEST_DEADLINE, TEST_STDERR_LIMIT, authenticated,
     classify, diagnose, fetch_key_args, test_args,
 };
-
-/// How long a new-terminal launcher may run before its launch counts as requested.
-const LAUNCH_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct OpenSsh {
@@ -172,7 +170,7 @@ pub enum OpenSshError {
 
 impl OpenSsh {
     pub fn system() -> Self {
-        Self::new("ssh".into(), "xdg-terminal-exec".into()).with_portico(
+        Self::new("ssh".into(), DEFAULT_LAUNCHER.into()).with_portico(
             // A replaced binary reports a path that no longer exists.
             std::env::current_exe().ok().filter(|path| path.exists()),
         )
@@ -544,7 +542,7 @@ impl OpenSsh {
     /// non-zero when it cannot find or start a terminal, but a terminal that
     /// stays open (or hands the window to a running instance later) is
     /// indistinguishable from one that is still starting. A launcher that
-    /// fails within `LAUNCH_GRACE` is reported as `LaunchFailed`; anything
+    /// fails within the launch grace period is reported as `LaunchFailed`; anything
     /// else is `LaunchRequested`, which promises only that the request was
     /// accepted, never that the SSH session itself succeeded.
     pub fn launch_in_new_terminal(&self, alias: &str) -> Result<ConnectionOutcome, OpenSshError> {
@@ -561,47 +559,19 @@ impl OpenSsh {
         portico_args: &[OsString],
         fallback: &[OsString],
     ) -> Result<ConnectionOutcome, OpenSshError> {
-        // The command follows the launcher's own arguments directly: older
-        // launchers have no option parsing and would take `--` as the command.
-        let mut command = Command::new(&self.terminal);
-        match &self.portico {
-            Some(portico) => command.arg(portico).args(portico_args),
-            None => command.args(fallback),
+        let command: Vec<OsString> = match &self.portico {
+            Some(portico) => std::iter::once(portico.clone().into())
+                .chain(portico_args.iter().cloned())
+                .collect(),
+            None => fallback.to_vec(),
         };
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| OpenSshError::Io {
+        match launch(&self.terminal, &command) {
+            Ok(Launch::Requested) => Ok(ConnectionOutcome::LaunchRequested),
+            Ok(Launch::Failed(status)) => Ok(ConnectionOutcome::LaunchFailed(status)),
+            Err(source) => Err(OpenSshError::Io {
                 program: self.terminal.clone(),
                 source,
-            })?;
-        let deadline = Instant::now() + LAUNCH_GRACE;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => {
-                    return Ok(ConnectionOutcome::LaunchRequested);
-                }
-                Ok(Some(status)) => return Ok(ConnectionOutcome::LaunchFailed(status)),
-                Ok(None) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                    return Ok(ConnectionOutcome::LaunchRequested);
-                }
-                Err(source) => {
-                    let program = self.terminal.clone();
-                    terminate_process_tree(&mut child).map_err(|source| OpenSshError::Io {
-                        program: program.clone(),
-                        source,
-                    })?;
-                    return Err(OpenSshError::Io { program, source });
-                }
-            }
+            }),
         }
     }
 
