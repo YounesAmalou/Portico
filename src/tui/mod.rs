@@ -1,6 +1,6 @@
 use std::{
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -47,7 +47,9 @@ use crate::{
     domain::host::{Change, Host, HostChanges},
     domain::identity::IdentityInventory,
     domain::managed::TransactionError,
+    domain::settings::{SettingsError, Tabs},
     domain::suggest,
+    platform::paths::tilde,
 };
 use containers::{
     ContainerTabs, PanelAction, fix_status, render_containers, shell_status, show_fix,
@@ -146,6 +148,10 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     let mut watch = ConfigWatch::new(&inventory.inputs, Instant::now());
     let mut state = UiState::new(inventory, session.keyboard_enhancement());
     state.home = app.home().to_owned();
+    match app.settings() {
+        Ok(settings) => state.apply_tabs(settings.tabs),
+        Err(error) => state.status = Some(settings_problem(&error, &state.home)),
+    }
     sync_details(&mut state, &mut workers.resolver, false);
     let mut redraw = true;
 
@@ -917,14 +923,24 @@ impl Tab {
         }
     }
 
-    fn number(self) -> usize {
-        Self::ALL.iter().position(|&tab| tab == self).unwrap_or(0) + 1
+    /// Whether the tab is shown with `tabs` turned on; the hosts always are.
+    fn shown(self, tabs: &Tabs) -> bool {
+        match self {
+            Self::Hosts => true,
+            Self::Tunnels => tabs.tunnels,
+            Self::Containers(backend) => tabs.shows(backend),
+        }
     }
 
-    /// The tab `by` places after this one, wrapping around.
-    fn cycled(self, by: isize) -> Self {
-        let count = Self::ALL.len() as isize;
-        Self::ALL[(self.number() as isize - 1 + by).rem_euclid(count) as usize]
+    /// The number that selects the tab among the `visible` ones.
+    fn number(self, visible: &[Self]) -> usize {
+        visible.iter().position(|&tab| tab == self).unwrap_or(0) + 1
+    }
+
+    /// The tab `by` places after this one among the `visible` ones, wrapping around.
+    fn cycled(self, by: isize, visible: &[Self]) -> Self {
+        let count = visible.len() as isize;
+        visible[(self.number(visible) as isize - 1 + by).rem_euclid(count) as usize]
     }
 }
 
@@ -964,6 +980,8 @@ struct UiState {
     container_tab: BackendId,
     /// The tab shown and receiving keys.
     tab: Tab,
+    /// Which optional tabs are turned on.
+    tabs: Tabs,
     /// The migrate screen while in `Mode::Migrate`.
     migrate: Option<MigrateState>,
     /// Every identity Portico knows of, for the IdentityFile suggestions; built once a form
@@ -1050,10 +1068,34 @@ impl UiState {
             containers: ContainerTabs::default(),
             container_tab: BackendId::Docker,
             tab: Tab::Hosts,
+            tabs: Tabs::default(),
             migrate: None,
             identity_inventory: None,
             home: PathBuf::new(),
             tunnels: TunnelsScreen::default(),
+        }
+    }
+
+    /// The tabs the tab bar shows and Tab cycles, in order.
+    fn visible_tabs(&self) -> Vec<Tab> {
+        Tab::ALL
+            .into_iter()
+            .filter(|tab| tab.shown(&self.tabs))
+            .collect()
+    }
+
+    /// Turns tabs on or off. The tab shown returns to the hosts when it is turned off, and the
+    /// container tab `c` shows moves to the first one left.
+    fn apply_tabs(&mut self, tabs: Tabs) {
+        self.tabs = tabs;
+        self.containers.set_tabs(tabs);
+        if !self.tab.shown(&tabs) {
+            self.tab = Tab::Hosts;
+        }
+        if !tabs.shows(self.container_tab)
+            && let Some(backend) = AUTOMATIC.into_iter().find(|&backend| tabs.shows(backend))
+        {
+            self.container_tab = backend;
         }
     }
 
@@ -1120,14 +1162,27 @@ impl UiState {
         {
             return None;
         }
-        let containers = Tab::Containers(self.container_tab);
+        let visible = self.visible_tabs();
         let tab = match key.code {
-            KeyCode::Char(digit @ '1'..='5') => Tab::ALL[digit as usize - '1' as usize],
-            KeyCode::Tab => self.tab.cycled(1),
-            KeyCode::BackTab => self.tab.cycled(-1),
+            KeyCode::Char(digit @ '1'..='5') => match visible.get(digit as usize - '1' as usize) {
+                Some(&tab) => tab,
+                None => return Some(UiAction::None),
+            },
+            KeyCode::Tab => self.tab.cycled(1, &visible),
+            KeyCode::BackTab => self.tab.cycled(-1, &visible),
             // Terminals report Shift+T as `T`, with or without the Shift modifier.
-            KeyCode::Char('T') => Tab::Tunnels,
+            KeyCode::Char('T') if self.tabs.tunnels => Tab::Tunnels,
             KeyCode::Char('c') => {
+                // The tab shown last, or the first shown when that one is turned off.
+                let Some(backend) = [self.container_tab]
+                    .into_iter()
+                    .chain(AUTOMATIC)
+                    .find(|&backend| self.tabs.shows(backend))
+                else {
+                    return Some(UiAction::None);
+                };
+                self.container_tab = backend;
+                let containers = Tab::Containers(backend);
                 if self.tab == Tab::Hosts
                     && let Some(alias) = self.selected_alias()
                 {
@@ -1137,6 +1192,7 @@ impl UiState {
                 }
                 containers
             }
+            KeyCode::Char('T') => return Some(UiAction::None),
             _ => return None,
         };
         let from = self.tab;
@@ -1212,7 +1268,10 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .areas(frame.area());
-    frame.render_widget(Paragraph::new(tab_bar(state.tab, bar.width)), bar);
+    frame.render_widget(
+        Paragraph::new(tab_bar(&state.visible_tabs(), state.tab, bar.width)),
+        bar,
+    );
     match state.tab {
         Tab::Hosts => render_hosts(frame, body, state),
         Tab::Tunnels => {
@@ -1228,6 +1287,14 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
     }
 }
 
+/// The error's line, with the settings file's path shown from `home` as `~`.
+fn settings_problem(error: &SettingsError, home: &Path) -> String {
+    let (SettingsError::Invalid { path, .. } | SettingsError::Io { path, .. }) = error;
+    error
+        .to_string()
+        .replacen(&path.display().to_string(), &tilde(path, home), 1)
+}
+
 /// Starts `lists`, or nothing when there are none.
 fn list_containers(lists: Vec<(BackendId, Target)>) -> UiAction {
     if lists.is_empty() {
@@ -1240,15 +1307,15 @@ fn list_containers(lists: Vec<(BackendId, Target)>) -> UiAction {
 /// The tab bar: each tab's number and name, the active one highlighted. When the names do not
 /// fit, the other tabs show only their numbers, and when even that does not fit only the active
 /// tab is shown, so the bar never wraps or hides the active tab.
-fn tab_bar(active: Tab, width: u16) -> Line<'static> {
+fn tab_bar(visible: &[Tab], active: Tab, width: u16) -> Line<'static> {
     let separator = " \u{2502} ";
-    let full = |tab: Tab| format!("{} {}", tab.number(), tab.label());
+    let full = |tab: Tab| format!("{} {}", tab.number(visible), tab.label());
     let labels = |short: bool| {
-        Tab::ALL
+        visible
             .iter()
             .map(|&tab| {
                 if short && tab != active {
-                    tab.number().to_string()
+                    tab.number(visible).to_string()
                 } else {
                     full(tab)
                 }
@@ -1275,7 +1342,7 @@ fn tab_bar(active: Tab, width: u16) -> Line<'static> {
     };
     match shown {
         Some(shown) => {
-            for (index, (tab, label)) in Tab::ALL.iter().zip(shown).enumerate() {
+            for (index, (tab, label)) in visible.iter().zip(shown).enumerate() {
                 if index > 0 {
                     spans.push(Span::raw(separator));
                 }
@@ -2464,6 +2531,108 @@ mod tests {
         assert_eq!(state.tab, Tab::Tunnels);
     }
 
+    fn without(configure: impl FnOnce(&mut Tabs)) -> UiState {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let mut tabs = Tabs::default();
+        configure(&mut tabs);
+        state.apply_tabs(tabs);
+        state
+    }
+
+    #[test]
+    fn hidden_tabs_leave_the_bar_and_renumber() {
+        let mut state = without(|tabs| tabs.podman = false);
+        let podman = Tab::Containers(BackendId::Podman);
+        assert!(!state.visible_tabs().contains(&podman));
+        assert!(matches!(char(&mut state, '4'), UiAction::ListContainers(_)));
+        assert_eq!(state.tab, Tab::Containers(BackendId::Proxmox));
+        assert_eq!(char(&mut state, '5'), UiAction::None);
+        assert_eq!(state.tab, Tab::Containers(BackendId::Proxmox));
+        let text = tab_bar(&state.visible_tabs(), state.tab, 100).to_string();
+        assert!(!text.contains("Podman"), "{text}");
+        assert!(text.contains("4 Proxmox"), "{text}");
+    }
+
+    #[test]
+    fn tab_cycles_over_visible_tabs_only() {
+        let mut state = without(|tabs| tabs.tunnels = false);
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.tab, DOCKER);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.tab, Tab::Hosts);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.tab, Tab::Containers(BackendId::Proxmox));
+    }
+
+    #[test]
+    fn t_does_nothing_when_tunnels_are_off() {
+        let mut state = without(|tabs| tabs.tunnels = false);
+        assert_eq!(char(&mut state, 'T'), UiAction::None);
+        assert_eq!(state.tab, Tab::Hosts);
+    }
+
+    #[test]
+    fn c_skips_a_hidden_container_tab() {
+        let mut state = without(|tabs| tabs.docker = false);
+        assert_eq!(
+            state.container_tab,
+            BackendId::Podman,
+            "moved on by apply_tabs"
+        );
+        state.container_tab = BackendId::Docker;
+        char(&mut state, 'c');
+        assert_eq!(state.tab, Tab::Containers(BackendId::Podman));
+    }
+
+    #[test]
+    fn c_does_nothing_with_every_backend_off() {
+        let mut state = without(|tabs| {
+            tabs.docker = false;
+            tabs.podman = false;
+            tabs.proxmox = false;
+        });
+        assert_eq!(char(&mut state, 'c'), UiAction::None);
+        assert_eq!(state.tab, Tab::Hosts);
+    }
+
+    #[test]
+    fn turning_off_the_open_tab_returns_to_hosts() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        char(&mut state, '4');
+        assert_eq!(state.tab, Tab::Containers(BackendId::Podman));
+        state.apply_tabs(Tabs {
+            podman: false,
+            ..Tabs::default()
+        });
+        assert_eq!(state.tab, Tab::Hosts);
+        assert_eq!(state.container_tab, BackendId::Docker, "Docker is first");
+    }
+
+    #[test]
+    fn showing_a_target_lists_only_visible_backends() {
+        let mut state = without(|tabs| tabs.docker = false);
+        let dev = Target::Host("dev".into());
+        assert_eq!(
+            char(&mut state, 'c'),
+            UiAction::ListContainers(vec![
+                (BackendId::Podman, dev.clone()),
+                (BackendId::Proxmox, dev)
+            ])
+        );
+    }
+
+    #[test]
+    fn a_settings_problem_shows_the_path_with_a_tilde() {
+        let error = SettingsError::Invalid {
+            path: PathBuf::from("/home/test/.config/portico/settings.toml"),
+            line: Some(2),
+            reason: "expected a boolean".into(),
+        };
+        let line = settings_problem(&error, Path::new("/home/test"));
+        assert!(line.contains("~/.config/portico/settings.toml"), "{line}");
+        assert!(!line.contains("/home/test"), "{line}");
+    }
+
     #[test]
     fn the_container_tabs_follow_the_backend_order() {
         let tabs: Vec<Tab> = Tab::ALL[2..].to_vec();
@@ -2759,7 +2928,7 @@ mod tests {
 
     #[test]
     fn the_tab_bar_highlights_the_active_tab_and_never_wraps() {
-        let line = tab_bar(Tab::Tunnels, 100);
+        let line = tab_bar(&Tab::ALL, Tab::Tunnels, 100);
         assert_eq!(
             line.to_string(),
             " 1 Hosts \u{2502} 2 Tunnels \u{2502} 3 Docker \u{2502} 4 Podman \u{2502} 5 Proxmox"
@@ -2771,10 +2940,10 @@ mod tests {
             .unwrap();
         assert!(active.style.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(
-            tab_bar(DOCKER, 30).to_string(),
+            tab_bar(&Tab::ALL, DOCKER, 30).to_string(),
             " 1 \u{2502} 2 \u{2502} 3 Docker \u{2502} 4 \u{2502} 5"
         );
-        assert_eq!(tab_bar(DOCKER, 14).to_string(), " 3 Docker");
+        assert_eq!(tab_bar(&Tab::ALL, DOCKER, 14).to_string(), " 3 Docker");
 
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         char(&mut state, '3');

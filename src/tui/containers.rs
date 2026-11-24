@@ -22,6 +22,7 @@ use crate::{
     },
     domain::fuzzy,
     domain::openssh::ConnectionOutcome,
+    domain::settings::Tabs,
     picker::{HIT, Outcome, Row, Single, State},
 };
 
@@ -796,12 +797,15 @@ fn failure(error: &ContainerError) -> PanelFailure {
 #[derive(Debug)]
 pub(super) struct ContainerTabs {
     panels: Vec<Panel>,
+    /// The backends listed: a turned-off tab is never listed.
+    tabs: Tabs,
 }
 
 impl Default for ContainerTabs {
     fn default() -> Self {
         Self {
             panels: AUTOMATIC.into_iter().map(Panel::new).collect(),
+            tabs: Tabs::default(),
         }
     }
 }
@@ -826,13 +830,20 @@ impl ContainerTabs {
         self.panels[0].target()
     }
 
+    pub(super) fn set_tabs(&mut self, tabs: Tabs) {
+        self.tabs = tabs;
+    }
+
     /// Shows `target` in every panel and returns the listings to start: each panel's that is
-    /// neither kept nor running.
+    /// neither kept nor running, and whose tab is turned on.
     pub(super) fn show(&mut self, target: &Target) -> Vec<(BackendId, Target)> {
+        let tabs = self.tabs;
         self.panels
             .iter_mut()
             .filter_map(|panel| match panel.show(target.clone()) {
-                PanelAction::List(target) => Some((panel.backend, target)),
+                PanelAction::List(target) if tabs.shows(panel.backend) => {
+                    Some((panel.backend, target))
+                }
                 _ => None,
             })
             .collect()
