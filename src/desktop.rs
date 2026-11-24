@@ -8,6 +8,7 @@ pub mod combo;
 pub mod keybinding;
 pub mod launcher;
 pub mod panel;
+pub mod status;
 
 use std::{
     ffi::OsString,
