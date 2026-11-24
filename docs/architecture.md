@@ -19,7 +19,7 @@ A layer uses only the layers below it, never the ones above:
 - `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files and processes through `platform` and plain `std`; it never calls `app`, `cli` or `tui`.
 - `backend` adapters use `platform` and the domain's host types, never `app` or an interface.
 - `app` is the entry point the interfaces use for anything that reads or changes state.
-- An interface does not call another interface. One known exception: `src/picker.rs` (shared by the CLI and the TUI, so it sits at the crate root) imports `TextInput` from `crate::tui`.
+- An interface does not call another interface, with two deliberate cases. `portico` with no subcommand starts the TUI: `cli::run` calls `crate::tui::run` (`src/cli/mod.rs`). And `src/picker.rs`, the inline pickers and the fuzzy-ranked rows both interfaces use, sits at the crate root: the CLI and the TUI's containers, tunnels and migrate screens use it. It is not clean, though: it imports `TextInput` and `display_width` from `crate::tui`, which is a known exception to the rule.
 
 The layer is called `domain`, not `core`: a crate-root module named `core` is ambiguous with the built-in `core` crate in `use` paths.
 
@@ -59,6 +59,7 @@ Adapters are compiled in and chosen at run time through the `BackendId` enum. No
 1. Add the adapter in `src/backend/<name>.rs`, implementing `Backend`.
 2. Add one `BackendId` variant.
 3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str` and the dispatch functions `list`, `shell_words` and `plain_issue`.
+4. Make the app choose it. The app names `BackendId::Docker` itself in `src/app/containers.rs` (listing, opening a shell, and explaining a local spawn failure), and `local_failure` there also checks for the `docker` binary by name. These are the only non-test places that do; a new backend needs its selection added there, or the app never reaches the adapter.
 
 ### Add a platform
 
