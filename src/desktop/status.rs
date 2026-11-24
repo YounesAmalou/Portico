@@ -15,7 +15,9 @@ pub struct Line {
 
 impl Line {
     /// The row as `portico desktop status` prints it: the label in a 12-column column, then
-    /// the text; the indented target rows are printed as they are.
+    /// the text. Invariant: a row with an empty label whose text starts with two spaces is a
+    /// per-target row, already laid out, and is printed as it is; no other row's text starts
+    /// with spaces.
     pub fn render(&self) -> String {
         if self.label.is_empty() && self.text.starts_with("  ") {
             self.text.clone()
