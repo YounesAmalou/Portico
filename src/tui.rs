@@ -6867,7 +6867,7 @@ mod tests {
             "deploy",
             "/var/run/docker.sock",
         );
-        let command = crate::backend::docker::remote_command(&offer.words);
+        let command = crate::backend::remote_command(&offer.words);
         let issue = crate::backend::BackendIssue {
             backend: crate::backend::BackendId::Docker,
             target: Target::Host("dev".into()),

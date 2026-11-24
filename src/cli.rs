@@ -17,7 +17,8 @@ use crate::{
     },
     backend::{
         BackendIssue, ContainerList, GroupTool, Target,
-        docker::{ResolveError, display_name, group, remote_command, resolve},
+        docker::{ResolveError, display_name, group, resolve},
+        remote_command,
     },
     discovery::DiscoveryWarning,
     explain::Explanation,
@@ -914,14 +915,14 @@ fn list_with_offers<I: BufRead, O: Write, E: Write>(
         let offer = match &issue.offer {
             Some(offer) if interactive && !offered => offer,
             _ => {
-                print_docker_issue(error, &issue, true)?;
+                print_backend_issue(error, &issue, true)?;
                 return Err(String::new());
             }
         };
-        print_docker_issue(error, &issue, false)?;
+        print_backend_issue(error, &issue, false)?;
         let prompt = format!("{} [y/N] ", offer.prompt);
         if !confirm(input, output, &prompt)? {
-            print_docker_issue_next(error, &issue)?;
+            print_backend_issue_next(error, &issue)?;
             return Err(String::new());
         }
         let status = match app.run_offer(target, offer) {
@@ -939,19 +940,19 @@ fn list_with_offers<I: BufRead, O: Write, E: Write>(
 }
 
 /// Prints the issue's headline, and with `next` what to do about it.
-fn print_docker_issue(
+fn print_backend_issue(
     error: &mut impl Write,
     issue: &BackendIssue,
     next: bool,
 ) -> Result<(), String> {
     writeln!(error, "error: {}", issue.headline).map_err(|error| error.to_string())?;
     if next {
-        print_docker_issue_next(error, issue)?;
+        print_backend_issue_next(error, issue)?;
     }
     Ok(())
 }
 
-fn print_docker_issue_next(error: &mut impl Write, issue: &BackendIssue) -> Result<(), String> {
+fn print_backend_issue_next(error: &mut impl Write, issue: &BackendIssue) -> Result<(), String> {
     for line in &issue.next {
         writeln!(error, "  {line}").map_err(|error| error.to_string())?;
     }
@@ -966,7 +967,7 @@ fn report_container_failure(
 ) -> Result<String, String> {
     match failure {
         ContainerError::Backend(issue) => {
-            print_docker_issue(error, &issue, true)?;
+            print_backend_issue(error, &issue, true)?;
             Ok(String::new())
         }
         ContainerError::Ssh {
@@ -1585,7 +1586,10 @@ mod tests {
     use super::*;
     use crate::{
         app::{App, ContainerPrograms},
-        backend::docker::{SHELL_SCRIPT, join_group_words, remote_command},
+        backend::{
+            docker::{SHELL_SCRIPT, join_group_words},
+            remote_command,
+        },
         host::Host,
         managed::{ConfigPaths, ManagedStore},
         openssh::OpenSsh,

@@ -13,7 +13,8 @@ use crate::{
     app::ContainerError,
     backend::{
         ContainerList, GroupTool, Offer, Target,
-        docker::{Container, display_name, group, remote_command},
+        docker::{Container, display_name, group},
+        remote_command,
     },
     fuzzy,
     openssh::ConnectionOutcome,
@@ -255,7 +256,7 @@ impl Panel {
             }
             KeyCode::Enter => self.shell(false),
             KeyCode::Char('n') => self.shell(true),
-            KeyCode::Char(character @ ('g' | 's')) => match state {
+            KeyCode::Char(character) => match state {
                 PanelState::Failed(failure) => match &failure.offer {
                     Some(offer) if offer.key == character => PanelAction::Fix {
                         target,
@@ -850,6 +851,41 @@ mod tests {
             offer,
             stderr: "Cannot connect to the Docker daemon".into(),
         })
+    }
+
+    #[test]
+    fn a_key_runs_only_the_offer_bound_to_it() {
+        let failed = |offer: Option<Offer>| {
+            let mut panel = Panel::default();
+            panel.show(host("dev"));
+            panel.finish(host("dev"), Err(issue(offer)));
+            panel
+        };
+        let mut panel = failed(Some(join_group_offer(
+            &host("dev"),
+            "deploy",
+            "/var/run/docker.sock",
+        )));
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('s')),
+            PanelAction::None
+        ));
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('g')),
+            PanelAction::Fix { .. }
+        ));
+
+        let mut custom = start_daemon_offer(&host("dev"));
+        custom.key = 'x';
+        let mut panel = failed(Some(custom));
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('s')),
+            PanelAction::None
+        ));
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('x')),
+            PanelAction::Fix { .. }
+        ));
     }
 
     #[test]

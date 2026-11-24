@@ -35,6 +35,35 @@ pub enum GroupTool {
     Sg,
 }
 
+impl GroupTool {
+    /// The name `--via` takes for the tool.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GroupTool::Sg => "sg",
+        }
+    }
+}
+
+/// Quotes one word for a POSIX shell: words made only of safe characters
+/// stay as they are, anything else is single-quoted.
+pub fn quote(word: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The words quoted and joined into the one string ssh runs remotely.
+pub fn remote_command<S: AsRef<str>>(words: &[S]) -> String {
+    words
+        .iter()
+        .map(|word| quote(word.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The running containers of a target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerList {
@@ -190,6 +219,28 @@ pub fn plain_issue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotes_only_when_needed() {
+        assert_eq!(quote("web"), "web");
+        assert_eq!(quote("a b"), "'a b'");
+        assert_eq!(quote("o'brien"), "'o'\\''brien'");
+        assert_eq!(quote(""), "''");
+    }
+
+    #[test]
+    fn remote_command_round_trips_through_sh() {
+        let words = ["printf", "%s|", "a b", "o'brien", "", "$HOME"];
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command(&words))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "a b|o'brien||$HOME|"
+        );
+    }
 
     #[test]
     fn ids_and_problems_keep_the_json_strings() {

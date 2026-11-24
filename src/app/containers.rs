@@ -15,8 +15,7 @@ use super::{App, AppError};
 use crate::{
     backend::{
         self, BackendId, BackendIssue, ContainerList, GroupTool, ListFailure, Offer, Problem,
-        RunFailure, Target,
-        docker::{remote_command, tool_name},
+        RunFailure, Target, remote_command,
     },
     explain::Explanation,
     openssh::{ConnectionOutcome, OpenSshError},
@@ -136,7 +135,7 @@ impl App {
                 args.extend(["-u".into(), user.into()]);
             }
             if let Some(tool) = via {
-                args.extend(["--via".into(), tool_name(tool).into()]);
+                args.extend(["--via".into(), tool.as_str().into()]);
             }
             args.extend(["--".into(), id.into()]);
             let fallback = self.direct_words(&target, &words);
