@@ -720,7 +720,13 @@ mod tests {
                     fs::read(&paths.managed).unwrap(),
                     b"# Managed by Portico. Do not edit manually.\n"
                 );
-                for descriptor in fs::read_dir("/proc/self/fd").unwrap().flatten() {
+                // `/proc/self/fd` names each descriptor's file; macOS has no such list.
+                let descriptors = if cfg!(target_os = "linux") {
+                    fs::read_dir("/proc/self/fd").unwrap().flatten().collect()
+                } else {
+                    Vec::new()
+                };
+                for descriptor in descriptors {
                     if let Ok(target) = fs::read_link(descriptor.path())
                         && (target == paths.entry || target == paths.managed)
                     {

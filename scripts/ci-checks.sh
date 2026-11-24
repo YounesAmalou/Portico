@@ -55,6 +55,14 @@ desktop() {
     QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 "$qt/qmltestrunner" -input "$dir/tests"
 }
 
+# macOS's temporary directory is reached through a symbolic link (/var -> /private/var).
+# Portico resolves links in the paths it writes, so tests that compare those paths with
+# their temporary home need the resolved spelling from the start.
+if [ "$(uname -s)" = Darwin ]; then
+    TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)/
+    export TMPDIR
+fi
+
 [ $# -eq 1 ] || usage
 case "$1" in
     fmt) cargo fmt --check ;;

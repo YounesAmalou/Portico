@@ -276,9 +276,13 @@ pub enum Bind {
     Denied,
 }
 
-/// Binds `address:port` and closes it at once, as ssh would bind it (`SO_REUSEADDR`, which the
-/// standard library sets). A name is resolved and every address it yields is tried. Addresses
-/// this machine does not have (no IPv6, say) count as free: ssh skips them too.
+/// Binds `address:port` and closes it at once, as ssh would bind it. A name is resolved and
+/// every address it yields is tried. Addresses this machine does not have (no IPv6, say) count
+/// as free: ssh skips them too.
+///
+/// On Linux the probe sets `SO_REUSEADDR`, as ssh does (and the standard library's listener).
+/// macOS lets a second `SO_REUSEADDR` socket bind an address another socket listens on, so
+/// there the probe goes without it and finds the listener.
 pub fn try_bind(address: &str, port: u16) -> Bind {
     let addresses: Vec<SocketAddr> = match address.parse::<IpAddr>() {
         Ok(ip) => vec![SocketAddr::new(ip, port)],
@@ -289,8 +293,8 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
     };
     for address in addresses {
         let bound = match address {
-            SocketAddr::V4(_) => TcpListener::bind(address).map(drop),
-            SocketAddr::V6(address) => bind_v6_only(address),
+            SocketAddr::V4(_) if cfg!(target_os = "linux") => TcpListener::bind(address).map(drop),
+            _ => bind_probe(address),
         };
         match bound {
             Ok(()) => {}
@@ -302,18 +306,27 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
     Bind::Free
 }
 
-/// Binds an IPv6 address with `IPV6_V6ONLY`, as ssh listens, and closes it again; the
-/// standard library's listener is dual-stack and would also collide with IPv4 listeners.
-fn bind_v6_only(address: std::net::SocketAddrV6) -> io::Result<()> {
-    // SAFETY: plain socket calls on a descriptor owned here, with a properly sized
-    // `sockaddr_in6` and option values that outlive each call.
+/// Binds `address` and closes it again: an IPv6 address with `IPV6_V6ONLY`, as ssh listens
+/// (the standard library's listener is dual-stack and would also collide with IPv4
+/// listeners), and `SO_REUSEADDR` on Linux only (see `try_bind`).
+fn bind_probe(address: SocketAddr) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    let mut options = Vec::new();
+    let domain = match address {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => {
+            options.push((libc::IPPROTO_IPV6, libc::IPV6_V6ONLY));
+            libc::AF_INET6
+        }
+    };
+    if cfg!(target_os = "linux") {
+        options.push((libc::SOL_SOCKET, libc::SO_REUSEADDR));
+    }
+    // SAFETY: plain socket calls on a descriptor owned here, with properly sized socket
+    // addresses and option values that outlive each call.
     unsafe {
-        let socket = cloexec_socket(libc::AF_INET6, libc::SOCK_STREAM)?;
-        let one: libc::c_int = 1;
-        for option in [
-            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
-            (libc::SOL_SOCKET, libc::SO_REUSEADDR),
-        ] {
+        let socket = cloexec_socket(domain, libc::SOCK_STREAM)?;
+        for option in options {
             if libc::setsockopt(
                 socket.as_raw_fd(),
                 option.0,
@@ -325,17 +338,32 @@ fn bind_v6_only(address: std::net::SocketAddrV6) -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
         }
-        let mut raw: libc::sockaddr_in6 = std::mem::zeroed();
-        raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        raw.sin6_port = address.port().to_be();
-        raw.sin6_addr.s6_addr = address.ip().octets();
-        raw.sin6_scope_id = address.scope_id();
-        if libc::bind(
-            socket.as_raw_fd(),
-            (&raw const raw).cast(),
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        ) != 0
-        {
+        let bound = match address {
+            SocketAddr::V4(address) => {
+                let mut raw: libc::sockaddr_in = std::mem::zeroed();
+                raw.sin_family = libc::AF_INET as libc::sa_family_t;
+                raw.sin_port = address.port().to_be();
+                raw.sin_addr.s_addr = u32::from(*address.ip()).to_be();
+                libc::bind(
+                    socket.as_raw_fd(),
+                    (&raw const raw).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(address) => {
+                let mut raw: libc::sockaddr_in6 = std::mem::zeroed();
+                raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                raw.sin6_port = address.port().to_be();
+                raw.sin6_addr.s6_addr = address.ip().octets();
+                raw.sin6_scope_id = address.scope_id();
+                libc::bind(
+                    socket.as_raw_fd(),
+                    (&raw const raw).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        };
+        if bound != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -704,6 +732,8 @@ mod tests {
         assert_eq!(Record::read(&path), None);
     }
 
+    /// macOS has no runtime directory: its `runtime_dir` is tested in `platform::macos`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn runtime_dir_falls_back_without_a_usable_xdg_runtime_dir() {
         let dir = tempfile::tempdir().unwrap();

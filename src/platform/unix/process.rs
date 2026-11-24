@@ -356,8 +356,13 @@ mod tests {
         let grandchild: libc::pid_t = line.trim().parse().unwrap();
         terminate_process_tree(&mut child).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        // The orphaned `sleep` is reaped by init (or launchd) once killed.
-        while unsafe { libc::kill(grandchild, 0) } == 0 {
+        // The orphaned `sleep` is left a zombie where nothing reaps orphans (a container's
+        // PID 1), so only a running one counts.
+        let grandchild = u32::try_from(grandchild).unwrap();
+        while Proc::system()
+            .stat(grandchild)
+            .is_some_and(|stat| stat.state != 'Z')
+        {
             assert!(Instant::now() < deadline, "the grandchild survived");
             thread::sleep(Duration::from_millis(10));
         }

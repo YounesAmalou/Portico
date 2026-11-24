@@ -114,11 +114,16 @@ impl Drop for HangupWatch {
 /// Sleeps until `tty` hangs up (true) or `stopped`'s peer is dropped (false).
 fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     // Hang-ups and errors are always reported, so the terminal asks for no events: its
-    // ordinary input must not wake the watcher.
+    // ordinary input must not wake the watcher. macOS reports a terminal's hang-up only to a
+    // poll for input, so there input wakes the watcher too, which tells the two apart.
     let mut fds = [
         libc::pollfd {
             fd: tty.as_raw_fd(),
-            events: 0,
+            events: if cfg!(target_os = "macos") {
+                libc::POLLIN
+            } else {
+                0
+            },
             revents: 0,
         },
         libc::pollfd {
@@ -142,7 +147,23 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             return true;
         }
+        if fds[0].revents & libc::POLLIN != 0 {
+            if nothing_to_read(tty) {
+                return true;
+            }
+            // Input waits for its reader: look again shortly, not at once.
+            thread::sleep(Duration::from_millis(50));
+        }
     }
+}
+
+/// Whether a terminal that polls readable holds no input: reading it would return end of file,
+/// as a hung-up terminal does.
+fn nothing_to_read(tty: &OwnedFd) -> bool {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `FIONREAD` writes one `int` to the location given.
+    let read = unsafe { libc::ioctl(tty.as_raw_fd(), libc::FIONREAD as _, &mut queued) };
+    read == -1 || queued == 0
 }
 
 /// Points `target` at the read end of a pipe that stays empty and open, so reading it fails

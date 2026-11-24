@@ -74,7 +74,7 @@ Locking (`flock` through `fs2`), atomic writes (`rename(2)`), directory sync and
 
 ### `libc` outside the platform layer
 
-- `domain::tunnel::runtime::bind_v6_only` creates its socket without `SOCK_CLOEXEC`, which macOS lacks; the platform's `fs::cloexec_socket` sets `FD_CLOEXEC` after `socket(2)` on macOS and keeps the atomic flag on Linux.
+- `domain::tunnel::runtime` probes a port (`bind_probe`, formerly `bind_v6_only`) on a socket from the platform's `fs::cloexec_socket`, which sets `FD_CLOEXEC` after `socket(2)` on macOS (no `SOCK_CLOEXEC`) and keeps the atomic flag on Linux. macOS lets a second `SO_REUSEADDR` socket bind an address another socket listens on, so the macOS probe binds without `SO_REUSEADDR` (for IPv4 too); Linux keeps its probe.
 - `tui::hangup` uses `pipe2`, which macOS lacks; the platform's `fs::nonblocking_pipe` replaces it (`pipe` plus `fcntl` on macOS).
 - `localtime_r`, `access`, `geteuid`, `getuid`, `kill`, `isatty`, `poll` and the errno values used exist on both systems and stay.
 
