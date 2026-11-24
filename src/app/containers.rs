@@ -88,8 +88,8 @@ impl App {
 
     /// Lists the running containers of `target` with the first of `backends` installed there,
     /// in the order given (one backend is listed exactly, installed or not); when none is, the
-    /// first one's issue is returned. `backends` is never empty: [`backend::AUTOMATIC`] is the
-    /// default order. On a host, `batch` keeps ssh from prompting and lets `cancelled` stop it, and
+    /// first one's issue is returned. An empty `backends` lists in the [`backend::AUTOMATIC`]
+    /// order. On a host, `batch` keeps ssh from prompting and lets `cancelled` stop it, and
     /// an ssh failure is explained as in the TUI. When the docker socket is refused because
     /// this session predates the user's docker group, the listing is rerun inside the group.
     pub fn containers(
@@ -100,6 +100,11 @@ impl App {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ContainerList, ContainerError> {
         let target = self.container_target(target)?;
+        let backends = if backends.is_empty() {
+            &backend::AUTOMATIC[..]
+        } else {
+            backends
+        };
         let mut first_missing = None;
         for &backend in backends {
             match self.list_with(backend, &target, batch, cancelled) {
@@ -109,9 +114,9 @@ impl App {
                 result => return result,
             }
         }
-        Err(ContainerError::Backend(
-            first_missing.expect("backends names at least one backend"),
-        ))
+        Err(ContainerError::Backend(first_missing.expect(
+            "a listing that finds no backend installed names its first",
+        )))
     }
 
     /// Lists the running containers of `target`, already spelled as the inventory spells it,
@@ -736,6 +741,19 @@ mod tests {
             several.to_string(),
             "web matches several containers on this machine: shop/web#1, shop/web#2"
         );
+    }
+
+    #[test]
+    fn no_backends_means_the_automatic_order() {
+        let fixture = fixture();
+        fixture.behave("docker", &format!("echo '{LISTING}'\n"));
+
+        let list = fixture
+            .app
+            .containers(&Target::Local, &[], false, None)
+            .unwrap();
+
+        assert_eq!(list.backend, BackendId::Docker);
     }
 
     #[test]

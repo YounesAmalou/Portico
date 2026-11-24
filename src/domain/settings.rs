@@ -114,7 +114,7 @@ impl Key {
     }
 
     /// The key's name inside its table.
-    fn leaf(self) -> &'static str {
+    pub fn leaf(self) -> &'static str {
         self.name()
             .split_once('.')
             .map_or(self.name(), |(_, leaf)| leaf)

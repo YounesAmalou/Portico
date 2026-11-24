@@ -146,9 +146,11 @@ impl SettingsOverlay {
         let rows = self.rows();
         let cursor = rows.get(self.cursor).copied();
         let mut lines = vec![Line::styled("Tabs", bold)];
+        let mut cursor_line = 0;
         for key in Key::ALL {
             let on = self.value(key);
             let marker = if cursor == Some(Row::Toggle(key)) {
+                cursor_line = lines.len();
                 ">"
             } else {
                 " "
@@ -165,6 +167,9 @@ impl SettingsOverlay {
             )));
         }
         let on_action = matches!(cursor, Some(Row::Run(_)));
+        if on_action {
+            cursor_line = lines.len();
+        }
         let mut actions = vec![Span::raw(if on_action { "> " } else { "  " })];
         for row in &rows {
             let Row::Run(run) = *row else { continue };
@@ -194,9 +199,16 @@ impl SettingsOverlay {
             width,
             height,
         };
+        // On a terminal too short for every line, the lines scroll to keep the cursor's in view.
+        let visible = usize::from(height.saturating_sub(2)).max(1);
+        let scroll = (cursor_line + 1)
+            .saturating_sub(visible)
+            .min(lines.len().saturating_sub(visible));
         frame.render_widget(Clear, overlay);
         frame.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Settings")),
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Settings"))
+                .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
             overlay,
         );
     }
@@ -352,6 +364,31 @@ mod tests {
         for row in &rows {
             assert!(row.chars().count() <= 30);
         }
+    }
+
+    #[test]
+    fn a_short_terminal_scrolls_to_the_cursor() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut overlay = SettingsOverlay::open(Tabs::default(), status(true));
+        let draw = |overlay: &SettingsOverlay| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+            terminal
+                .draw(|frame| overlay.render(frame, frame.area(), "settings.toml"))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..6)
+                .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let top = draw(&overlay);
+        assert!(top.contains("[x] Tunnels"), "{top}");
+        for _ in 0..10 {
+            press(&mut overlay, KeyCode::Down);
+        }
+        let text = draw(&overlay);
+        assert!(text.contains("> [Install or update]"), "{text}");
+        assert!(!text.contains("[x] Tunnels"), "{text}");
     }
 
     #[test]

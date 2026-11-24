@@ -70,10 +70,10 @@ enum Attempt {
     Failed,
 }
 
-/// Lists the containers of `target` with the first of `backends` installed. When the backend refuses with a fix Portico can run, an interactive session is asked
-/// whether to run it, and on yes the listing runs once more. With `quiet_missing`, a backend
-/// that is not installed is returned unprinted. An `Err` stops the command: an ssh failure,
-/// or a fix that failed.
+/// Lists the containers of `target` with the first of `backends` installed. When the backend
+/// refuses with a fix Portico can run, an interactive session is asked whether to run it, and
+/// on yes the listing runs once more. With `quiet_missing`, a backend that is not installed is
+/// returned unprinted. An `Err` stops the command: an ssh failure, or a fix that failed.
 #[allow(clippy::too_many_arguments)]
 fn attempt<I: BufRead, O: Write, E: Write>(
     app: &App,

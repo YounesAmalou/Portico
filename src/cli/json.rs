@@ -215,11 +215,7 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             let settings = app.settings()?;
             let mut tabs = Map::new();
             for key in Key::ALL {
-                let leaf = key
-                    .name()
-                    .split_once('.')
-                    .map_or(key.name(), |(_, leaf)| leaf);
-                tabs.insert(leaf.to_owned(), json!(key.get(&settings)));
+                tabs.insert(key.leaf().to_owned(), json!(key.get(&settings)));
             }
             success(json!({
                 "exists": app.settings_path().exists(),

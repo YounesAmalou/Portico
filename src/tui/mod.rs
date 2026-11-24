@@ -1198,7 +1198,30 @@ impl UiState {
         if self.mode == Mode::Settings {
             String::new()
         } else {
-            footer()
+            self.with_tab_keys(footer())
+        }
+    }
+
+    /// `footer` with its `Tab/1-5 tabs` hint worded for the tabs shown: `Tab/1-n tabs`, or
+    /// nothing when the hosts are the only tab.
+    fn with_tab_keys(&self, footer: String) -> String {
+        footer.replace("Tab/1-5 tabs  ", &self.tab_keys_hint())
+    }
+
+    /// The footer hint for the tab keys, with its trailing separator, or empty with one tab.
+    fn tab_keys_hint(&self) -> String {
+        match self.visible_tabs().len() {
+            0 | 1 => String::new(),
+            count => format!("Tab/1-{count} tabs  "),
+        }
+    }
+
+    /// The footer hint for `c`, with its trailing separator, or empty when no container tab is shown.
+    fn containers_hint(&self) -> &'static str {
+        if (self.visible_tabs().iter()).any(|tab| matches!(tab, Tab::Containers(_))) {
+            "c containers  "
+        } else {
+            ""
         }
     }
 
@@ -1564,8 +1587,10 @@ fn footer_text(state: &UiState) -> String {
             } else {
                 ""
             };
+            let containers = state.containers_hint();
+            let tab_keys = state.tab_keys_hint();
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  c containers  Tab/1-5 tabs  , settings  q quit"
+                "{output}t test  Enter connect  {new_terminal}  {containers}{tab_keys}, settings  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -1591,7 +1616,7 @@ fn footer_text(state: &UiState) -> String {
                     format!("↑↓ move  / filter{clear_filter}  a add  m adopt  {refresh}  {connect}")
                 }
                 None => format!(
-                    "/ filter{clear_filter}  a add  {refresh}  Tab/1-5 tabs  , settings  q quit"
+                    "/ filter{clear_filter}  a add  {refresh}  {tab_keys}, settings  q quit"
                 ),
             }
         }
@@ -3140,6 +3165,29 @@ mod tests {
             "{footer}"
         );
         assert!(!footer.contains("T tunnels"));
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.apply_tabs(Tabs {
+            tunnels: false,
+            docker: false,
+            podman: true,
+            proxmox: false,
+        });
+        let footer = footer_text(&state);
+        assert!(
+            footer.contains("c containers  Tab/1-2 tabs  , settings"),
+            "{footer}"
+        );
+        state.apply_tabs(Tabs {
+            tunnels: true,
+            docker: false,
+            podman: false,
+            proxmox: false,
+        });
+        let footer = footer_text(&state);
+        assert!(!footer.contains("c containers"), "{footer}");
+        assert!(footer.contains("Tab/1-2 tabs"), "{footer}");
+        let tunnels = state.tab_footer(|| state.tunnels.footer());
+        assert!(tunnels.contains("Tab/1-2 tabs  , settings"), "{tunnels}");
         let state = test_state(Vec::new());
         assert!(footer_text(&state).contains("Tab/1-5 tabs"));
         let state = tunnels_state();

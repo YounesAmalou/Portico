@@ -110,8 +110,8 @@ Item {
             }
             model.program = found.program
             model.problem = null
-            checkVersion()
             readSettings(function () {
+                checkVersion()
                 listHosts()
                 if (model.tabs.tunnels)
                     listTunnels()
@@ -128,8 +128,10 @@ Item {
                 return
             let before = Portico.enabledBackends(model.tabs).join()
             model.tabs = exitCode === 0 ? Portico.parseSettings(stdout) : Portico.parseSettings("")
-            // Listings of a backend that is now off must not outlive it.
+            // Listings of a backend that is now off must not outlive it, nor one still in flight
+            // from the old set: a new session drops its reply.
             if (Portico.enabledBackends(model.tabs).join() !== before || !model.containersOn) {
+                session += 1
                 model.containers = ({})
                 model.expanded = ({})
             }
