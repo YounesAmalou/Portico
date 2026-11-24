@@ -193,6 +193,7 @@ pub fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
         }
         None => false,
     }) {
+        PIDFD_OPEN_FAILED.with(|failed| failed.set(true));
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -206,12 +207,21 @@ pub fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
 #[cfg(test)]
 thread_local! {
     static FAIL_PIDFD_OPEN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static PIDFD_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Makes the pidfd open after `skipped` successful ones fail with `EMFILE`.
 #[cfg(test)]
 pub fn fail_pidfd_open_after(skipped: u32) {
+    PIDFD_OPEN_FAILED.with(|failed| failed.set(false));
     FAIL_PIDFD_OPEN.with(|countdown| countdown.set(Some(skipped)));
+}
+
+/// Whether the failure `fail_pidfd_open_after` armed has been injected, so a test can prove it
+/// exercised the path without a pidfd rather than passing through the normal one.
+#[cfg(test)]
+pub fn pidfd_open_failure_injected() -> bool {
+    PIDFD_OPEN_FAILED.with(std::cell::Cell::get)
 }
 
 pub fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) -> io::Result<()> {

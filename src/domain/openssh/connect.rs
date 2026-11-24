@@ -357,7 +357,7 @@ mod tests {
         FakeProgram, fake_failure, fake_ssh, fixture_path, wait_for_contents,
     };
     use crate::domain::probe::{Failure, KeySource, OfferedKey};
-    use crate::platform::process::fail_pidfd_open_after;
+    use crate::platform::process::{fail_pidfd_open_after, pidfd_open_failure_injected};
     use crate::test_executable::write_executable;
 
     #[test]
@@ -549,6 +549,7 @@ mod tests {
             started.elapsed()
         );
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(pidfd_open_failure_injected(), "ssh's pidfd opened");
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
@@ -584,6 +585,10 @@ mod tests {
 
         cancel.join().unwrap();
         assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(
+            pidfd_open_failure_injected(),
+            "every descendant's pidfd opened"
+        );
         for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
             assert_dies(pid);
         }
