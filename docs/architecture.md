@@ -16,10 +16,10 @@ interfaces   src/tui/, src/cli/            (and src/desktop/, used by the CLI)
 
 A layer uses only the layers below it, never the ones above:
 
-- `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files and processes through `platform` and plain `std`; it never calls `app`, `cli` or `tui`.
+- `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files and processes through `platform` and plain `std`, except for a few direct `libc` calls that are Linux-specific code outside `platform`: `bind_v6_only` in `domain/tunnel/runtime.rs`, `clock` (`localtime_r`) in `domain/tunnel/mod.rs`, and `access`, `geteuid` and errno values in `domain/adopt/mod.rs`. A port to another system must revisit them. `domain` never calls `app`, `cli` or `tui`.
 - `backend` adapters use `platform` and the domain's host types, never `app` or an interface.
 - `app` is the entry point the interfaces use for anything that reads or changes state.
-- An interface does not call another interface, with two deliberate cases. `portico` with no subcommand starts the TUI: `cli::run` calls `crate::tui::run` (`src/cli/mod.rs`). And `src/picker.rs`, the inline pickers and the fuzzy-ranked rows both interfaces use, sits at the crate root: the CLI and the TUI's containers, tunnels and migrate screens use it. It is not clean, though: it imports `TextInput` and `display_width` from `crate::tui`, which is a known exception to the rule.
+- An interface does not call another interface, with two deliberate cases. `portico` with no subcommand starts the TUI: `cli::run` calls `crate::tui::run` (`src/cli/mod.rs`). And `src/picker.rs`, the inline pickers and the fuzzy-ranked rows both interfaces use, sits at the crate root: the CLI and the TUI's hosts, containers, tunnels and migrate screens use it. It is not clean, though: it imports `TextInput` and `display_width` from `crate::tui`, which is a known exception to the rule.
 
 The layer is called `domain`, not `core`: a crate-root module named `core` is ambiguous with the built-in `core` crate in `use` paths.
 
@@ -29,9 +29,9 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 
 | Module | Holds |
 |---|---|
-| `platform::process` | Process control: killing process trees through pidfds, reading `/proc`, stopping a recognised process |
+| `platform::process` | Process control: killing process trees through pidfds, reading `/proc`, stopping a recognised process; `Proc::scan` and `Logged` know how a started tunnel's `ssh` looks (`-E <log>`) |
 | `platform::launcher` | Opening a command in a new terminal window (`xdg-terminal-exec`) |
-| `platform::paths` | The home directory, `~` display, and the well-known locations under it |
+| `platform::paths` | The home directory, `~` display, the well-known locations under it, `SYSTEM_SSH_CONFIG` and `runtime_dir` |
 | `platform::fs` | Locking, atomic writes, directory sync and file identity (`Stamp`, `stamp`) |
 | `domain::host`, `domain::discovery` | Hosts, and reading the inventory from the OpenSSH configuration |
 | `domain::managed` | The managed host file: store and transactions (`store`), parser (`config`), renderer (`render`), setup of the entry config (`init`) |
@@ -41,7 +41,8 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `domain::probe` | The connection test: its options and outcomes |
 | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | Identity data, jump-host suggestions, fuzzy matching, failure explanations, configuration errors |
 | `backend` | The `Backend` interface, `BackendId`, `Target`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
-| `backend::docker` | The Docker adapter: `docker ps` parsing, grouping by Compose project, and its access decision (`Access`, `decide`, private to this file) |
+| `backend::listing` | The container rows every backend produces (`Container`, `Listing`), grouping by Compose project, display names, and resolving a container reference |
+| `backend::docker` | The Docker adapter: `docker ps` parsing, and its access decision (`Access`, `decide`, private to this file) |
 | `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities` |
 | `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`) and the JSON documents (`json`) |
 | `picker` | The inline pickers the CLI opens when a host or container is missing; also used by the TUI |
@@ -56,7 +57,7 @@ Adapters are compiled in and chosen at run time through the `BackendId` enum. No
 
 ### Add a backend
 
-1. Add the adapter in `src/backend/<name>.rs`, implementing `Backend`.
+1. Add the adapter in `src/backend/<name>.rs`, implementing `Backend`. It produces the shared `backend::Listing` of `backend::Container` rows (`src/backend/listing.rs`), which grouping, naming and lookup already work on.
 2. Add one `BackendId` variant.
 3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str` and the dispatch functions `list`, `shell_words` and `plain_issue`.
 4. Make the app choose it. The app names `BackendId::Docker` itself in `src/app/containers.rs` (listing, opening a shell, and explaining a local spawn failure), and `local_failure` there also checks for the `docker` binary by name. These are the only non-test places that do; a new backend needs its selection added there, or the app never reaches the adapter.
