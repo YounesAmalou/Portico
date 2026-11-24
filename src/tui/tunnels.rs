@@ -645,7 +645,7 @@ impl TunnelsScreen {
                     "o log  "
                 };
                 format!(
-                    "↑↓ move  / filter  {toggle}a add  e edit  x remove  r refresh  {log}Tab/1-3 tabs  q quit"
+                    "↑↓ move  / filter  {toggle}a add  e edit  x remove  r refresh  {log}Tab/1-5 tabs  q quit"
                 )
             }
             Screen::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),

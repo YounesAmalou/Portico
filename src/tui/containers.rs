@@ -11,11 +11,13 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use super::{TextInput, TuiError, UiState, display_width, hosts::explanation_lines, tab_areas};
+use super::{
+    TextInput, TuiError, UiAction, UiState, display_width, hosts::explanation_lines, tab_areas,
+};
 use crate::{
     app::ContainerError,
     backend::{
-        BackendId, Container, ContainerList, Offer, Target, Via, display_name, group,
+        AUTOMATIC, BackendId, Container, ContainerList, Offer, Target, Via, display_name, group,
         remote_command,
     },
     domain::fuzzy,
@@ -77,6 +79,8 @@ impl std::fmt::Debug for TargetPicker {
 
 #[derive(Debug, Default)]
 pub(super) struct Panel {
+    /// The backend this panel lists with.
+    backend: BackendId,
     /// The host whose containers are shown, or this machine when `None`.
     host: Option<String>,
     lists: HashMap<Target, PanelState>,
@@ -100,6 +104,14 @@ pub(super) struct Panel {
 }
 
 impl Panel {
+    /// An empty panel that lists with `backend`.
+    pub(super) fn new(backend: BackendId) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+
     /// The machine whose containers the panel shows: this one until `c`, or `h`, picks a host.
     pub(super) fn target(&self) -> Target {
         self.host.clone().map_or(Target::Local, Target::Host)
@@ -371,9 +383,9 @@ impl Panel {
         ])
     }
 
-    /// `Containers /<filter>`, with the filter's cursor while it is edited.
+    /// `<Backend> /<filter>`, with the filter's cursor while it is edited.
     pub(super) fn title(&self) -> Line<'static> {
-        let mut title = vec![Span::raw("Containers /")];
+        let mut title = vec![Span::raw(format!("{} /", self.backend.title()))];
         title.extend(self.filter.spans(self.editing_filter));
         Line::from(title)
     }
@@ -569,7 +581,7 @@ impl Panel {
             };
             let user = if self.root_only() { "" } else { "  u user" };
             format!(
-                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
             )
         }
     }
@@ -779,10 +791,90 @@ fn failure(error: &ContainerError) -> PanelFailure {
     }
 }
 
+/// The container tabs: one panel per backend, in the order of [`AUTOMATIC`], sharing one
+/// target. Showing a target lists it with every backend at once, each on its own worker.
+#[derive(Debug)]
+pub(super) struct ContainerTabs {
+    panels: Vec<Panel>,
+}
+
+impl Default for ContainerTabs {
+    fn default() -> Self {
+        Self {
+            panels: AUTOMATIC.into_iter().map(Panel::new).collect(),
+        }
+    }
+}
+
+impl ContainerTabs {
+    pub(super) fn panel(&self, backend: BackendId) -> &Panel {
+        self.panels
+            .iter()
+            .find(|panel| panel.backend == backend)
+            .expect("a panel for every backend")
+    }
+
+    pub(super) fn panel_mut(&mut self, backend: BackendId) -> &mut Panel {
+        self.panels
+            .iter_mut()
+            .find(|panel| panel.backend == backend)
+            .expect("a panel for every backend")
+    }
+
+    /// The target every panel shows.
+    pub(super) fn target(&self) -> Target {
+        self.panels[0].target()
+    }
+
+    /// Shows `target` in every panel and returns the listings to start: each panel's that is
+    /// neither kept nor running.
+    pub(super) fn show(&mut self, target: &Target) -> Vec<(BackendId, Target)> {
+        self.panels
+            .iter_mut()
+            .filter_map(|panel| match panel.show(target.clone()) {
+                PanelAction::List(target) => Some((panel.backend, target)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What `action`, from the panel of `backend` whose target was `before`, asks of the
+    /// session. A new target is shown in the other panels too, so a pick or `L` lists it with
+    /// every backend; `r` lists again with this one only.
+    pub(super) fn after_key(
+        &mut self,
+        backend: BackendId,
+        before: &Target,
+        action: PanelAction,
+    ) -> UiAction {
+        let target = self.panel(backend).target();
+        let mut lists = Vec::new();
+        if &target != before {
+            lists = self.show(&target);
+        }
+        if let PanelAction::List(listed) = &action
+            && !lists.iter().any(|(listing, _)| *listing == backend)
+        {
+            lists.push((backend, listed.clone()));
+        }
+        if lists.is_empty() {
+            UiAction::Containers(backend, action)
+        } else {
+            lists.sort_by_key(|(backend, _)| AUTOMATIC.iter().position(|b| b == backend));
+            UiAction::ListContainers(lists)
+        }
+    }
+}
+
 /// The Containers tab: the target line, the list with the user line, and the selected
 /// container's details, with the target picker over them while it is open.
-pub(super) fn render_containers(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let panel = &state.containers;
+pub(super) fn render_containers(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &UiState,
+    backend: BackendId,
+) {
+    let panel = state.containers.panel(backend);
     let content = tab_areas(
         area,
         panel.status().map(str::to_owned),
@@ -998,14 +1090,14 @@ mod tests {
     fn starts_on_this_machine_and_l_comes_back_to_it() {
         let mut panel = Panel::default();
         assert_eq!(panel.target(), Target::Local);
-        assert_eq!(panel.title().to_string(), "Containers /");
+        assert_eq!(panel.title().to_string(), "Docker /");
         assert_eq!(
             panel.target_line().to_string(),
             "Target: this machine   h change  L this machine"
         );
         panel.show(host("dev"));
         assert_eq!(panel.target(), host("dev"));
-        assert_eq!(panel.title().to_string(), "Containers /");
+        assert_eq!(panel.title().to_string(), "Docker /");
 
         assert_eq!(
             press(&mut panel, KeyCode::Char('L')),
@@ -1128,7 +1220,7 @@ mod tests {
         );
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
+            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
@@ -1752,10 +1844,10 @@ mod tests {
     fn filter_edit_esc_restores_and_esc_clears() {
         let mut panel = listed_panel();
         type_filter(&mut panel, "db");
-        assert_eq!(panel.title().to_string(), "Containers /db");
+        assert_eq!(panel.title().to_string(), "Docker /db");
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-3 tabs  q quit"
+            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
         );
 
         press(&mut panel, KeyCode::Char('/'));
@@ -1767,17 +1859,17 @@ mod tests {
         press(&mut panel, KeyCode::Backspace);
         assert_eq!(press(&mut panel, KeyCode::Char('q')), PanelAction::None);
         panel.paste("uu\n");
-        assert_eq!(panel.title().to_string(), "Containers /quu ");
+        assert_eq!(panel.title().to_string(), "Docker /quu ");
         assert_eq!(
             texts(&panel.lines(false, 100, 200)),
             ["No containers match \"quu\"."]
         );
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None);
-        assert_eq!(panel.title().to_string(), "Containers /db");
+        assert_eq!(panel.title().to_string(), "Docker /db");
         assert_eq!(texts(&panel.lines(false, 100, 200)).len(), 2);
 
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None, "clears");
-        assert_eq!(panel.title().to_string(), "Containers /");
+        assert_eq!(panel.title().to_string(), "Docker /");
         assert_eq!(texts(&panel.lines(false, 100, 200)).len(), 7);
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None);
     }
@@ -1814,9 +1906,9 @@ mod tests {
         press(&mut panel, KeyCode::Down);
         type_filter(&mut panel, "web");
         panel.show(host("dev"));
-        assert_eq!(panel.title().to_string(), "Containers /web", "same target");
+        assert_eq!(panel.title().to_string(), "Docker /web", "same target");
         panel.show(Target::Local);
-        assert_eq!(panel.title().to_string(), "Containers /");
+        assert_eq!(panel.title().to_string(), "Docker /");
         assert_eq!(
             panel.target_line().to_string(),
             "Target: this machine   h change  L this machine"

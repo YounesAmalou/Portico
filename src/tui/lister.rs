@@ -12,7 +12,7 @@ use std::{
 use super::containers::Panel;
 use crate::{
     app::{App, ContainerError},
-    backend::{ContainerList, Target},
+    backend::{BackendId, ContainerList, Target},
 };
 
 type Listed = (Target, Result<ContainerList, ContainerError>);
@@ -23,8 +23,9 @@ struct Request {
     cancelled: Arc<AtomicBool>,
 }
 
-/// Runs one listing at a time with the scheme of the tester: starting a listing cancels the
-/// running one (its `ssh` is killed) and bumps the generation, so a stale result is dropped.
+/// Runs one listing at a time with one backend, with the scheme of the tester: starting a
+/// listing cancels the running one (its `ssh` is killed) and bumps the generation, so a stale
+/// result is dropped. Each container tab has its own, so the backends list in parallel.
 pub(super) struct Lister {
     requests: mpsc::Sender<Request>,
     results: mpsc::Receiver<(u64, Listed)>,
@@ -41,10 +42,11 @@ impl Lister {
     pub(super) fn spawn<'scope>(
         scope: &'scope thread::Scope<'scope, '_>,
         app: &'scope App,
+        backend: BackendId,
     ) -> Self {
         let (requests, receiver) = mpsc::channel();
         let (sender, results) = mpsc::channel();
-        scope.spawn(move || list_worker(app, &receiver, &sender));
+        scope.spawn(move || list_worker(app, backend, &receiver, &sender));
         Self {
             requests,
             results,
@@ -114,6 +116,7 @@ impl Drop for Lister {
 
 fn list_worker(
     app: &App,
+    backend: BackendId,
     requests: &mpsc::Receiver<Request>,
     results: &mpsc::Sender<(u64, Listed)>,
 ) {
@@ -121,7 +124,12 @@ fn list_worker(
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
         }
-        let result = app.containers(&request.target, None, true, Some(&request.cancelled));
+        let result = app.containers(
+            &request.target,
+            Some(backend),
+            true,
+            Some(&request.cancelled),
+        );
         if request.cancelled.load(Ordering::Relaxed) {
             continue;
         }
@@ -219,7 +227,7 @@ mod tests {
         let (app, slow, pid) = local_app(dir.path());
         fs::write(&slow, "").unwrap();
         thread::scope(|scope| {
-            let mut lister = Lister::spawn(scope, &app);
+            let mut lister = Lister::spawn(scope, &app, BackendId::Docker);
             lister.start(Target::Local);
             let first = wait_for_pid(&pid);
 
@@ -244,7 +252,7 @@ mod tests {
         let (app, slow, pid) = local_app(dir.path());
         fs::write(&slow, "").unwrap();
         thread::scope(|scope| {
-            let mut lister = Lister::spawn(scope, &app);
+            let mut lister = Lister::spawn(scope, &app, BackendId::Docker);
             lister.start(Target::Local);
             let sleeping = wait_for_pid(&pid);
 
@@ -269,7 +277,7 @@ mod tests {
             generation: 0,
             running: None,
         };
-        let mut panel = Panel::default();
+        let mut panel = Panel::new(BackendId::Docker);
         panel.show(Target::Host("dev".into()));
 
         lister.list(&mut panel, Target::Host("dev".into()));

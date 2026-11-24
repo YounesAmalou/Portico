@@ -65,6 +65,7 @@ pub struct ContainerPrograms {
     pub sg: PathBuf,
     pub sh: PathBuf,
     pub pct: PathBuf,
+    pub podman: PathBuf,
 }
 
 impl Default for ContainerPrograms {
@@ -75,6 +76,7 @@ impl Default for ContainerPrograms {
             sg: "sg".into(),
             sh: "sh".into(),
             pct: "pct".into(),
+            podman: "podman".into(),
         }
     }
 }
@@ -333,6 +335,7 @@ impl App {
             "sg" => programs.sg.as_os_str(),
             "sh" => programs.sh.as_os_str(),
             "pct" => programs.pct.as_os_str(),
+            "podman" => programs.podman.as_os_str(),
             other => OsStr::new(other),
         }
     }
@@ -396,7 +399,7 @@ mod tests {
             SHELL_SCRIPT, exec_words, in_group, join_group_offer, join_group_words, ps_words,
             start_daemon_offer, start_daemon_words,
         },
-        backend::proxmox,
+        backend::{podman, proxmox},
         domain::host::Host,
         domain::managed::{ConfigPaths, ManagedStore},
         domain::openssh::OpenSsh,
@@ -416,7 +419,9 @@ mod tests {
         app: App,
     }
 
-    const PROGRAMS: [&str; 7] = ["ssh", "terminal", "docker", "sudo", "sg", "sh", "pct"];
+    const PROGRAMS: [&str; 8] = [
+        "ssh", "terminal", "docker", "sudo", "sg", "sh", "pct", "podman",
+    ];
 
     fn fixture() -> Fixture {
         fixture_with_portico(None)
@@ -449,6 +454,7 @@ mod tests {
             sg: program("sg"),
             sh: program("sh"),
             pct: program("pct"),
+            podman: program("podman"),
         });
         app.initialize(true).unwrap();
         app.add(Host::new("dev", "h.example", None, None, None, None).unwrap())
@@ -540,7 +546,11 @@ mod tests {
         let ids: Vec<_> = list.listing.containers.iter().map(|c| &c.id).collect();
         assert_eq!(ids, ["101"]);
         let calls = fixture.calls("ssh");
-        assert_eq!(calls.matches("[dev]").count(), 2);
+        assert_eq!(
+            calls.matches("[dev]").count(),
+            3,
+            "Docker, Podman, then Proxmox"
+        );
         assert!(calls.ends_with(&call(&[
             "-o",
             "RemoteCommand=none",
@@ -809,12 +819,152 @@ mod tests {
         );
     }
 
-    /// An ssh fake for a host without docker: `docker ps` is not found, and the Proxmox
-    /// listing gets `proxmox`'s behaviour.
+    /// An ssh fake for a host without docker or podman: `docker ps` and `podman ps` are not
+    /// found, and the Proxmox listing gets `proxmox`'s behaviour.
     fn without_docker(proxmox: &str) -> String {
         format!(
-            "case \"$last\" in *'docker ps'*) echo 'sh: 1: docker: not found' >&2; exit 127 ;; esac\n{proxmox}"
+            "case \"$last\" in *'docker ps'*) echo 'sh: 1: docker: not found' >&2; exit 127 ;; *'podman ps'*) echo 'sh: 2: exec: podman: not found' >&2; exit 127 ;; esac\n{proxmox}"
         )
+    }
+
+    /// An ssh fake for a host with podman only: `docker ps` is not found, and the Podman
+    /// listing prints `listing` after its marker.
+    fn podman_only(listing: &str) -> String {
+        format!(
+            "case \"$last\" in *'docker ps'*) echo 'sh: 1: docker: not found' >&2; exit 127 ;; *'podman ps'*) printf 'portico-user=deploy\\n%s\\n' '{listing}'; exit 0 ;; esac\necho 'pct must not run' >&2\nexit 99\n"
+        )
+    }
+
+    const PODMAN_LISTING: &str =
+        r#"[{"Id":"6f1c0a3c9e2b","Names":["web"],"Image":"nginx","Status":"Up 1 hour"}]"#;
+
+    #[test]
+    fn a_podman_host_is_listed_after_docker_and_before_proxmox() {
+        let fixture = fixture();
+        fixture.behave("ssh", &podman_only(PODMAN_LISTING));
+
+        let list = fixture.app.containers(&host(), None, true, None).unwrap();
+
+        assert_eq!(list.backend, BackendId::Podman);
+        assert_eq!(list.via, None);
+        let names: Vec<_> = list.listing.containers.iter().map(|c| &c.name).collect();
+        assert_eq!(names, ["web"]);
+        let calls = fixture.calls("ssh");
+        assert_eq!(calls.matches("[dev]").count(), 2, "Docker, then Podman");
+        assert!(calls.ends_with(&call(&[
+            "-o",
+            "RemoteCommand=none",
+            "-o",
+            "BatchMode=yes",
+            "--",
+            "dev",
+            &remote_command(&podman::list_words()),
+        ])));
+    }
+
+    #[test]
+    fn a_local_podman_listing_runs_the_script_with_sh() {
+        let fixture = fixture();
+        fixture.behave(
+            "sh",
+            &format!("printf 'portico-user=me\\n%s\\n' '{PODMAN_LISTING}'\n"),
+        );
+
+        let list = fixture
+            .app
+            .containers(&Target::Local, Some(BackendId::Podman), false, None)
+            .unwrap();
+
+        assert_eq!(list.backend, BackendId::Podman);
+        assert_eq!(list.listing.containers.len(), 1);
+        assert_eq!(fixture.calls("sh"), call(&podman::list_words()[1..]));
+        assert_eq!(fixture.calls("docker"), "");
+    }
+
+    #[test]
+    fn a_podman_shell_runs_podman_exec_over_ssh_as_the_user() {
+        let fixture = fixture();
+        fixture
+            .app
+            .container_shell(
+                &host(),
+                BackendId::Podman,
+                "6f1c0a3c9e2b",
+                Some("app"),
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fixture.calls("ssh"),
+            call(&[
+                "-t",
+                "-o",
+                "RemoteCommand=none",
+                "--",
+                "dev",
+                &remote_command(&podman::exec_words("6f1c0a3c9e2b", Some("app"))),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_local_podman_shell_without_podman_is_not_installed() {
+        let fixture = fixture();
+        fs::remove_file(fixture.path("podman")).unwrap();
+
+        let issue = match fixture.app.container_shell(
+            &Target::Local,
+            BackendId::Podman,
+            "abc",
+            None,
+            None,
+            false,
+            None,
+            false,
+        ) {
+            Err(ContainerError::Backend(issue)) => *issue,
+            other => panic!("expected an issue, got {other:?}"),
+        };
+
+        assert_eq!(issue.backend, BackendId::Podman);
+        assert_eq!(issue.problem, Problem::NotInstalled);
+    }
+
+    #[test]
+    fn a_podman_shell_in_a_new_terminal_names_its_backend() {
+        let fixture = fixture_with_portico(Some("/opt/portico"));
+        fixture
+            .app
+            .container_shell(
+                &host(),
+                BackendId::Podman,
+                "6f1c0a3c9e2b",
+                None,
+                None,
+                true,
+                None,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            launched(&fixture),
+            call(&[
+                "/opt/portico",
+                "shell",
+                "--hold",
+                "--on",
+                "dev",
+                "--backend",
+                "podman",
+                "--",
+                "6f1c0a3c9e2b",
+            ])
+        );
     }
 
     const NO_PCT: &str = "echo 'portico: no pct' >&2\nexit 127\n";

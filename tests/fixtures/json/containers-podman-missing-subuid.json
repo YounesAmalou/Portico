@@ -1,0 +1,11 @@
+{
+  "error": {
+    "kind": "podman",
+    "message": "Error: cannot set up namespace using \"/usr/bin/newuidmap\": exit status 1",
+    "next": [
+      "Give deploy subordinate IDs on this machine: add a range for them to /etc/subuid and /etc/subgid, then run podman system migrate."
+    ],
+    "problem": "other"
+  },
+  "schema": 1
+}

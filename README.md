@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker and Podman containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
 ## What Portico does
 
@@ -13,11 +13,11 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
-- Lists the running Docker containers on this machine or a host, grouped by Compose project, or a Proxmox VE node's LXC containers, and opens a shell in one.
+- Lists the running Docker and Podman containers on this machine or a host, grouped by Compose project, and a Proxmox VE node's LXC containers, and opens a shell in one.
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Prints one versioned JSON document per command for scripts and desktop panels.
 - Comes with a desktop panel for Quickshell and Omarchy to open hosts and container shells in a new terminal and to start and stop tunnels.
-- Provides a TUI with Hosts, Tunnels and Containers tabs when run without a subcommand.
+- Provides a TUI with Hosts and Tunnels tabs and a tab per container backend (Docker, Podman, Proxmox) when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
@@ -30,7 +30,7 @@ Private keys remain where they already live. Portico stores identity-file refere
 - Linux on x86_64 (verified on Arch Linux; other platforms are on the [roadmap](ROADMAP.md))
 - OpenSSH client tools (`ssh`)
 - `xdg-terminal-exec` for the new-terminal option only
-- `docker`, only for container shells, on this machine or on the host (Podman is not supported), or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
+- Only for container shells, on this machine or on the host: `docker`, `podman`, or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
 - Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty` to run the complete PTY integration test
@@ -144,9 +144,9 @@ portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
 portico identities              List agents and identity files, and whether each is available
-portico containers [--on [<alias>]] [--backend docker|proxmox]
+portico containers [--on [<alias>]] [--backend docker|podman|proxmox]
                                 List running containers, here or on a host
-portico shell [<container>] [--on [<alias>]] [--backend docker|proxmox] [-u <user>] [-n]
+portico shell [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [-u <user>] [-n]
                                 Open a shell in a container
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
@@ -262,13 +262,15 @@ portico shell myapp/api#2 -u root
 portico shell 3f9a1c -n
 ```
 
-`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
+`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". It lists with every backend installed there (Docker, Podman, Proxmox VE), each under its name when there are several; `--backend docker|podman|proxmox` uses only one. A backend that fails is reported and the others are still listed, with exit status 1. `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
 
-A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates.
+A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates. Without `--backend`, `portico shell` looks in every installed backend; a name found in two of them is an error asking for `--backend`.
 
-Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
+Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration, once per backend; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
 
-**Proxmox VE.** On a host without Docker, Portico lists the node's running LXC containers instead, with `pct list`, under "Proxmox containers": `portico containers --on pve`, then `portico shell 101 --on pve` by VMID or `portico shell web --on pve` by name. `--backend proxmox` (or `--backend docker`) uses only that backend, for a node that has both. `pct` needs root: Portico runs it directly when the ssh user is root and otherwise through `sudo -n`, which never asks for a password. When neither works it says how to give access (connect as root, or allow passwordless sudo for `/usr/sbin/pct`) and changes nothing on the node. The shell runs as root inside the container (bash, or sh), so `-u` is refused there: run `su` inside it. Stopped containers are not listed, and Portico does not start or stop them.
+**Podman.** Portico runs `podman` as the ssh user, so it lists that user's own (rootless) containers, or root's when you connect as root; an empty listing by another user says so. `-u` works as with Docker. A rootless user without subordinate IDs (`/etc/subuid`, `/etc/subgid`) is told how to add them; Portico changes nothing on the host.
+
+**Proxmox VE.** On a Proxmox VE node, Portico lists the running LXC containers with `pct list`, under "Proxmox containers": `portico containers --on pve`, then `portico shell 101 --on pve` by VMID or `portico shell web --on pve` by name. `pct` needs root: Portico runs it directly when the ssh user is root and otherwise through `sudo -n`, which never asks for a password. When neither works it says how to give access (connect as root, or allow passwordless sudo for `/usr/sbin/pct`) and changes nothing on the node. The shell runs as root inside the container (bash, or sh), so `-u` is refused there: run `su` inside it. Stopped containers are not listed, and Portico does not start or stop them.
 
 When Docker fails, Portico explains why and, where it can, offers the fix. The full command is shown first and `sudo` prompts in your terminal; Portico never sees a password. Declining prints the options to do it yourself.
 
@@ -386,14 +388,14 @@ Connecting runs `portico connect --new-terminal`, so the terminal is the one `xd
 
 ## TUI keys
 
-The TUI has three tabs, shown at the top with their numbers: **Hosts**, **Tunnels** and **Containers**. It opens on Hosts. Each tab keeps its own selection, filter, scroll and open form while you look at another one, and a test, listing or tunnel start keeps running when you switch away.
+The TUI has five tabs, shown at the top with their numbers: **Hosts**, **Tunnels**, and one per container backend: **Docker**, **Podman** and **Proxmox**. It opens on Hosts. Each tab keeps its own selection, filter, scroll and open form while you look at another one, and a test, listing or tunnel start keeps running when you switch away.
 
 | Key | Action |
 |---|---|
-| `1` / `2` / `3` | Show the Hosts, Tunnels or Containers tab |
+| `1` to `5` | Show the Hosts, Tunnels, Docker, Podman or Proxmox tab |
 | `Tab` / `Shift+Tab` | Show the next or previous tab |
 | `T` | Show the Tunnels tab |
-| `c` | Show the Containers tab; on the Hosts tab, for the selected host |
+| `c` | Show the container tab shown last (Docker at first); on the Hosts tab, for the selected host |
 | `r` / `F5` | Refresh the tab shown |
 | `q` | Quit (running tunnels keep running) |
 
@@ -414,7 +416,7 @@ These keys work while a tab is browsing its list. In a filter, a form or a picke
 | `o` | Unfold or fold ssh's output for the last test or connection (`Ctrl+O` in a form) |
 | `m` | Adopt the selected external host, or export the selected managed host, after a preview |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
-| `c` | Show the selected host's containers on the Containers tab |
+| `c` | Show the selected host's containers on the container tab shown last |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 
 In the filter and the host form, type normally: `Backspace` and `Delete` erase text, `←` / `→` / `Home` / `End` move the cursor, `Enter` applies the filter or saves the form, and `Esc` cancels.
@@ -454,9 +456,9 @@ The Tunnels tab lists the saved tunnels with their status, and the selected one'
 
 In the tunnel form, `↑` / `↓` (or `Tab` / `Shift+Tab`) move between fields: name, host, kind, bind address, bind port, target host and target port (a dynamic forward has no target). While you type a host, a dropdown lists the known hosts that match, as the ProxyJump field does: `↑` / `↓` choose, `Enter` or `Tab` fills in the alias, `Esc` closes the list (a second `Esc` cancels the form), and `Ctrl+Space` opens it before you type. `Space` or `←` / `→` changes the kind, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
 
-### Containers tab
+### Container tabs
 
-The Containers tab lists the containers of one target, shown on its first line: `Target: this machine` or `Target: <alias>`. Nothing is listed when the TUI starts: this machine's containers are listed the first time you open the tab. `c` on the Hosts tab targets the selected host, `h` picks the target with the fuzzy picker (this machine first, then every host), and `L` comes back to this machine. A target is listed the first time it is shown and after a failed listing, and otherwise shows the result kept for the session; `r` or `F5` lists again. Only the target shown is ever listed. The right side shows the selected container.
+The Docker, Podman and Proxmox tabs each list the containers of one target with their backend. The three share the target, shown on their first line: `Target: this machine` or `Target: <alias>`. Nothing is listed when the TUI starts: this machine's containers are listed the first time you open a container tab, with all three backends at once, in parallel. A backend that is not installed on the target says so in its tab. `c` on the Hosts tab targets the selected host, `h` picks the target with the fuzzy picker (this machine first, then every host), and `L` comes back to this machine; the new target is listed in all three tabs. A target is listed the first time it is shown and after a failed listing, and otherwise shows the result kept for the session; `r` or `F5` lists again in the tab shown. Only the target shown is ever listed. The right side shows the selected container.
 
 | Key | Action |
 |---|---|

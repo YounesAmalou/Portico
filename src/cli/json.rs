@@ -515,7 +515,7 @@ pub(super) fn containers(list: &ContainerList) -> Value {
         .map(|container| {
             // A Proxmox container has no image.
             let image = match list.backend {
-                BackendId::Docker => json!(line(&container.image)),
+                BackendId::Docker | BackendId::Podman => json!(line(&container.image)),
                 BackendId::Proxmox => Value::Null,
             };
             json!({
