@@ -19,6 +19,7 @@ use thiserror::Error;
 use super::{App, AppError};
 use crate::{
     domain::explain::{Explanation, Operation},
+    domain::openssh::OpenSshError,
     domain::probe::{Failure, diagnose},
     domain::tunnel::{
         Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
@@ -28,7 +29,6 @@ use crate::{
         },
         start_args,
     },
-    openssh::OpenSshError,
     platform::fs::{acquire_lock, open_lock},
     platform::process::{Logged, current_uid, kill_process_tree, stop_process},
 };
@@ -728,8 +728,8 @@ mod tests {
     use super::*;
     use crate::{
         domain::managed::{ConfigPaths, ManagedStore},
+        domain::openssh::OpenSsh,
         domain::tunnel::runtime::RuntimeDir,
-        openssh::OpenSsh,
         platform::process::Proc,
     };
 

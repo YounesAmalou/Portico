@@ -145,7 +145,7 @@ mod tests {
     use crate::{
         app::ContainerPrograms,
         domain::managed::{ConfigPaths, ManagedStore},
-        openssh::OpenSsh,
+        domain::openssh::OpenSsh,
         test_executable::write_executable,
     };
 

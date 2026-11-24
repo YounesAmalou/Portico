@@ -23,7 +23,7 @@ use crate::{
         self, Agent, AgentProblem, Expansion, FileFacts, HostIdentities, Identity,
         IdentityInventory, InventoryAgent, InventoryFile, PublicKey, Socket,
     },
-    openssh::{OpenSsh, OpenSshError, ResolvedConfig},
+    domain::openssh::{OpenSsh, OpenSshError, ResolvedConfig},
 };
 
 /// How long `ssh-add` or `ssh-keygen` may run before it is killed.

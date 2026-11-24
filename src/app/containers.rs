@@ -18,7 +18,7 @@ use crate::{
         RunFailure, Target, remote_command,
     },
     domain::explain::Explanation,
-    openssh::{ConnectionOutcome, OpenSshError},
+    domain::openssh::{ConnectionOutcome, OpenSshError},
 };
 
 /// Why a container command did not run.
@@ -343,7 +343,7 @@ mod tests {
         },
         domain::host::Host,
         domain::managed::{ConfigPaths, ManagedStore},
-        openssh::OpenSsh,
+        domain::openssh::OpenSsh,
         test_executable::write_executable,
     };
 
@@ -513,7 +513,7 @@ mod tests {
                 .app
                 .containers(&Target::Local, true, Some(&cancelled)),
             Err(ContainerError::App(AppError::OpenSsh(
-                crate::openssh::OpenSshError::Cancelled
+                crate::domain::openssh::OpenSshError::Cancelled
             )))
         ));
     }

@@ -57,8 +57,8 @@ use crate::{
     domain::host::{Change, ClearField, Host, HostChanges, HostError, HostField, parse_port},
     domain::identity::IdentityInventory,
     domain::managed::{InitPlan, TransactionError},
+    domain::openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     domain::suggest::{self, Candidate},
-    openssh::{ConnectionOutcome, PresentedKey, ResolvedConfig},
     picker::HIT,
 };
 use containers::{Panel, PanelAction, fix_status, shell_status, show_fix};
@@ -3354,8 +3354,8 @@ mod tests {
         domain::discovery::DiscoveryWarning,
         domain::host::{Change, Host},
         domain::managed::InitPlan,
+        domain::openssh::ResolvedConfig,
         domain::probe::ProbeResult,
-        openssh::ResolvedConfig,
     };
 
     use super::*;
@@ -3516,7 +3516,10 @@ mod tests {
             .unwrap();
             let app = App::new(
                 store,
-                crate::openssh::OpenSsh::new("/usr/bin/false".into(), "/usr/bin/false".into()),
+                crate::domain::openssh::OpenSsh::new(
+                    "/usr/bin/false".into(),
+                    "/usr/bin/false".into(),
+                ),
             );
             let mut state = UiState::new(app.hosts().unwrap(), false);
 
@@ -4848,7 +4851,7 @@ mod tests {
         );
         let app = App::new(
             store,
-            crate::openssh::OpenSsh::new(ssh, "/usr/bin/false".into()),
+            crate::domain::openssh::OpenSsh::new(ssh, "/usr/bin/false".into()),
         );
         (app, log)
     }
@@ -5132,7 +5135,7 @@ mod tests {
                 "prod",
                 ProbeResult::Failed(crate::domain::probe::Failure::HostKeyUnknown),
             ),
-            key: crate::openssh::PresentedKey {
+            key: crate::domain::openssh::PresentedKey {
                 lines: Vec::new(),
                 fingerprints: Vec::new(),
             },
@@ -5261,9 +5264,9 @@ mod tests {
                 alias,
                 ProbeResult::Failed(crate::domain::probe::Failure::HostKeyUnknown),
             ),
-            key: crate::openssh::PresentedKey {
+            key: crate::domain::openssh::PresentedKey {
                 lines: b"h ssh-ed25519 AAAA\n".to_vec(),
-                fingerprints: vec![crate::openssh::KeyFingerprint {
+                fingerprints: vec![crate::domain::openssh::KeyFingerprint {
                     host: host.into(),
                     fingerprint: "SHA256:abc".into(),
                     key_type: "ED25519".into(),

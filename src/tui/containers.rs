@@ -17,7 +17,7 @@ use crate::{
         remote_command,
     },
     domain::fuzzy,
-    openssh::ConnectionOutcome,
+    domain::openssh::ConnectionOutcome,
     picker::{HIT, Outcome, Row, Single, State},
 };
 

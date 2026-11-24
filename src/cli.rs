@@ -25,7 +25,7 @@ use crate::{
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::identity::{self, Agent, HostIdentities, IdentityInventory},
     domain::managed::{InitOutcome, InitPlan},
-    openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
+    domain::openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     picker::{Picker, Row},
 };
 
@@ -1592,7 +1592,7 @@ mod tests {
         },
         domain::host::Host,
         domain::managed::{ConfigPaths, ManagedStore},
-        openssh::OpenSsh,
+        domain::openssh::OpenSsh,
         picker::Row,
     };
 
@@ -2733,7 +2733,7 @@ fi
                 source: "/home/me/.ssh/config".into(),
             },
             declared: None,
-            resolution: Ok(crate::openssh::ResolvedConfig {
+            resolution: Ok(crate::domain::openssh::ResolvedConfig {
                 hostname: "dev.example".into(),
                 user: Some("deploy".into()),
                 port: Some(22),
