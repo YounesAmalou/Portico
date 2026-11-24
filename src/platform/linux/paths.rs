@@ -35,6 +35,18 @@ pub fn runtime_dir(home: &Path, xdg_runtime_dir: Option<&OsStr>) -> PathBuf {
     }
 }
 
+/// `$XDG_CONFIG_HOME/portico` when `xdg_config_home` is an absolute path, otherwise
+/// `~/.config/portico`.
+pub fn config_dir(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
+    match xdg_config_home
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+    {
+        Some(path) => path.join("portico"),
+        None => home.join(".config/portico"),
+    }
+}
+
 /// `path` with a leading `home` shown as `~`.
 pub fn tilde(path: &Path, home: &Path) -> String {
     if home.as_os_str().is_empty() {
@@ -68,6 +80,18 @@ pub fn expand(value: &str, home: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_dir_follows_absolute_xdg_only() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            config_dir(home, Some(OsStr::new("/x"))),
+            Path::new("/x/portico")
+        );
+        for xdg in [None, Some(OsStr::new("rel"))] {
+            assert_eq!(config_dir(home, xdg), Path::new("/home/me/.config/portico"));
+        }
+    }
 
     #[test]
     fn runtime_dir_falls_back_under_the_home_without_a_usable_xdg_dir() {

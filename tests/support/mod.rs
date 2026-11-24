@@ -149,7 +149,8 @@ impl TestEnv {
             .env("HOME", &self.home)
             .env("PATH", path)
             .env_remove("SSH_AUTH_SOCK")
-            .env_remove("XDG_RUNTIME_DIR");
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("XDG_CONFIG_HOME");
         command
     }
 
