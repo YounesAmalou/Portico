@@ -9,7 +9,7 @@ Portico's read commands, its settings, and starting and stopping tunnels, print 
 | `portico hosts --json` | [The host list](#hosts) |
 | `portico show <alias> --json` | [One host's details and identities](#show) |
 | `portico identities --json` | [Every agent and identity file](#identities) |
-| `portico containers [--on <alias>] [--backend docker\|podman\|proxmox] --json` | [The running containers of this machine or a host](#containers) |
+| `portico containers [--on <alias>] [--backend docker\|podman\|proxmox]... --json` | [The running containers of this machine or a host](#containers) |
 | `portico settings --json` | [Portico's settings](#settings) |
 | `portico tunnels --json` | [The saved tunnels and their status](#tunnels) |
 | `portico tunnel show <name> --json` | [One tunnel, its command line and its log](#tunnel-show) |
@@ -322,7 +322,7 @@ When the host does not resolve, the command still succeeds:
 
 ## Containers
 
-`portico containers --json` lists the running containers of this machine, and `portico containers --on <alias> --json` those of a host, through `ssh`. The document holds one backend's listing: the first of Docker, Podman (see [Podman containers](#podman-containers)) and Proxmox VE's `pct` (see [Proxmox containers](#proxmox-containers)) installed there. `--backend docker`, `--backend podman` or `--backend proxmox` uses that one, for a target that has several. (Without `--json`, `portico containers` prints every installed backend's listing.)
+`portico containers --json` lists the running containers of this machine, and `portico containers --on <alias> --json` those of a host, through `ssh`. The document holds one backend's listing: the first of Docker, Podman (see [Podman containers](#podman-containers)) and Proxmox VE's `pct` (see [Proxmox containers](#proxmox-containers)) installed there. `--backend docker`, `--backend podman` or `--backend proxmox` uses that one, for a target that has several. Repeat `--backend` to choose among some of them: the document is of the first of those installed, in the order given (`--backend podman --backend proxmox` never lists Docker), or, when none is installed, the `not-installed` error of the first one given. (Without `--json`, `portico containers` prints every installed backend's listing.)
 
 <!-- golden: containers-on-host.json -->
 ```json

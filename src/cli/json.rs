@@ -12,7 +12,9 @@ use crate::{
         App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
         TunnelRefusal,
     },
-    backend::{BackendId, BackendIssue, ContainerList, Target, Via, display_name, group},
+    backend::{
+        AUTOMATIC, BackendId, BackendIssue, ContainerList, Target, Via, display_name, group,
+    },
     domain::discovery::DiscoveryWarning,
     domain::explain::Explanation,
     domain::identity::{
@@ -34,7 +36,7 @@ pub(super) enum JsonCommand {
     Hosts,
     Show(Option<String>),
     Identities,
-    Containers(Option<Option<String>>, Option<BackendId>),
+    Containers(Option<Option<String>>, Vec<BackendId>),
     Tunnels,
     Settings,
     TunnelShow(Option<String>),
@@ -191,14 +193,19 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             success(details(&app.show(&alias)?))
         }
         JsonCommand::Identities => success(inventory(&app.identity_inventory()?)),
-        JsonCommand::Containers(on, backend) => {
+        JsonCommand::Containers(on, backends) => {
             let target = match on {
                 None => Target::Local,
                 Some(Some(alias)) => Target::Host(alias),
                 Some(None) => return Err(Failure::usage("containers --on <alias>")),
             };
             // Batch: ssh must not ask for a password nobody sees.
-            success(containers(&app.containers(&target, backend, true, None)?))
+            let backends = if backends.is_empty() {
+                &AUTOMATIC[..]
+            } else {
+                &backends[..]
+            };
+            success(containers(&app.containers(&target, backends, true, None)?))
         }
         JsonCommand::Tunnels => {
             let reports = app.tunnels()?;

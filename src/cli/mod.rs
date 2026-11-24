@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     app::{App, AppError, Ownership},
-    backend::{BackendId, Via},
+    backend::{AUTOMATIC, BackendId, Via},
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
@@ -138,9 +138,10 @@ enum Command {
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
         /// List with this backend only; without it, every installed one (with --json, the first
-        /// installed of Docker, Podman and Proxmox).
+        /// installed of Docker, Podman and Proxmox). Repeat it to list with those only, in that
+        /// order (with --json, the first installed of them).
         #[arg(long, value_enum)]
-        backend: Option<BackendArg>,
+        backend: Vec<BackendArg>,
         /// Print one JSON document instead of text (see docs/json-output.md).
         #[arg(long)]
         json: bool,
@@ -413,7 +414,10 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
             on,
             backend,
             json: true,
-        } => JsonCommand::Containers(on.clone(), backend.map(BackendId::from)),
+        } => JsonCommand::Containers(
+            on.clone(),
+            backend.iter().copied().map(BackendId::from).collect(),
+        ),
         Command::Tunnels { json: true } => JsonCommand::Tunnels,
         Command::Settings { json: true, .. } => JsonCommand::Settings,
         Command::Tunnel { command } => return tunnels::json_command(command),
@@ -586,12 +590,13 @@ fn execute<I: BufRead, O: Write, E: Write>(
             let Some(target) = on_argument(on, app, picker, interactive, "containers")? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
-            let (lists, failed) = match backend.map(BackendId::from) {
-                Some(backend) => (
+            let backends: Vec<BackendId> = backend.into_iter().map(BackendId::from).collect();
+            let (lists, failed) = match backends.as_slice() {
+                [backend] => (
                     vec![list_with_offers(
                         app,
                         &target,
-                        Some(backend),
+                        &[*backend],
                         input,
                         output,
                         error,
@@ -599,8 +604,14 @@ fn execute<I: BufRead, O: Write, E: Write>(
                     )?],
                     false,
                 ),
-                None => {
-                    let every = list_every(app, &target, input, output, error, interactive)?;
+                several => {
+                    let several = if several.is_empty() {
+                        &AUTOMATIC[..]
+                    } else {
+                        several
+                    };
+                    let every =
+                        list_every(app, &target, several, input, output, error, interactive)?;
                     (every.lists, every.failed)
                 }
             };
@@ -636,13 +647,16 @@ fn execute<I: BufRead, O: Write, E: Write>(
                         Some(backend) => vec![list_with_offers(
                             app,
                             &target,
-                            Some(backend),
+                            &[backend],
                             input,
                             output,
                             error,
                             interactive,
                         )?],
-                        None => list_every(app, &target, input, output, error, interactive)?.lists,
+                        None => {
+                            list_every(app, &target, &AUTOMATIC, input, output, error, interactive)?
+                                .lists
+                        }
                     };
                     if lists.iter().all(|list| list.listing.containers.is_empty()) {
                         writeln!(error, "No running containers on {target}.")

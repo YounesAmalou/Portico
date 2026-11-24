@@ -144,7 +144,7 @@ portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
 portico identities              List agents and identity files, and whether each is available
-portico containers [--on [<alias>]] [--backend docker|podman|proxmox]
+portico containers [--on [<alias>]] [--backend docker|podman|proxmox]...
                                 List running containers, here or on a host
 portico shell [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [-u <user>] [-n]
                                 Open a shell in a container
@@ -262,7 +262,7 @@ portico shell myapp/api#2 -u root
 portico shell 3f9a1c -n
 ```
 
-`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". It lists with every backend installed there (Docker, Podman, Proxmox VE), each under its name when there are several; `--backend docker|podman|proxmox` uses only one. A backend that fails is reported and the others are still listed, with exit status 1. `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
+`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". It lists with every backend installed there (Docker, Podman, Proxmox VE), each under its name when there are several; `--backend docker|podman|proxmox` uses only one, and repeating it uses only those, in the order given (with `--json`, the first installed of them). A backend that fails is reported and the others are still listed, with exit status 1. `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
 
 A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates. Without `--backend`, `portico shell` looks in every installed backend; a name found in two of them is an error asking for `--backend`.
 
