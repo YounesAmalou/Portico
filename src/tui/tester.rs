@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     app::{App, HostSummary, TestOutcome, TestTarget},
-    openssh::PresentedKey,
+    domain::openssh::PresentedKey,
 };
 
 /// Where a test was started, which decides where its result is shown.
@@ -194,8 +194,8 @@ mod tests {
 
     use crate::{
         domain::managed::{ConfigPaths, ManagedStore},
+        domain::openssh::OpenSsh,
         domain::probe::ProbeResult,
-        openssh::OpenSsh,
         test_executable::write_executable,
     };
 

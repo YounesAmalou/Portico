@@ -9,8 +9,8 @@ use portico::{
     cli::{Cli, fail, run, run_desktop},
     desktop::{DesktopEnv, is_development_binary, panel, reload_omarchy_panel},
     domain::managed::{ConfigPaths, ManagedStore},
+    domain::openssh::OpenSsh,
     domain::tunnel::runtime::RuntimeDir,
-    openssh::OpenSsh,
     picker::TerminalPicker,
     platform,
 };

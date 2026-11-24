@@ -176,7 +176,7 @@ mod tests {
                             .unwrap()
                             .ends_with(b"# raw \xff\r\nHost legacy\n HostName legacy.example\n")
                     );
-                    crate::openssh::OpenSsh::system()
+                    crate::domain::openssh::OpenSsh::system()
                         .validate(candidate, aliases)
                         .map_err(|error| error.to_string())
                 },

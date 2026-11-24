@@ -6,6 +6,7 @@ pub mod fuzzy;
 pub mod host;
 pub mod identity;
 pub mod managed;
+pub mod openssh;
 pub mod probe;
 pub mod suggest;
 pub mod tunnel;
