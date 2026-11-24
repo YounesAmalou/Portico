@@ -9,10 +9,11 @@ use serde_json::{Map, Value, json};
 use super::{format_warning, ownership};
 use crate::{
     app::{
-        App, AppError, ContainerError, ContainerList, DockerIssue, HostDetails, HostInventory,
-        StartOutcome, StopOutcome, Target, TunnelRefusal,
+        App, AppError, ContainerError, DockerIssue, HostDetails, HostInventory, StartOutcome,
+        StopOutcome, TunnelRefusal,
     },
-    container::{DockerProblem, GroupTool, display_name, group},
+    backend::{ContainerList, GroupTool, Target},
+    container::{DockerProblem, display_name, group},
     discovery::DiscoveryWarning,
     explain::Explanation,
     identity::{

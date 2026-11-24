@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::backend::GroupTool;
+
 /// The `docker ps --format` template: one flat JSON object of strings per
 /// container, with the Compose labels that group and name it.
 pub const PS_FORMAT: &str = concat!(
@@ -428,12 +430,6 @@ pub fn parse_probe(stdout: &str) -> Option<Probe> {
         has_sg: value("sg") == "yes",
         has_systemctl: value("systemctl") == "yes",
     })
-}
-
-/// The tool that runs a command inside the docker group. `newgrp` cannot: it takes no command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum GroupTool {
-    Sg,
 }
 
 /// What to do about a refused docker socket.

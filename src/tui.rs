@@ -47,9 +47,9 @@ mod watch;
 use crate::{
     adopt,
     app::{
-        App, AppError, HostDetails, HostInventory, HostSummary, Ownership, Target, TestOutcome,
-        TestTarget,
+        App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
     },
+    backend::Target,
     config_error::ConfigRejection,
     discovery::{DiscoveryWarning, Input},
     explain::Explanation,
@@ -3358,7 +3358,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::app::{ContainerList, Target};
+    use crate::backend::{ContainerList, Target};
 
     fn test_state(hosts: Vec<HostSummary>) -> UiState {
         UiState::new(

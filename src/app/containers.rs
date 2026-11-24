@@ -3,7 +3,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    fmt, io,
+    io,
     path::PathBuf,
     process::{Command, ExitStatus, Output, Stdio},
     sync::atomic::AtomicBool,
@@ -13,48 +13,14 @@ use thiserror::Error;
 
 use super::{App, AppError};
 use crate::{
+    backend::{ContainerList, GroupTool, Target},
     container::{
-        Access, DockerProblem, GroupTool, Listing, PROBE_SCRIPT, Probe, classify, decide,
-        exec_words, in_group, join_group_words, parse_listing, parse_probe, ps_words,
-        remote_command, start_daemon_words,
+        Access, DockerProblem, PROBE_SCRIPT, Probe, classify, decide, exec_words, in_group,
+        join_group_words, parse_listing, parse_probe, ps_words, remote_command, start_daemon_words,
     },
     explain::Explanation,
     openssh::{ConnectionOutcome, OpenSshError},
 };
-
-/// Where docker runs: on this machine, or through ssh on a host of the inventory.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub enum Target {
-    Local,
-    Host(String),
-}
-
-impl Target {
-    /// `this machine`, or the host's alias.
-    pub fn describe(&self) -> String {
-        match self {
-            Target::Local => "this machine".into(),
-            Target::Host(alias) => alias.clone(),
-        }
-    }
-}
-
-impl fmt::Display for Target {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.describe())
-    }
-}
-
-/// The running containers of a target.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContainerList {
-    pub target: Target,
-    pub listing: Listing,
-    /// The tool docker had to run through to reach the socket, if any.
-    pub via: Option<GroupTool>,
-    /// Said once when `via` is set: other shells still lack the group.
-    pub note: Option<String>,
-}
 
 /// A privileged fix Portico can run in the user's terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
