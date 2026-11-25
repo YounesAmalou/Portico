@@ -12,12 +12,15 @@ use crate::{
         App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
         TunnelRefusal,
     },
-    backend::{BackendId, BackendIssue, ContainerList, Target, Via, display_name, group},
+    backend::{
+        AUTOMATIC, BackendId, BackendIssue, ContainerList, Target, Via, display_name, group,
+    },
     domain::discovery::DiscoveryWarning,
     domain::explain::Explanation,
     domain::identity::{
         Agent, Availability, HostIdentities, Identity, IdentityInventory, Provider, PublicKey,
     },
+    domain::settings::{Key, SettingsError},
     domain::tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
 };
 
@@ -33,8 +36,9 @@ pub(super) enum JsonCommand {
     Hosts,
     Show(Option<String>),
     Identities,
-    Containers(Option<Option<String>>, Option<BackendId>),
+    Containers(Option<Option<String>>, Vec<BackendId>),
     Tunnels,
+    Settings,
     TunnelShow(Option<String>),
     TunnelStart(Vec<String>),
     TunnelStop { names: Vec<String>, all: bool },
@@ -92,6 +96,16 @@ impl From<AppError> for Failure {
             }
             AppError::Tunnel(TunnelRefusal::Unknown(_)) => "unknown-tunnel",
             _ => "other",
+        };
+        Self::new(kind, error.to_string())
+    }
+}
+
+impl From<SettingsError> for Failure {
+    fn from(error: SettingsError) -> Self {
+        let kind = match &error {
+            SettingsError::Invalid { .. } => "settings",
+            SettingsError::Io { .. } => "other",
         };
         Self::new(kind, error.to_string())
     }
@@ -179,18 +193,35 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             success(details(&app.show(&alias)?))
         }
         JsonCommand::Identities => success(inventory(&app.identity_inventory()?)),
-        JsonCommand::Containers(on, backend) => {
+        JsonCommand::Containers(on, backends) => {
             let target = match on {
                 None => Target::Local,
                 Some(Some(alias)) => Target::Host(alias),
                 Some(None) => return Err(Failure::usage("containers --on <alias>")),
             };
             // Batch: ssh must not ask for a password nobody sees.
-            success(containers(&app.containers(&target, backend, true, None)?))
+            let backends = if backends.is_empty() {
+                &AUTOMATIC[..]
+            } else {
+                &backends[..]
+            };
+            success(containers(&app.containers(&target, backends, true, None)?))
         }
         JsonCommand::Tunnels => {
             let reports = app.tunnels()?;
             success(json!({ "tunnels": reports.iter().map(report).collect::<Vec<_>>() }))
+        }
+        JsonCommand::Settings => {
+            let settings = app.settings()?;
+            let mut tabs = Map::new();
+            for key in Key::ALL {
+                tabs.insert(key.leaf().to_owned(), json!(key.get(&settings)));
+            }
+            success(json!({
+                "exists": app.settings_path().exists(),
+                "path": path(app.settings_path()),
+                "tabs": tabs,
+            }))
         }
         JsonCommand::TunnelShow(name) => {
             let name = name.ok_or_else(|| Failure::usage("tunnel show <name>"))?;

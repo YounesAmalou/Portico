@@ -69,6 +69,8 @@ environment["PORTICO_TERMINAL"] = os.path.join(fake_bin, "xdg-terminal-exec")
 environment.pop("TERM_PROGRAM", None)
 # The developer's own agent must never be asked (a locked 1Password would prompt).
 environment.pop("SSH_AUTH_SOCK", None)
+# Settings come from the temporary home, never the developer's own.
+environment.pop("XDG_CONFIG_HOME", None)
 
 
 def is_running(pid):
@@ -150,9 +152,15 @@ def check_terminal(scenario):
         os.setsid()
         fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
+    scenario_environment = dict(environment, HOME=str(scenario_home))
+    if scenario == "desktop_action":
+        # `portico desktop install` must look only at the temporary home, and never offer to
+        # bind a key in the developer's own compositor.
+        for name in ["XDG_DATA_HOME", "XDG_DATA_DIRS", "HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK"]:
+            scenario_environment.pop(name, None)
     process = subprocess.Popen(
         [binary], stdin=slave, stdout=slave, stderr=slave,
-        env=dict(environment, HOME=str(scenario_home)), preexec_fn=controlling_terminal,
+        env=scenario_environment, preexec_fn=controlling_terminal,
     )
 
     def answer_keyboard_query():
@@ -369,6 +377,50 @@ def check_terminal(scenario):
             os.write(master, b"/2")
             read_screen("Hosts /2")
             os.write(master, b"\r")
+        elif scenario == "settings":
+            read_screen("4 Podman")
+            os.write(master, b",")
+            # The overlay's settings path; the desktop integration is offered only on Linux.
+            read_screen("settings.toml")
+            # Down twice reaches Podman; Space turns it off, written at once.
+            os.write(master, b"\x1b[B\x1b[B ")
+            read_screen("[ ] Podman")
+            os.write(master, b"\x1b[27u")
+            deadline = time.monotonic() + 5
+            while "settings.toml" in screen.text():
+                pump(deadline)
+            tab_bar = screen.text().splitlines()[0]
+            assert "Podman" not in tab_bar, tab_bar
+            assert "4 Proxmox" in tab_bar, tab_bar
+            settings = Path(home, ".config/portico/settings.toml").read_text()
+            assert "podman = false" in settings, settings
+        elif scenario == "desktop_action":
+            os.write(master, b",")
+            read_screen("Install or update")
+            # Past the four toggles to "Install or update", which runs `portico desktop install`
+            # with the TUI suspended.
+            os.write(master, b"\x1b[B" * 4 + b"\r")
+            start = len(transcript)
+            read_until(b"\x1b[?1049l", start)
+            # Decline whatever it offers, which depends on the tools installed, until it is done.
+            declined = 0
+            prompt = b"Press Enter to return to Portico."
+            deadline = time.monotonic() + 10
+            while prompt not in transcript[start:]:
+                pump(deadline)
+                asked = transcript[start:].count(b"[y/N]")
+                while declined < asked:
+                    os.write(master, b"n\r")
+                    declined += 1
+            resumed = len(transcript)
+            os.write(master, b"\r")
+            # The TUI comes back with the overlay, and still takes keys.
+            read_until(b"\x1b[?1049h", resumed)
+            read_screen("Install or update")
+            os.write(master, b"\x1b[27u")
+            deadline = time.monotonic() + 5
+            while "Install or update" in screen.text():
+                pump(deadline)
         elif scenario == "launcher_failure":
             start = len(transcript)
             os.write(master, b"n")

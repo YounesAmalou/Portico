@@ -658,3 +658,55 @@ fn a_podman_shell_in_a_new_terminal_names_its_backend() {
         )
     );
 }
+
+#[test]
+fn json_with_several_backends_takes_the_first_installed_of_them() {
+    let env = TestEnv::new();
+    install_proxmox(&env);
+
+    let result = env.run([
+        "containers",
+        "--json",
+        "--backend",
+        "podman",
+        "--backend",
+        "proxmox",
+    ]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert!(stdout.contains("\"backend\": \"proxmox\""), "{stdout}");
+}
+
+#[test]
+fn json_with_several_backends_none_installed_reports_the_first() {
+    let env = TestEnv::new();
+
+    let result = env.run([
+        "containers",
+        "--json",
+        "--backend",
+        "podman",
+        "--backend",
+        "proxmox",
+    ]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    assert!(
+        stdout.contains("\"problem\": \"not-installed\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"kind\": \"podman\""), "{stdout}");
+}
+
+#[test]
+fn human_listing_with_several_backends_lists_only_those() {
+    let env = TestEnv::new();
+    install_docker(&env, &shop_listing());
+    install_podman(&env, PODMAN_LISTING);
+
+    let result = env.run(["containers", "--backend", "podman", "--backend", "proxmox"]);
+    let stdout = String::from_utf8_lossy(&result.0.stdout).into_owned();
+    result.assert_success();
+    assert!(stdout.contains("toolbox"), "{stdout}");
+    assert!(!stdout.contains("Docker"), "{stdout}");
+    assert!(!stdout.contains("shop-db-1"), "{stdout}");
+}

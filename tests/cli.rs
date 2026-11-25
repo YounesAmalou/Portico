@@ -898,6 +898,64 @@ fn adopt_and_export_keep_ssh_g_identical_with_real_openssh() {
     assert!(exported.contains("# deploys only"), "{exported}");
 }
 
+fn settings_file(env: &TestEnv) -> std::path::PathBuf {
+    env.home().join(".config/portico/settings.toml")
+}
+
+#[test]
+fn settings_lists_every_key_and_the_path() {
+    let env = TestEnv::new();
+    let output = env.run(["settings"]);
+    let stdout = String::from_utf8_lossy(&output.0.stdout).into_owned();
+    for expected in [
+        "tabs.tunnels  on",
+        "tabs.podman   on",
+        "~/.config/portico/settings.toml (not created yet)",
+    ] {
+        assert!(stdout.contains(expected), "{stdout}");
+    }
+    output.assert_success();
+}
+
+#[test]
+fn settings_set_writes_and_reports() {
+    let env = TestEnv::new();
+    env.run(["settings", "set", "tabs.podman", "off"])
+        .assert_stdout_contains("tabs.podman: off");
+    assert!(
+        std::fs::read_to_string(settings_file(&env))
+            .unwrap()
+            .contains("podman = false")
+    );
+    env.run(["settings"])
+        .assert_stdout_contains("tabs.podman   off  (default on)");
+    env.run(["settings", "set", "tabs.podman", "off"])
+        .assert_stdout_contains("tabs.podman: already off");
+}
+
+#[test]
+fn settings_set_rejects_unknown_key_and_value() {
+    let env = TestEnv::new();
+    env.run(["settings", "set", "tabs.kubernetes", "off"])
+        .assert_exit_code_and_stderr_contains(
+            2,
+            "tabs.tunnels, tabs.docker, tabs.podman, tabs.proxmox",
+        );
+    env.run(["settings", "set", "tabs.docker", "maybe"])
+        .assert_exit_code_and_stderr_contains(2, "on or off");
+    env.run(["settings", "--json", "set", "tabs.docker", "off"])
+        .assert_exit_code(2);
+}
+
+#[test]
+fn settings_reports_an_invalid_file() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(settings_file(&env).parent().unwrap()).unwrap();
+    std::fs::write(settings_file(&env), "[tabs\n").unwrap();
+    env.run(["settings"])
+        .assert_exit_code_and_stderr_contains(1, "line 1");
+}
+
 /// The desktop integration is Omarchy's: other systems refuse it and keep it out of the help.
 #[cfg(not(target_os = "linux"))]
 #[test]

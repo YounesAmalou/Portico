@@ -86,24 +86,27 @@ impl App {
         &self.container_programs
     }
 
-    /// Lists the running containers of `target` with `backend`, or without one with the first
-    /// of [`backend::AUTOMATIC`] installed there; when none is, the first one's issue is
-    /// returned. On a host, `batch` keeps ssh from prompting and lets `cancelled` stop it, and
+    /// Lists the running containers of `target` with the first of `backends` installed there,
+    /// in the order given (one backend is listed exactly, installed or not); when none is, the
+    /// first one's issue is returned. An empty `backends` lists in the [`backend::AUTOMATIC`]
+    /// order. On a host, `batch` keeps ssh from prompting and lets `cancelled` stop it, and
     /// an ssh failure is explained as in the TUI. When the docker socket is refused because
     /// this session predates the user's docker group, the listing is rerun inside the group.
     pub fn containers(
         &self,
         target: &Target,
-        backend: Option<BackendId>,
+        backends: &[BackendId],
         batch: bool,
         cancelled: Option<&AtomicBool>,
     ) -> Result<ContainerList, ContainerError> {
         let target = self.container_target(target)?;
-        if let Some(backend) = backend {
-            return self.list_with(backend, &target, batch, cancelled);
-        }
+        let backends = if backends.is_empty() {
+            &backend::AUTOMATIC[..]
+        } else {
+            backends
+        };
         let mut first_missing = None;
-        for backend in backend::AUTOMATIC {
+        for &backend in backends {
             match self.list_with(backend, &target, batch, cancelled) {
                 Err(ContainerError::Backend(issue)) if issue.problem == Problem::NotInstalled => {
                     first_missing.get_or_insert(issue);
@@ -111,9 +114,9 @@ impl App {
                 result => return result,
             }
         }
-        Err(ContainerError::Backend(
-            first_missing.expect("AUTOMATIC names at least one backend"),
-        ))
+        Err(ContainerError::Backend(first_missing.expect(
+            "a listing that finds no backend installed names its first",
+        )))
     }
 
     /// Lists the running containers of `target`, already spelled as the inventory spells it,
@@ -523,7 +526,10 @@ mod tests {
         let fixture = fixture();
         fixture.behave("ssh", &format!("echo '{LISTING}'\n"));
 
-        let list = fixture.app.containers(&host(), None, false, None).unwrap();
+        let list = fixture
+            .app
+            .containers(&host(), &backend::AUTOMATIC, false, None)
+            .unwrap();
 
         assert_eq!(list.backend, BackendId::Docker);
         assert_eq!(fixture.calls("ssh").lines().count(), 1);
@@ -538,7 +544,10 @@ mod tests {
             &without_docker(&format!("printf 'user=deploy\\nvia=sudo\\n{PCT_TABLE}'\n")),
         );
 
-        let list = fixture.app.containers(&host(), None, true, None).unwrap();
+        let list = fixture
+            .app
+            .containers(&host(), &backend::AUTOMATIC, true, None)
+            .unwrap();
 
         assert_eq!(list.backend, BackendId::Proxmox);
         assert_eq!(list.via, Some(Via::Sudo));
@@ -567,7 +576,11 @@ mod tests {
         let fixture = fixture();
         fixture.behave("ssh", &fails_with("error during connect: something broke"));
 
-        let issue = docker_issue(fixture.app.containers(&host(), None, false, None));
+        let issue = docker_issue(
+            fixture
+                .app
+                .containers(&host(), &backend::AUTOMATIC, false, None),
+        );
 
         assert_eq!(issue.backend, BackendId::Docker);
         assert_eq!(fixture.calls("ssh").lines().count(), 1);
@@ -580,7 +593,7 @@ mod tests {
 
         let issue = docker_issue(fixture.app.containers(
             &host(),
-            Some(BackendId::Proxmox),
+            &[BackendId::Proxmox],
             false,
             None,
         ));
@@ -598,7 +611,7 @@ mod tests {
 
         let list = fixture
             .app
-            .containers(&Target::Local, Some(BackendId::Proxmox), false, None)
+            .containers(&Target::Local, &[BackendId::Proxmox], false, None)
             .unwrap();
 
         assert_eq!(list.listing.containers.len(), 1);
@@ -731,13 +744,26 @@ mod tests {
     }
 
     #[test]
+    fn no_backends_means_the_automatic_order() {
+        let fixture = fixture();
+        fixture.behave("docker", &format!("echo '{LISTING}'\n"));
+
+        let list = fixture
+            .app
+            .containers(&Target::Local, &[], false, None)
+            .unwrap();
+
+        assert_eq!(list.backend, BackendId::Docker);
+    }
+
+    #[test]
     fn a_local_listing_runs_the_configured_docker() {
         let fixture = fixture();
         fixture.behave("docker", &format!("echo '{LISTING}'\n"));
 
         let list = fixture
             .app
-            .containers(&Target::Local, None, false, None)
+            .containers(&Target::Local, &backend::AUTOMATIC, false, None)
             .unwrap();
 
         assert_eq!(list.target, Target::Local);
@@ -753,7 +779,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .app
-                .containers(&Target::Local, None, true, Some(&cancelled)),
+                .containers(&Target::Local, &backend::AUTOMATIC, true, Some(&cancelled)),
             Err(ContainerError::App(AppError::OpenSsh(
                 crate::domain::openssh::OpenSshError::Cancelled
             )))
@@ -772,7 +798,7 @@ mod tests {
             ..ContainerPrograms::default()
         });
 
-        let issue = docker_issue(app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(app.containers(&Target::Local, &backend::AUTOMATIC, false, None));
 
         assert_eq!(issue.problem, Problem::NotInstalled);
         assert_eq!(
@@ -793,7 +819,7 @@ mod tests {
 
         let list = fixture
             .app
-            .containers(&Target::Host("DEV".into()), None, true, None)
+            .containers(&Target::Host("DEV".into()), &backend::AUTOMATIC, true, None)
             .unwrap();
         assert_eq!(list.target, host());
         assert_eq!(list.listing.containers[0].id, "abc123");
@@ -812,7 +838,10 @@ mod tests {
         );
 
         fs::remove_file(fixture.path("ssh.calls")).unwrap();
-        fixture.app.containers(&host(), None, false, None).unwrap();
+        fixture
+            .app
+            .containers(&host(), &backend::AUTOMATIC, false, None)
+            .unwrap();
         assert_eq!(
             fixture.calls("ssh"),
             call(&["-o", "RemoteCommand=none", "--", "dev", &command])
@@ -843,7 +872,10 @@ mod tests {
         let fixture = fixture();
         fixture.behave("ssh", &podman_only(PODMAN_LISTING));
 
-        let list = fixture.app.containers(&host(), None, true, None).unwrap();
+        let list = fixture
+            .app
+            .containers(&host(), &backend::AUTOMATIC, true, None)
+            .unwrap();
 
         assert_eq!(list.backend, BackendId::Podman);
         assert_eq!(list.via, None);
@@ -872,7 +904,7 @@ mod tests {
 
         let list = fixture
             .app
-            .containers(&Target::Local, Some(BackendId::Podman), false, None)
+            .containers(&Target::Local, &[BackendId::Podman], false, None)
             .unwrap();
 
         assert_eq!(list.backend, BackendId::Podman);
@@ -975,7 +1007,11 @@ mod tests {
         let fixture = fixture();
         fixture.behave("ssh", &without_docker(NO_PCT));
 
-        let issue = docker_issue(fixture.app.containers(&host(), None, false, None));
+        let issue = docker_issue(
+            fixture
+                .app
+                .containers(&host(), &backend::AUTOMATIC, false, None),
+        );
 
         // Neither is installed: Docker's issue, as before Proxmox.
         assert_eq!(issue.backend, BackendId::Docker);
@@ -995,7 +1031,10 @@ mod tests {
             "echo 'ssh: connect to host h port 22: Connection refused' >&2\nexit 255\n",
         );
 
-        match fixture.app.containers(&host(), None, false, None) {
+        match fixture
+            .app
+            .containers(&host(), &backend::AUTOMATIC, false, None)
+        {
             Err(error @ ContainerError::Ssh { .. }) => {
                 assert_eq!(error.to_string(), "ssh to dev failed");
                 let ContainerError::Ssh { alias, stderr, .. } = error else {
@@ -1012,7 +1051,7 @@ mod tests {
     fn an_unknown_host_is_an_app_error() {
         let fixture = fixture();
         assert!(matches!(
-            fixture.app.containers(&Target::Host("nope".into()), None, false, None),
+            fixture.app.containers(&Target::Host("nope".into()), &backend::AUTOMATIC, false, None),
             Err(ContainerError::App(AppError::UnknownHost(alias))) if alias == "nope"
         ));
     }
@@ -1029,7 +1068,7 @@ mod tests {
 
         let list = fixture
             .app
-            .containers(&Target::Local, None, false, None)
+            .containers(&Target::Local, &backend::AUTOMATIC, false, None)
             .unwrap();
 
         assert_eq!(list.via, Some(Via::Sg));
@@ -1061,7 +1100,11 @@ mod tests {
             ),
         );
 
-        let issue = docker_issue(fixture.app.containers(&host(), None, false, None));
+        let issue = docker_issue(
+            fixture
+                .app
+                .containers(&host(), &backend::AUTOMATIC, false, None),
+        );
 
         assert_eq!(issue.problem, Problem::PermissionDenied);
         assert_eq!(issue.offer, Some(join_group_offer(&host(), "me", SOCKET)));
@@ -1084,7 +1127,12 @@ mod tests {
 
         fixture.behave("docker", &fails_with(DENIED));
         fixture.behave("sh", &probe_output("me", "no", SOCKET, "root", ALL_TOOLS));
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
         assert_eq!(
             issue.headline,
             "me cannot use Docker on this machine: permission denied on /var/run/docker.sock."
@@ -1107,7 +1155,12 @@ mod tests {
             ),
         );
 
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
 
         assert_eq!(
             issue.headline,
@@ -1123,7 +1176,12 @@ mod tests {
         fixture.behave("docker", &fails_with(DENIED));
         fixture.behave("sh", &probe_output("me", "yes", SOCKET, "staff", ALL_TOOLS));
 
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
 
         assert_eq!(
             issue.headline,
@@ -1142,7 +1200,12 @@ mod tests {
         fixture.behave("docker", &fails_with(DENIED));
         fixture.behave("sh", &probe_output("me", "no", "", "", ALL_TOOLS));
 
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
 
         assert_eq!(issue.offer, None);
         assert_eq!(
@@ -1161,7 +1224,12 @@ mod tests {
         fixture.behave("docker", &fails_with(DENIED));
         fixture.behave("sh", "exit 2\n");
 
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
 
         assert_eq!(issue.problem, Problem::PermissionDenied);
         assert_eq!(issue.headline, DENIED);
@@ -1178,7 +1246,12 @@ mod tests {
             &probe_output("me docker", "yes", SOCKET, "docker", ALL_TOOLS),
         );
 
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
 
         assert_eq!(issue.problem, Problem::ServiceDown);
         assert_eq!(
@@ -1192,7 +1265,12 @@ mod tests {
             "sh",
             &probe_output("me docker", "yes", SOCKET, "docker", NO_TOOLS),
         );
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
         assert_eq!(issue.next, ["Start the Docker daemon, then list again."]);
         assert_eq!(issue.offer, None);
     }
@@ -1202,7 +1280,12 @@ mod tests {
         let fixture = fixture();
         fixture.behave("docker", &fails_with("Error response from daemon: boom"));
 
-        let issue = docker_issue(fixture.app.containers(&Target::Local, None, false, None));
+        let issue = docker_issue(fixture.app.containers(
+            &Target::Local,
+            &backend::AUTOMATIC,
+            false,
+            None,
+        ));
 
         assert_eq!(issue.problem, Problem::Other);
         assert_eq!(

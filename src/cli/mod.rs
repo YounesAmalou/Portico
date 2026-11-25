@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     app::{App, AppError, Ownership},
-    backend::{BackendId, Via},
+    backend::{AUTOMATIC, BackendId, Via},
+    desktop::DesktopEnv,
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
@@ -21,6 +22,7 @@ mod desktop;
 mod hosts;
 mod json;
 mod migrate;
+mod settings;
 mod tunnels;
 
 use self::{
@@ -137,9 +139,10 @@ enum Command {
         #[arg(long = "on", value_name = "ALIAS", num_args = 0..=1)]
         on: Option<Option<String>>,
         /// List with this backend only; without it, every installed one (with --json, the first
-        /// installed of Docker, Podman and Proxmox).
+        /// installed of Docker, Podman and Proxmox). Repeat it to list with those only, in that
+        /// order (with --json, the first installed of them).
         #[arg(long, value_enum)]
-        backend: Option<BackendArg>,
+        backend: Vec<BackendArg>,
         /// Print one JSON document instead of text (see docs/json-output.md).
         #[arg(long)]
         json: bool,
@@ -177,6 +180,15 @@ enum Command {
     Tunnel {
         #[command(subcommand)]
         command: tunnels::TunnelCommand,
+    },
+    /// Show Portico's settings, or change one.
+    #[command(args_conflicts_with_subcommands = true)]
+    Settings {
+        #[command(subcommand)]
+        command: Option<settings::SettingsCommand>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
     },
     /// Install the desktop panel, a launcher entry and a keybinding, or show or remove them.
     #[cfg_attr(not(target_os = "linux"), command(hide = true))]
@@ -344,11 +356,13 @@ impl Interrupts {
 
 /// Runs `cli`. An error with an empty message was already reported. `handle_signals` lets
 /// `portico test` catch SIGINT, SIGTERM and SIGHUP to stop its `ssh`; only the real program sets
-/// it, so tests never install process-wide handlers.
+/// it, so tests never install process-wide handlers. `desktop` is the environment whose desktop
+/// integration the TUI's settings overlay shows and manages.
 #[allow(clippy::too_many_arguments)]
 pub fn run<I, O, E>(
     cli: Cli,
     app: &App,
+    desktop: &DesktopEnv,
     picker: &mut dyn Picker,
     input: &mut I,
     output: &mut O,
@@ -367,6 +381,7 @@ where
     match execute(
         cli,
         app,
+        desktop,
         picker,
         input,
         output,
@@ -404,8 +419,12 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
             on,
             backend,
             json: true,
-        } => JsonCommand::Containers(on.clone(), backend.map(BackendId::from)),
+        } => JsonCommand::Containers(
+            on.clone(),
+            backend.iter().copied().map(BackendId::from).collect(),
+        ),
         Command::Tunnels { json: true } => JsonCommand::Tunnels,
+        Command::Settings { json: true, .. } => JsonCommand::Settings,
         Command::Tunnel { command } => return tunnels::json_command(command),
         _ => return None,
     })
@@ -415,6 +434,7 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
 fn execute<I: BufRead, O: Write, E: Write>(
     cli: Cli,
     app: &App,
+    desktop: &DesktopEnv,
     picker: &mut dyn Picker,
     input: &mut I,
     output: &mut O,
@@ -423,7 +443,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
     handle_signals: bool,
 ) -> Result<ExitCode, String> {
     match cli.command {
-        None => crate::tui::run(app)
+        None => crate::tui::run(app, desktop)
             .map(|()| ExitCode::SUCCESS)
             .map_err(|error| error.to_string()),
         Some(Command::Init { yes }) => {
@@ -576,12 +596,13 @@ fn execute<I: BufRead, O: Write, E: Write>(
             let Some(target) = on_argument(on, app, picker, interactive, "containers")? else {
                 return Ok(ExitCode::from(CANCELLED));
             };
-            let (lists, failed) = match backend.map(BackendId::from) {
-                Some(backend) => (
+            let backends: Vec<BackendId> = backend.into_iter().map(BackendId::from).collect();
+            let (lists, failed) = match backends.as_slice() {
+                [backend] => (
                     vec![list_with_offers(
                         app,
                         &target,
-                        Some(backend),
+                        &[*backend],
                         input,
                         output,
                         error,
@@ -589,8 +610,14 @@ fn execute<I: BufRead, O: Write, E: Write>(
                     )?],
                     false,
                 ),
-                None => {
-                    let every = list_every(app, &target, input, output, error, interactive)?;
+                several => {
+                    let several = if several.is_empty() {
+                        &AUTOMATIC[..]
+                    } else {
+                        several
+                    };
+                    let every =
+                        list_every(app, &target, several, input, output, error, interactive)?;
                     (every.lists, every.failed)
                 }
             };
@@ -626,13 +653,16 @@ fn execute<I: BufRead, O: Write, E: Write>(
                         Some(backend) => vec![list_with_offers(
                             app,
                             &target,
-                            Some(backend),
+                            &[backend],
                             input,
                             output,
                             error,
                             interactive,
                         )?],
-                        None => list_every(app, &target, input, output, error, interactive)?.lists,
+                        None => {
+                            list_every(app, &target, &AUTOMATIC, input, output, error, interactive)?
+                                .lists
+                        }
                     };
                     if lists.iter().all(|list| list.listing.containers.is_empty()) {
                         writeln!(error, "No running containers on {target}.")
@@ -674,6 +704,7 @@ fn execute<I: BufRead, O: Write, E: Write>(
         Some(Command::Tunnel { command }) => {
             tunnels::run(command, app, picker, input, output, error, interactive)
         }
+        Some(Command::Settings { command, .. }) => settings::run(command, app, output),
         // `main` runs these through `run_desktop`, with the desktop environment.
         Some(Command::Desktop { .. }) => {
             Err("portico desktop needs the desktop environment".into())
@@ -779,6 +810,11 @@ mod tests {
         picker::Row,
     };
 
+    /// A desktop environment the commands under test never touch.
+    fn test_desktop() -> DesktopEnv {
+        DesktopEnv::new("/nonexistent".into(), |_| None, None)
+    }
+
     #[test]
     fn parses_short_host_flags_and_new_terminal() {
         let cli = Cli::try_parse_from([
@@ -832,6 +868,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "init"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b"y\n"),
             &mut output,
@@ -846,6 +883,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b"n\n"),
             &mut output,
@@ -859,6 +897,7 @@ mod tests {
         let _ = run(
             Cli::try_parse_from(["portico", "remove", "dev"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b"y\n"),
             &mut output,
@@ -885,6 +924,7 @@ mod tests {
             let exit = run(
                 Cli::try_parse_from(["portico", "remove", alias]).unwrap(),
                 &app,
+                &test_desktop(),
                 &mut Scripted::default(),
                 &mut Cursor::new(b"y\n"),
                 &mut output,
@@ -928,6 +968,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "test", "dev"]).unwrap(),
             app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(answer),
             &mut output,
@@ -1034,6 +1075,7 @@ mod tests {
         let exit = run(
             Cli::try_parse_from(["portico", "containers"]).unwrap(),
             app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(answer),
             &mut output,
@@ -1155,6 +1197,7 @@ fi
         let exit = run(
             Cli::try_parse_from(["portico", "shell"]).unwrap(),
             app,
+            &test_desktop(),
             picker,
             &mut Cursor::new(b""),
             &mut output,
@@ -1297,6 +1340,7 @@ fi
         let exit = run(
             Cli::try_parse_from(["portico", "shell"]).unwrap(),
             &app,
+            &test_desktop(),
             &mut Scripted::default(),
             &mut Cursor::new(b""),
             &mut Vec::new(),
@@ -1588,6 +1632,7 @@ fi
         let exit = run(
             Cli::try_parse_from(std::iter::once("portico").chain(args.iter().copied())).unwrap(),
             app,
+            &test_desktop(),
             picker,
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
@@ -1858,6 +1903,7 @@ fi
             let exit = run(
                 cli,
                 &app,
+                &test_desktop(),
                 &mut Forbidden,
                 // A confirmation would read this.
                 &mut Cursor::new(b"y\n"),

@@ -22,6 +22,7 @@ use crate::{
     },
     domain::fuzzy,
     domain::openssh::ConnectionOutcome,
+    domain::settings::Tabs,
     picker::{HIT, Outcome, Row, Single, State},
 };
 
@@ -581,7 +582,7 @@ impl Panel {
             };
             let user = if self.root_only() { "" } else { "  u user" };
             format!(
-                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
             )
         }
     }
@@ -796,12 +797,15 @@ fn failure(error: &ContainerError) -> PanelFailure {
 #[derive(Debug)]
 pub(super) struct ContainerTabs {
     panels: Vec<Panel>,
+    /// The backends listed: a turned-off tab is never listed.
+    tabs: Tabs,
 }
 
 impl Default for ContainerTabs {
     fn default() -> Self {
         Self {
             panels: AUTOMATIC.into_iter().map(Panel::new).collect(),
+            tabs: Tabs::default(),
         }
     }
 }
@@ -826,13 +830,20 @@ impl ContainerTabs {
         self.panels[0].target()
     }
 
+    pub(super) fn set_tabs(&mut self, tabs: Tabs) {
+        self.tabs = tabs;
+    }
+
     /// Shows `target` in every panel and returns the listings to start: each panel's that is
-    /// neither kept nor running.
+    /// neither kept nor running, and whose tab is turned on.
     pub(super) fn show(&mut self, target: &Target) -> Vec<(BackendId, Target)> {
+        let tabs = self.tabs;
         self.panels
             .iter_mut()
             .filter_map(|panel| match panel.show(target.clone()) {
-                PanelAction::List(target) => Some((panel.backend, target)),
+                PanelAction::List(target) if tabs.shows(panel.backend) => {
+                    Some((panel.backend, target))
+                }
                 _ => None,
             })
             .collect()
@@ -878,7 +889,7 @@ pub(super) fn render_containers(
     let content = tab_areas(
         area,
         panel.status().map(str::to_owned),
-        &panel.footer(),
+        &state.tab_footer(|| panel.footer()),
         frame,
     );
     let [target, body] = Layout::default()
@@ -1220,7 +1231,7 @@ mod tests {
         );
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
+            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
@@ -1847,7 +1858,7 @@ mod tests {
         assert_eq!(panel.title().to_string(), "Docker /db");
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  q quit"
+            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
 
         press(&mut panel, KeyCode::Char('/'));

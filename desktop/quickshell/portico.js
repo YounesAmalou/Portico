@@ -129,6 +129,8 @@ function containerRows(doc, target) {
             key: "container:" + target + "/" + id,
             target: target,
             id: id,
+            // Docker documents have no backend key.
+            backend: text(doc && doc.backend) || "docker",
             name: text(c.display_name) || text(c.name) || id,
             dockerName: text(c.name),
             image: text(c.image),
@@ -291,16 +293,54 @@ function onArgument(target) {
     return text(target) === "" ? [] : ["--on=" + text(target)]
 }
 
-function containersCommand(program, target) {
-    return [program, "containers", "--json"].concat(onArgument(target))
+function settingsCommand(program) {
+    return [program, "settings", "--json"]
+}
+
+var BACKENDS = ["docker", "podman", "proxmox"]
+
+// The tabs the settings turn on. A Portico without `settings`, an error
+// document or a missing key leaves a tab on, so the panel keeps working.
+function parseSettings(stdout) {
+    var tabs = { tunnels: true, docker: true, podman: true, proxmox: true }
+    var doc = null
+    try {
+        doc = JSON.parse(String(stdout === undefined || stdout === null ? "" : stdout))
+    } catch (e) {
+        return tabs
+    }
+    if (doc === null || typeof doc !== "object" || doc.error || !doc.tabs || typeof doc.tabs !== "object")
+        return tabs
+    Object.keys(tabs).forEach(function (name) {
+        if (doc.tabs[name] === false)
+            tabs[name] = false
+    })
+    return tabs
+}
+
+// The enabled container backends, in Docker, Podman, Proxmox order.
+function enabledBackends(tabs) {
+    return BACKENDS.filter(function (name) { return !tabs || tabs[name] !== false })
+}
+
+// `backends` is the enabled list: all three (or null) adds no --backend flag.
+// An empty list is null (no command): no flag would mean every backend.
+function containersCommand(program, target, backends) {
+    var flags = []
+    if (backends && backends.length === 0)
+        return null
+    if (backends && backends.length < BACKENDS.length)
+        flags = BACKENDS.filter(function (name) { return backends.indexOf(name) >= 0 })
+                        .map(function (name) { return "--backend=" + name })
+    return [program, "containers", "--json"].concat(onArgument(target), flags)
 }
 
 function connectCommand(program, alias) {
     return [program, "connect", "--new-terminal", "--", alias]
 }
 
-function shellCommand(program, target, id) {
-    return [program, "shell", "--new-terminal"].concat(onArgument(target), ["--", id])
+function shellCommand(program, target, id, backend) {
+    return [program, "shell", "--new-terminal"].concat(onArgument(target), ["--backend=" + (text(backend) || "docker"), "--", id])
 }
 
 // Start and stop run under `setsid --fork --wait` when it exists, so a reload

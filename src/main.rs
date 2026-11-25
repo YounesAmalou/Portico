@@ -10,6 +10,7 @@ use portico::{
     desktop::{DesktopEnv, is_development_binary, panel, reload_omarchy_panel},
     domain::managed::{ConfigPaths, ManagedStore},
     domain::openssh::OpenSsh,
+    domain::settings,
     domain::tunnel::runtime::RuntimeDir,
     picker::TerminalPicker,
     platform,
@@ -66,14 +67,19 @@ fn main() -> ExitCode {
         let _ = reload_omarchy_panel(&desktop);
     }
     let runtime = RuntimeDir::locate(&home, std::env::var_os("XDG_RUNTIME_DIR").as_deref());
+    let settings_path =
+        platform::paths::config_dir(&home, std::env::var_os("XDG_CONFIG_HOME").as_deref())
+            .join(settings::FILE_NAME);
     let app = App::new(
         ManagedStore::new(ConfigPaths::from_home(home)),
         OpenSsh::system(),
     )
-    .with_runtime_dir(runtime);
+    .with_runtime_dir(runtime)
+    .with_settings_path(settings_path);
     run(
         cli,
         &app,
+        &desktop,
         &mut TerminalPicker,
         &mut stdin.lock(),
         &mut io::stdout().lock(),

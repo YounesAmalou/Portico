@@ -28,6 +28,12 @@ Item {
     // Set when `portico desktop install` wrote this panel for another Portico.
     property string versionBanner: ""
 
+    // Which tabs the settings turn on; read on every refresh.
+    property var tabs: ({ tunnels: true, docker: true, podman: true, proxmox: true })
+
+    // False when every container backend is turned off: hosts do not expand.
+    readonly property bool containersOn: Portico.enabledBackends(tabs).length > 0
+
     property bool hostsLoaded: false
     property var hosts: []
     property var hostWarnings: []
@@ -104,10 +110,37 @@ Item {
             }
             model.program = found.program
             model.problem = null
-            checkVersion()
-            listHosts()
-            listTunnels()
-            Object.keys(model.expanded).forEach(function (target) { model.loadContainers(target) })
+            readSettings(function () {
+                checkVersion()
+                listHosts()
+                if (model.tabs.tunnels)
+                    listTunnels()
+                Object.keys(model.expanded).forEach(function (target) { model.loadContainers(target) })
+            })
+        })
+    }
+
+    // An older Portico has no `settings`: any failure leaves every tab on.
+    function readSettings(done) {
+        let current = session
+        run(Portico.settingsCommand(program), function (stdout, stderr, exitCode) {
+            if (current !== session || stdout === null)
+                return
+            let before = Portico.enabledBackends(model.tabs).join()
+            model.tabs = exitCode === 0 ? Portico.parseSettings(stdout) : Portico.parseSettings("")
+            // Listings of a backend that is now off must not outlive it, nor one still in flight
+            // from the old set: a new session drops its reply.
+            if (Portico.enabledBackends(model.tabs).join() !== before || !model.containersOn) {
+                session += 1
+                model.containers = ({})
+                model.expanded = ({})
+            }
+            if (!model.tabs.tunnels) {
+                model.tunnels = []
+                model.tunnelsError = null
+                model.tunnelsLoaded = false
+            }
+            done()
         })
     }
 
@@ -183,6 +216,8 @@ Item {
     }
 
     function setExpanded(target, on) {
+        if (on && !containersOn)
+            return
         expanded = assign(expanded, target, on ? true : undefined)
         if (on && Portico.needsListing(containers[target]))
             loadContainers(target)
@@ -194,11 +229,12 @@ Item {
     }
 
     function loadContainers(target) {
-        if (program === "")
+        let command = Portico.containersCommand(program, target, Portico.enabledBackends(tabs))
+        if (program === "" || command === null)
             return
         let current = session
         containers = assign(containers, target, { state: "loading", rows: [], error: null })
-        run(Portico.containersCommand(program, target), function (stdout, stderr, exitCode) {
+        run(command, function (stdout, stderr, exitCode) {
             if (current !== session || stdout === null)
                 return
             let parsed = Portico.parse(stdout, exitCode)
@@ -233,8 +269,8 @@ Item {
         launch("host:" + alias, Portico.connectCommand(program, alias))
     }
 
-    function openShell(target, id) {
-        launch("container:" + target + "/" + id, Portico.shellCommand(program, target, id))
+    function openShell(target, id, backend) {
+        launch("container:" + target + "/" + id, Portico.shellCommand(program, target, id, backend))
     }
 
     function act(verb, name) {

@@ -8,5 +8,6 @@ pub mod identity;
 pub mod managed;
 pub mod openssh;
 pub mod probe;
+pub mod settings;
 pub mod suggest;
 pub mod tunnel;

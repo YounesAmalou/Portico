@@ -3,11 +3,26 @@
 //! The home always comes from the caller, ultimately from `App::home()`; only `main` reads
 //! `HOME` from the environment, through `home_dir`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 /// The home directory from `HOME`, if it is set.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `$XDG_CONFIG_HOME/portico` when `xdg_config_home` is an absolute path, otherwise
+/// `~/.config/portico`.
+pub fn config_dir(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
+    match xdg_config_home
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+    {
+        Some(path) => path.join("portico"),
+        None => home.join(".config/portico"),
+    }
 }
 
 /// `path` with a leading `home` shown as `~`.
@@ -55,6 +70,18 @@ mod tests {
         assert_eq!(tilde_text("~/.ssh/a", home), "~/.ssh/a");
         assert_eq!(tilde(Path::new("/a/b"), Path::new("")), "/a/b");
         assert_eq!(tilde_text("/a/b", Path::new("")), "/a/b");
+    }
+
+    #[test]
+    fn config_dir_follows_absolute_xdg_only() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            config_dir(home, Some(OsStr::new("/x"))),
+            Path::new("/x/portico")
+        );
+        for xdg in [None, Some(OsStr::new("rel"))] {
+            assert_eq!(config_dir(home, xdg), Path::new("/home/me/.config/portico"));
+        }
     }
 
     #[test]

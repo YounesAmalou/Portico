@@ -564,6 +564,7 @@ fn status_reports_each_component() {
     let before = text(&desktop.run(&["desktop", "status"], ""));
     assert!(before.contains("Panel        not installed"), "{before}");
     assert!(before.contains("Keybinding   not installed"), "{before}");
+    assert!(before.contains("\n  Omarchy    not linked"), "{before}");
 
     desktop.run(&["desktop", "install", "--yes"], "");
     let after = text(&desktop.run(&["desktop", "status"], ""));

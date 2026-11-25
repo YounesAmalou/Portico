@@ -3,8 +3,8 @@ use std::io::{BufRead, Write};
 use crate::{
     app::{App, ContainerError},
     backend::{
-        AUTOMATIC, BackendId, BackendIssue, ContainerList, Problem, ResolveError, Target, Via,
-        display_name, group, remote_command, resolve,
+        BackendId, BackendIssue, ContainerList, Problem, ResolveError, Target, Via, display_name,
+        group, remote_command, resolve,
     },
     picker::{Picker, Row},
 };
@@ -70,16 +70,15 @@ enum Attempt {
     Failed,
 }
 
-/// Lists the containers of `target` with `backend`, or the first installed one without it.
-/// When the backend refuses with a fix Portico can run, an interactive session is asked
-/// whether to run it, and on yes the listing runs once more. With `quiet_missing`, a backend
-/// that is not installed is returned unprinted. An `Err` stops the command: an ssh failure,
-/// or a fix that failed.
+/// Lists the containers of `target` with the first of `backends` installed. When the backend
+/// refuses with a fix Portico can run, an interactive session is asked whether to run it, and
+/// on yes the listing runs once more. With `quiet_missing`, a backend that is not installed is
+/// returned unprinted. An `Err` stops the command: an ssh failure, or a fix that failed.
 #[allow(clippy::too_many_arguments)]
 fn attempt<I: BufRead, O: Write, E: Write>(
     app: &App,
     target: &Target,
-    backend: Option<BackendId>,
+    backends: &[BackendId],
     quiet_missing: bool,
     input: &mut I,
     output: &mut O,
@@ -88,7 +87,7 @@ fn attempt<I: BufRead, O: Write, E: Write>(
 ) -> Result<Attempt, String> {
     let mut offered = false;
     loop {
-        let issue = match app.containers(target, backend, false, None) {
+        let issue = match app.containers(target, backends, false, None) {
             Ok(list) => return Ok(Attempt::Listed(list)),
             Err(ContainerError::Backend(issue)) => issue,
             Err(failure) => return Err(report_container_failure(error, failure)?),
@@ -123,12 +122,12 @@ fn attempt<I: BufRead, O: Write, E: Write>(
     }
 }
 
-/// Lists the containers of `target` with `backend`, or the first installed one without it,
+/// Lists the containers of `target` with the first of `backends` installed,
 /// offering a fix as [`attempt`] does. A refusal is printed and returned as an empty `Err`.
 pub(super) fn list_with_offers<I: BufRead, O: Write, E: Write>(
     app: &App,
     target: &Target,
-    backend: Option<BackendId>,
+    backends: &[BackendId],
     input: &mut I,
     output: &mut O,
     error: &mut E,
@@ -137,7 +136,7 @@ pub(super) fn list_with_offers<I: BufRead, O: Write, E: Write>(
     match attempt(
         app,
         target,
-        backend,
+        backends,
         false,
         input,
         output,
@@ -151,19 +150,20 @@ pub(super) fn list_with_offers<I: BufRead, O: Write, E: Write>(
 
 /// The listings of every backend installed on `target`.
 pub(super) struct Every {
-    /// In the order of [`AUTOMATIC`].
+    /// In the order the backends were given.
     pub lists: Vec<ContainerList>,
     /// Whether an installed backend refused (its issue was printed).
     pub failed: bool,
 }
 
-/// Lists `target` with each backend of [`AUTOMATIC`] in turn, offering fixes as
+/// Lists `target` with each of `backends` in turn, offering fixes as
 /// [`list_with_offers`] does. A backend that is not installed is skipped; one that refuses is
 /// reported and the next is listed. When no backend listed, the issues are printed and the
 /// result is an empty `Err`: the first backend's when none is installed.
 pub(super) fn list_every<I: BufRead, O: Write, E: Write>(
     app: &App,
     target: &Target,
+    backends: &[BackendId],
     input: &mut I,
     output: &mut O,
     error: &mut E,
@@ -174,11 +174,11 @@ pub(super) fn list_every<I: BufRead, O: Write, E: Write>(
         failed: false,
     };
     let mut first_missing = None;
-    for backend in AUTOMATIC {
+    for &backend in backends {
         match attempt(
             app,
             target,
-            Some(backend),
+            &[backend],
             true,
             input,
             output,

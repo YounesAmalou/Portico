@@ -124,6 +124,8 @@ exec /usr/bin/ssh -F "$flat" "$@"
             ("PATH".into(), std::env::join_paths(paths).unwrap()),
             // Tunnel records go to a temporary runtime directory, never the real one.
             ("XDG_RUNTIME_DIR".into(), self.runtime().into()),
+            // Settings go to the temporary home, never the developer's own.
+            ("XDG_CONFIG_HOME".into(), self.home.join(".config").into()),
         ]
     }
 

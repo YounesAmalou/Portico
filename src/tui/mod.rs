@@ -1,6 +1,6 @@
 use std::{
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -31,6 +31,7 @@ mod init;
 mod lister;
 mod migrate;
 mod planner;
+mod settings;
 mod terminal;
 mod tester;
 mod text_input;
@@ -40,6 +41,10 @@ mod watch;
 use crate::{
     app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestTarget},
     backend::{AUTOMATIC, BackendId, Target},
+    desktop::{
+        DesktopEnv,
+        status::{Status, status},
+    },
     domain::adopt,
     domain::config_error::ConfigRejection,
     domain::discovery::{DiscoveryWarning, Input},
@@ -47,7 +52,9 @@ use crate::{
     domain::host::{Change, Host, HostChanges},
     domain::identity::IdentityInventory,
     domain::managed::TransactionError,
+    domain::settings::{Key, SettingsError, Tabs},
     domain::suggest,
+    platform::paths::tilde,
 };
 use containers::{
     ContainerTabs, PanelAction, fix_status, render_containers, shell_status, show_fix,
@@ -61,6 +68,7 @@ use init::confirm_initialization;
 use lister::Lister;
 use migrate::MigrateState;
 use planner::Planner;
+use settings::{DesktopRun, OverlayAction, SettingsOverlay};
 use terminal::{PanicHook, Signals, TerminalGuard, TerminalSession, suspended};
 use tester::{Job, Origin, Tester};
 pub(crate) use text_input::TextInput;
@@ -85,7 +93,7 @@ pub enum TuiError {
     Child(String),
 }
 
-pub fn run(app: &App) -> Result<(), TuiError> {
+pub fn run(app: &App, desktop: &DesktopEnv) -> Result<(), TuiError> {
     let signals = Signals::install()?;
     let terminated = signals.flag();
     // A closed terminal ends the TUI like SIGHUP, even when crossterm is reading it.
@@ -117,11 +125,12 @@ pub fn run(app: &App) -> Result<(), TuiError> {
         return Err(error.into());
     }
 
-    browse(app, &mut terminal, &mut events, &signals, &session)
+    browse(app, desktop, &mut terminal, &mut events, &signals, &session)
 }
 
 fn browse<B: Backend<Error = io::Error>>(
     app: &App,
+    desktop: &DesktopEnv,
     terminal: &mut Terminal<B>,
     events: &mut TerminalEvents,
     signals: &Signals,
@@ -129,12 +138,13 @@ fn browse<B: Backend<Error = io::Error>>(
 ) -> Result<(), TuiError> {
     thread::scope(|scope| {
         let workers = Workers::spawn(scope, app);
-        browse_hosts(app, terminal, events, signals, session, workers)
+        browse_hosts(app, desktop, terminal, events, signals, session, workers)
     })
 }
 
 fn browse_hosts<B: Backend<Error = io::Error>>(
     app: &App,
+    desktop: &DesktopEnv,
     terminal: &mut Terminal<B>,
     events: &mut TerminalEvents,
     signals: &Signals,
@@ -146,6 +156,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     let mut watch = ConfigWatch::new(&inventory.inputs, Instant::now());
     let mut state = UiState::new(inventory, session.keyboard_enhancement());
     state.home = app.home().to_owned();
+    state.settings_path = app.settings_path().to_owned();
+    match app.settings() {
+        Ok(settings) => state.apply_tabs(settings.tabs),
+        Err(error) => state.status = Some(settings_problem(&error, &state.home)),
+    }
     sync_details(&mut state, &mut workers.resolver, false);
     let mut redraw = true;
 
@@ -340,6 +355,28 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 }
             }
             UiAction::CancelPlan => workers.planner.cancel(),
+            // The desktop integration is Omarchy's, so other systems leave it out of the overlay.
+            UiAction::OpenSettings => {
+                state.open_settings(cfg!(target_os = "linux").then(|| status(desktop)));
+            }
+            UiAction::Setting(key) => toggle_setting(app, &mut state, key),
+            UiAction::Desktop(run) => {
+                let result = match std::env::current_exe() {
+                    Ok(exe) => {
+                        let pause = || {
+                            signals.child_finished();
+                            wait_for_enter(terminated);
+                        };
+                        let child = || Ok(run_desktop(&exe, run, pause));
+                        match suspended(terminal, session, signals, child)? {
+                            Ok(result) => result,
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    Err(error) => Err(format!("cannot find portico's executable: {error}")),
+                };
+                state.finish_desktop(result, status(desktop));
+            }
             UiAction::Migrate(aliases) => {
                 if let Some(migrate) = state.migrate.take() {
                     let result = app.migrate_cancellable(&migrate.plan, &aliases, terminated);
@@ -499,6 +536,81 @@ fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, acti
         }
     }
     screen.reload(app);
+}
+
+/// Writes the open settings overlay's `key` turned over, showing a failure in the overlay; the
+/// tabs change when it closes.
+fn toggle_setting(app: &App, state: &mut UiState, key: Key) {
+    let home = state.home.clone();
+    let Some(overlay) = state.settings.as_mut() else {
+        return;
+    };
+    let value = !overlay.value(key);
+    let result = app
+        .set_setting(key, value)
+        .map(drop)
+        .map_err(|error| settings_problem(&error, &home));
+    overlay.finish_toggle(key, value, result);
+}
+
+/// Runs `portico desktop install` or `uninstall` with `exe` in the terminal, then asks for Enter
+/// and calls `pause` to wait for it, so the output can be read. A child that cannot start, which
+/// printed nothing and is not waited for, or that fails is the error.
+fn run_desktop(exe: &Path, run: DesktopRun, pause: impl FnOnce()) -> Result<(), String> {
+    let command = run.command();
+    let failed = |reason: String| format!("portico desktop {command} failed: {reason}");
+    let exit = std::process::Command::new(exe)
+        .args(["desktop", command])
+        .status()
+        .map_err(|error| failed(error.to_string()))?;
+    print!("\nPress Enter to return to Portico.");
+    let _ = io::Write::flush(&mut io::stdout());
+    pause();
+    if exit.success() {
+        Ok(())
+    } else {
+        Err(failed(exit.to_string()))
+    }
+}
+
+/// Waits for a line on the terminal, an end of input, or `terminated` (Ctrl+C, a signal or a
+/// hang-up).
+///
+/// Reads the descriptor directly: `main` holds the lock of `io::stdin()` for the whole session,
+/// so reading through it would wait for ever. One byte at a time, so nothing after the line is
+/// taken from the terminal.
+fn wait_for_enter(terminated: &AtomicBool) {
+    use std::{
+        io::Read,
+        os::fd::{AsFd, AsRawFd},
+    };
+    let Ok(fd) = io::stdin().as_fd().try_clone_to_owned() else {
+        return;
+    };
+    let mut input = std::fs::File::from(fd);
+    let mut byte = [0];
+    while !terminated.load(Ordering::Relaxed) {
+        let mut poll = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes only the one `pollfd` it is given.
+        let ready = unsafe { libc::poll(&mut poll, 1, IDLE_TICK.as_millis() as libc::c_int) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+        if ready <= 0 {
+            continue;
+        }
+        match input.read(&mut byte) {
+            Ok(0) => return,
+            Ok(_) if matches!(byte[0], b'\n' | b'\r') => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Cancels a running test of one of `aliases`, whose configuration just changed.
@@ -888,6 +1000,8 @@ enum Mode {
     ConfirmRemove,
     ConfirmTrust,
     Migrate,
+    /// The settings overlay, over whichever tab is shown.
+    Settings,
 }
 
 /// The tabs, in the order the tab bar shows them and Tab cycles them: one per container
@@ -917,14 +1031,24 @@ impl Tab {
         }
     }
 
-    fn number(self) -> usize {
-        Self::ALL.iter().position(|&tab| tab == self).unwrap_or(0) + 1
+    /// Whether the tab is shown with `tabs` turned on; the hosts always are.
+    fn shown(self, tabs: &Tabs) -> bool {
+        match self {
+            Self::Hosts => true,
+            Self::Tunnels => tabs.tunnels,
+            Self::Containers(backend) => tabs.shows(backend),
+        }
     }
 
-    /// The tab `by` places after this one, wrapping around.
-    fn cycled(self, by: isize) -> Self {
-        let count = Self::ALL.len() as isize;
-        Self::ALL[(self.number() as isize - 1 + by).rem_euclid(count) as usize]
+    /// The number that selects the tab among the `visible` ones.
+    fn number(self, visible: &[Self]) -> usize {
+        visible.iter().position(|&tab| tab == self).unwrap_or(0) + 1
+    }
+
+    /// The tab `by` places after this one among the `visible` ones, wrapping around.
+    fn cycled(self, by: isize, visible: &[Self]) -> Self {
+        let count = visible.len() as isize;
+        visible[(self.number(visible) as isize - 1 + by).rem_euclid(count) as usize]
     }
 }
 
@@ -964,6 +1088,8 @@ struct UiState {
     container_tab: BackendId,
     /// The tab shown and receiving keys.
     tab: Tab,
+    /// Which optional tabs are turned on.
+    tabs: Tabs,
     /// The migrate screen while in `Mode::Migrate`.
     migrate: Option<MigrateState>,
     /// Every identity Portico knows of, for the IdentityFile suggestions; built once a form
@@ -974,6 +1100,10 @@ struct UiState {
     home: PathBuf,
     /// The Tunnels tab.
     tunnels: TunnelsScreen,
+    /// The settings overlay while in `Mode::Settings`.
+    settings: Option<SettingsOverlay>,
+    /// The settings file, shown in the overlay.
+    settings_path: PathBuf,
 }
 
 type TestResults = PerHost<TestMark>;
@@ -1016,6 +1146,12 @@ enum UiAction {
     Migrate(Vec<String>),
     /// Stops building the plan of the migrate screen, which closed before it arrived.
     CancelPlan,
+    /// Opens the settings overlay, once the desktop integration's status is read.
+    OpenSettings,
+    /// Turns over a setting of the open overlay.
+    Setting(Key),
+    /// Runs a desktop integration action of the open overlay.
+    Desktop(DesktopRun),
 }
 
 impl UiState {
@@ -1050,16 +1186,111 @@ impl UiState {
             containers: ContainerTabs::default(),
             container_tab: BackendId::Docker,
             tab: Tab::Hosts,
+            tabs: Tabs::default(),
             migrate: None,
             identity_inventory: None,
             home: PathBuf::new(),
             tunnels: TunnelsScreen::default(),
+            settings: None,
+            settings_path: PathBuf::new(),
+        }
+    }
+
+    /// The footer of the tab shown, `footer`, or none while the overlay, with its own, is open.
+    fn tab_footer(&self, footer: impl FnOnce() -> String) -> String {
+        if self.mode == Mode::Settings {
+            String::new()
+        } else {
+            self.with_tab_keys(footer())
+        }
+    }
+
+    /// `footer` with its `Tab/1-5 tabs` hint worded for the tabs shown: `Tab/1-n tabs`, or
+    /// nothing when the hosts are the only tab.
+    fn with_tab_keys(&self, footer: String) -> String {
+        footer.replace("Tab/1-5 tabs  ", &self.tab_keys_hint())
+    }
+
+    /// The footer hint for the tab keys, with its trailing separator, or empty with one tab.
+    fn tab_keys_hint(&self) -> String {
+        match self.visible_tabs().len() {
+            0 | 1 => String::new(),
+            count => format!("Tab/1-{count} tabs  "),
+        }
+    }
+
+    /// The footer hint for `c`, with its trailing separator, or empty when no container tab is shown.
+    fn containers_hint(&self) -> &'static str {
+        if (self.visible_tabs().iter()).any(|tab| matches!(tab, Tab::Containers(_))) {
+            "c containers  "
+        } else {
+            ""
+        }
+    }
+
+    /// Opens the settings overlay with the tabs as they are and the desktop's status, if the
+    /// desktop integration is offered here.
+    fn open_settings(&mut self, desktop: Option<Status>) {
+        self.settings = Some(SettingsOverlay::open(self.tabs, desktop));
+        self.mode = Mode::Settings;
+    }
+
+    /// Records the outcome of a desktop action of the open overlay, and the status after it.
+    fn finish_desktop(&mut self, result: Result<(), String>, desktop: Status) {
+        if let Some(overlay) = &mut self.settings {
+            overlay.finish_run(result, desktop);
+        }
+    }
+
+    /// The settings overlay's keys. Closing it applies the tabs it wrote.
+    fn handle_settings_key(&mut self, key: KeyEvent) -> UiAction {
+        let Some(overlay) = &mut self.settings else {
+            self.mode = Mode::Browse;
+            return UiAction::None;
+        };
+        match overlay.handle_key(key) {
+            OverlayAction::None => UiAction::None,
+            OverlayAction::Toggle(key) => UiAction::Setting(key),
+            OverlayAction::Run(run) => UiAction::Desktop(run),
+            OverlayAction::Close => {
+                let tabs = overlay.tabs;
+                self.settings = None;
+                self.mode = Mode::Browse;
+                self.apply_tabs(tabs);
+                UiAction::None
+            }
+        }
+    }
+
+    /// The tabs the tab bar shows and Tab cycles, in order.
+    fn visible_tabs(&self) -> Vec<Tab> {
+        Tab::ALL
+            .into_iter()
+            .filter(|tab| tab.shown(&self.tabs))
+            .collect()
+    }
+
+    /// Turns tabs on or off. The tab shown returns to the hosts when it is turned off, and the
+    /// container tab `c` shows moves to the first one left.
+    fn apply_tabs(&mut self, tabs: Tabs) {
+        self.tabs = tabs;
+        self.containers.set_tabs(tabs);
+        if !self.tab.shown(&tabs) {
+            self.tab = Tab::Hosts;
+        }
+        if !tabs.shows(self.container_tab)
+            && let Some(backend) = AUTOMATIC.into_iter().find(|&backend| tabs.shows(backend))
+        {
+            self.container_tab = backend;
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         // An `e` waiting for details is dropped by any other key, a tab switch included.
         self.edit_pending = false;
+        if self.mode == Mode::Settings {
+            return self.handle_settings_key(key);
+        }
         if let Some(action) = self.handle_tab_key(key) {
             return action;
         }
@@ -1111,7 +1342,7 @@ impl UiState {
 
     /// The keys shared by every browsing tab: `1` to `5`, Tab and Shift+Tab switch tabs, `T`
     /// shows the tunnels and `c` the container tab shown last, for the selected host when on
-    /// the hosts.
+    /// the hosts, and `,` opens the settings.
     fn handle_tab_key(&mut self, key: KeyEvent) -> Option<UiAction> {
         if !self.browsing()
             || key
@@ -1120,14 +1351,27 @@ impl UiState {
         {
             return None;
         }
-        let containers = Tab::Containers(self.container_tab);
+        let visible = self.visible_tabs();
         let tab = match key.code {
-            KeyCode::Char(digit @ '1'..='5') => Tab::ALL[digit as usize - '1' as usize],
-            KeyCode::Tab => self.tab.cycled(1),
-            KeyCode::BackTab => self.tab.cycled(-1),
+            KeyCode::Char(digit @ '1'..='5') => match visible.get(digit as usize - '1' as usize) {
+                Some(&tab) => tab,
+                None => return Some(UiAction::None),
+            },
+            KeyCode::Tab => self.tab.cycled(1, &visible),
+            KeyCode::BackTab => self.tab.cycled(-1, &visible),
             // Terminals report Shift+T as `T`, with or without the Shift modifier.
-            KeyCode::Char('T') => Tab::Tunnels,
+            KeyCode::Char('T') if self.tabs.tunnels => Tab::Tunnels,
             KeyCode::Char('c') => {
+                // The tab shown last, or the first shown when that one is turned off.
+                let Some(backend) = [self.container_tab]
+                    .into_iter()
+                    .chain(AUTOMATIC)
+                    .find(|&backend| self.tabs.shows(backend))
+                else {
+                    return Some(UiAction::None);
+                };
+                self.container_tab = backend;
+                let containers = Tab::Containers(backend);
                 if self.tab == Tab::Hosts
                     && let Some(alias) = self.selected_alias()
                 {
@@ -1137,6 +1381,8 @@ impl UiState {
                 }
                 containers
             }
+            KeyCode::Char('T') => return Some(UiAction::None),
+            KeyCode::Char(',') => return Some(UiAction::OpenSettings),
             _ => return None,
         };
         let from = self.tab;
@@ -1212,20 +1458,38 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .areas(frame.area());
-    frame.render_widget(Paragraph::new(tab_bar(state.tab, bar.width)), bar);
+    frame.render_widget(
+        Paragraph::new(tab_bar(&state.visible_tabs(), state.tab, bar.width)),
+        bar,
+    );
     match state.tab {
         Tab::Hosts => render_hosts(frame, body, state),
         Tab::Tunnels => {
             let content = tab_areas(
                 body,
                 state.tunnels.status_line(),
-                &state.tunnels.footer(),
+                &state.tab_footer(|| state.tunnels.footer()),
                 frame,
             );
             state.tunnels.render(frame, content);
         }
         Tab::Containers(backend) => render_containers(frame, body, state, backend),
     }
+    if let Some(overlay) = &state.settings {
+        overlay.render(
+            frame,
+            frame.area(),
+            &tilde(&state.settings_path, &state.home),
+        );
+    }
+}
+
+/// The error's line, with the settings file's path shown from `home` as `~`.
+fn settings_problem(error: &SettingsError, home: &Path) -> String {
+    let (SettingsError::Invalid { path, .. } | SettingsError::Io { path, .. }) = error;
+    error
+        .to_string()
+        .replacen(&path.display().to_string(), &tilde(path, home), 1)
 }
 
 /// Starts `lists`, or nothing when there are none.
@@ -1240,15 +1504,15 @@ fn list_containers(lists: Vec<(BackendId, Target)>) -> UiAction {
 /// The tab bar: each tab's number and name, the active one highlighted. When the names do not
 /// fit, the other tabs show only their numbers, and when even that does not fit only the active
 /// tab is shown, so the bar never wraps or hides the active tab.
-fn tab_bar(active: Tab, width: u16) -> Line<'static> {
+fn tab_bar(visible: &[Tab], active: Tab, width: u16) -> Line<'static> {
     let separator = " \u{2502} ";
-    let full = |tab: Tab| format!("{} {}", tab.number(), tab.label());
+    let full = |tab: Tab| format!("{} {}", tab.number(visible), tab.label());
     let labels = |short: bool| {
-        Tab::ALL
+        visible
             .iter()
             .map(|&tab| {
                 if short && tab != active {
-                    tab.number().to_string()
+                    tab.number(visible).to_string()
                 } else {
                     full(tab)
                 }
@@ -1275,7 +1539,7 @@ fn tab_bar(active: Tab, width: u16) -> Line<'static> {
     };
     match shown {
         Some(shown) => {
-            for (index, (tab, label)) in Tab::ALL.iter().zip(shown).enumerate() {
+            for (index, (tab, label)) in visible.iter().zip(shown).enumerate() {
                 if index > 0 {
                     spans.push(Span::raw(separator));
                 }
@@ -1327,8 +1591,10 @@ fn footer_text(state: &UiState) -> String {
             } else {
                 ""
             };
+            let containers = state.containers_hint();
+            let tab_keys = state.tab_keys_hint();
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  c containers  Tab/1-5 tabs  q quit"
+                "{output}t test  Enter connect  {new_terminal}  {containers}{tab_keys}, settings  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -1353,7 +1619,9 @@ fn footer_text(state: &UiState) -> String {
                 Some(Ownership::External) => {
                     format!("↑↓ move  / filter{clear_filter}  a add  m adopt  {refresh}  {connect}")
                 }
-                None => format!("/ filter{clear_filter}  a add  {refresh}  Tab/1-5 tabs  q quit"),
+                None => format!(
+                    "/ filter{clear_filter}  a add  {refresh}  {tab_keys}, settings  q quit"
+                ),
             }
         }
         Mode::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -1379,6 +1647,8 @@ fn footer_text(state: &UiState) -> String {
             .migrate
             .as_ref()
             .map_or_else(|| "Esc cancel".into(), MigrateState::footer),
+        // The overlay draws its own footer.
+        Mode::Settings => String::new(),
     }
 }
 
@@ -2464,6 +2734,108 @@ mod tests {
         assert_eq!(state.tab, Tab::Tunnels);
     }
 
+    fn without(configure: impl FnOnce(&mut Tabs)) -> UiState {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        let mut tabs = Tabs::default();
+        configure(&mut tabs);
+        state.apply_tabs(tabs);
+        state
+    }
+
+    #[test]
+    fn hidden_tabs_leave_the_bar_and_renumber() {
+        let mut state = without(|tabs| tabs.podman = false);
+        let podman = Tab::Containers(BackendId::Podman);
+        assert!(!state.visible_tabs().contains(&podman));
+        assert!(matches!(char(&mut state, '4'), UiAction::ListContainers(_)));
+        assert_eq!(state.tab, Tab::Containers(BackendId::Proxmox));
+        assert_eq!(char(&mut state, '5'), UiAction::None);
+        assert_eq!(state.tab, Tab::Containers(BackendId::Proxmox));
+        let text = tab_bar(&state.visible_tabs(), state.tab, 100).to_string();
+        assert!(!text.contains("Podman"), "{text}");
+        assert!(text.contains("4 Proxmox"), "{text}");
+    }
+
+    #[test]
+    fn tab_cycles_over_visible_tabs_only() {
+        let mut state = without(|tabs| tabs.tunnels = false);
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.tab, DOCKER);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.tab, Tab::Hosts);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.tab, Tab::Containers(BackendId::Proxmox));
+    }
+
+    #[test]
+    fn t_does_nothing_when_tunnels_are_off() {
+        let mut state = without(|tabs| tabs.tunnels = false);
+        assert_eq!(char(&mut state, 'T'), UiAction::None);
+        assert_eq!(state.tab, Tab::Hosts);
+    }
+
+    #[test]
+    fn c_skips_a_hidden_container_tab() {
+        let mut state = without(|tabs| tabs.docker = false);
+        assert_eq!(
+            state.container_tab,
+            BackendId::Podman,
+            "moved on by apply_tabs"
+        );
+        state.container_tab = BackendId::Docker;
+        char(&mut state, 'c');
+        assert_eq!(state.tab, Tab::Containers(BackendId::Podman));
+    }
+
+    #[test]
+    fn c_does_nothing_with_every_backend_off() {
+        let mut state = without(|tabs| {
+            tabs.docker = false;
+            tabs.podman = false;
+            tabs.proxmox = false;
+        });
+        assert_eq!(char(&mut state, 'c'), UiAction::None);
+        assert_eq!(state.tab, Tab::Hosts);
+    }
+
+    #[test]
+    fn turning_off_the_open_tab_returns_to_hosts() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        char(&mut state, '4');
+        assert_eq!(state.tab, Tab::Containers(BackendId::Podman));
+        state.apply_tabs(Tabs {
+            podman: false,
+            ..Tabs::default()
+        });
+        assert_eq!(state.tab, Tab::Hosts);
+        assert_eq!(state.container_tab, BackendId::Docker, "Docker is first");
+    }
+
+    #[test]
+    fn showing_a_target_lists_only_visible_backends() {
+        let mut state = without(|tabs| tabs.docker = false);
+        let dev = Target::Host("dev".into());
+        assert_eq!(
+            char(&mut state, 'c'),
+            UiAction::ListContainers(vec![
+                (BackendId::Podman, dev.clone()),
+                (BackendId::Proxmox, dev)
+            ])
+        );
+    }
+
+    #[test]
+    fn a_settings_problem_shows_the_path_with_a_tilde() {
+        let error = SettingsError::Invalid {
+            path: PathBuf::from("/home/test/.config/portico/settings.toml"),
+            line: Some(2),
+            reason: "expected a boolean".into(),
+        };
+        let line = settings_problem(&error, Path::new("/home/test"));
+        assert!(line.contains("~/.config/portico/settings.toml"), "{line}");
+        assert!(!line.contains("/home/test"), "{line}");
+    }
+
     #[test]
     fn the_container_tabs_follow_the_backend_order() {
         let tabs: Vec<Tab> = Tab::ALL[2..].to_vec();
@@ -2759,7 +3131,7 @@ mod tests {
 
     #[test]
     fn the_tab_bar_highlights_the_active_tab_and_never_wraps() {
-        let line = tab_bar(Tab::Tunnels, 100);
+        let line = tab_bar(&Tab::ALL, Tab::Tunnels, 100);
         assert_eq!(
             line.to_string(),
             " 1 Hosts \u{2502} 2 Tunnels \u{2502} 3 Docker \u{2502} 4 Podman \u{2502} 5 Proxmox"
@@ -2771,10 +3143,10 @@ mod tests {
             .unwrap();
         assert!(active.style.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(
-            tab_bar(DOCKER, 30).to_string(),
+            tab_bar(&Tab::ALL, DOCKER, 30).to_string(),
             " 1 \u{2502} 2 \u{2502} 3 Docker \u{2502} 4 \u{2502} 5"
         );
-        assert_eq!(tab_bar(DOCKER, 14).to_string(), " 3 Docker");
+        assert_eq!(tab_bar(&Tab::ALL, DOCKER, 14).to_string(), " 3 Docker");
 
         let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
         char(&mut state, '3');
@@ -2793,14 +3165,42 @@ mod tests {
         let state = test_state(vec![summary("dev", Ownership::Managed)]);
         let footer = footer_text(&state);
         assert!(
-            footer.contains("c containers  Tab/1-5 tabs  q quit"),
+            footer.contains("c containers  Tab/1-5 tabs  , settings  q quit"),
             "{footer}"
         );
         assert!(!footer.contains("T tunnels"));
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.apply_tabs(Tabs {
+            tunnels: false,
+            docker: false,
+            podman: true,
+            proxmox: false,
+        });
+        let footer = footer_text(&state);
+        assert!(
+            footer.contains("c containers  Tab/1-2 tabs  , settings"),
+            "{footer}"
+        );
+        state.apply_tabs(Tabs {
+            tunnels: true,
+            docker: false,
+            podman: false,
+            proxmox: false,
+        });
+        let footer = footer_text(&state);
+        assert!(!footer.contains("c containers"), "{footer}");
+        assert!(footer.contains("Tab/1-2 tabs"), "{footer}");
+        let tunnels = state.tab_footer(|| state.tunnels.footer());
+        assert!(tunnels.contains("Tab/1-2 tabs  , settings"), "{tunnels}");
         let state = test_state(Vec::new());
         assert!(footer_text(&state).contains("Tab/1-5 tabs"));
         let state = tunnels_state();
-        assert!(state.tunnels.footer().contains("Tab/1-5 tabs  q quit"));
+        assert!(
+            state
+                .tunnels
+                .footer()
+                .contains("Tab/1-5 tabs  , settings  q quit")
+        );
         assert!(
             state
                 .containers
@@ -2962,5 +3362,148 @@ mod tests {
         assert!(text.contains("Tab/1-5 tabs"), "{text}");
         assert_eq!(char(&mut state, 'T'), UiAction::None);
         assert_eq!(state.tab, Tab::Tunnels);
+    }
+
+    fn no_desktop() -> crate::desktop::status::Status {
+        crate::desktop::status::Status {
+            lines: Vec::new(),
+            installed: false,
+        }
+    }
+
+    /// An app whose home, and so whose settings file, is `dir`.
+    fn settings_app(dir: &std::path::Path) -> App {
+        App::new(
+            crate::domain::managed::ManagedStore::new(
+                crate::domain::managed::ConfigPaths::from_home(dir),
+            ),
+            crate::domain::openssh::OpenSsh::new("/usr/bin/false".into(), "/usr/bin/false".into()),
+        )
+    }
+
+    /// The state of `app` with the settings overlay open.
+    fn overlay_state(app: &App) -> UiState {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        state.home = app.home().to_owned();
+        state.settings_path = app.settings_path().to_owned();
+        assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
+        state.open_settings(Some(no_desktop()));
+        state
+    }
+
+    #[test]
+    fn comma_opens_the_overlay_only_while_browsing() {
+        let mut state = test_state(vec![summary("dev", Ownership::Managed)]);
+        assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
+        state.open_settings(Some(no_desktop()));
+        assert_eq!(state.mode, Mode::Settings);
+        let text = rendered(&state);
+        assert!(text.contains("Settings"), "{text}");
+        assert!(text.contains("[x] Podman"), "{text}");
+        assert!(text.contains("Install or update"), "{text}");
+        assert!(text.contains("Esc close"), "{text}");
+        assert_eq!(char(&mut state, ','), UiAction::None);
+        assert_eq!(state.mode, Mode::Browse);
+
+        char(&mut state, '/');
+        assert_eq!(char(&mut state, ','), UiAction::None);
+        assert_eq!(state.mode, Mode::Filter);
+        assert_eq!(state.filter.as_str(), ",");
+
+        // Any browsing tab opens it, and its keys go to the overlay, not to the tab.
+        let mut state = tunnels_state();
+        char(&mut state, '2');
+        assert_eq!(char(&mut state, ','), UiAction::OpenSettings);
+        state.open_settings(Some(no_desktop()));
+        // The tab's footer gives way to the overlay's, on every tab.
+        let text = rendered(&state);
+        assert!(!text.contains("q quit"), "{text}");
+        char(&mut state, ',');
+        char(&mut state, '3');
+        char(&mut state, ',');
+        state.open_settings(Some(no_desktop()));
+        let text = rendered(&state);
+        assert!(!text.contains("q quit"), "{text}");
+        char(&mut state, ',');
+        char(&mut state, '2');
+        char(&mut state, ',');
+        state.open_settings(Some(no_desktop()));
+        assert_eq!(char(&mut state, 's'), UiAction::None);
+        assert_eq!(char(&mut state, '1'), UiAction::None);
+        assert_eq!(state.tab, Tab::Tunnels);
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(footer_text(&state).contains(", settings"));
+        assert!(state.tunnels.footer().contains(", settings"));
+    }
+
+    #[test]
+    fn toggle_writes_and_applies_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path());
+        let mut state = overlay_state(&app);
+        let podman = Tab::Containers(BackendId::Podman);
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        let action = char(&mut state, ' ');
+        assert_eq!(action, UiAction::Setting(Key::TabsPodman));
+        toggle_setting(&app, &mut state, Key::TabsPodman);
+
+        let written = std::fs::read_to_string(app.settings_path()).unwrap();
+        assert!(written.contains("podman = false"), "{written}");
+        assert!(rendered(&state).contains("[ ] Podman"));
+        assert!(state.visible_tabs().contains(&podman), "applied on close");
+
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.mode, Mode::Browse);
+        assert!(!state.visible_tabs().contains(&podman));
+        assert!(!rendered(&state).contains("Podman"));
+    }
+
+    #[test]
+    fn toggle_failure_keeps_the_value_and_shows_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path());
+        std::fs::create_dir_all(app.settings_path().parent().unwrap()).unwrap();
+        std::fs::write(app.settings_path(), "[tabs\n").unwrap();
+        let mut state = overlay_state(&app);
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        let Some(UiAction::Setting(key)) = Some(press(&mut state, KeyCode::Enter)) else {
+            panic!("no toggle");
+        };
+        toggle_setting(&app, &mut state, key);
+
+        let overlay = state.settings.as_ref().unwrap();
+        let error = overlay.error.as_deref().unwrap();
+        assert!(error.contains("line 1"), "{error}");
+        assert!(error.contains("~/.config/portico/settings.toml"), "{error}");
+        assert!(overlay.tabs.podman);
+        assert!(rendered(&state).contains("line 1"));
+        press(&mut state, KeyCode::Esc);
+        assert!(state.tabs.podman);
+    }
+
+    #[test]
+    fn desktop_action_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path());
+        let mut state = overlay_state(&app);
+        let result = run_desktop(&dir.path().join("missing"), DesktopRun::Install, || {
+            panic!("a child that never started is not waited for")
+        });
+        let error = result.clone().unwrap_err();
+        assert!(
+            error.starts_with("portico desktop install failed: "),
+            "{error}"
+        );
+
+        state.finish_desktop(result, no_desktop());
+
+        assert_eq!(
+            state.settings.as_ref().unwrap().error.as_deref(),
+            Some(error.as_str())
+        );
+        assert!(rendered(&state).contains("portico desktop install failed"));
     }
 }

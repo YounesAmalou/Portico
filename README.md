@@ -152,7 +152,9 @@ portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
 portico identities              List agents and identity files, and whether each is available
-portico containers [--on [<alias>]] [--backend docker|podman|proxmox]
+portico settings [set <key> on|off]
+                                Show or change the preferences
+portico containers [--on [<alias>]] [--backend docker|podman|proxmox]...
                                 List running containers, here or on a host
 portico shell [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [-u <user>] [-n]
                                 Open a shell in a container
@@ -168,7 +170,7 @@ portico tunnel start [<name>...]
 portico tunnel stop [<name>...] [-A|--all]
 ```
 
-`hosts`, `show`, `identities`, `containers`, `tunnels`, `tunnel show`, `tunnel start` and `tunnel stop` also take `--json` (see [Machine-readable output](#machine-readable-output)).
+`hosts`, `show`, `identities`, `containers`, `tunnels`, `settings`, `tunnel show`, `tunnel start` and `tunnel stop` also take `--json` (see [Machine-readable output](#machine-readable-output)).
 
 ### Picking a host
 
@@ -272,7 +274,7 @@ portico shell myapp/api#2 -u root
 portico shell 3f9a1c -n
 ```
 
-`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". It lists with every backend installed there (Docker, Podman, Proxmox VE), each under its name when there are several; `--backend docker|podman|proxmox` uses only one. A backend that fails is reported and the others are still listed, with exit status 1. `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
+`portico containers` lists the running containers on this machine, or on a host with `--on <alias>`, grouped by Compose project with the rest under "Other". It lists with every backend installed there (Docker, Podman, Proxmox VE), each under its name when there are several; `--backend docker|podman|proxmox` uses only one, and repeating it uses only those, in the order given (with `--json`, the first installed of them). A backend that fails is reported and the others are still listed, with exit status 1. `portico shell` opens a shell in one (bash when the container has it, sh otherwise), as the image's default user unless `-u` names another, and `-n` does it in a new terminal. Without a container, `portico shell` asks in the terminal with the picker described under [Picking a host](#picking-a-host). Cancelling exits with 130.
 
 A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates. Without `--backend`, `portico shell` looks in every installed backend; a name found in two of them is an error asking for `--backend`.
 
@@ -334,6 +336,23 @@ portico containers --on prod-db --json
 ```
 
 In JSON mode Portico never opens a picker or asks a question (a missing name is an error), never prompts for a password, writes nothing to stderr, and prints nothing the text output does not show: no key material and no credentials. The documents, their fields, the errors and the versioning rules are in [`docs/json-output.md`](docs/json-output.md).
+
+### Settings
+
+Press `,` in the TUI to open the settings. The overlay lists a checkbox for each tab that can be hidden (Tunnels, Docker, Podman and Proxmox; Hosts is always shown) and, on Linux, the desktop integration. `↑` / `↓` or `j` / `k` move, `Space` or `Enter` toggles a tab or runs an action, and `Esc` or `,` closes it. A hidden tab disappears from the tab bar, and neither the TUI nor the desktop panel runs its tool (`docker`, `podman` or `pct`) while it is hidden. On Linux, the desktop integration shows what `portico desktop status` reports and offers **Install or update** and, once something is installed, **Uninstall**; each runs the same preview and confirmations as `portico desktop install` and `uninstall`. The desktop panel reads the same settings and hides the same tabs.
+
+The settings live in `~/.config/portico/settings.toml` (under `$XDG_CONFIG_HOME` when set). The file is optional: without it, every tab is shown. It is plain TOML, and you can edit it by hand:
+
+```toml
+# Portico's settings. Edit by hand or with portico settings.
+[tabs]
+podman = false
+proxmox = false
+```
+
+`portico settings` prints each setting and whether the file exists, `portico settings set tabs.podman off` changes one (`on`, `off`, `true`, `false`, `yes` and `no` are accepted), and `portico settings --json` prints the same for scripts (see [Machine-readable output](#machine-readable-output)). The keys are `tabs.tunnels`, `tabs.docker`, `tabs.podman` and `tabs.proxmox`. A change keeps the file's comments, order and keys Portico does not know, and a symlinked file is written through, so the link stays. A file that cannot be read as settings is reported with its line and is never overwritten.
+
+The settings only choose what the TUI and the desktop panel show. The CLI is unaffected: `portico containers`, `portico shell` and the other commands work with every backend whatever the file says.
 
 ### Adopt and export hosts
 
@@ -400,15 +419,16 @@ Connecting runs `portico connect --new-terminal`, so the terminal is the one `xd
 
 ## TUI keys
 
-The TUI has five tabs, shown at the top with their numbers: **Hosts**, **Tunnels**, and one per container backend: **Docker**, **Podman** and **Proxmox**. It opens on Hosts. Each tab keeps its own selection, filter, scroll and open form while you look at another one, and a test, listing or tunnel start keeps running when you switch away.
+The TUI has up to five tabs, shown at the top with their numbers: **Hosts**, **Tunnels**, and one per container backend: **Docker**, **Podman** and **Proxmox**; tabs turned off in the [settings](#settings) are hidden. It opens on Hosts. Each tab keeps its own selection, filter, scroll and open form while you look at another one, and a test, listing or tunnel start keeps running when you switch away.
 
 | Key | Action |
 |---|---|
-| `1` to `5` | Show the Hosts, Tunnels, Docker, Podman or Proxmox tab |
+| `1` to `5` | Show the tab with that number in the tab bar (hidden tabs are skipped) |
 | `Tab` / `Shift+Tab` | Show the next or previous tab |
 | `T` | Show the Tunnels tab |
-| `c` | Show the container tab shown last (Docker at first); on the Hosts tab, for the selected host |
+| `c` | Show the container tab shown last (Docker at first, or the first one shown); on the Hosts tab, for the selected host |
 | `r` / `F5` | Refresh the tab shown |
+| `,` | Open the [settings](#settings) |
 | `q` | Quit (running tunnels keep running) |
 
 These keys work while a tab is browsing its list. In a filter, a form or a picker, digits are typed and `Tab` moves between fields or picks a suggestion; a confirmation, the trust prompt and the adopt and export checklist keep their own keys until you answer them. `Esc` never switches tabs.
@@ -470,7 +490,7 @@ In the tunnel form, `↑` / `↓` (or `Tab` / `Shift+Tab`) move between fields: 
 
 ### Container tabs
 
-The Docker, Podman and Proxmox tabs each list the containers of one target with their backend. The three share the target, shown on their first line: `Target: this machine` or `Target: <alias>`. Nothing is listed when the TUI starts: this machine's containers are listed the first time you open a container tab, with all three backends at once, in parallel. A backend that is not installed on the target says so in its tab. `c` on the Hosts tab targets the selected host, `h` picks the target with the fuzzy picker (this machine first, then every host), and `L` comes back to this machine; the new target is listed in all three tabs. A target is listed the first time it is shown and after a failed listing, and otherwise shows the result kept for the session; `r` or `F5` lists again in the tab shown. Only the target shown is ever listed. The right side shows the selected container.
+The Docker, Podman and Proxmox tabs each list the containers of one target with their backend. The three share the target, shown on their first line: `Target: this machine` or `Target: <alias>`. Nothing is listed when the TUI starts: this machine's containers are listed the first time you open a container tab, with every backend whose tab is shown at once, in parallel. A backend that is not installed on the target says so in its tab. `c` on the Hosts tab targets the selected host, `h` picks the target with the fuzzy picker (this machine first, then every host), and `L` comes back to this machine; the new target is listed in every container tab shown. A target is listed the first time it is shown and after a failed listing, and otherwise shows the result kept for the session; `r` or `F5` lists again in the tab shown. Only the target shown is ever listed. The right side shows the selected container.
 
 | Key | Action |
 |---|---|
@@ -503,4 +523,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 
 ## Current scope
 
-Portico deliberately does not include Podman, container logs or lifecycle, tunnels that start or restart by themselves, key generation, loading keys into an agent, or a daemon. Those features remain deferred until their workflows and integration contracts are clear.
+Portico deliberately does not include container logs or lifecycle, tunnels that start or restart by themselves, key generation, loading keys into an agent, or a daemon. Those features remain deferred until their workflows and integration contracts are clear.
