@@ -380,13 +380,14 @@ def check_terminal(scenario):
         elif scenario == "settings":
             read_screen("4 Podman")
             os.write(master, b",")
-            read_screen("Install or update")
+            # The overlay's settings path; the desktop integration is offered only on Linux.
+            read_screen("settings.toml")
             # Down twice reaches Podman; Space turns it off, written at once.
             os.write(master, b"\x1b[B\x1b[B ")
             read_screen("[ ] Podman")
             os.write(master, b"\x1b[27u")
             deadline = time.monotonic() + 5
-            while "Install or update" in screen.text():
+            while "settings.toml" in screen.text():
                 pump(deadline)
             tab_bar = screen.text().splitlines()[0]
             assert "Podman" not in tab_bar, tab_bar
