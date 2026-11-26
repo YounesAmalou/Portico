@@ -87,7 +87,11 @@ pub fn acquire_lock(file: &File, cancelled: Option<&AtomicBool>) -> io::Result<(
         }
         match FileExt::try_lock_exclusive(file) {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            // Another holder: `EWOULDBLOCK` on Unix, `ERROR_LOCK_VIOLATION` on Windows.
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
                 thread::sleep(Duration::from_millis(20));
             }
             Err(error) => return Err(error),
