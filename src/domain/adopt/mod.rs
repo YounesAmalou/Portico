@@ -1153,6 +1153,27 @@ mod tests {
         assert_no_staged_files(&fixture.paths);
     }
 
+    /// Adds (`/deny`) or removes (`/remove:d`) a rule denying the user writes to `path`.
+    #[cfg(windows)]
+    fn icacls(path: &Path, action: &str) {
+        let user = std::env::var("USERNAME").unwrap();
+        let rule = if action == "/deny" {
+            format!("{user}:(W)")
+        } else {
+            user
+        };
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args([action, &rule])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn reasons_follow_the_spec_order() {
         let fixture = fixture_with(
@@ -1176,11 +1197,19 @@ mod tests {
         fixture.write("latin.conf", b"Host latin\n  HostName l\n# caf\xe9\n");
         let locked = fixture.write("locked/hosts.conf", b"Host locked\n  HostName k\n");
         let locked_dir = locked.parent().unwrap().to_path_buf();
+        // Windows ignores a directory's read-only attribute: a rule denying the user writes
+        // there locks it instead.
+        #[cfg(unix)]
         set_mode(&locked_dir, 0o555).unwrap();
+        #[cfg(windows)]
+        icacls(&locked_dir, "/deny");
         fixture.write("cond.conf", b"Host cond\n  HostName c\n");
 
         let plan = fixture.store.adoption_plan(same());
+        #[cfg(unix)]
         set_mode(&locked_dir, 0o755).unwrap();
+        #[cfg(windows)]
+        icacls(&locked_dir, "/remove:d");
         let plan = plan.unwrap();
 
         let reason = |text: &str| Some(text.to_owned());

@@ -8,7 +8,6 @@ use std::{
     fs,
     io::Write,
     net::TcpListener,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::{Path, PathBuf},
 };
 
@@ -32,8 +31,9 @@ struct Fixture {
     /// Holds the busy tunnel's port.
     _busy: TcpListener,
     busy_port: u16,
-    /// The agent's socket.
-    _agent: UnixListener,
+    /// The agent's socket. Windows' agents listen on named pipes instead.
+    #[cfg(unix)]
+    _agent: std::os::unix::net::UnixListener,
 }
 
 fn calls(env: &TestEnv, name: &str) -> PathBuf {
@@ -149,14 +149,21 @@ fn setup() -> Fixture {
         ),
     )
     .unwrap();
-    fs::set_permissions(ssh.join("id_ed25519"), fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        ssh.join("id_ed25519"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     fs::write(
         ssh.join("id_ed25519.pub"),
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIprod deploy@prod\n",
     )
     .unwrap();
     fs::create_dir_all(env.home().join(".1password")).unwrap();
-    let agent = UnixListener::bind(env.home().join(".1password/agent.sock")).unwrap();
+    #[cfg(unix)]
+    let agent =
+        std::os::unix::net::UnixListener::bind(env.home().join(".1password/agent.sock")).unwrap();
     env.install_program(
         "ssh-add",
         "#!/bin/sh\nprintf '256 SHA256:YmF6cXV4Zm9vYmFycXV1eGNvcmdlZ3JhdWx0Z2FycGx5 deploy@prod (ED25519)\\n256 SHA256:Zm9vYmFyYmF6cXV4cXV1eGNvcmdlZ3JhdWx0Z2FycGx5 work laptop (ED25519)\\n'\n",
@@ -173,6 +180,7 @@ fn setup() -> Fixture {
         env,
         _busy: busy,
         busy_port,
+        #[cfg(unix)]
         _agent: agent,
     }
 }
@@ -619,7 +627,7 @@ fn an_unknown_host_is_an_error_document() {
 fn an_unreadable_config_is_an_error_document_on_stdout() {
     let fixture = setup();
     let config = fixture.env.ssh_config();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+    support::deny_read(&config);
     for args in [
         &["hosts", "--json"][..],
         &["show", "prod", "--json"],
@@ -627,7 +635,7 @@ fn an_unreadable_config_is_an_error_document_on_stdout() {
         &["containers", "--on", "prod", "--json"],
     ] {
         let output = fixture.run(args);
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        support::allow_read(&config);
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         assert!(output.stderr.is_empty(), "{args:?}");
         let document: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -640,9 +648,9 @@ fn an_unreadable_config_is_an_error_document_on_stdout() {
                 .contains(".ssh/config"),
             "{args:?}: {document}"
         );
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+        support::deny_read(&config);
     }
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    support::allow_read(&config);
 }
 
 #[test]
@@ -684,11 +692,11 @@ fn an_unset_home_is_an_error_document() {
 fn start_and_stop_with_an_unreadable_tunnels_file_report_per_name() {
     let fixture = setup();
     let tunnels = fixture.env.home().join(".ssh/portico/tunnels");
-    fs::set_permissions(&tunnels, fs::Permissions::from_mode(0o000)).unwrap();
+    support::deny_read(&tunnels);
     let start = fixture.run(&["tunnel", "start", "db", "--json"]);
     let stop = fixture.run(&["tunnel", "stop", "db", "--json"]);
     let stop_all = fixture.run(&["tunnel", "stop", "--all", "--json"]);
-    fs::set_permissions(&tunnels, fs::Permissions::from_mode(0o600)).unwrap();
+    support::allow_read(&tunnels);
 
     for (output, name) in [(&start, "start"), (&stop, "stop")] {
         assert_eq!(output.status.code(), Some(1), "{name}");

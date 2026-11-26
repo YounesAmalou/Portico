@@ -1,9 +1,10 @@
 mod support;
 
-use std::os::unix::fs::PermissionsExt;
-
 use portico::domain::managed::ManagedConfig;
-use support::TestEnv;
+use support::{
+    TestEnv,
+    pty::{self, Scenario},
+};
 
 #[test]
 fn ordinary_openssh_resolves_a_portico_host() {
@@ -114,6 +115,8 @@ fn managed_strings_round_trip_through_openssh() {
     }
 }
 
+/// Unix-only: a symbolic link on Windows needs a privilege the tests do not have.
+#[cfg(unix)]
 #[test]
 fn symlinked_entry_discovery_agrees_with_openssh() {
     let env = TestEnv::new();
@@ -253,25 +256,9 @@ exit 23
         "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$HOME/launcher-args\"\n[ -f \"$HOME/fail-launcher\" ] && exit 23\nexit 0\n",
     );
 
-    let output = std::process::Command::new("python3")
-        .arg("-I")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/tui_pty.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_portico"))
-        .arg(env.home())
-        .arg(env.bin())
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "PTY harness failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    for scenario in pty::lifecycle() {
+        pty::check_terminal(&env, scenario);
+    }
 }
 
 #[test]
@@ -292,26 +279,7 @@ printf 'Authenticated to 10.0.0.5 ([10.0.0.5]:22) using "publickey".\n' >&2
 "#,
     );
 
-    let output = std::process::Command::new("python3")
-        .arg("-I")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/tui_pty.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_portico"))
-        .arg(env.home())
-        .arg(env.bin())
-        .arg("connection_test")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "PTY harness failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    pty::check_terminal(&env, Scenario::ConnectionTest);
 }
 
 #[test]
@@ -326,26 +294,7 @@ fn tui_tabs_switch_on_a_real_pty() {
     );
     env.install_program("docker", "#!/bin/sh\n: > \"$HOME/docker-called\"\nexit 0\n");
 
-    let output = std::process::Command::new("python3")
-        .arg("-I")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/tui_pty.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_portico"))
-        .arg(env.home())
-        .arg(env.bin())
-        .arg("tabs")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "PTY harness failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    pty::check_terminal(&env, Scenario::Tabs);
 }
 
 #[test]
@@ -369,27 +318,8 @@ exit 0
     );
 
     // A first run sets the user and opens a shell; a second run starts from the saved file.
-    for scenario in ["remembered_user", "remembered_user_restored"] {
-        let output = std::process::Command::new("python3")
-            .arg("-I")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/support/tui_pty.py"
-            ))
-            .arg(env!("CARGO_BIN_EXE_portico"))
-            .arg(env.home())
-            .arg(env.bin())
-            .arg(scenario)
-            .output()
-            .unwrap();
-
-        assert!(
-            output.status.success(),
-            "PTY harness failed ({scenario}):\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        println!("{}", String::from_utf8_lossy(&output.stdout));
+    for scenario in [Scenario::RememberedUser, Scenario::RememberedUserRestored] {
+        pty::check_terminal(&env, scenario);
     }
 }
 
@@ -404,26 +334,7 @@ fn settings_overlay_hides_a_tab() {
         "#!/bin/sh\nprintf 'hostname dev.example\\nport 22\\n'\n",
     );
 
-    let output = std::process::Command::new("python3")
-        .arg("-I")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/tui_pty.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_portico"))
-        .arg(env.home())
-        .arg(env.bin())
-        .arg("settings")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "PTY harness failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    pty::check_terminal(&env, Scenario::Settings);
 }
 
 /// The desktop integration is Omarchy's, so only Linux offers it in the overlay.
@@ -439,26 +350,7 @@ fn settings_overlay_runs_a_desktop_action_and_comes_back() {
         "#!/bin/sh\nprintf 'hostname dev.example\\nport 22\\n'\n",
     );
 
-    let output = std::process::Command::new("python3")
-        .arg("-I")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/tui_pty.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_portico"))
-        .arg(env.home())
-        .arg(env.bin())
-        .arg("desktop_action")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "PTY harness failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    pty::check_terminal(&env, Scenario::DesktopAction);
 }
 
 #[test]
@@ -532,9 +424,10 @@ fn approved_v1_flow_works_in_an_isolated_home() {
         let entry_before = b"# Existing SSH configuration.\nInclude external.conf\n";
         let expected_entry = b"Include ~/.ssh/portico/config\n# Existing SSH configuration.\nInclude external.conf\n";
         std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(
             external.parent().unwrap(),
-            std::fs::Permissions::from_mode(0o700),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
         std::fs::write(env.ssh_config(), entry_before).unwrap();
@@ -557,16 +450,19 @@ fn approved_v1_flow_works_in_an_isolated_home() {
                 .unwrap()
                 .contains("connect\n--hold\n--\ndev")
         );
-        assert_eq!(file_mode(env.home().join(".ssh")), Some(0o700));
-        assert_eq!(
-            file_mode(env.managed_config().parent().unwrap()),
-            Some(0o700)
-        );
-        assert_eq!(file_mode(env.managed_config()), Some(0o600));
-        assert_eq!(
-            file_mode(env.managed_config().with_file_name("config.bak")),
-            Some(0o600)
-        );
+        // Windows has no modes: the files inherit the access rules of the home.
+        if cfg!(unix) {
+            assert_eq!(file_mode(env.home().join(".ssh")), Some(0o700));
+            assert_eq!(
+                file_mode(env.managed_config().parent().unwrap()),
+                Some(0o700)
+            );
+            assert_eq!(file_mode(env.managed_config()), Some(0o600));
+            assert_eq!(
+                file_mode(env.managed_config().with_file_name("config.bak")),
+                Some(0o600)
+            );
+        }
         env.run(["remove", "dev", "-f"]).assert_success();
         let managed =
             ManagedConfig::parse(&std::fs::read_to_string(env.managed_config()).unwrap()).unwrap();
@@ -623,10 +519,17 @@ fn read_or_error(path: impl AsRef<std::path::Path>) -> String {
     std::fs::read_to_string(path.as_ref()).unwrap_or_else(|error| format!("<{error}>"))
 }
 
+#[cfg(unix)]
 fn file_mode(path: impl AsRef<std::path::Path>) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions().mode() & 0o777)
+}
+
+#[cfg(windows)]
+fn file_mode(_path: impl AsRef<std::path::Path>) -> Option<u32> {
+    None
 }
 
 fn openssh_diagnostics(env: &TestEnv) -> String {

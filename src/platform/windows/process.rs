@@ -210,6 +210,8 @@ mod tests {
         if std::env::var_os("PORTICO_DETACH_HELPER").is_none() {
             return;
         }
+        // Left running on purpose: the other test checks it outlives this helper.
+        #[allow(clippy::zombie_processes)]
         let child = detach(Command::new("ping").args(["-n", "30", "127.0.0.1"]))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

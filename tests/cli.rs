@@ -1,6 +1,6 @@
 mod support;
 
-use support::TestEnv;
+use support::{TestEnv, shown};
 
 #[test]
 fn review_raw_comments_survive_init_and_host_operations() {
@@ -464,6 +464,7 @@ fn external_hosts_can_be_tested() {
         .assert_stdout_contains("legacy: authenticated as deploy@10.0.0.5:22 (publickey)");
 }
 
+#[cfg(unix)]
 fn alive(pid: libc::pid_t) -> bool {
     u32::try_from(pid)
         .ok()
@@ -471,6 +472,8 @@ fn alive(pid: libc::pid_t) -> bool {
         .is_some_and(|stat| stat.state != 'Z')
 }
 
+/// Unix-only: Windows sends no signals.
+#[cfg(unix)]
 #[test]
 fn interrupting_a_test_stops_ssh_and_exits_130() {
     use std::{
@@ -556,7 +559,10 @@ fn a_save_rejected_by_the_users_own_config_names_that_file() {
     env.run(["add", "x", "-H", "h"])
         .assert_exit_code_and_stderr_contains(
             1,
-            "line 3 of ~/.ssh/config: Bad configuration option: bogus; nothing was saved; fix that line, then save again",
+            &format!(
+                "line 3 of {}: Bad configuration option: bogus; nothing was saved; fix that line, then save again",
+                shown("~/.ssh/config")
+            ),
         );
 }
 
@@ -598,6 +604,8 @@ fn connect_explains_a_refused_login() {
         );
 }
 
+/// Unix-only: Windows sends no signals.
+#[cfg(unix)]
 #[test]
 fn connect_exits_as_a_shell_would_when_a_signal_kills_ssh() {
     let env = env_with_x();
@@ -650,7 +658,10 @@ fn connect_explains_a_rejected_configuration() {
 
     env.run(["connect", "x"]).assert_exit_code_and_stderr_contains(
         255,
-        "\n\nx: failed \u{2014} OpenSSH rejected the configuration\n  file: ~/.ssh/config\n  line: 3 (Bad configuration option: bogus)\n",
+        &format!(
+            "\n\nx: failed \u{2014} OpenSSH rejected the configuration\n  file: {}\n  line: 3 (Bad configuration option: bogus)\n",
+            shown("~/.ssh/config")
+        ),
     );
 }
 
@@ -735,7 +746,10 @@ fn a_test_rejected_by_the_users_own_config_names_that_file() {
 
     env.run(["test", "x"]).assert_exit_code_and_stdout_contains(
         1,
-        "x: failed \u{2014} OpenSSH rejected the configuration\n  file: ~/.ssh/config\n  line: 3 (Bad configuration option: bogus)\n  next: fix that line, then try again\n",
+        &format!(
+            "x: failed \u{2014} OpenSSH rejected the configuration\n  file: {}\n  line: 3 (Bad configuration option: bogus)\n  next: fix that line, then try again\n",
+            shown("~/.ssh/config")
+        ),
     );
 }
 
@@ -908,11 +922,14 @@ fn settings_lists_every_key_and_the_path() {
     let output = env.run(["settings"]);
     let stdout = String::from_utf8_lossy(&output.0.stdout).into_owned();
     for expected in [
-        "tabs.tunnels  on",
-        "tabs.podman   on",
-        "~/.config/portico/settings.toml (not created yet)",
+        "tabs.tunnels  on".to_owned(),
+        "tabs.podman   on".to_owned(),
+        format!(
+            "{} (not created yet)",
+            shown("~/.config/portico/settings.toml")
+        ),
     ] {
-        assert!(stdout.contains(expected), "{stdout}");
+        assert!(stdout.contains(&expected), "{stdout}");
     }
     assert!(!stdout.contains("Remembered"), "{stdout}");
     output.assert_success();

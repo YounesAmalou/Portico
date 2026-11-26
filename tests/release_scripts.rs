@@ -1,3 +1,7 @@
+//! The release scripts, which the Linux and macOS release jobs run (Windows builds its zips
+//! in its own job): Unix-only.
+#![cfg(unix)]
+
 use std::{fs, process::Command};
 
 use tempfile::TempDir;

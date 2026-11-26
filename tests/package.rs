@@ -67,7 +67,8 @@ fn published_crate_contains_only_intended_files() {
         );
     }
     // Repository-hygiene tests read files that are not published, so they must not ship either,
-    // nor do the panel's tests and preview image, or the AUR and Arch packaging.
+    // nor do the panel's tests and preview image, the AUR and Arch packaging, or the launcher
+    // the tests put beside their fake programs on Windows.
     for forbidden in [
         ".superpowers",
         ".worktrees",
@@ -79,6 +80,7 @@ fn published_crate_contains_only_intended_files() {
         "desktop/quickshell/preview.png",
         "tests/docs.rs",
         "tests/package.rs",
+        "tests/support/sh_shim.rs",
     ] {
         assert!(
             !files.iter().any(|file| file.starts_with(forbidden)),

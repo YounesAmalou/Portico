@@ -6,6 +6,10 @@
 //! a regular user. Each test owns its server, its keys and its home, all in
 //! temporary directories, and proves that the real `~/.ssh/known_hosts` was
 //! not touched.
+//!
+//! The suite's server, process and hang-up helpers are Unix ones for now, so it builds on
+//! Unix only.
+#![cfg(unix)]
 
 #[path = "support/executable.rs"]
 mod executable;

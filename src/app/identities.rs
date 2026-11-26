@@ -528,11 +528,13 @@ mod tests {
     use tempfile::TempDir;
 
     struct Fixture {
+        #[cfg_attr(windows, allow(dead_code))]
         dir: TempDir,
         app: App,
     }
 
     impl Fixture {
+        #[cfg(unix)]
         fn path(&self, name: &str) -> PathBuf {
             self.dir.path().join(name)
         }
@@ -568,6 +570,7 @@ mod tests {
     }
 
     /// What a public key file starts with.
+    #[cfg(unix)]
     const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test\n";
 
     fn resolved(text: &str) -> ResolvedConfig {

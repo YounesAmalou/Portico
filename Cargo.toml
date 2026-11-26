@@ -21,6 +21,7 @@ exclude = [
     "desktop/quickshell/preview.png",
     "tests/docs.rs",
     "tests/package.rs",
+    "tests/support/sh_shim.rs",
 ]
 
 [lib]
