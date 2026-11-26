@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::process::terminate_process_tree;
+use super::super::common::process::terminate_process_tree;
 
 /// How long a new-terminal launcher may run before its launch counts as requested.
 const LAUNCH_GRACE: Duration = Duration::from_millis(500);

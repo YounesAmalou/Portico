@@ -12,11 +12,9 @@ use std::{
     },
     path::PathBuf,
     process::{Command, ExitStatus},
-    thread,
-    time::{Duration, Instant},
 };
 
-use super::super::os::process::{Pin, Proc, children, wait_until_stopped};
+use super::super::os::process::{Pin, Stat, children, wait_until_stopped};
 
 /// A user as the process table names one: the numeric UID.
 pub type Uid = u32;
@@ -68,43 +66,11 @@ pub fn terminate_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-pub fn terminate_process_tree(child: &mut std::process::Child) -> io::Result<()> {
-    if let Err(error) = kill_process_tree(child.id()) {
-        let _ = kill_direct_child(child);
-        let _ = reap_child_bounded(child);
-        return Err(error);
-    }
-    match reap_child_bounded(child) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = kill_direct_child(child);
-            let _ = reap_child_bounded(child);
-            Err(error)
-        }
-    }
-}
-
 pub fn kill_direct_child(child: &mut std::process::Child) -> io::Result<()> {
     match child.kill() {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         Err(error) => Err(error),
-    }
-}
-
-pub fn reap_child_bounded(child: &mut std::process::Child) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        match child.try_wait()? {
-            Some(_) => return Ok(()),
-            None if Instant::now() >= deadline => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out reaping child process",
-                ));
-            }
-            None => thread::sleep(Duration::from_millis(5)),
-        }
     }
 }
 
@@ -215,41 +181,10 @@ fn stop_tree_member(
 /// Pins the identity of `pid`; `ESRCH` when it is gone.
 fn open_pin(pid: libc::pid_t) -> io::Result<Pin> {
     #[cfg(test)]
-    if FAIL_PIN_OPEN.with(|countdown| match countdown.get() {
-        Some(0) => {
-            countdown.set(None);
-            true
-        }
-        Some(remaining) => {
-            countdown.set(Some(remaining - 1));
-            false
-        }
-        None => false,
-    }) {
-        PIN_OPEN_FAILED.with(|failed| failed.set(true));
+    if super::super::common::process::pin_open_fails() {
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
     Pin::open(pid)
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_PIN_OPEN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-    static PIN_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Makes the pin open after `skipped` successful ones fail with `EMFILE`.
-#[cfg(test)]
-pub fn fail_pin_after(skipped: u32) {
-    PIN_OPEN_FAILED.with(|failed| failed.set(false));
-    FAIL_PIN_OPEN.with(|countdown| countdown.set(Some(skipped)));
-}
-
-/// Whether the failure `fail_pin_after` armed has been injected, so a test can prove it
-/// exercised the path without a pin rather than passing through the normal one.
-#[cfg(test)]
-pub fn pin_failure_injected() -> bool {
-    PIN_OPEN_FAILED.with(std::cell::Cell::get)
 }
 
 pub fn kill_process_group(child: &mut std::process::Child) {
@@ -263,41 +198,18 @@ pub fn kill_process_group(child: &mut std::process::Child) {
     }
 }
 
-impl Proc {
-    /// Every live process of `uid` that leads its own session (as `ssh -f` does once it has put
-    /// itself in the background) and whose command line has `-E <path>`: what a status listing
-    /// searches for tunnels without a record, read once however many tunnels it lists.
-    pub fn scan(&self, uid: &Uid) -> Vec<Logged> {
-        self.pids()
-            .into_iter()
-            .filter_map(|pid| {
-                // The command line rejects nearly every process, so it is read first.
-                let args = self.cmdline(pid)?;
-                let log = args
-                    .windows(2)
-                    .find(|pair| pair[0] == b"-E")
-                    .map(|pair| PathBuf::from(OsStr::from_bytes(&pair[1])))?;
-                let stat = self.stat(pid)?;
-                // Only a backgrounded ssh counts: a foreground one may still fail to connect.
-                (!matches!(stat.state, 'Z' | 'X' | 'x')
-                    && stat.session == pid
-                    && self.uid(pid).as_ref() == Some(uid))
-                .then_some(Logged {
-                    pid,
-                    start: stat.start,
-                    log,
-                })
-            })
-            .collect()
-    }
+/// The path an argument of `Proc::cmdline` names.
+pub(crate) fn arg_path(arg: &[u8]) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(arg))
 }
 
-/// A process that logs to a file with `-E`, as every started tunnel does.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Logged {
-    pub pid: u32,
-    pub start: u64,
-    pub log: PathBuf,
+impl Stat {
+    /// Whether the process `pid` this describes runs in the background: `ssh -f` calls
+    /// `setsid`, so a backgrounded tunnel leads its own session, while the foreground ssh that
+    /// is still connecting does not.
+    pub(crate) fn in_background(&self, pid: u32) -> bool {
+        self.session == pid
+    }
 }
 
 /// The user the process acts as: the effective UID, which decides who owns the files it creates.
@@ -345,8 +257,13 @@ pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool>
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use std::{
+        process::Command,
+        thread,
+        time::{Duration, Instant},
+    };
 
+    use super::super::super::{common::process::terminate_process_tree, os::process::Proc};
     use super::*;
 
     #[test]

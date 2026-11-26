@@ -29,7 +29,7 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 
 | Module | Holds |
 |---|---|
-| `platform::process` | Process control: killing process trees, stopping a recognised process, reading the process table (`Proc`); `Uid`, `current_uid` and `effective_uid`, `exit_code`, `own_group`, `detach` and `HANGUP_SIGNALS`; `Proc::scan` and `Logged` know how a started tunnel's `ssh` looks (`-E <log>`). The algorithms are shared (`unix`); each system pins a process (`Pin`: a pidfd on Linux, a kqueue exit watch on macOS) and reads its process table (`/proc` on Linux, `sysctl` and libproc on macOS) |
+| `platform::process` | Process control: killing process trees, stopping a recognised process, reading the process table (`Proc`); `Uid`, `current_uid` and `effective_uid`, `exit_code`, `own_group`, `detach` and `HANGUP_SIGNALS`; `Proc::scan` and `Logged` know how a started tunnel's `ssh` looks (`-E <log>`). Ending a child with its descendants, reaping within a bound and `scan` are portable (`common`); the Unix tree walk and `stop_process` are shared (`unix`); each system pins a process (`Pin`: a pidfd on Linux, a kqueue exit watch on macOS, a process handle on Windows) and reads its process table (`/proc` on Linux, `sysctl` and libproc on macOS, the Toolhelp snapshot and process handles on Windows). Windows sends no signals: it terminates a pinned process |
 | `platform::launcher` | Opening a command in a new terminal window: `xdg-terminal-exec` on Linux; on macOS, `open(1)` with the terminal named by `PORTICO_TERMINAL`, else the one Portico runs in (`TERM_PROGRAM`), else Terminal |
 | `platform::paths` | The home directory, `~` display and the well-known locations under it (shared), `openssh_path` (a path as written into an OpenSSH file: `~` and `/` on every system), `config_dir` (shared), `system_ssh_config` and `runtime_dir` (per system) |
 | `platform::net` | `bind_probe`: whether a local address can be listened on, as ssh binds it |
@@ -77,19 +77,22 @@ src/platform/
   fs.rs, net.rs, paths.rs, process.rs, launcher.rs, time.rs   re-export `common` (fs, paths) plus `unix` and the
                 system's own module on Unix, or `windows` on Windows
   common/       portable on every system: `~` display and expansion, config_dir, path
-                normalisation, locking, PendingFile, Stamp, LocalTime and the test fault hooks
+                normalisation, locking, PendingFile, Stamp, LocalTime, terminate_process_tree,
+                reap_child_bounded, Proc::scan and Logged, and the test fault hooks
   unix/         shared by Linux and macOS: permissions, symlinks, descriptors, file identity,
                 the socket probe (bind_probe), local time, the home directory (HOME), the process
-                algorithms (tree walk, stop_process, scan) and Uid, exit codes, process groups
+                algorithms (tree walk, stop_process) and Uid, exit codes, process groups
                 and hang-up signals, running a launcher program
   linux/        Pin (pidfd), children and stopped state (/proc), Proc, xdg-terminal-exec,
                 runtime_dir (XDG_RUNTIME_DIR)
   macos/        Pin (kqueue NOTE_EXIT), children and stopped state (libproc), Proc (sysctl),
                 open(1) and its terminals, runtime_dir (~/.ssh/portico/run/tunnels)
-  windows/      fs, net, paths, process, launcher and time for Windows (empty modules until implemented)
+  windows/      fs, net, paths, launcher and time for Windows; process: Pin (process handle),
+                Proc (Toolhelp, GetProcessTimes, the token's SID, the command line from ntdll),
+                tree walk by creation time, stop_process by TerminateProcess
 ```
 
-A system provides what `unix` calls (`Pin` with `open`, `signal` and `wait_exit`; `children`; `wait_until_stopped`; `Proc` with `stat`, `uid`, `cmdline`, `pids`, `boot_id` and `started_at`) and the per-system items of `paths` and `launcher`. A record's `start` is whatever the system's `Proc::stat` reports (clock ticks after boot on Linux, microseconds since the epoch on macOS); records never move between systems.
+A system provides what `unix` calls (`Pin` with `open`, `signal` and `wait_exit`; `children`; `wait_until_stopped`; `Proc` with `stat`, `uid`, `cmdline`, `pids`, `boot_id` and `started_at`) and the per-system items of `paths` and `launcher`. A record's `start` is whatever the system's `Proc::stat` reports (clock ticks after boot on Linux, microseconds since the epoch on macOS, the creation `FILETIME` on Windows); records never move between systems.
 
 1. Add a sibling of `src/platform/linux/` (for example `src/platform/windows/`). A system that is not a Unix also replaces what `unix` provides, so `fs.rs`, `net.rs`, `paths.rs`, `process.rs`, `launcher.rs` and `time.rs` select it instead; what is portable belongs in `common/`.
 2. Add its `cfg` selection in `src/platform/mod.rs`, which refuses to compile on other systems.

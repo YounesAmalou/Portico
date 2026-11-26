@@ -581,19 +581,39 @@ mod tests {
         );
     }
 
-    /// The real process table on either system: a process whose command line looks like a
-    /// started tunnel's, in its own session as `ssh -f` puts itself.
+    /// The real process table on every system: a process whose command line looks like a
+    /// started tunnel's, detached as a started tunnel is (in its own session as `ssh -f` puts
+    /// itself on Unix).
     #[test]
     fn a_live_tunnel_process_is_recognised_rebuilt_and_stopped() {
         use crate::platform::process::{current_uid, detach, stop_process};
 
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("db.log");
-        let mut command = std::process::Command::new("sh");
-        command
-            .args(["-c", "sleep 30; :", "ssh", "-E"])
-            .arg(&log)
-            .args(["-L", "5432:db:5432", "--", "prod-db"]);
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", "sleep 30; :", "ssh", "-E"])
+                .arg(&log)
+                .args(["-L", "5432:db:5432", "--", "prod-db"]);
+            command
+        };
+        // `rem` leaves the rest of cmd's command line, which reads as a tunnel's, unrun.
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = std::process::Command::new("cmd");
+            command
+                .raw_arg(format!(
+                    "/c ping -n 30 127.0.0.1 >nul & rem ssh -E \"{}\" -L 5432:db:5432 -- prod-db",
+                    log.display()
+                ))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        };
         let mut child = detach(&mut command).spawn().unwrap();
         let (proc, uid) = (Proc::system(), current_uid());
 
