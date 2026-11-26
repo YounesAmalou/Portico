@@ -1,0 +1,10 @@
+# The version manifest of Portico's winget package. scripts/winget-manifest.sh renders it with
+# the installer and locale manifests beside it, and the release workflow submits them to
+# microsoft/winget-pkgs; edit these templates only when the packaging itself changes.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
+
+PackageIdentifier: YounesAmalou.Portico
+PackageVersion: @VERSION@
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.9.0

@@ -185,3 +185,150 @@ fn homebrew_formula_requires_both_tarballs() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("x86_64-apple-darwin.tar.gz"));
 }
+
+#[test]
+fn package_release_zips_a_windows_build_with_portico_exe_at_the_root() {
+    let target = "x86_64-pc-windows-msvc";
+    let dir = TempDir::new().unwrap();
+    let binary = dir.path().join("portico.exe");
+    fs::write(&binary, "MZ").unwrap();
+    let out = dir.path().join("out");
+    let output = Command::new(script("package-release.sh"))
+        .args(["0.1.0", target])
+        .arg(&binary)
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let zip = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(
+        zip.file_name().unwrap().to_str().unwrap(),
+        format!("portico-v0.1.0-{target}.zip")
+    );
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+
+    // winget's manifest names portico.exe at the root of the zip.
+    let listing = Command::new("bsdtar")
+        .arg("-tf")
+        .arg(&zip)
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    let mut entries: Vec<String> = String::from_utf8(listing.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        ["LICENSE-APACHE", "LICENSE-MIT", "README.md", "portico.exe"]
+    );
+}
+
+fn winget_zips(dir: &std::path::Path, version: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let x64 = dir.join(format!("portico-v{version}-x86_64-pc-windows-msvc.zip"));
+    let arm64 = dir.join(format!("portico-v{version}-aarch64-pc-windows-msvc.zip"));
+    fs::write(&x64, "x64").unwrap();
+    fs::write(&arm64, "arm64").unwrap();
+    (x64, arm64)
+}
+
+#[test]
+fn winget_manifest_renders_version_urls_and_hashes() {
+    let dir = TempDir::new().unwrap();
+    let (x64, arm64) = winget_zips(dir.path(), "1.2.3");
+    let out = dir.path().join("manifests");
+    let output = Command::new(script("winget-manifest.sh"))
+        .arg("1.2.3")
+        .arg(&x64)
+        .arg(&arm64)
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let read = |name: &str| fs::read_to_string(out.join(name)).unwrap();
+    let version = read("YounesAmalou.Portico.yaml");
+    let installer = read("YounesAmalou.Portico.installer.yaml");
+    let locale = read("YounesAmalou.Portico.locale.en-US.yaml");
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
+
+    for (manifest, kind) in [
+        (&version, "version"),
+        (&installer, "installer"),
+        (&locale, "defaultLocale"),
+    ] {
+        assert!(
+            manifest.starts_with(&format!(
+                "# yaml-language-server: $schema=https://aka.ms/winget-manifest.{}.1.9.0.schema.json\n",
+                kind
+            )),
+            "{manifest}"
+        );
+        assert!(!manifest.contains('@'), "a placeholder is left: {manifest}");
+        for expected in [
+            "PackageIdentifier: YounesAmalou.Portico\n",
+            "PackageVersion: 1.2.3\n",
+            &format!("ManifestType: {kind}\n"),
+            "ManifestVersion: 1.9.0\n",
+        ] {
+            assert!(
+                manifest.contains(expected),
+                "the {kind} manifest lacks {expected}:\n{manifest}"
+            );
+        }
+    }
+    for expected in [
+        "InstallerType: zip\n",
+        "NestedInstallerType: portable\n",
+        "- RelativeFilePath: portico.exe\n  PortableCommandAlias: portico\n",
+        "- Architecture: x64\n  InstallerUrl: https://github.com/YounesAmalou/Portico/releases/download/v1.2.3/portico-v1.2.3-x86_64-pc-windows-msvc.zip\n  \
+         InstallerSha256: 5609F728403E197BB255EF50C62AEABB1F93B09F7B7C379903440B65CD4319CB\n",
+        "- Architecture: arm64\n  InstallerUrl: https://github.com/YounesAmalou/Portico/releases/download/v1.2.3/portico-v1.2.3-aarch64-pc-windows-msvc.zip\n  \
+         InstallerSha256: F69162950F235E3CDBBAD33F1F912D1A504BE90D8A37D002C735D6F3E3882265\n",
+    ] {
+        assert!(
+            installer.contains(expected),
+            "the installer manifest lacks {expected}:\n{installer}"
+        );
+    }
+    for expected in [
+        "PackageLocale: en-US\n",
+        "License: MIT OR Apache-2.0\n",
+        "ReleaseNotesUrl: https://github.com/YounesAmalou/Portico/releases/tag/v1.2.3\n",
+    ] {
+        assert!(
+            locale.contains(expected),
+            "the locale manifest lacks {expected}:\n{locale}"
+        );
+    }
+    assert!(version.contains("DefaultLocale: en-US\n"), "{version}");
+}
+
+#[test]
+fn winget_manifest_refuses_a_zip_of_another_version() {
+    let dir = TempDir::new().unwrap();
+    let (x64, arm64) = winget_zips(dir.path(), "1.2.2");
+    let output = Command::new(script("winget-manifest.sh"))
+        .arg("1.2.3")
+        .arg(&x64)
+        .arg(&arm64)
+        .arg(dir.path().join("manifests"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("portico-v1.2.3-x86_64-pc-windows-msvc.zip"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
