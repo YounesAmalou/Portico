@@ -38,23 +38,20 @@ e2e() {
     cargo test --test e2e -- --ignored
 }
 
-# TEMPORARY DIAGNOSTIC (Ruling G): how often the unit tests' process group is sent SIGHUP,
-# with and without the tunnel start cancellation test.
+# TEMPORARY DIAGNOSTIC (Ruling G): which unit tests the SIGHUP comes with.
 diag_rounds() {
-    local phase round skip code out
+    local filter round code out
     out=$(mktemp)
-    for phase in without with; do
-        skip=
-        [ "$phase" = without ] && skip=cancelling_a_start_kills_ssh_and_its_proxy_child
-        for round in 1 2 3 4 5 6 7 8; do
+    for filter in app::containers:: backend:: app::tests:: cli:: tui:: domain:: platform::; do
+        for round in 1 2 3 4 5 6; do
             set -m
-            cargo test --lib -q -- ${skip:+--skip "$skip"} >"$out" 2>&1 </dev/null &
+            cargo test --lib -q -- --test-threads=8 "$filter" >"$out" 2>&1 </dev/null &
             local job=$!
             set +m
             code=0
             wait "$job" || code=$?
-            echo "DIAG $phase the cancellation test, round $round: exit $code"
-            [ "$code" = 0 ] || tail -n 5 "$out"
+            echo "DIAG $filter round $round: exit $code"
+            [ "$code" = 0 ] || tail -n 3 "$out"
         done
     done
     rm -f -- "$out"
