@@ -23,7 +23,10 @@ use windows_sys::Win32::{
     },
 };
 
-use super::super::common::launcher::{LAUNCH_GRACE, Launch, run};
+use super::{
+    super::common::launcher::{LAUNCH_GRACE, Launch, run},
+    process::keep_standard_handles,
+};
 
 /// The launcher run when none is configured: Windows Terminal, which Portico drives itself.
 pub const DEFAULT_LAUNCHER: &str = "wt";
@@ -79,8 +82,11 @@ fn find_wt() -> Option<PathBuf> {
 }
 
 /// Opens `command` in a new terminal window. `DEFAULT_LAUNCHER` chooses the terminal (see
-/// `choose`); any other launcher is run with the command as its arguments.
+/// `choose`); any other launcher is run with the command as its arguments. The launcher and
+/// what it starts inherit none of Portico's standard handles, so a launcher that stays (or the
+/// terminal it opens) never keeps a pipe Portico writes to open after Portico exits.
 pub fn launch(launcher: &Path, command: &[OsString]) -> io::Result<Launch> {
+    keep_standard_handles();
     if launcher != Path::new(DEFAULT_LAUNCHER) {
         return run(launcher, command);
     }

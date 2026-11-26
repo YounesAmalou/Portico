@@ -108,7 +108,7 @@ pub fn detach(command: &mut Command) -> &mut Command {
 /// `Stdio::inherit` are unaffected: the standard library hands them a fresh inheritable
 /// duplicate of the handle at each spawn (`Stdio::to_handle` in its
 /// `sys/process/windows.rs`: `io.duplicate(0, true, DUPLICATE_SAME_ACCESS)`).
-fn keep_standard_handles() {
+pub(in crate::platform) fn keep_standard_handles() {
     for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: `GetStdHandle` has no preconditions, and `SetHandleInformation` only
         // changes the flags of a handle this process holds. A failure leaves the handle as it
