@@ -565,7 +565,9 @@ mod tests {
             .with_ssh_add(add)
             .with_keygen(keygen);
         let mut app = App::new(ManagedStore::new(ConfigPaths::from_home(&home)), openssh);
-        app.identities = IdentityState::with_deadline(Duration::from_millis(500));
+        // Shorter than the real deadline, so a listing that never answers ends soon, yet long
+        // enough for a shell fake to answer on a busy machine.
+        app.identities = IdentityState::with_deadline(Duration::from_secs(2));
         Fixture { dir, app }
     }
 
