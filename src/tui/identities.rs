@@ -215,7 +215,8 @@ fn key_label(key: &PublicKey) -> String {
 }
 
 /// The IdentityFile suggestions: every file of the inventory, or, until it is built, the key
-/// files in `~/.ssh`. Missing files come last.
+/// files in `~/.ssh`. Missing files come last. Each is spelled as the managed file writes it
+/// (`openssh_path`).
 pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> Vec<Candidate> {
     let Some(inventory) = inventory else {
         if home.as_os_str().is_empty() {
@@ -229,7 +230,7 @@ pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> 
                 } else {
                     "key file".into()
                 }),
-                alias: crate::platform::paths::tilde(&path, home),
+                alias: crate::platform::paths::openssh_path(&path, home),
             })
             .collect();
     };
@@ -256,7 +257,7 @@ pub(super) fn candidates(inventory: Option<&IdentityInventory>, home: &Path) -> 
                 ));
             }
             let alias = match &file.path {
-                Some(path) => crate::platform::paths::tilde(path, home),
+                Some(path) => crate::platform::paths::openssh_path(path, home),
                 None => file.configured.clone(),
             };
             (

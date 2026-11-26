@@ -45,7 +45,12 @@ toml_edit = "0.25.20"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Time",
+] }
 
 [dev-dependencies]
 portable-pty = "0.9"

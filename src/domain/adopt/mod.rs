@@ -243,7 +243,7 @@ fn source_problem(path: &Path, contents: &[u8], euid: &Uid) -> Option<String> {
     if !metadata.is_file() {
         return Some("not a regular file".into());
     }
-    if has_other_links(&metadata) {
+    if has_other_links(path, &metadata) {
         return Some("has other hard links".into());
     }
     if std::str::from_utf8(contents).is_err() {

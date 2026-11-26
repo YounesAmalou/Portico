@@ -36,7 +36,7 @@ use crate::{
         runtime::RuntimeDir,
         store::{StoreError, TunnelStore},
     },
-    platform::{self, fs::read_lossy, process::Proc},
+    platform::{fs::read_lossy, process::Proc},
 };
 
 pub struct App {
@@ -211,8 +211,8 @@ impl App {
             // user's real runtime directory.
             runtime: RuntimeDir::locate(&home, None),
             // Without `with_settings_path`, the file sits under the home: tests never reach the
-            // user's real preferences.
-            settings_path: platform::paths::config_dir(&home, None).join(settings::FILE_NAME),
+            // user's real preferences (on Windows, `config_dir` would read `%APPDATA%`).
+            settings_path: home.join(".config/portico").join(settings::FILE_NAME),
             proc: Proc::system(),
         }
     }

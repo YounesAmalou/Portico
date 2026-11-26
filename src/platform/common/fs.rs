@@ -12,6 +12,12 @@ use std::{
 
 use fs2::FileExt;
 
+#[cfg(unix)]
+use std::fs::rename as replace;
+
+#[cfg(windows)]
+use super::super::windows::fs::replace;
+
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -113,8 +119,9 @@ impl PendingFile {
         self.path.as_deref().expect("pending file has a path")
     }
 
+    /// Moves the file over `destination` in one step, replacing what is there.
     pub fn rename_to(mut self, destination: &Path) -> io::Result<()> {
-        fs::rename(self.path(), destination)?;
+        replace(self.path(), destination)?;
         self.path = None;
         Ok(())
     }

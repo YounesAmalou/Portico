@@ -63,8 +63,8 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
-/// Whether the file can be run by someone.
-pub fn is_executable(metadata: &Metadata) -> bool {
+/// Whether the file at `_path` can be run by someone, as its permission bits say.
+pub fn is_executable(_path: &Path, metadata: &Metadata) -> bool {
     metadata.permissions().mode() & 0o111 != 0
 }
 
@@ -73,8 +73,8 @@ pub fn is_socket(metadata: &Metadata) -> bool {
     metadata.file_type().is_socket()
 }
 
-/// Whether other names refer to the same file, so replacing it would detach them.
-pub fn has_other_links(metadata: &Metadata) -> bool {
+/// Whether other names refer to the file at `_path`, so replacing it would detach them.
+pub fn has_other_links(_path: &Path, metadata: &Metadata) -> bool {
     metadata.nlink() > 1
 }
 

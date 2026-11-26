@@ -95,7 +95,7 @@ impl DesktopEnv {
         std::env::split_paths(self.path.as_deref()?)
             .map(|dir| dir.join(program))
             .find(|path| {
-                fs::metadata(path).is_ok_and(|meta| meta.is_file() && is_executable(&meta))
+                fs::metadata(path).is_ok_and(|meta| meta.is_file() && is_executable(path, &meta))
             })
     }
 
