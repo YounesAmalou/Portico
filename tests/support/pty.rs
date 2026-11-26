@@ -459,8 +459,12 @@ fn act(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
             terminal.write(b"3");
             terminal.read_screen("api");
             terminal.write(b"u");
+            terminal.read_screen("Enter apply");
             terminal.enter_text("deploy");
+            terminal.read_screen("user: deploy");
             terminal.write(b"\r");
+            // The user is applied: the field closes, and the container shows it.
+            terminal.wait_gone("Enter apply");
             terminal.read_screen("user: deploy");
             // Opening the shell (the fake docker exits at once) remembers the user.
             terminal.write(b"\r");
@@ -883,10 +887,11 @@ impl Terminal {
         self.parser.screen().contents()
     }
 
-    /// Waits up to five seconds for `done`; fails with the screen when it never holds. What
-    /// Portico prints meanwhile is read only then, so the scenario reads it as before.
+    /// Waits up to fifteen seconds for `done` (a fake program starts slowly on Windows, through
+    /// its launcher and Git's `sh`); fails with the screen when it never holds. What Portico
+    /// prints meanwhile is read only then, so the scenario reads it as before.
     fn wait_until(&mut self, mut done: impl FnMut() -> bool, failure: &dyn Fn() -> String) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !done() {
             if Instant::now() >= deadline {
                 let shown = Instant::now() + Duration::from_millis(200);
