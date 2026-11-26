@@ -239,7 +239,7 @@ fn run(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
     }
     #[cfg(unix)]
     if scenario == BlockedConnection {
-        for pid in connection_pids(home) {
+        for pid in connection_processes(home) {
             let deadline = Instant::now() + Duration::from_secs(1);
             while is_running(pid) {
                 assert!(
@@ -610,7 +610,7 @@ fn clean_up(home: &Path, scenario: Scenario, managed_before: Option<&str>) {
         BlockedConnection => {
             #[cfg(unix)]
             if home.join("connection-started").exists() {
-                for pid in connection_pids(home) {
+                for pid in connection_processes(home) {
                     // SAFETY: plain kill(2) of processes this scenario's fake started.
                     unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
                 }
@@ -675,6 +675,17 @@ fn wait_for_file(path: &Path, failure: &str) {
 
 /// The shell, parent, worker thread and child of the blocked connection, as its fake records
 /// them once it has started.
+/// The processes of the blocked connection: its `ssh`, the script it runs and that script's
+/// child. The worker thread's ID is left out: only Linux numbers threads like processes (macOS
+/// gives a thread an ID no process has, or one an unrelated process has).
+#[cfg(unix)]
+fn connection_processes(home: &Path) -> [u32; 3] {
+    let [ssh, script, _worker, child] = connection_pids(home);
+    [ssh, script, child]
+}
+
+/// What the blocked connection recorded: its `ssh`, the script it runs, the script's worker
+/// thread and the child that thread started.
 #[cfg(unix)]
 fn connection_pids(home: &Path) -> [u32; 4] {
     let marker = home.join("connection-started");
