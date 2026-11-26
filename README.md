@@ -27,12 +27,13 @@ Private keys remain where they already live. Portico stores identity-file refere
 
 ## Requirements
 
-- Linux on x86_64 or aarch64 (verified on Arch Linux), macOS on Apple silicon or Intel, or Windows 10 or newer on x64 or arm64
+- Linux on x86_64 or aarch64 (verified on Arch Linux), macOS on Apple silicon or Intel, or Windows 10 1809 or newer on x64 or arm64
 - OpenSSH client tools (`ssh`); on Windows, the OpenSSH Client optional feature, which current Windows installs include
 - `xdg-terminal-exec` for the new-terminal option only, on Linux
 - Only for container shells, on this machine or on the host: `docker`, `podman`, or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
 - Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel) (Linux only)
 - Rust 1.88 or newer, only when building from source
+- Python 3 and `stty`, only to run the complete pseudo-terminal integration test on Linux and macOS
 
 ## Install
 
@@ -243,7 +244,7 @@ portico connect development
 portico connect development --new-terminal
 ```
 
-New-terminal connections are handed to `xdg-terminal-exec` (on macOS, see below) in the background, so the CLI returns without waiting for the session and the TUI remains usable. If the launcher fails right away (for example no terminal is available) its exit status is reported; once it has started, Portico can only report that the launch was requested, not whether the SSH session succeeds.
+New-terminal connections are handed to `xdg-terminal-exec` (on macOS and Windows, see below) in the background, so the CLI returns without waiting for the session and the TUI remains usable. If the launcher fails right away (for example no terminal is available) its exit status is reported; once it has started, Portico can only report that the launch was requested, not whether the SSH session succeeds.
 
 On macOS, a new terminal window opens in the terminal named by `PORTICO_TERMINAL` (`Terminal`, `iTerm2`, `Ghostty`, `WezTerm`, `kitty` or `Alacritty`, or the path of a launcher program that takes the command as its arguments, like `xdg-terminal-exec`), otherwise in the terminal Portico itself runs in, otherwise in Terminal. Terminal and iTerm2 are handed a private, self-deleting `.command` script, so no Automation permission is asked for.
 
@@ -405,7 +406,7 @@ Use `portico <command> --help` for the authoritative options for a command.
 
 ![The desktop panel, with saved tunnels and an expanded host](desktop/quickshell/preview.png)
 
-The desktop panel and `portico desktop` need Linux; on macOS the command is hidden and refused.
+The desktop panel and `portico desktop` need Linux; on macOS and Windows the command is hidden and refused.
 
 `desktop/quickshell/` is a small Quickshell panel: the saved tunnels with their status and a Start or Stop button, and the hosts to connect to in a new terminal, each expandable to its running containers to open a shell in. It runs `portico` with `--json` when it opens and lists the tunnels again every 5 seconds while it stays open; nothing runs while it is closed. Containers are listed only when you expand a host (`→`), and the panel never runs `portico show`. It manages nothing: hosts and tunnels are added, edited and removed in the CLI and the TUI. Typing filters tunnels by name or host, hosts by alias, and the containers already listed by name, image or ID (a host whose listed containers match stays visible, showing only those), `↑` / `↓` move, `Enter` connects, opens the shell or starts or stops the tunnel, `←` collapses, `F5` lists again and `Esc` closes.
 

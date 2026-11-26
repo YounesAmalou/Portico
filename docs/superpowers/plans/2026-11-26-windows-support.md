@@ -18,7 +18,7 @@
 - Do not touch `domain::settings` logic or the container shell user picker (only `config_dir` moves).
 - Home on Windows: `USERPROFILE` only. Settings: `%APPDATA%\portico\settings.toml`, `XDG_CONFIG_HOME` wins when set. System config: `%ProgramData%\ssh\ssh_config` (default `C:\ProgramData\ssh\ssh_config`). Runtime: `~\.ssh\portico\run\tunnels`.
 - Paths written into OpenSSH files use `/` and `~`; paths shown to people use `\`.
-- Windows tunnels: `ssh -N` without `-f`, `-o LogLevel=VERBOSE`, detached (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`); `-L`/`-D` up when the listen address is bound while ssh runs; `-R` up when the log shows `Authenticated to` and ssh still runs 1 s later.
+- Windows tunnels: `ssh -N` without `-f`, `-o LogLevel=VERBOSE`, detached (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`: a hidden console of its own, which proxy programs inherit); every kind up when the log shows `Authenticated to` and ssh still runs 1 s later, `-L`/`-D` also with the listen address bound; at most 30 s.
 - Commit messages: Conventional Commits, no AI attribution lines. Run `scripts/ci-checks.sh` checks as a regular user.
 - After every task: `cargo check --target x86_64-pc-windows-gnu --all-targets` must not gain errors in files the task touched (from Task 7 on it must pass).
 
