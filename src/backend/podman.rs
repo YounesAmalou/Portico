@@ -4,6 +4,8 @@
 
 use serde_json::Value;
 
+use crate::platform::process::UNIX_TOOLS;
+
 use super::{
     Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, Problem,
     RunFailure, RunResult, SHELL_SCRIPT, Target, Via,
@@ -21,6 +23,19 @@ const USER_MARKER: &str = "portico-user=";
 /// The words of the listing command, to be run locally or quoted for ssh.
 pub fn list_words() -> Vec<String> {
     ["sh", "-c", LIST_SCRIPT].map(String::from).to_vec()
+}
+
+/// The words that list `target`'s containers: [`list_words`], or on a local machine without
+/// Unix tools (`unix_tools` false: Windows, with no `sh`) `podman ps` itself, which names no
+/// user.
+fn listing_words(target: &Target, unix_tools: bool) -> Vec<String> {
+    if unix_tools || !matches!(target, Target::Local) {
+        list_words()
+    } else {
+        ["podman", "ps", "--format", "json"]
+            .map(String::from)
+            .to_vec()
+    }
 }
 
 /// The words that open a shell in container `id`, as `user` when given.
@@ -204,13 +219,34 @@ impl Backend for Podman {
         BackendId::Podman
     }
 
-    /// Runs [`LIST_SCRIPT`] once, as the user Portico connects as.
+    /// Runs [`LIST_SCRIPT`] once, as the user Portico connects as (`podman ps` itself on a
+    /// Windows machine).
     fn list<E>(
         &self,
         target: &Target,
         run: &mut dyn FnMut(&[String]) -> RunResult<E>,
     ) -> Result<ContainerList, ListFailure<E>> {
-        let output = run(&list_words()).map_err(|failure| match failure {
+        list(target, run, UNIX_TOOLS)
+    }
+
+    /// `podman exec` into container `id`, as `user` when given. Podman needs no `via`.
+    fn shell_words(&self, id: &str, user: Option<&str>, _via: Option<Via>) -> Vec<String> {
+        exec_words(id, user)
+    }
+
+    fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue {
+        issue(target, problem, None, stderr)
+    }
+}
+
+/// `Podman::list`, where this machine has Unix tools when `unix_tools`.
+fn list<E>(
+    target: &Target,
+    run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    unix_tools: bool,
+) -> Result<ContainerList, ListFailure<E>> {
+    {
+        let output = run(&listing_words(target, unix_tools)).map_err(|failure| match failure {
             RunFailure::Cancelled(error) | RunFailure::Failed(error) => ListFailure::Run(error),
         })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -241,15 +277,6 @@ impl Backend for Podman {
             note,
         })
     }
-
-    /// `podman exec` into container `id`, as `user` when given. Podman needs no `via`.
-    fn shell_words(&self, id: &str, user: Option<&str>, _via: Option<Via>) -> Vec<String> {
-        exec_words(id, user)
-    }
-
-    fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue {
-        issue(target, problem, None, stderr)
-    }
 }
 
 fn failed<E>(issue: BackendIssue) -> ListFailure<E> {
@@ -265,7 +292,7 @@ fn issue(target: &Target, problem: Problem, user: Option<&str>, stderr: String) 
             format!(
                 "Podman is not installed on {target}, or it is not on the PATH of a non-interactive shell there."
             ),
-            vec!["Install Podman from the distribution's packages, then list again.".into()],
+            vec![super::install_hint("Podman", target)],
         ),
         Problem::PermissionDenied => (
             message.unwrap_or_else(|| "Permission denied".into()),
@@ -300,9 +327,10 @@ fn issue(target: &Target, problem: Problem, user: Option<&str>, stderr: String) 
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::process::ExitStatusExt, process::ExitStatus, process::Output};
+    use std::process::Output;
 
     use super::*;
+    use crate::platform::process::exit_status;
 
     /// A listing recorded from `podman ps --format json` (Podman 5), trimmed: a Compose
     /// service with a port, a lone container, and a pod's infra container.
@@ -352,7 +380,7 @@ mod tests {
 
     fn output(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
-            status: ExitStatus::from_raw(code << 8),
+            status: exit_status(code),
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -361,12 +389,38 @@ mod tests {
     fn list(target: &Target, output: Output) -> Result<ContainerList, ListFailure<()>> {
         let mut calls = Vec::new();
         let mut output = Some(output);
-        let result = Podman.list(target, &mut |words| {
-            calls.push(words.to_vec());
-            Ok(output.take().expect("one command"))
-        });
+        // With Unix tools, so that the script's tests run on every system.
+        let result = super::list(
+            target,
+            &mut |words| {
+                calls.push(words.to_vec());
+                Ok(output.take().expect("one command"))
+            },
+            true,
+        );
         assert_eq!(calls, [list_words()]);
         result
+    }
+
+    #[test]
+    fn a_local_machine_without_unix_tools_runs_podman_itself() {
+        let mut calls = Vec::new();
+        let mut run = |words: &[String]| {
+            calls.push(words.to_vec());
+            Ok::<_, RunFailure<()>>(output(0, LISTING, ""))
+        };
+        let listed = super::list(&Target::Local, &mut run, false).unwrap();
+        assert_eq!(calls, [["podman", "ps", "--format", "json"]]);
+        assert!(!listed.listing.containers.is_empty());
+        assert_eq!(listed.note, None);
+        // A host is a Linux machine with sh whatever this one is.
+        let mut calls = Vec::new();
+        let mut run = |words: &[String]| {
+            calls.push(words.to_vec());
+            Ok::<_, RunFailure<()>>(output(0, LISTING, ""))
+        };
+        super::list(&Target::Host("dev".into()), &mut run, false).unwrap();
+        assert_eq!(calls, [list_words()]);
     }
 
     fn issue_of(result: Result<ContainerList, ListFailure<()>>) -> BackendIssue {

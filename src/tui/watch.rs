@@ -127,7 +127,11 @@ impl<M: Metadata> ConfigWatch<M> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, fs, os::unix::fs::PermissionsExt};
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{cell::RefCell, collections::HashMap};
 
     use super::*;
 
@@ -339,6 +343,7 @@ mod tests {
         assert!(watch.tick(start + ms(1300)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_filesystem_stamp_follows_existence_renames_and_access() {
         let dir = tempfile::tempdir().unwrap();

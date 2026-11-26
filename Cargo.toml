@@ -21,6 +21,8 @@ exclude = [
     "desktop/quickshell/preview.png",
     "tests/docs.rs",
     "tests/package.rs",
+    "tests/support/sh_shim.rs",
+    "tests/support/listen.rs",
 ]
 
 [lib]
@@ -35,12 +37,30 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 fs2 = "0.4"
 glob = "0.3"
-libc = "0.2"
 ratatui = "0.30"
 serde_json = "1"
 signal-hook = "0.4"
 thiserror = "2"
 toml_edit = "0.25.20"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 portable-pty = "0.9"

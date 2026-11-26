@@ -381,6 +381,8 @@ impl UiState {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use crate::platform::paths::shown as path_shown;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
         Terminal,
@@ -608,13 +610,13 @@ mod tests {
     fn space_toggles_only_eligible_rows() {
         let mut state = adoption(None);
         press(&mut state, KeyCode::Char(' '));
-        assert_eq!(text(&state)[0], "[x] web   ~/.ssh/config");
+        assert_eq!(text(&state)[0], path_shown("[x] web   ~/.ssh/config"));
         press(&mut state, KeyCode::Down);
         press(&mut state, KeyCode::Char(' '));
         assert_eq!(text(&state)[1], "    wild  its Host line has a wildcard");
         press(&mut state, KeyCode::Char('k'));
         press(&mut state, KeyCode::Char(' '));
-        assert_eq!(text(&state)[0], "[ ] web   ~/.ssh/config");
+        assert_eq!(text(&state)[0], path_shown("[ ] web   ~/.ssh/config"));
 
         let lines = state.lines(60, usize::MAX);
         assert!(lines[1].style.add_modifier.contains(Modifier::DIM));
@@ -629,9 +631,9 @@ mod tests {
         assert_eq!(
             text(&state),
             [
-                "[x] web   ~/.ssh/config",
+                path_shown("[x] web   ~/.ssh/config").as_str(),
                 "    wild  its Host line has a wildcard",
-                "[x] db    ~/.ssh/config",
+                path_shown("[x] db    ~/.ssh/config").as_str(),
             ]
         );
         press(&mut state, KeyCode::Enter);
@@ -676,7 +678,10 @@ mod tests {
         assert_eq!(state.footer(), "↑↓ scroll  y apply  Esc back");
         assert!(state.title().to_string().starts_with("Adopt hosts /"));
         let preview = text(&state);
-        assert!(preview.contains(&"~/.ssh/config".to_owned()), "{preview:?}");
+        assert!(
+            preview.contains(&path_shown("~/.ssh/config")),
+            "{preview:?}"
+        );
         assert!(preview.contains(&"  -4: Host db".to_owned()), "{preview:?}");
         assert_eq!(
             press(&mut state, KeyCode::Char('y')),
@@ -712,14 +717,14 @@ mod tests {
         press(&mut state, KeyCode::Enter);
         assert_eq!(state.footer(), "↑↓ scroll  y apply  Esc back");
         assert_eq!(press(&mut state, KeyCode::Esc), MigrateAction::None);
-        assert_eq!(text(&state)[0], "[x] web   ~/.ssh/config");
+        assert_eq!(text(&state)[0], path_shown("[x] web   ~/.ssh/config"));
         assert_eq!(press(&mut state, KeyCode::Esc), MigrateAction::Close);
     }
 
     #[test]
     fn preselected_host_is_checked() {
         let state = adoption(Some("DB"));
-        assert_eq!(text(&state)[2], "[x] db    ~/.ssh/config");
+        assert_eq!(text(&state)[2], path_shown("[x] db    ~/.ssh/config"));
         assert!(
             state.lines(60, usize::MAX)[2]
                 .style
@@ -796,7 +801,7 @@ mod tests {
         };
 
         let (rows, cursor) = window(&state);
-        assert_eq!(rows[cursor], "[x] host27  ~/.ssh/config");
+        assert_eq!(rows[cursor], path_shown("[x] host27  ~/.ssh/config"));
         press(&mut state, KeyCode::Down);
         press(&mut state, KeyCode::Down);
         let (rows, cursor) = window(&state);
@@ -805,12 +810,18 @@ mod tests {
         // Moving up keeps the window until the cursor reaches its top.
         press(&mut state, KeyCode::Up);
         let (rows, cursor) = window(&state);
-        assert_eq!((rows[0].as_str(), cursor), ("[ ] host20  ~/.ssh/config", 8));
+        assert_eq!(
+            (rows[0].as_str(), cursor),
+            (path_shown("[ ] host20  ~/.ssh/config").as_str(), 8)
+        );
         for _ in 0..30 {
             press(&mut state, KeyCode::Up);
         }
         let (rows, cursor) = window(&state);
-        assert_eq!((rows[0].as_str(), cursor), ("[ ] host00  ~/.ssh/config", 0));
+        assert_eq!(
+            (rows[0].as_str(), cursor),
+            (path_shown("[ ] host00  ~/.ssh/config").as_str(), 0)
+        );
     }
 
     #[test]
@@ -818,7 +829,7 @@ mod tests {
         let mut state = adoption(Some("web"));
         let checklist = pane(&state);
         assert!(checklist.contains("Adopt hosts"));
-        assert!(checklist.contains("[x] web   ~/.ssh/config"));
+        assert!(checklist.contains(&path_shown("[x] web   ~/.ssh/config")));
         press(&mut state, KeyCode::Enter);
         let preview = pane(&state);
         assert!(preview.contains("  -1: Host web"));

@@ -5,12 +5,9 @@ mod scan;
 pub(crate) use scan::*;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::ops::Range;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,8 +19,10 @@ use crate::domain::managed::{
     HostComments, ManagedConfig, ManagedStore, TransactionError, render_host,
 };
 use crate::platform::fs::{
-    PendingFile, acquire_lock, normalize_path, open_lock, symlink_target, sync_dir, write_unique,
+    PendingFile, acquire_lock, canonicalize, has_other_links, mode_of, normalize_path, open_lock,
+    owner_is, symlink_target, sync_dir, writable, write_unique,
 };
+use crate::platform::process::{Uid, effective_uid};
 
 /// Whether hosts move into the managed fragment or out of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,7 +170,7 @@ fn file_key(file: PathBuf) -> PathBuf {
     } else {
         dir
     };
-    match fs::canonicalize(dir) {
+    match canonicalize(dir) {
         Ok(dir) => dir.join(name),
         Err(_) => normalize_path(&file),
     }
@@ -236,7 +235,7 @@ fn lossless_reason(
 /// The first rule `path` breaks as a file to rewrite: a regular file without other hard links
 /// (replacing it would detach them), valid UTF-8, owned by `euid`, and writable along with its
 /// directory.
-fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
+fn source_problem(path: &Path, contents: &[u8], euid: &Uid) -> Option<String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => return Some(format!("cannot inspect {}: {error}", path.display())),
@@ -244,13 +243,13 @@ fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
     if !metadata.is_file() {
         return Some("not a regular file".into());
     }
-    if metadata.nlink() > 1 {
+    if has_other_links(path, &metadata) {
         return Some("has other hard links".into());
     }
     if std::str::from_utf8(contents).is_err() {
         return Some("not valid UTF-8".into());
     }
-    if metadata.uid() != euid {
+    if !owner_is(&metadata, euid) {
         return Some("owned by another user".into());
     }
     let dir = match path.parent() {
@@ -258,32 +257,18 @@ fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
         _ => Path::new("."),
     };
     for (what, path) in [("file", path), ("directory", dir)] {
-        if let Err(error) = writable(path) {
-            return Some(match error.raw_os_error() {
-                Some(libc::EACCES | libc::EPERM | libc::EROFS) => format!("{what} is read-only"),
-                _ => format!(
+        match writable(path) {
+            Ok(true) => {}
+            Ok(false) => return Some(format!("{what} is read-only")),
+            Err(error) => {
+                return Some(format!(
                     "cannot check whether {} is writable: {error}",
                     path.display()
-                ),
-            });
+                ));
+            }
         }
     }
     None
-}
-
-fn writable(path: &Path) -> io::Result<()> {
-    let path = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: `path` is a NUL-terminated string that outlives the call.
-    if unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
 }
 
 /// Managed blocks as export writes them below the Include and the global directives after it:
@@ -309,7 +294,7 @@ struct Source {
 }
 
 impl Source {
-    fn read(path: &Path, euid: u32, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) -> Self {
+    fn read(path: &Path, euid: &Uid, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) -> Self {
         let target = match symlink_target(path) {
             Ok(target) => file_key(target),
             Err((at, error)) => {
@@ -376,7 +361,7 @@ impl ManagedStore {
         for external in &discovery.hosts {
             let source = sources
                 .entry(external.source.clone())
-                .or_insert_with(|| Source::read(&external.source, euid, &mut snapshot));
+                .or_insert_with(|| Source::read(&external.source, &euid, &mut snapshot));
             let key = external.alias.to_ascii_lowercase();
             let eligibility = (|| {
                 let blocks = source.blocks.as_ref().map_err(Clone::clone)?;
@@ -451,7 +436,7 @@ impl ManagedStore {
         let (managed_bytes, config) = self.read_managed()?;
         let entry = file_key(self.entry_file()?);
         let entry_bytes = fs::read(&entry).map_err(|source| io_error(&entry, source))?;
-        let problem = source_problem(&entry, &entry_bytes, effective_uid());
+        let problem = source_problem(&entry, &entry_bytes, &effective_uid());
 
         let mut candidates = Vec::new();
         let mut moves = BTreeMap::new();
@@ -696,11 +681,7 @@ impl ManagedStore {
             let mode = if managed {
                 0o600
             } else {
-                fs::metadata(path)
-                    .map_err(|source| io_error(path, source))?
-                    .permissions()
-                    .mode()
-                    & 0o7777
+                mode_of(&fs::metadata(path).map_err(|source| io_error(path, source))?) & 0o7777
             };
             let dir = parent_dir(path);
             let candidate = write_unique(&dir, &temporary_stem(path, "candidate"), contents, mode)
@@ -1077,9 +1058,16 @@ mod tests {
     use crate::domain::managed::{ConfigPaths, ManagedStore};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    use crate::platform::fs::mode_of;
+    use crate::platform::fs::set_mode;
+
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+        crate::platform::fs::symlink(target.as_ref(), link.as_ref())
+    }
 
     const HEADER: &str = "# Managed by Portico. Do not edit manually.\n";
 
@@ -1167,6 +1155,29 @@ mod tests {
         assert_no_staged_files(&fixture.paths);
     }
 
+    /// Adds (`/deny`) or removes (`/remove:d`) a rule denying the user writes to `path`.
+    #[cfg(windows)]
+    fn icacls(path: &Path, action: &str) {
+        let user = std::env::var("USERNAME").unwrap();
+        let rule = if action == "/deny" {
+            format!("{user}:(W)")
+        } else {
+            user
+        };
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args([action, rule.as_str()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "icacls {} {action} {rule}: {}{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn reasons_follow_the_spec_order() {
         let fixture = fixture_with(
@@ -1186,15 +1197,23 @@ mod tests {
             "readonly.conf",
             b"Host ro\n  HostName r\nHost rofwd\n  ForwardAgent yes\n",
         );
-        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o444)).unwrap();
+        set_mode(&readonly, 0o444).unwrap();
         fixture.write("latin.conf", b"Host latin\n  HostName l\n# caf\xe9\n");
         let locked = fixture.write("locked/hosts.conf", b"Host locked\n  HostName k\n");
         let locked_dir = locked.parent().unwrap().to_path_buf();
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        // Windows ignores a directory's read-only attribute: a rule denying the user writes
+        // there locks it instead.
+        #[cfg(unix)]
+        set_mode(&locked_dir, 0o555).unwrap();
+        #[cfg(windows)]
+        icacls(&locked_dir, "/deny");
         fixture.write("cond.conf", b"Host cond\n  HostName c\n");
 
         let plan = fixture.store.adoption_plan(same());
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        set_mode(&locked_dir, 0o755).unwrap();
+        #[cfg(windows)]
+        icacls(&locked_dir, "/remove:d");
         let plan = plan.unwrap();
 
         let reason = |text: &str| Some(text.to_owned());
@@ -1243,18 +1262,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_file_owned_by_another_user_is_refused() {
         let fixture = fixture("");
         let path = fixture.write("hosts.conf", b"Host a\n  HostName a\n");
         let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&path).unwrap());
-        assert_eq!(source_problem(&path, b"Host a\n", uid), None);
+        assert_eq!(source_problem(&path, b"Host a\n", &uid), None);
         assert_eq!(
-            source_problem(&path, b"Host a\n", uid.wrapping_add(1)).as_deref(),
+            source_problem(&path, b"Host a\n", &uid.wrapping_add(1)).as_deref(),
             Some("owned by another user")
         );
         assert_eq!(
-            source_problem(&fixture.paths.ssh_dir, b"", uid).as_deref(),
+            source_problem(&fixture.paths.ssh_dir, b"", &uid).as_deref(),
             Some("not a regular file")
         );
     }
@@ -1304,8 +1324,10 @@ mod tests {
         let preview = plan.preview(&["dev".into()]).unwrap();
         assert_eq!(
             preview.render(Some(fixture.home())),
-            "~/.ssh/portico/config\n  +2: \n  +3: # box\n  +4: Host dev\n  +5:     HostName d\n  +6:     User bob\n\n\
-             ~/.ssh/config\n  -3: # box\n  -4: Host dev\n  -5:   HostName d\n  -6:   User bob\n  -7: \n"
+            shown_headers(
+                "~/.ssh/portico/config\n  +2: \n  +3: # box\n  +4: Host dev\n  +5:     HostName d\n  +6:     User bob\n\n\
+                 ~/.ssh/config\n  -3: # box\n  -4: Host dev\n  -5:   HostName d\n  -6:   User bob\n  -7: \n"
+            ),
         );
         assert_eq!(
             fs::read_to_string(&fixture.paths.managed).unwrap(),
@@ -1325,9 +1347,11 @@ mod tests {
         let preview = plan.preview(&["C".into(), "a".into(), "b".into()]).unwrap();
         assert_eq!(
             preview.render(Some(fixture.home())),
-            "~/.ssh/portico/config\n  +2: \n  +3: Host a\n  +4:     HostName a\n  +5: \n  +6: Host b\n  +7:     HostName b\n  +8: \n  +9: Host c\n  +10:     HostName c\n\n\
-             ~/.ssh/config\n  -3: Host a\n  -4:   HostName a\n\n\
-             ~/.ssh/extra.conf\n  -1: Host b\n  -2:   HostName b\n  -3: \n  -4: Host c\n  -5:   HostName c\n"
+            shown_headers(
+                "~/.ssh/portico/config\n  +2: \n  +3: Host a\n  +4:     HostName a\n  +5: \n  +6: Host b\n  +7:     HostName b\n  +8: \n  +9: Host c\n  +10:     HostName c\n\n\
+                 ~/.ssh/config\n  -3: Host a\n  -4:   HostName a\n\n\
+                 ~/.ssh/extra.conf\n  -1: Host b\n  -2:   HostName b\n  -3: \n  -4: Host c\n  -5:   HostName c\n"
+            ),
         );
     }
 
@@ -1362,8 +1386,10 @@ mod tests {
         let preview = plan.preview(&["dev".into()]).unwrap();
         assert_eq!(
             preview.render(Some(fixture.home())),
-            "~/.ssh/config\n  +2: # box\n  +3: Host dev\n  +4:     HostName d\n  +5:     User bob\n  +6: \n\n\
-             ~/.ssh/portico/config\n  -2: \n  -3: # box\n  -4: Host dev\n  -5:     HostName d\n  -6:     User bob\n"
+            shown_headers(
+                "~/.ssh/config\n  +2: # box\n  +3: Host dev\n  +4:     HostName d\n  +5:     User bob\n  +6: \n\n\
+                 ~/.ssh/portico/config\n  -2: \n  -3: # box\n  -4: Host dev\n  -5:     HostName d\n  -6:     User bob\n"
+            ),
         );
         assert_no_staged_files(&fixture.paths);
     }
@@ -1404,7 +1430,7 @@ mod tests {
         assert!(plan.preview(&[]).unwrap().files.is_empty());
 
         let fixture = fixture_with("", "\nHost dev\n    HostName d\n");
-        fs::set_permissions(&fixture.paths.entry, fs::Permissions::from_mode(0o444)).unwrap();
+        set_mode(&fixture.paths.entry, 0o444).unwrap();
         let plan = fixture.store.export_plan(same()).unwrap();
         assert_eq!(
             plan.preview(&["dev".into()]).unwrap_err().to_string(),
@@ -1478,16 +1504,34 @@ mod tests {
             )
         );
     }
+    /// A rendered preview's expected text with the file names, its lines that start with `~`
+    /// or `/`, spelled as this system shows paths.
+    fn shown_headers(text: &str) -> String {
+        text.split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with(['~', '/']) {
+                    crate::platform::paths::shown(line)
+                } else {
+                    line.into()
+                }
+            })
+            .collect()
+    }
+
     /// Every file under the temporary home with its bytes, apart from Portico's lock and the
     /// managed fragment's `config.bak`; comparing two of these also proves no temporary file
     /// was left behind.
     fn tree(paths: &ConfigPaths) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn walk(dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        fn walk(dir: &Path, paths: &ConfigPaths, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
+                // Windows refuses to read a locked file, and another thread may hold the lock.
+                if path == paths.lock || path == paths.backup {
+                    continue;
+                }
                 let kind = fs::symlink_metadata(&path).unwrap().file_type();
                 if kind.is_dir() {
-                    walk(&path, files);
+                    walk(&path, paths, files);
                 } else if kind.is_symlink() {
                     let target = fs::read_link(&path).unwrap();
                     files.insert(path, target.into_os_string().into_encoded_bytes());
@@ -1497,9 +1541,7 @@ mod tests {
             }
         }
         let mut files = BTreeMap::new();
-        walk(&paths.ssh_dir, &mut files);
-        files.remove(&paths.lock);
-        files.remove(&paths.backup);
+        walk(&paths.ssh_dir, paths, &mut files);
         files
     }
 
@@ -1565,7 +1607,7 @@ mod tests {
             "extra.conf",
             b"Host b\n  HostName b\n\nHost c\n  HostName c\n# tail\n",
         );
-        fs::set_permissions(&extra, fs::Permissions::from_mode(0o640)).unwrap();
+        set_mode(&extra, 0o640).unwrap();
         let plan = fixture.store.adoption_plan(same()).unwrap();
         assert_eq!(migrate(&fixture, &plan, &["b", "a"]).unwrap(), ["a", "b"]);
         assert_eq!(
@@ -1573,10 +1615,9 @@ mod tests {
             "Include ~/.ssh/portico/config\nInclude extra.conf\n"
         );
         assert_eq!(read(&extra), "Host c\n  HostName c\n# tail\n");
-        assert_eq!(
-            fs::metadata(&extra).unwrap().permissions().mode() & 0o7777,
-            0o640
-        );
+        // Windows keeps only the read-only attribute of a mode.
+        #[cfg(unix)]
+        assert_eq!(mode_of(&fs::metadata(&extra).unwrap()) & 0o7777, 0o640);
         assert_eq!(
             read(&fixture.paths.managed),
             format!("{HEADER}\nHost a\n    HostName a\n\nHost b\n    HostName b\n")

@@ -15,6 +15,7 @@ use crate::{
     domain::managed::InitPlan,
     domain::openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     picker::{Picker, Row},
+    platform::paths::DEFAULT_AGENT,
 };
 
 use super::{CANCELLED, Interrupts, Step, confirm, exit_code};
@@ -418,16 +419,7 @@ pub(super) fn print_inventory(
             ),
             Agent::Disabled | Agent::NotConfigured { .. } => continue,
         };
-        let mut uses = Vec::new();
-        if known.environment {
-            uses.push("SSH_AUTH_SOCK".to_owned());
-        }
-        if !known.used_by.is_empty() {
-            uses.push(format!(
-                "used by {}",
-                identity::count(known.used_by.len(), "host")
-            ));
-        }
+        let uses = agent_uses(known, DEFAULT_AGENT);
         text.push_str(&format!("  {name}  {socket}  {state}"));
         if !uses.is_empty() {
             text.push_str(&format!("  ({})", uses.join(", ")));
@@ -498,6 +490,26 @@ pub(super) fn print_inventory(
         .map_err(|error| error.to_string())
 }
 
+/// What the inventory says of `known`: whether ssh uses it by default, through `SSH_AUTH_SOCK`
+/// or as the system's `default_agent` (Windows' agent pipe, used without the variable), and
+/// how many hosts name it.
+fn agent_uses(known: &identity::InventoryAgent, default_agent: Option<&str>) -> Vec<String> {
+    let mut uses = Vec::new();
+    if known.environment {
+        uses.push("SSH_AUTH_SOCK".to_owned());
+    } else if default_agent.is_some_and(|default| known.agent.socket() == Some(Path::new(default)))
+    {
+        uses.push("default agent".to_owned());
+    }
+    if !known.used_by.is_empty() {
+        uses.push(format!(
+            "used by {}",
+            identity::count(known.used_by.len(), "host")
+        ));
+    }
+    uses
+}
+
 fn print_optional(output: &mut impl Write, label: &str, value: Option<&str>) -> Result<(), String> {
     writeln!(output, "{label}: {}", value.unwrap_or("-")).map_err(|error| error.to_string())
 }
@@ -531,6 +543,7 @@ pub(super) fn format_warning(warning: &DiscoveryWarning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::shown;
 
     #[test]
     fn field_change_rejects_setting_and_unsetting_together() {
@@ -627,11 +640,12 @@ mod tests {
         assert_eq!(
             shown_details(Some(identities)),
             format!(
-                "{before}Agent: 1Password, ~/.1password/agent.sock, 2 keys\n\
+                "{before}Agent: 1Password, {}, 2 keys\n\
                  Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:gh \"GitHub\")\n\
                  Identity: ~/.ssh/id_work: missing (no such file)\n\
                  IdentitiesOnly: yes\n\
-                 PKCS#11 provider: /usr/lib/p11.so\n"
+                 PKCS#11 provider: /usr/lib/p11.so\n",
+                shown("~/.1password/agent.sock")
             )
         );
     }
@@ -650,14 +664,37 @@ mod tests {
             also_offered: vec![key("SHA256:vps", "VPS"), key("SHA256:x", "")],
             pkcs11_provider: None,
         };
-        let shown = shown_details(Some(identities));
+        let details = shown_details(Some(identities));
         assert!(
-            shown.ends_with(
-                "Agent: SSH agent, /run/agent, 2 keys\n\
+            details.ends_with(&format!(
+                "Agent: SSH agent, {}, 2 keys\n\
                  Identity: OpenSSH defaults: none present\n\
-                 Also offered by the agent: 2 (VPS, SHA256:x)\n"
-            ),
-            "{shown}"
+                 Also offered by the agent: 2 (VPS, SHA256:x)\n",
+                shown("/run/agent")
+            )),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn the_system_default_agent_is_labelled_as_such() {
+        let pipe = r"\\.\pipe\openssh-ssh-agent";
+        let mut known = identity::InventoryAgent {
+            agent: Agent::Listed {
+                socket: pipe.into(),
+                provider: identity::Provider::Generic,
+                keys: Vec::new(),
+            },
+            environment: false,
+            used_by: Vec::new(),
+        };
+        assert_eq!(agent_uses(&known, Some(pipe)), ["default agent"]);
+        assert!(agent_uses(&known, None).is_empty());
+        known.environment = true;
+        known.used_by = vec!["a".into()];
+        assert_eq!(
+            agent_uses(&known, Some(pipe)),
+            ["SSH_AUTH_SOCK", "used by 1 host"]
         );
     }
 
@@ -708,16 +745,20 @@ mod tests {
         print_inventory(&mut output, &inventory, Path::new("/home/me")).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Agents\n\
-             \x20 1Password  ~/.1password/agent.sock  2 keys  (SSH_AUTH_SOCK, used by 2 hosts)\n\
+            format!(
+                "Agents\n\
+             \x20 1Password  {}  2 keys  (SSH_AUTH_SOCK, used by 2 hosts)\n\
              \x20   ED25519  SHA256:gh   GitHub  ~/.ssh/github.pub\n\
              \x20   ED25519  SHA256:vps  VPS\n\
-             \x20 SSH agent  /run/gone  unavailable: no such socket  (used by 1 host)\n\
+             \x20 SSH agent  {}  unavailable: no such socket  (used by 1 host)\n\
              \n\
              Identity files\n\
              \x20 ~/.ssh/github.pub  in agent  used by: a, b\n\
              \x20 ~/.ssh/old         key file  used by: -\n\
-             Warning: z: could not resolve: boom\n"
+             Warning: z: could not resolve: boom\n",
+                shown("~/.1password/agent.sock"),
+                shown("/run/gone")
+            )
         );
     }
 }

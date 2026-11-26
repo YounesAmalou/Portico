@@ -284,9 +284,10 @@ fn root_steps(target: &Target, who: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::process::ExitStatusExt, process::Output};
+    use std::process::Output;
 
     use super::*;
+    use crate::platform::process::exit_status;
 
     const TABLE: &str = "\
 VMID       Status     Lock         Name                \n\
@@ -408,7 +409,7 @@ VMID       Status     Lock         Name                \n\
 
     fn output(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
-            status: std::process::ExitStatus::from_raw(code << 8),
+            status: exit_status(code),
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -552,7 +553,7 @@ VMID       Status     Lock         Name                \n\
                 "id",
                 &format!("case \"$1\" in -u) echo {uid} ;; -un) echo deploy ;; esac"),
             );
-            let output = std::process::Command::new("/bin/sh")
+            let output = std::process::Command::new(crate::test_executable::posix_sh())
                 .args(["-c", LIST_SCRIPT])
                 .env("PATH", dir.path())
                 .output()

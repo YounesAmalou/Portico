@@ -5,12 +5,11 @@ use std::{
     cell::OnceCell,
     fs::{File, OpenOptions},
     io,
-    os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -25,12 +24,15 @@ use crate::{
         Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
         check_args, collide, collisions, listeners_in_effective_config,
         runtime::{
-            Bind, Identity, Record, RunningRecord, find_in, log_reason, log_tail, now, try_bind,
+            Bind, Identity, READY_BOUND, Record, RunningRecord, authenticated, find_in, listening,
+            log_reason, log_tail, now, ready, try_bind, up_at_bound,
         },
         start_args,
     },
-    platform::fs::{acquire_lock, open_lock},
-    platform::process::{Logged, current_uid, kill_process_tree, stop_process},
+    platform::fs::{acquire_lock, open_lock, private},
+    platform::process::{
+        Logged, SSH_BACKGROUNDS, current_uid, detach, kill_process_tree, stop_process,
+    },
 };
 
 /// Why a tunnel operation was refused before anything changed.
@@ -183,6 +185,7 @@ impl App {
                 &self.runtime.log(&tunnel.name),
                 &tunnel.host,
                 &tunnel.forward,
+                SSH_BACKGROUNDS,
             ))
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
@@ -257,7 +260,16 @@ impl App {
         self.runtime.ensure().map_err(runtime_error(dir))?;
         let lock_path = self.runtime.lock();
         let lock = open_lock(&lock_path).map_err(runtime_error(lock_path.clone()))?;
-        acquire_lock(&lock, cancelled).map_err(runtime_error(lock_path))?;
+        acquire_lock(&lock, cancelled).map_err(|source| -> AppError {
+            // Cancelled while another start held the lock.
+            if source.kind() == io::ErrorKind::Interrupted
+                && cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+            {
+                OpenSshError::Cancelled.into()
+            } else {
+                runtime_error(lock_path)(source).into()
+            }
+        })?;
 
         if let TunnelStatus::Running { pid, .. } = self.run_state_locked(&tunnel.name) {
             return Ok(StartOutcome::AlreadyRunning { pid });
@@ -303,7 +315,8 @@ impl App {
         self.launch(&tunnel, cancelled, in_tui)
     }
 
-    /// Runs the tunnel's ssh, waits for it to background itself, and records the result.
+    /// Runs the tunnel's ssh, waits for it to background itself (or, where ssh cannot, for its
+    /// forward to come up while it runs detached), and records the result.
     fn launch(
         &self,
         tunnel: &Tunnel,
@@ -316,44 +329,101 @@ impl App {
         );
         Record::remove(&record_path).map_err(runtime_error(record_path.clone()))?;
         let create = |path: &PathBuf| {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(runtime_error(path.clone()))
+            private(
+                OpenOptions::new().write(true).create(true).truncate(true),
+                0o600,
+            )
+            .open(path)
+            .map_err(runtime_error(path.clone()))
         };
-        create(&log)?;
+        let log_file = create(&log)?;
         // stderr goes to a file, not a pipe: a ProxyCommand child (`ssh -W`, `nc`) inherits it and
-        // lives as long as the tunnel, so a pipe would never reach end of file.
+        // lives as long as the tunnel, so a pipe would never reach end of file. A foreground ssh
+        // logs there too, to the tunnel's log, which Portico opened so it can read it while ssh
+        // runs (Windows' ssh would keep its own `-E` file from being read).
         let stderr_path = self.runtime.stderr(&tunnel.name);
-        let stderr_file = create(&stderr_path)?;
-        let mut child = Command::new(self.openssh.ssh_program())
-            .args(start_args(&log, &tunnel.host, &tunnel.forward))
+        let stderr_file = if SSH_BACKGROUNDS {
+            create(&stderr_path)?
+        } else {
+            log_file
+        };
+        let mut command = Command::new(self.openssh.ssh_program());
+        command
+            .args(start_args(
+                &log,
+                &tunnel.host,
+                &tunnel.forward,
+                SSH_BACKGROUNDS,
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(stderr_file)
-            .spawn()
-            .map_err(|source| OpenSshError::Io {
-                program: self.openssh.ssh_program().to_path_buf(),
-                source,
-            })?;
+            .stderr(stderr_file);
+        if !SSH_BACKGROUNDS {
+            // This ssh is the tunnel: it must outlive Portico and its console.
+            detach(&mut command);
+        }
+        let mut child = command.spawn().map_err(|source| OpenSshError::Io {
+            program: self.openssh.ssh_program().to_path_buf(),
+            source,
+        })?;
+        let spawned = Instant::now();
         // The background ssh is forked from this one, so it cannot have started earlier.
         let since = self.proc.stat(child.id()).map(|stat| stat.start);
+        let mut authenticated_at = None;
         let status = loop {
+            // A foreground ssh is the tunnel: its forward is judged before ssh is seen running,
+            // so it counts as up only while ssh runs.
+            let (up, timed_out) = if SSH_BACKGROUNDS {
+                (false, false)
+            } else {
+                if authenticated_at.is_none() && authenticated(&log) {
+                    authenticated_at = Some(Instant::now());
+                }
+                let timed_out = spawned.elapsed() >= READY_BOUND;
+                let up = ready(
+                    &tunnel.forward,
+                    authenticated_at.is_some(),
+                    authenticated_at,
+                ) || (timed_out
+                    && up_at_bound(&tunnel.forward, listening(&tunnel.forward)));
+                (up, timed_out)
+            };
             if let Some(status) = child.try_wait().map_err(|source| OpenSshError::Io {
                 program: self.openssh.ssh_program().to_path_buf(),
                 source,
             })? {
                 break status;
             }
-            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
-                // A ProxyCommand child would outlive ssh, so the whole tree goes.
-                if kill_process_tree(child.id()).is_err() {
-                    let _ = child.kill();
+            // The foreground ssh is the tunnel itself, so no search for it is needed.
+            if up
+                && let Some(start) =
+                    since.or_else(|| self.proc.stat(child.id()).map(|stat| stat.start))
+            {
+                // ssh keeps writing to its open file; the name is no longer needed.
+                let _ = Record::remove(&stderr_path);
+                return self.record_started(tunnel, &record_path, child.id(), start);
+            }
+            if timed_out {
+                end_tree(&mut child);
+                let _ = Record::remove(&stderr_path);
+                let reason = format!(
+                    "ssh did not report the forward up within {} s",
+                    READY_BOUND.as_secs()
+                );
+                Record::Failed {
+                    reason: reason.clone(),
+                    exit: None,
+                    finished: now(),
                 }
-                let _ = child.wait();
+                .write(&record_path)
+                .map_err(runtime_error(record_path))?;
+                return Ok(StartOutcome::Failed {
+                    reason,
+                    explanation: None,
+                });
+            }
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+                end_tree(&mut child);
                 let _ = Record::remove(&stderr_path);
                 return Err(OpenSshError::Cancelled.into());
             }
@@ -364,20 +434,9 @@ impl App {
         let _ = Record::remove(&stderr_path);
         let uid = current_uid();
         if status.success()
-            && let Some((pid, start)) = self.proc.find_tunnel(&log, uid, since)
+            && let Some((pid, start)) = self.proc.find_tunnel(&log, &uid, since)
         {
-            let record = Record::Running(RunningRecord {
-                pid,
-                start,
-                boot: self.proc.boot_id().unwrap_or_default(),
-                started: now(),
-                host: tunnel.host.clone(),
-                forward: format!("{} {}", tunnel.forward.kind.flag(), tunnel.forward.spec()),
-            });
-            record
-                .write(&record_path)
-                .map_err(runtime_error(record_path))?;
-            return Ok(StartOutcome::Started { pid });
+            return self.record_started(tunnel, &record_path, pid, start);
         }
         let mut text = log_tail(&log, 200).join("\n");
         text.push('\n');
@@ -403,6 +462,27 @@ impl App {
         })
     }
 
+    /// Records that `tunnel` runs as `pid`, which started at `start`.
+    fn record_started(
+        &self,
+        tunnel: &Tunnel,
+        record_path: &Path,
+        pid: u32,
+        start: u64,
+    ) -> Result<StartOutcome, AppError> {
+        Record::Running(RunningRecord {
+            pid,
+            start,
+            boot: self.proc.boot_id().unwrap_or_default(),
+            started: now(),
+            host: tunnel.host.clone(),
+            forward: format!("{} {}", tunnel.forward.kind.flag(), tunnel.forward.spec()),
+        })
+        .write(record_path)
+        .map_err(runtime_error(record_path.to_path_buf()))?;
+        Ok(StartOutcome::Started { pid })
+    }
+
     /// Stops a tunnel: its process when one is running, and its record and log in any case.
     pub fn stop_tunnel(&self, name: &str) -> Result<StopOutcome, AppError> {
         let name = self.saved_name(name).or_else(|error| {
@@ -420,7 +500,7 @@ impl App {
                 Some(Record::Running(record)) => {
                     let uid = current_uid();
                     stop_process(record.pid, || {
-                        self.proc.identify(&record, &log, uid) == Identity::Alive
+                        self.proc.identify(&record, &log, &uid) == Identity::Alive
                     })
                     .map_err(runtime_error(record_path.clone()))?
                 }
@@ -503,7 +583,7 @@ impl App {
         let (record_path, log) = (self.runtime.record(name), self.runtime.log(name));
         match Record::read(&record_path) {
             Some(Record::Running(record)) => {
-                match self.proc.identify(&record, &log, current_uid()) {
+                match self.proc.identify(&record, &log, &current_uid()) {
                     Identity::Alive => {
                         return TunnelStatus::Running {
                             pid: record.pid,
@@ -550,7 +630,7 @@ impl App {
     ) -> Option<TunnelStatus> {
         let log = self.runtime.log(name);
         let (pid, start) = find_in(
-            scan.get_or_init(|| self.proc.scan(current_uid())),
+            scan.get_or_init(|| self.proc.scan(&current_uid())),
             &log,
             None,
         )?;
@@ -721,6 +801,15 @@ impl App {
     }
 }
 
+/// Ends a start's ssh and what it started: a ProxyCommand child would outlive ssh, so the
+/// whole tree goes.
+fn end_tree(child: &mut Child) {
+    if kill_process_tree(child.id()).is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -763,7 +852,9 @@ mod tests {
             &ssh,
             &format!(
                 "#!/bin/sh\nif [ \"$1\" = -G ]; then printf 'hostname x\\nport 22\\n'; exit 0; fi\n\
-                 sleep 60 &\necho $! > '{}'\nsleep 60\n",
+                 sleep 60 &\nchild=$!\n\
+                 [ -r /proc/$child/winpid ] && child=$(cat /proc/$child/winpid)\n\
+                 echo $child > '{}'\nsleep 60\n",
                 child_pid.display()
             ),
         );

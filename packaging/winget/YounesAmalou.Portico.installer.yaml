@@ -1,0 +1,20 @@
+# The installer manifest of Portico's winget package: the release's Windows zips, which hold
+# portico.exe at their root. scripts/winget-manifest.sh fills in the version and checksums.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+
+PackageIdentifier: YounesAmalou.Portico
+PackageVersion: @VERSION@
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+- RelativeFilePath: portico.exe
+  PortableCommandAlias: portico
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/YounesAmalou/Portico/releases/download/v@VERSION@/portico-v@VERSION@-x86_64-pc-windows-msvc.zip
+  InstallerSha256: @X64_SHA256@
+- Architecture: arm64
+  InstallerUrl: https://github.com/YounesAmalou/Portico/releases/download/v@VERSION@/portico-v@VERSION@-aarch64-pc-windows-msvc.zip
+  InstallerSha256: @ARM64_SHA256@
+ManifestType: installer
+ManifestVersion: 1.9.0

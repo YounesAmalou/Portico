@@ -2,16 +2,23 @@
 
 #[path = "executable.rs"]
 mod executable;
+pub mod pty;
 
 use std::{
     ffi::OsStr,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
 use tempfile::TempDir;
 
+#[cfg(windows)]
+#[allow(
+    unused_imports,
+    reason = "only some test binaries compile programs of their own"
+)]
+pub use executable::compile_program;
 use executable::write_executable;
 
 pub struct TestEnv {
@@ -138,23 +145,51 @@ impl TestEnv {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_portico"));
+        command.args(args).env("PATH", self.path());
+        for (key, value) in self.vars() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command
+    }
+
+    /// The environment Portico runs in, beyond `PATH`: a variable set, or removed (`None`).
+    pub fn vars(&self) -> Vec<(&'static str, Option<PathBuf>)> {
+        self.vars_in(&self.home)
+    }
+
+    /// `vars` with `home` as the home directory.
+    pub fn vars_in(&self, home: &Path) -> Vec<(&'static str, Option<PathBuf>)> {
+        vec![
+            ("HOME", Some(home.to_owned())),
+            // Windows' home and settings directory. Settings land where the other systems put
+            // them, so tests find them at one path.
+            ("USERPROFILE", Some(home.to_owned())),
+            ("APPDATA", Some(home.join(".config"))),
+            // The developer's own agent must never be asked (a locked 1Password would prompt).
+            ("SSH_AUTH_SOCK", None),
+            // Tunnel records stay in the temporary home, never in the real runtime directory.
+            ("XDG_RUNTIME_DIR", None),
+            // Settings come from the temporary home, never the developer's own.
+            ("XDG_CONFIG_HOME", None),
+            // macOS and Windows run the fake launcher named here; Linux finds it on `PATH`.
+            (
+                "PORTICO_TERMINAL",
+                Some(exe(self.bin.join("xdg-terminal-exec"))),
+            ),
+            ("TERM_PROGRAM", None),
+        ]
+    }
+
+    /// `PATH` with the fake programs first.
+    pub fn path(&self) -> std::ffi::OsString {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.bin.clone()];
         paths.extend(std::env::split_paths(&inherited));
-        let path = std::env::join_paths(paths).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_portico"));
-        // Tunnel records stay in the temporary home, never in the real runtime directory.
-        command
-            .args(args)
-            .env("HOME", &self.home)
-            .env("PATH", path)
-            .env_remove("SSH_AUTH_SOCK")
-            .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("XDG_CONFIG_HOME")
-            // macOS runs the fake launcher named here; Linux finds it on `PATH`.
-            .env("PORTICO_TERMINAL", self.bin.join("xdg-terminal-exec"))
-            .env_remove("TERM_PROGRAM");
-        command
+        std::env::join_paths(paths).unwrap()
     }
 
     pub fn ssh_config(&self) -> PathBuf {
@@ -180,6 +215,94 @@ impl TestEnv {
     pub fn reject_alias(&self, alias: &str) {
         fs::write(self._dir.path().join("rejected-alias"), alias).unwrap();
     }
+}
+
+/// OpenSSH's client program `name` as Portico runs it: the one on `PATH`, or on Windows the one
+/// Windows ships, since Git for Windows' own ssh, often first on `PATH`, reads a Windows path
+/// as a relative one.
+pub fn openssh(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        Path::new(&root)
+            .join(r"System32\OpenSSH")
+            .join(format!("{name}.exe"))
+    } else {
+        name.into()
+    }
+}
+
+/// `path` as an OpenSSH configuration file takes it: Windows' OpenSSH reads `/` in a Windows
+/// path, where a `\` may start an escape.
+pub fn config_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
+    }
+}
+
+/// `path`, written with `/`, as Portico shows it to people: with the system's separator.
+pub fn shown(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The file a fake program written at `path` runs from: `path` itself, or `<path>.exe` on
+/// Windows, where a program named by its full path must exist under that name.
+pub fn exe(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if cfg!(windows) {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".exe");
+        PathBuf::from(name)
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Takes reading the file at `path` away from the user running the tests, until `allow_read`:
+/// its mode on Unix, an access rule denying it on Windows.
+pub fn deny_read(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    #[cfg(windows)]
+    icacls(path, &["/deny", &format!("{}:(R)", windows_user())]);
+}
+
+/// Gives back what `deny_read` took (on Unix, the private mode `0o600`).
+pub fn allow_read(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(windows)]
+    icacls(path, &["/remove:d", &windows_user()]);
+}
+
+#[cfg(windows)]
+fn windows_user() -> String {
+    std::env::var("USERNAME").expect("USERNAME names the user running the tests")
+}
+
+/// Changes the access rules of `path` with `icacls`.
+#[cfg(windows)]
+pub fn icacls(path: &Path, args: &[&str]) {
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "icacls {} {args:?}: {}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 impl RunResult {
@@ -263,4 +386,36 @@ impl RunResult {
             self.0.status,
         );
     }
+}
+
+/// A fake receives its arguments and `HOME` as given, its standard input, and exits with the
+/// script's code, also on Windows, where it runs through the launcher, and `sh` parses its own
+/// command line and rewrites `HOME`.
+#[test]
+fn shim_passes_arguments_and_exit_code() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake");
+    write_executable(
+        &fake,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$HOME\"\ncat\nexit 7\n",
+    );
+    let args = ["a b", "c", "*", "it's", "\"q\"", "", "trail\\", "@x"];
+    let mut child = Command::new(&fake)
+        .args(args)
+        .env("HOME", dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"in\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "a b\nc\n*\nit's\n\"q\"\n\ntrail\\\n@x\n{}\nin\n",
+            dir.path().display()
+        )
+    );
+    assert_eq!(output.status.code(), Some(7));
 }

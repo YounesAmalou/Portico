@@ -263,6 +263,7 @@ mod tests {
         assert_eq!(state(&dir), State::Stale("999.0.0".into()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn never_follows_a_link_at_the_panel_directory() {
         let home = tempfile::tempdir().unwrap();
@@ -279,6 +280,7 @@ mod tests {
         assert!(!checkout.join("shell.qml").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_refresh_leaves_the_old_stamp() {
         use std::os::unix::fs::PermissionsExt;

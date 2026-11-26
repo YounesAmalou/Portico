@@ -4,14 +4,33 @@ use std::{fs, net::TcpListener, path::PathBuf};
 
 use support::TestEnv;
 
+/// How Portico starts a tunnel's ssh: in the background, or on Windows, whose ssh cannot
+/// background itself, in the foreground with the log level that shows the authentication.
+const START: &str = if cfg!(windows) {
+    "-N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none -o LogLevel=VERBOSE"
+} else {
+    "-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none"
+};
+
+/// What names the tunnel's log on its ssh command line: ssh's own log, or on Windows a
+/// `LocalCommand` that never runs.
+const LOG_MARKER: &str = if cfg!(windows) {
+    "-o PermitLocalCommand=no -o LocalCommand=portico-tunnel "
+} else {
+    "-E "
+};
+
 /// A fake `ssh`: `-G` answers like OpenSSH (refusing the alias `rejected`), and a tunnel start
-/// (`-f`) logs its arguments and leaves a background stand-in that carries them, as the real
-/// ssh's background process does, unless `fail-start` exists, when it fails as ssh would on a
-/// busy remote port.
+/// (`-f`, or `-N` where ssh cannot background itself) logs its arguments and leaves a
+/// background stand-in that carries them, as the real ssh's background process does (or, with
+/// `-N`, stays in the foreground authenticated), unless `fail-start` exists, when it fails as
+/// ssh would on a busy remote port, or `exit-after-auth`, when it does so half a second after
+/// authenticating.
 fn tunnel_env() -> (TestEnv, PathBuf) {
     let env = TestEnv::new();
     let log = env.home().parent().unwrap().join("ssh-calls");
     let fail = env.home().parent().unwrap().join("fail-start");
+    let exit_after_auth = env.home().parent().unwrap().join("exit-after-auth");
     env.install_program(
         "ssh",
         &format!(
@@ -25,8 +44,10 @@ if [ "$1" = -G ]; then
   printf 'hostname resolved.example\nuser resolved\nport 22\n'
   exit 0
 fi
-if [ "$1" = -f ]; then
+if [ "$1" = -f ] || [ "$1" = -N ]; then
   printf '%s\n' "$*" >> '{log}'
+  # The log: `-E <log>`, or on Windows standard error, which Portico sends to the log.
+  elog=/dev/stderr
   prev=
   for arg do
     [ "$prev" = -E ] && elog=$arg
@@ -35,6 +56,17 @@ if [ "$1" = -f ]; then
   if [ -f '{fail}' ]; then
     printf '\033[31mError: remote port forwarding failed for listen port 8080\033[0m\a\n' >> "$elog"
     exit 255
+  fi
+  if [ -f '{exit_after_auth}' ]; then
+    printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
+    sleep 0.5
+    printf 'Error: remote port forwarding failed for listen port 8080\n' >> "$elog"
+    exit 255
+  fi
+  if [ "$1" = -N ]; then
+    printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
+    {hold}
+    exit 0
   fi
   # Like ssh -f, the background process leads its own session. macOS has no setsid command,
   # so Perl forks it there, and returns only once it leads its session and carries the
@@ -54,12 +86,26 @@ exit 0
 "#,
             log = log.display(),
             fail = fail.display(),
+            exit_after_auth = exit_after_auth.display(),
+            hold = hold_forward(),
         ),
     );
     env.run(["init", "-y"]).assert_success();
     env.run(["add", "prod", "-H", "prod.example"])
         .assert_success();
     (env, log)
+}
+
+/// What the fake `ssh -N` does once authenticated: stay up, holding the listen address of a
+/// local or dynamic forward, by which Windows' Portico sees the forward up.
+fn hold_forward() -> String {
+    #[cfg(windows)]
+    return format!(
+        "exec '{}' \"$@\"",
+        support::compile_program("tests/support/listen.rs").display()
+    );
+    #[cfg(unix)]
+    "sleep 60".into()
 }
 
 fn stdout(env: &TestEnv, args: &[&str]) -> String {
@@ -117,10 +163,7 @@ fn tunnels_are_added_listed_shown_edited_and_removed() {
         "{show}"
     );
     assert!(show.contains("Status:  stopped"), "{show}");
-    assert!(
-        show.contains("-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none -E "),
-        "{show}"
-    );
+    assert!(show.contains(&format!("{START} {LOG_MARKER}")), "{show}");
 
     env.run([
         "tunnel",
@@ -193,11 +236,13 @@ fn a_tunnel_starts_in_the_background_and_stops() {
     env.run(["tunnel", "start", "socks"])
         .assert_stdout_contains("Started socks (socks 127.0.0.1:");
     let call = fs::read_to_string(&calls).unwrap();
-    let runtime = env.home().join(".ssh/portico/run/tunnels");
+    let runtime = [".ssh", "portico", "run", "tunnels"]
+        .iter()
+        .fold(env.home().to_path_buf(), |path, part| path.join(part));
     assert_eq!(
         call.trim(),
         format!(
-            "-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none -E {} -D {spec} -- prod",
+            "{START} {LOG_MARKER}{} -D {spec} -- prod",
             runtime.join("socks.log").display()
         )
     );
@@ -305,6 +350,63 @@ fn a_failed_start_is_recorded_and_explained() {
     env.run(["tunnel", "stop", "preview"])
         .assert_stdout_contains("preview is not running.");
     assert!(stdout(&env, &["tunnels"]).contains("stopped"));
+}
+
+#[test]
+fn a_tunnel_whose_ssh_exits_while_waiting_is_failed() {
+    let (env, _) = tunnel_env();
+    let _stop = StopAll(&env);
+    // ssh authenticates, then the server refuses the forward: where ssh runs in the foreground,
+    // the start is still waiting for it to stay up.
+    fs::write(env.home().parent().unwrap().join("exit-after-auth"), "").unwrap();
+    env.run([
+        "tunnel",
+        "add",
+        "preview",
+        "--on",
+        "prod",
+        "-R",
+        "8080:localhost:3000",
+    ])
+    .assert_success();
+    env.run(["tunnel", "start", "preview"])
+        .assert_failure_stderr_contains("the server refused the remote forward");
+    let record =
+        fs::read_to_string(env.home().join(".ssh/portico/run/tunnels/preview.run")).unwrap();
+    assert!(record.starts_with("state failed\n"), "{record}");
+    let list = stdout(&env, &["tunnels"]);
+    assert!(
+        list.contains("failed  the server refused the remote forward on port 8080"),
+        "{list}"
+    );
+    let show = stdout(&env, &["tunnel", "show", "preview"]);
+    assert!(
+        show.contains("Error: remote port forwarding failed for listen port 8080"),
+        "{show}"
+    );
+}
+
+/// Unix-only: Windows lets a socket bind loopback on a port that an ordinary listener on every
+/// address holds (the more specific one gets the connections), so the port is free for ssh
+/// there, and the probe rightly says so (see `platform::windows::net`).
+#[cfg(unix)]
+#[test]
+fn a_busy_local_port_is_not_mistaken_for_ready() {
+    let (env, calls) = tunnel_env();
+    let _stop = StopAll(&env);
+    // Another program listens on every address; the tunnel wants the port on loopback only. A
+    // start that let ssh run would see the port bound and could take it for ssh's.
+    let held = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let spec = format!("127.0.0.1:{port}");
+    env.run(["tunnel", "add", "socks", "--on", "prod", "-D", &spec])
+        .assert_success();
+    env.run(["tunnel", "start", "socks"])
+        .assert_failure_stderr_contains(&format!("port {port} on 127.0.0.1 is in use"));
+    assert!(!calls.exists(), "ssh was started");
+    let list = stdout(&env, &["tunnels"]);
+    assert!(!list.contains("running"), "{list}");
+    drop(held);
 }
 
 /// Needs a second loopback address: macOS answers on `127.0.0.1` only.

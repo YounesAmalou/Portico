@@ -12,7 +12,7 @@ use std::{
 use super::process::terminate_process_tree;
 
 /// How long a new-terminal launcher may run before its launch counts as requested.
-const LAUNCH_GRACE: Duration = Duration::from_millis(500);
+pub(in crate::platform) const LAUNCH_GRACE: Duration = Duration::from_millis(500);
 
 /// How a launch request ended.
 #[derive(Debug)]

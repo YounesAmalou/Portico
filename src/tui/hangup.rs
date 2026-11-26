@@ -8,19 +8,26 @@
 //!
 //! crossterm-rs/crossterm#1067 fixes the loop by returning `UnexpectedEof` instead, so the
 //! terminal's events are read through `next_event`, which takes that error for a hang-up too.
+//!
+//! The watcher is Unix-only. On Windows crossterm reads console input events, and closing the
+//! console ends the process (`CTRL_CLOSE_EVENT`), so nothing is watched; an error from the
+//! console is taken for its end.
 
 use std::{
     io,
-    os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
-        unix::net::UnixStream,
-    },
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{self, JoinHandle},
     time::Duration,
+};
+#[cfg(unix)]
+use std::{
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+        unix::net::UnixStream,
+    },
+    thread::{self, JoinHandle},
 };
 
 use crossterm::event::{self, Event};
@@ -35,8 +42,91 @@ pub(super) enum Input {
 }
 
 /// Waits at most `timeout` for the terminal's next event.
+#[cfg(unix)]
 pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
     next_event_from(event::poll, event::read, timeout)
+}
+
+/// Waits at most `timeout` for the console's next event. A key press ConPTY reports by its
+/// control character alone, which crossterm would drop, is read here (see
+/// `platform::console`); everything else through crossterm.
+#[cfg(windows)]
+pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
+    use crate::platform::console;
+    let bare = match console::wait_for_input(timeout) {
+        Ok(false) => return Ok(Input::Idle),
+        Ok(true) => console::take_bare_key(),
+        Err(error) => Err(error),
+    };
+    match bare {
+        Ok(Some(key)) => Ok(Input::Event(Event::Key(bare_key(
+            key.character,
+            key.alt,
+            key.shift,
+        )))),
+        // Anything else queued is crossterm's to read, one record at a time.
+        Ok(None) => next_event_from(event::poll, event::read, Duration::ZERO),
+        Err(error) if is_closed(&error) => Ok(Input::Closed),
+        Err(error) => Err(error),
+    }
+}
+
+/// Waits for the terminal's next event, however long that takes, for a reader outside the TUI
+/// (the CLI's pickers): crossterm's own read on Unix.
+#[cfg(unix)]
+pub(crate) fn read_event() -> io::Result<Event> {
+    event::read()
+}
+
+/// Waits for the console's next event, however long that takes; its end is `UnexpectedEof`.
+/// It also reads the keys ConPTY reports in a form crossterm drops (see `next_event`).
+#[cfg(windows)]
+pub(crate) fn read_event() -> io::Result<Event> {
+    loop {
+        match next_event(Duration::from_secs(60))? {
+            Input::Event(event) => return Ok(event),
+            Input::Idle => {}
+            Input::Closed => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the console is gone",
+                ));
+            }
+        }
+    }
+}
+
+/// The key a control character (or DEL) stands for, read as crossterm reads it from a Unix
+/// terminal, with the modifiers held.
+#[cfg(any(windows, test))]
+fn bare_key(character: u8, alt: bool, shift: bool) -> event::KeyEvent {
+    use event::{KeyCode, KeyModifiers};
+    let (mut code, mut modifiers) = match character {
+        b'\r' => (KeyCode::Enter, KeyModifiers::NONE),
+        b'\t' => (KeyCode::Tab, KeyModifiers::NONE),
+        0x1b => (KeyCode::Esc, KeyModifiers::NONE),
+        0x7f => (KeyCode::Backspace, KeyModifiers::NONE),
+        0 => (KeyCode::Char(' '), KeyModifiers::CONTROL),
+        0x01..=0x1a => (
+            KeyCode::Char(char::from(character - 0x01 + b'a')),
+            KeyModifiers::CONTROL,
+        ),
+        0x1c..=0x1f => (
+            KeyCode::Char(char::from(character - 0x1c + b'4')),
+            KeyModifiers::CONTROL,
+        ),
+        _ => (KeyCode::Char(char::from(character)), KeyModifiers::NONE),
+    };
+    if alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if shift {
+        if code == KeyCode::Tab {
+            code = KeyCode::BackTab;
+        }
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    event::KeyEvent::new(code, modifiers)
 }
 
 fn next_event_from(
@@ -51,18 +141,97 @@ fn next_event_from(
     };
     match event {
         Ok(event) => Ok(Input::Event(event)),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Input::Closed),
+        Err(error) if is_closed(&error) => Ok(Input::Closed),
         Err(error) => Err(error),
     }
 }
 
+/// Whether `error`, from waiting for or reading the terminal, means it is gone: end of file, or
+/// on Windows any error from the console.
+fn is_closed(error: &io::Error) -> bool {
+    cfg!(windows) || error.kind() == io::ErrorKind::UnexpectedEof
+}
+
+/// Waits for a line on the terminal, an end of input, or `terminated` (Ctrl+C, a signal or a
+/// hang-up).
+///
+/// Reads the descriptor directly: `main` holds the lock of `io::stdin()` for the whole session,
+/// so reading through it would wait for ever. One byte at a time, so nothing after the line is
+/// taken from the terminal.
+#[cfg(unix)]
+pub(super) fn wait_for_enter(terminated: &AtomicBool, tick: Duration) {
+    use std::{
+        io::Read,
+        os::fd::{AsFd, AsRawFd},
+    };
+    let Ok(fd) = io::stdin().as_fd().try_clone_to_owned() else {
+        return;
+    };
+    let mut input = std::fs::File::from(fd);
+    let mut byte = [0];
+    while !terminated.load(Ordering::Relaxed) {
+        let mut poll = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes only the one `pollfd` it is given.
+        let ready = unsafe { libc::poll(&mut poll, 1, tick.as_millis() as libc::c_int) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+        if ready <= 0 {
+            continue;
+        }
+        match input.read(&mut byte) {
+            Ok(0) => return,
+            Ok(_) if matches!(byte[0], b'\n' | b'\r') => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// Waits for Enter on the console, the console's end, or `terminated` (Ctrl+C or a signal).
+///
+/// Reads the console's input events, as the interface does, so only key presses count.
+#[cfg(windows)]
+pub(super) fn wait_for_enter(terminated: &AtomicBool, tick: Duration) {
+    use crossterm::event::{KeyCode, KeyEventKind};
+    while !terminated.load(Ordering::Relaxed) {
+        match next_event(tick) {
+            Ok(Input::Event(Event::Key(key)))
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter =>
+            {
+                return;
+            }
+            Ok(Input::Event(_) | Input::Idle) => {}
+            Ok(Input::Closed) | Err(_) => return,
+        }
+    }
+}
+
+/// Nothing to watch on Windows: closing the console ends the process.
+#[cfg(windows)]
+pub(super) struct HangupWatch;
+
+#[cfg(windows)]
+impl HangupWatch {
+    pub(super) fn start(_terminated: Arc<AtomicBool>) -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
 /// Watches the terminal until dropped.
+#[cfg(unix)]
 pub(super) struct HangupWatch {
     // Dropping it wakes the watcher, which then returns.
     stop: Option<UnixStream>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl HangupWatch {
     /// Watches standard input, the terminal crossterm reads when standard input is one.
     ///
@@ -102,6 +271,7 @@ impl HangupWatch {
     }
 }
 
+#[cfg(unix)]
 impl Drop for HangupWatch {
     fn drop(&mut self) {
         drop(self.stop.take());
@@ -111,6 +281,7 @@ impl Drop for HangupWatch {
     }
 }
 
+#[cfg(unix)]
 /// Sleeps until `tty` hangs up (true) or `stopped`'s peer is dropped (false).
 fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     // Hang-ups and errors are always reported, so the terminal asks for no events: its
@@ -157,6 +328,7 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     }
 }
 
+#[cfg(unix)]
 /// Whether a terminal that polled readable holds no input and stays that way: reading it would
 /// return end of file, as a hung-up terminal does. Input the interface reads between two looks
 /// also leaves the terminal empty, but then no longer readable, so it is looked at a few times.
@@ -188,6 +360,7 @@ fn stays_readable_and_empty(tty: &OwnedFd) -> bool {
     true
 }
 
+#[cfg(unix)]
 /// Points `target` at the read end of a pipe that stays empty and open, so reading it fails
 /// with `WouldBlock` instead of returning end of file.
 fn replace_with_quiet_pipe(target: RawFd) -> io::Result<()> {
@@ -208,6 +381,7 @@ fn replace_with_quiet_pipe(target: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::{
         fs::File,
         io::Read,
@@ -222,6 +396,41 @@ mod tests {
 
     fn end_of_file() -> io::Error {
         io::Error::new(io::ErrorKind::UnexpectedEof, "the terminal is gone")
+    }
+
+    #[test]
+    fn bare_control_characters_are_the_keys_a_unix_terminal_sends() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let none = KeyModifiers::NONE;
+        let control = KeyModifiers::CONTROL;
+        for (character, expected) in [
+            (b'\r', key(KeyCode::Enter, none)),
+            (0x1b, key(KeyCode::Esc, none)),
+            (b'\t', key(KeyCode::Tab, none)),
+            (0x7f, key(KeyCode::Backspace, none)),
+            (0x03, key(KeyCode::Char('c'), control)),
+            (0x14, key(KeyCode::Char('t'), control)),
+            (0x00, key(KeyCode::Char(' '), control)),
+            (0x1c, key(KeyCode::Char('4'), control)),
+        ] {
+            assert_eq!(
+                bare_key(character, false, false),
+                expected,
+                "{character:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_key_keeps_alt_and_shift() {
+        assert_eq!(
+            bare_key(b'\r', true, false),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+        );
+        assert_eq!(
+            bare_key(b'\t', false, true),
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+        );
     }
 
     #[test]
@@ -254,6 +463,7 @@ mod tests {
         assert!(matches!(read, Ok(Input::Closed)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn other_errors_are_still_failures() {
         let input = next_event_from(
@@ -264,6 +474,18 @@ mod tests {
         assert_eq!(input.unwrap_err().to_string(), "Input/output error");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn any_console_error_is_a_closed_console() {
+        let input = next_event_from(
+            |_| Err(io::Error::other("The handle is invalid.")),
+            || panic!("nothing to read after a failed wait"),
+            Duration::ZERO,
+        );
+        assert!(matches!(input, Ok(Input::Closed)));
+    }
+
+    #[cfg(unix)]
     /// A pseudo-terminal: the controlling side and the side a program reads.
     fn pty() -> (OwnedFd, File) {
         let (mut master, mut slave) = (-1, -1);
@@ -281,6 +503,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait_until(flag: &AtomicBool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !flag.load(Ordering::Relaxed) {
@@ -292,6 +515,7 @@ mod tests {
         true
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_hang_up_raises_the_flag_and_leaves_reads_that_would_block() {
         let (master, mut slave) = pty();
@@ -307,6 +531,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
+    #[cfg(unix)]
     #[test]
     fn input_on_a_live_terminal_leaves_it_alone() {
         let (master, mut slave) = pty();
@@ -326,6 +551,7 @@ mod tests {
         assert!(!terminated.load(Ordering::Relaxed));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_the_watch_stops_it_promptly() {
         let (_master, slave) = pty();

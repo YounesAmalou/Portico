@@ -1,0 +1,26 @@
+# The default locale manifest of Portico's winget package. scripts/winget-manifest.sh fills
+# in the version.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+
+PackageIdentifier: YounesAmalou.Portico
+PackageVersion: @VERSION@
+PackageLocale: en-US
+Publisher: Younes Amalou
+PublisherUrl: https://github.com/YounesAmalou
+PublisherSupportUrl: https://github.com/YounesAmalou/Portico/issues
+PackageName: Portico
+PackageUrl: https://github.com/YounesAmalou/Portico
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/YounesAmalou/Portico#license
+ShortDescription: Keyboard-first terminal UI and CLI for managing OpenSSH hosts
+Description: Portico manages OpenSSH hosts, saved tunnels and container shells from a keyboard-first terminal UI and a CLI, while leaving OpenSSH in control of connections and configuration.
+Moniker: portico
+Tags:
+- cli
+- openssh
+- ssh
+- terminal
+- tui
+ReleaseNotesUrl: https://github.com/YounesAmalou/Portico/releases/tag/v@VERSION@
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

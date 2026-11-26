@@ -13,11 +13,11 @@ pub mod status;
 use std::{
     ffi::OsString,
     fs, io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
 };
 
+use crate::platform::fs::{is_executable, symlink};
 use combo::Combo;
 use keybinding::{Location, Setup, Unavailable};
 
@@ -95,8 +95,7 @@ impl DesktopEnv {
         std::env::split_paths(self.path.as_deref()?)
             .map(|dir| dir.join(program))
             .find(|path| {
-                fs::metadata(path)
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                fs::metadata(path).is_ok_and(|meta| meta.is_file() && is_executable(path, &meta))
             })
     }
 
@@ -236,8 +235,7 @@ pub fn reload_omarchy_panel(env: &DesktopEnv) -> io::Result<bool> {
     };
     let temporary = plugins.join(format!(".portico.tmp-{}", std::process::id()));
     let _ = fs::remove_file(&temporary);
-    let result =
-        std::os::unix::fs::symlink(&dir, &temporary).and_then(|()| fs::rename(&temporary, &link));
+    let result = symlink(&dir, &temporary).and_then(|()| fs::rename(&temporary, &link));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
@@ -383,7 +381,7 @@ pub fn apply(env: &DesktopEnv, step: &Step) -> Result<Option<String>, String> {
             if replaces.is_some() {
                 fs::remove_file(path).map_err(io(format!("could not remove {}", show(path))))?;
             }
-            std::os::unix::fs::symlink(env.panel_dir(), path)
+            symlink(&env.panel_dir(), path)
                 .map_err(io(format!("could not link {}", show(path))))?;
         }
         Step::ReloadOmarchyPanel => {
@@ -711,6 +709,8 @@ mod tests {
         )
     }
 
+    // XDG base directories (absolute Unix paths, `:`-separated lists) belong to the Linux desktop, which Windows lacks.
+    #[cfg(unix)]
     #[test]
     fn follows_the_xdg_base_directories() {
         let plain = env(&[]);
@@ -766,6 +766,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reloads_omarchy_by_re_creating_only_portico_s_link() {
         use std::os::unix::fs::MetadataExt;
@@ -812,6 +813,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn tells_links_apart() {
         let dir = tempfile::tempdir().unwrap();

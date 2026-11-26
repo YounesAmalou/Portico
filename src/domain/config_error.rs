@@ -177,6 +177,7 @@ fn field_of(directive: &str) -> Option<HostField> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::shown;
 
     const MANAGED: &str = "Host dev\n  HostName 10.0.0.5\n  Port 99999\n";
 
@@ -294,7 +295,10 @@ mod tests {
         );
         assert_eq!(
             rejection.to_string(),
-            "line 3 of ~/.ssh/config: Bad configuration option: bogus"
+            format!(
+                "line 3 of {}: Bad configuration option: bogus",
+                shown("~/.ssh/config")
+            )
         );
     }
 
@@ -315,14 +319,20 @@ mod tests {
             message: "x".into(),
             home: "/home/u".into(),
         };
-        assert_eq!(rejection.to_string(), "line 1 of /etc/ssh/ssh_config: x");
+        assert_eq!(
+            rejection.to_string(),
+            format!("line 1 of {}: x", shown("/etc/ssh/ssh_config"))
+        );
         let rejection = ConfigRejection::UserFile {
             path: "/home/u/.ssh/config".into(),
             line: 12,
             message: "x".into(),
             home: "/home/u".into(),
         };
-        assert_eq!(rejection.to_string(), "line 12 of ~/.ssh/config: x");
+        assert_eq!(
+            rejection.to_string(),
+            format!("line 12 of {}: x", shown("~/.ssh/config"))
+        );
     }
 
     #[test]

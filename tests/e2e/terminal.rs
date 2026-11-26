@@ -30,6 +30,23 @@ const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 /// The answer of a terminal without the kitty protocol.
 const DEVICE_ATTRIBUTES: &[u8] = b"\x1b[?62;c";
 
+/// The system's variables Portico keeps on Windows, where the environment is otherwise cleared
+/// as on Unix: without `SystemRoot` a program cannot even open a socket.
+#[cfg(windows)]
+const WINDOWS_ENV: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERDOMAIN",
+    "ProgramData",
+    "ProgramFiles",
+];
+
 #[derive(Clone, Copy, Debug)]
 pub enum Key {
     Enter,
@@ -74,6 +91,13 @@ impl Terminal {
         let mut command = CommandBuilder::new(Client::binary());
         command.args(args);
         command.env_clear();
+        // What every Windows program needs, sockets and child processes included.
+        #[cfg(windows)]
+        for name in WINDOWS_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command.env("TERM", "xterm-256color");
         for (key, value) in client.env() {
             command.env(key, value);

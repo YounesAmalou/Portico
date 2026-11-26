@@ -925,7 +925,9 @@ fn status(env: &DesktopEnv, output: Out) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+// The desktop integration (Omarchy, Quickshell, Hyprland) exists on Linux only; Windows
+// refuses it, and its programs here are found by their bare names, which Windows cannot run.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_executable::write_executable;

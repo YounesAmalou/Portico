@@ -1,11 +1,13 @@
-//! The process table on Linux and macOS, for the tests: whether a process exists or runs, its
-//! start time, its arguments and its processor time.
+//! The process table, for the tests: whether a process exists or runs, its start time, its
+//! arguments and (on Unix) its processor time.
 
+#[cfg(unix)]
 use std::time::Duration;
 
 use portico::platform::process::Proc;
 
 /// Whether `pid` exists at all, a zombie included.
+#[cfg(unix)]
 pub fn exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -13,6 +15,12 @@ pub fn exists(pid: u32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     let signalled = unsafe { libc::kill(pid, 0) } == 0;
     signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether `pid` exists at all, an exited process that a handle still holds included.
+#[cfg(windows)]
+pub fn exists(pid: u32) -> bool {
+    Proc::system().stat(pid).is_some()
 }
 
 /// Whether `pid` exists and is not a zombie.
@@ -56,7 +64,7 @@ pub fn cpu_time(pid: u32) -> Duration {
 
 /// The user and system time of `pid`, all its threads together; zero once it is gone.
 /// `ps` prints it as `[[days-]hours:]minutes:seconds.hundredths`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn cpu_time(pid: u32) -> Duration {
     let output = std::process::Command::new("ps")
         .args(["-o", "time=", "-p", &pid.to_string()])

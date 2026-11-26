@@ -1,7 +1,7 @@
 name: Release
 
-# A pushed vX.Y.Z tag verifies, builds, releases and publishes to crates.io and the AUR
-# (independent jobs: one failing never blocks or reruns the other). A manual run is a
+# A pushed vX.Y.Z tag verifies, builds, releases and publishes to crates.io, the AUR, the
+# Homebrew tap and winget (independent jobs: one failing never blocks or reruns another). A manual run is a
 # rehearsal: it verifies, builds, packages, checks and attests every artifact, but never
 # creates a release or publishes.
 on:
@@ -183,6 +183,100 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
 
+  # The Windows artifacts, built on a Windows x64 runner for both architectures (arm64 is
+  # cross-compiled by the runner's Visual Studio): a zip of portico.exe and a CycloneDX SBOM,
+  # attested in the same job. The x64 binary is run before it is packaged. They are not
+  # code-signed.
+  build-windows:
+    needs: [verify, checks]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - run: cargo install --locked cargo-cyclonedx
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: build
+        name: Build and package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          # The attest action reads Windows paths, not Git for Windows' /d/... ones.
+          binary=$(cygpath -m "$(scripts/build-release.sh "$VERSION" "$TARGET" dist)")
+          if [ "$TARGET" = x86_64-pc-windows-msvc ]; then
+            "$binary" --version | grep -qx "portico $VERSION"
+          fi
+          {
+            echo "binary=$binary"
+            echo "sbom=dist/portico-v$VERSION-$TARGET.cdx.json"
+            echo "carriers<<EOF"
+            echo "$binary"
+            find dist -type f ! -name '*.cdx.json'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*
+            ${{ steps.build.outputs.binary }}
+      - name: Attest the SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: ${{ steps.build.outputs.sbom }}
+          subject-path: ${{ steps.build.outputs.carriers }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  # A rehearsal renders the winget manifests of the Windows zips it built and checks them
+  # with `winget validate` where the runner has winget. The winget job renders them again
+  # for a release.
+  winget-manifests:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [verify, build-windows]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*-pc-windows-msvc
+          path: dist
+          merge-multiple: true
+      - name: Render the manifests
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          scripts/winget-manifest.sh "$VERSION" \
+            "dist/portico-v$VERSION-x86_64-pc-windows-msvc.zip" \
+            "dist/portico-v$VERSION-aarch64-pc-windows-msvc.zip" winget
+      - name: Validate the manifests
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            "::notice::winget is not installed on this runner: the manifests were not validated"
+            exit 0
+          }
+          winget validate --manifest winget
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: winget-manifests
+          path: winget/*
+
   # Installs each artifact in a clean container of its distribution and runs it, on the
   # architecture it was built for.
   verify-packages:
@@ -204,7 +298,7 @@ jobs:
       - run: scripts/verify-packages.sh "${{ needs.verify.outputs.version }}" dist
 
   checksums:
-    needs: [verify-packages, build-macos]
+    needs: [verify-packages, build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -314,3 +408,60 @@ jobs:
           fi
           git commit -m "portico $VERSION"
           git push origin HEAD
+
+  # Opens the pull request that adds this release's winget manifests (packaging/winget/) to
+  # microsoft/winget-pkgs, from the repository owner's fork of it. It does nothing until the
+  # winget environment holds WINGET_TOKEN, a token of the fork's owner that can push to the
+  # fork and open pull requests; a version that already has a pull request is left alone.
+  winget:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    environment: winget
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - name: Open the pull request to winget-pkgs
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          FORK: ${{ github.repository_owner }}/winget-pkgs
+          UPSTREAM: microsoft/winget-pkgs
+        run: |
+          if [ -z "$WINGET_TOKEN" ]; then
+            echo "::notice::WINGET_TOKEN is not set: no pull request was opened to winget-pkgs"
+            exit 0
+          fi
+          export GH_TOKEN=$WINGET_TOKEN
+          scripts/winget-manifest.sh "$VERSION" \
+            "dist/portico-v$VERSION-x86_64-pc-windows-msvc.zip" \
+            "dist/portico-v$VERSION-aarch64-pc-windows-msvc.zip" manifests
+          branch="YounesAmalou.Portico-$VERSION"
+          title="New version: YounesAmalou.Portico version $VERSION"
+          if [ -n "$(gh pr list --repo "$UPSTREAM" --head "$branch" --state all --json url --jq '.[].url')" ]; then
+            echo "winget-pkgs already has a pull request for portico $VERSION"
+            exit 0
+          fi
+          # One commit on top of the fork's master, brought level with winget-pkgs first,
+          # adds the three manifests where winget-pkgs keeps this version.
+          gh api -X POST "repos/$FORK/merge-upstream" -f branch=master > /dev/null
+          base=$(gh api "repos/$FORK/git/ref/heads/master" --jq .object.sha)
+          dir="manifests/y/YounesAmalou/Portico/$VERSION"
+          tree=$(for file in manifests/*.yaml; do
+              jq -n --arg path "$dir/${file#manifests/}" --rawfile content "$file" \
+                '{path: $path, mode: "100644", type: "blob", content: $content}'
+            done | jq -s --arg base "$base" '{base_tree: $base, tree: .}' |
+            gh api -X POST "repos/$FORK/git/trees" --input - --jq .sha)
+          commit=$(jq -n --arg message "$title" --arg tree "$tree" --arg base "$base" \
+              '{message: $message, tree: $tree, parents: [$base]}' |
+            gh api -X POST "repos/$FORK/git/commits" --input - --jq .sha)
+          if gh api "repos/$FORK/git/ref/heads/$branch" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$FORK/git/refs/heads/$branch" -f "sha=$commit" -F force=true > /dev/null
+          else
+            gh api -X POST "repos/$FORK/git/refs" -f "ref=refs/heads/$branch" -f "sha=$commit" > /dev/null
+          fi
+          gh pr create --repo "$UPSTREAM" --base master --head "${FORK%%/*}:$branch" --title "$title" \
+            --body "Portico $VERSION: https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION"

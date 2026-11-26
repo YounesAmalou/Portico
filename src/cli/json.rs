@@ -6,7 +6,11 @@ use std::{io::Write, path::Path, process::ExitCode};
 
 use serde_json::{Map, Value, json};
 
-use super::hosts::{format_warning, ownership};
+use super::{
+    Interrupts, Step,
+    hosts::{format_warning, ownership},
+    tunnels::start_interrupts,
+};
 use crate::{
     app::{
         App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
@@ -20,6 +24,7 @@ use crate::{
     domain::identity::{
         Agent, Availability, HostIdentities, Identity, IdentityInventory, Provider, PublicKey,
     },
+    domain::openssh::OpenSshError,
     domain::settings::{Key, SettingsError},
     domain::tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
 };
@@ -156,8 +161,15 @@ fn backend_failure(issue: &BackendIssue) -> Failure {
 }
 
 /// Runs `command` and prints its document, or an error document; never reads a terminal.
-pub(super) fn run(command: JsonCommand, app: &App, output: &mut impl Write) -> ExitCode {
-    let (document, exit) = match document(command, app) {
+/// `handle_signals` lets `tunnel start` catch the signals that cancel it (see
+/// `tunnels::start_interrupts`).
+pub(super) fn run(
+    command: JsonCommand,
+    app: &App,
+    output: &mut impl Write,
+    handle_signals: bool,
+) -> ExitCode {
+    let (document, exit) = match document(command, app, handle_signals) {
         Ok(result) => result,
         Err(failure) => (json!({ "error": failure.value() }), ExitCode::FAILURE),
     };
@@ -184,7 +196,11 @@ fn print(output: &mut impl Write, mut document: Value) -> std::io::Result<()> {
     output.flush()
 }
 
-fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failure> {
+fn document(
+    command: JsonCommand,
+    app: &App,
+    handle_signals: bool,
+) -> Result<(Value, ExitCode), Failure> {
     let success = |document| Ok((document, ExitCode::SUCCESS));
     match command {
         JsonCommand::Hosts => success(hosts(&app.hosts()?)),
@@ -257,9 +273,9 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             if names.is_empty() {
                 return Err(Failure::usage("tunnel start <name>..."));
             }
-            Ok(results(
-                names.iter().map(|name| start_result(app, name)).collect(),
-            ))
+            let interrupts =
+                start_interrupts(handle_signals).map_err(|error| Failure::new("other", error))?;
+            Ok(results(start_results(app, &names, &interrupts)))
         }
         JsonCommand::TunnelStop { names, all } => {
             let names = if all {
@@ -307,8 +323,32 @@ fn result(
     })
 }
 
-fn start_result(app: &App, name: &str) -> Value {
-    match app.start_tunnel(name, None, false) {
+/// Starts `names` in turn. Once a signal cancels a start, or arrives after one, no other is
+/// tried: each name left fails with the cancellation.
+fn start_results(app: &App, names: &[String], interrupts: &Interrupts) -> Vec<Value> {
+    let mut results = Vec::new();
+    let mut cancelled = false;
+    for name in names {
+        if cancelled {
+            let failure = AppError::from(OpenSshError::Cancelled).into();
+            results.push(result(app, name, "failed", None, Some(failure)));
+            continue;
+        }
+        let outcome = match interrupts.during(|flag| app.start_tunnel(name, Some(flag), false)) {
+            Step::Done(outcome) => outcome,
+            Step::Late(outcome) => {
+                cancelled = true;
+                outcome
+            }
+        };
+        cancelled |= matches!(outcome, Err(AppError::OpenSsh(OpenSshError::Cancelled)));
+        results.push(start_result(app, name, outcome));
+    }
+    results
+}
+
+fn start_result(app: &App, name: &str, outcome: Result<StartOutcome, AppError>) -> Value {
+    match outcome {
         Ok(StartOutcome::Started { pid }) => result(app, name, "started", Some(pid), None),
         Ok(StartOutcome::AlreadyRunning { pid }) => {
             result(app, name, "already-running", Some(pid), None)
@@ -644,7 +684,9 @@ pub(super) fn report(report: &TunnelReport) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
     use super::*;
     use crate::{
@@ -653,6 +695,24 @@ mod tests {
         domain::identity::MissingReason,
         domain::tunnel::{Kind, Tunnel},
     };
+
+    #[test]
+    fn a_signal_during_a_start_fails_it_and_every_name_after_it() {
+        let (_dir, app) = crate::cli::tunnels::tests::two_tunnels();
+        let started = start_results(
+            &app,
+            &["db".into(), "web".into()],
+            &Interrupts::signalled_during(),
+        );
+        assert_eq!(started.len(), 2);
+        for (result, name) in started.iter().zip(["db", "web"]) {
+            assert_eq!(result["name"], name);
+            assert_eq!(result["outcome"], "failed");
+            assert_eq!(result["error"]["message"], "SSH operation cancelled");
+            assert_eq!(result["tunnel"]["status"]["state"], "stopped", "{result}");
+        }
+        assert_eq!(results(started).1, ExitCode::FAILURE);
+    }
 
     fn text(document: Value) -> String {
         let mut output = Vec::new();
@@ -830,6 +890,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_external_host_declares_nothing_and_a_failed_resolution_says_why() {
         let value = details(&HostDetails {

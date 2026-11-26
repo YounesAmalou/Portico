@@ -10,6 +10,11 @@
 # macOS (aarch64-apple-darwin or x86_64-apple-darwin): the binary in a tarball and a
 # CycloneDX SBOM. Needs rustup with the target added and cargo-cyclonedx; the release
 # workflow runs it on an Apple silicon runner, which builds both targets.
+#
+# Windows (x86_64-pc-windows-msvc or aarch64-pc-windows-msvc): portico.exe in a zip and a
+# CycloneDX SBOM. Needs rustup with the target added, cargo-cyclonedx and Git for Windows'
+# bash; the release workflow runs it on a Windows x64 runner, whose Visual Studio builds both
+# targets.
 set -euo pipefail
 
 [ $# -eq 3 ] || { echo "usage: $0 <version> <target> <outdir>" >&2; exit 2; }
@@ -26,6 +31,9 @@ outdir=$(readlink -f "$outdir")
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
 cargo build --release --locked --target "$target"
 binary=target/$target/release/portico
+case "$target" in
+    *-windows-*) binary=$binary.exe ;;
+esac
 
 sbom() {
     cargo cyclonedx --format json --spec-version 1.5 --no-build-deps --target "$target" \
@@ -35,7 +43,7 @@ sbom() {
 
 scripts/package-release.sh "$version" "$target" "$binary" "$outdir" >&2
 case "$target" in
-    *-apple-darwin)
+    *-apple-darwin | *-windows-*)
         sbom >&2
         readlink -f "$binary"
         exit 0

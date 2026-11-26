@@ -36,7 +36,7 @@ use crate::{
         runtime::RuntimeDir,
         store::{StoreError, TunnelStore},
     },
-    platform::{self, fs::read_lossy, process::Proc},
+    platform::{fs::read_lossy, process::Proc},
 };
 
 pub struct App {
@@ -211,8 +211,8 @@ impl App {
             // user's real runtime directory.
             runtime: RuntimeDir::locate(&home, None),
             // Without `with_settings_path`, the file sits under the home: tests never reach the
-            // user's real preferences.
-            settings_path: platform::paths::config_dir(&home, None).join(settings::FILE_NAME),
+            // user's real preferences (on Windows, `config_dir` would read `%APPDATA%`).
+            settings_path: home.join(".config/portico").join(settings::FILE_NAME),
             proc: Proc::system(),
         }
     }
@@ -977,10 +977,11 @@ fn stderr_of(error: OpenSshError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         fs,
         ops::Deref,
-        os::unix::fs::PermissionsExt,
         panic,
         sync::{
             Arc, Condvar, Mutex,
@@ -1550,6 +1551,7 @@ exit 255
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn inaccessible_include_parent_blocks_mutation() {
         let app = test_app_with_external("Include locked/hidden.conf\n");

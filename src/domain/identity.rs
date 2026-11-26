@@ -284,7 +284,7 @@ pub struct IdentityInventory {
 pub struct Expansion<'a> {
     pub home: &'a Path,
     pub local_user: &'a str,
-    pub uid: u32,
+    pub uid: String,
     pub hostname: &'a str,
     pub remote_user: &'a str,
     pub port: u16,
@@ -317,7 +317,7 @@ pub fn expand(value: &str, context: &Expansion<'_>) -> Result<PathBuf, String> {
                     '%' => expanded.push('%'),
                     'd' => expanded.push_str(&context.home.to_string_lossy()),
                     'u' => expanded.push_str(context.local_user),
-                    'i' => expanded.push_str(&context.uid.to_string()),
+                    'i' => expanded.push_str(&context.uid),
                     'h' => expanded.push_str(context.hostname),
                     'r' => expanded.push_str(context.remote_user),
                     'p' => expanded.push_str(&context.port.to_string()),
@@ -572,7 +572,7 @@ mod tests {
         Expansion {
             home: Path::new("/home/me"),
             local_user: "me",
-            uid: 1000,
+            uid: "1000".into(),
             hostname: "dev.example",
             remote_user: "deploy",
             port: 2222,
@@ -881,7 +881,10 @@ mod tests {
                 keys: vec![key("SHA256:a")],
             }
             .describe(home),
-            "1Password, ~/.1password/agent.sock, 1 key"
+            format!(
+                "1Password, {}, 1 key",
+                crate::platform::paths::shown("~/.1password/agent.sock")
+            )
         );
         assert_eq!(
             Agent::Unavailable {
@@ -890,7 +893,10 @@ mod tests {
                 reason: AgentProblem::NoSuchSocket,
             }
             .describe(home),
-            "SSH agent, /run/a, unavailable: no such socket"
+            format!(
+                "SSH agent, {}, unavailable: no such socket",
+                crate::platform::paths::shown("/run/a")
+            )
         );
         assert_eq!(Agent::Disabled.describe(home), "none (IdentityAgent none)");
         assert_eq!(

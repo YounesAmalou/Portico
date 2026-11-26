@@ -1,11 +1,14 @@
 mod support;
 
-use std::{ffi::OsStr, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use support::TestEnv;
 
+#[cfg(unix)]
 const DENIED: &str = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: dial unix /var/run/docker.sock: connect: permission denied";
+#[cfg(unix)]
 const DAEMON_DOWN: &str = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+#[cfg(unix)]
 const SOCKET_HOST: &str = "unix:///var/run/docker.sock";
 
 /// One line of `docker ps` output for a container, in a Compose project when `compose` is
@@ -75,6 +78,7 @@ fn install_failing_docker(env: &TestEnv, message: &str) {
 
 /// Fakes the probe's view of the group database: `me` is in the process groups `me`, the
 /// database groups `database`, and the socket belongs to `docker`.
+#[cfg(unix)]
 fn install_probe(env: &TestEnv, database: &str) {
     env.install_program(
         "id",
@@ -108,12 +112,13 @@ fn env_with_dev(listing: &str) -> TestEnv {
     env
 }
 
+#[cfg(unix)]
 fn run_with_socket<I, S>(env: &TestEnv, args: I) -> support::RunResult
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
+    S: AsRef<std::ffi::OsStr>,
 {
-    env.run_with_env(args, "DOCKER_HOST", OsStr::new(SOCKET_HOST))
+    env.run_with_env(args, "DOCKER_HOST", std::ffi::OsStr::new(SOCKET_HOST))
 }
 
 #[test]
@@ -167,6 +172,9 @@ fn no_containers_message() {
         .assert_stdout_contains("No running containers on this machine.\n");
 }
 
+/// Unix-only: Windows also finds a program in its system folders, whatever `PATH` says, so a
+/// `docker.exe` there (GitHub's runners have one in `System32`) cannot be hidden.
+#[cfg(unix)]
 #[test]
 fn docker_missing_is_explained() {
     let env = TestEnv::new();
@@ -178,6 +186,8 @@ fn docker_missing_is_explained() {
         );
 }
 
+/// Unix-only: Docker's local daemon socket and group logic (`UNIX_GROUPS`).
+#[cfg(unix)]
 #[test]
 fn daemon_down_offers_start_and_declines_non_interactively() {
     let env = TestEnv::new();
@@ -192,6 +202,8 @@ fn daemon_down_offers_start_and_declines_non_interactively() {
     );
 }
 
+/// Unix-only: Docker's local daemon socket and group logic (`UNIX_GROUPS`).
+#[cfg(unix)]
 #[test]
 fn permission_denied_rerun_through_sg() {
     let env = TestEnv::new();
@@ -220,6 +232,8 @@ fn permission_denied_rerun_through_sg() {
     );
 }
 
+/// Unix-only: Docker's local daemon socket and group logic (`UNIX_GROUPS`).
+#[cfg(unix)]
 #[test]
 fn join_offer_declined_lists_options() {
     let env = TestEnv::new();

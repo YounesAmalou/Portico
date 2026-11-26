@@ -265,12 +265,7 @@ impl From<ViaArg> for Via {
 /// ssh's exit status as Portico's: its code, or 128 plus the signal that killed it, as a shell
 /// reports it.
 fn exit_code(status: std::process::ExitStatus) -> ExitCode {
-    use std::os::unix::process::ExitStatusExt;
-    status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from)
+    crate::platform::process::exit_code(status).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 /// The exit status of a `portico test` that a signal cancelled, as for SIGINT.
@@ -290,6 +285,9 @@ struct Interrupts {
     /// that window would; 0 never does.
     #[cfg(test)]
     signal_after: std::cell::Cell<usize>,
+    /// Raises the flag as the next step starts, as a signal while it runs would.
+    #[cfg(test)]
+    signal_within: std::cell::Cell<bool>,
 }
 
 /// A step's result, `Late` when a signal arrived after the step stopped checking for one.
@@ -305,13 +303,11 @@ impl Interrupts {
             default_action: Arc::new(AtomicBool::new(true)),
             #[cfg(test)]
             signal_after: std::cell::Cell::new(0),
+            #[cfg(test)]
+            signal_within: std::cell::Cell::new(false),
         };
         if handle_signals {
-            for signal in [
-                signal_hook::consts::SIGINT,
-                signal_hook::consts::SIGTERM,
-                signal_hook::consts::SIGHUP,
-            ] {
+            for &signal in crate::platform::process::HANGUP_SIGNALS {
                 signal_hook::flag::register_conditional_default(
                     signal,
                     Arc::clone(&interrupts.default_action),
@@ -330,11 +326,23 @@ impl Interrupts {
         interrupts
     }
 
+    /// Interrupts without handlers whose flag is raised while the next step runs.
+    #[cfg(test)]
+    fn signalled_during() -> Self {
+        let interrupts = Self::install(false).expect("no handlers to install");
+        interrupts.signal_within.set(true);
+        interrupts
+    }
+
     /// Runs `step` with the cancel flag the signals set.
     fn during<T>(&self, step: impl FnOnce(&AtomicBool) -> T) -> Step<T> {
         // A signal acted on after an earlier step must not cancel this one.
         self.cancelled.store(false, Ordering::SeqCst);
         self.default_action.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        if self.signal_within.take() {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
         let result = step(&self.cancelled);
         #[cfg(test)]
         match self.signal_after.get() {
@@ -376,7 +384,7 @@ where
     E: Write,
 {
     if let Some(command) = cli.command.as_ref().and_then(json_command) {
-        return json::run(command, app, output);
+        return json::run(command, app, output, handle_signals);
     }
     match execute(
         cli,
@@ -701,9 +709,16 @@ fn execute<I: BufRead, O: Write, E: Write>(
             finish_connection(outcome, hold, input, error)
         }
         Some(Command::Tunnels { .. }) => tunnels::list(app, output),
-        Some(Command::Tunnel { command }) => {
-            tunnels::run(command, app, picker, input, output, error, interactive)
-        }
+        Some(Command::Tunnel { command }) => tunnels::run(
+            command,
+            app,
+            picker,
+            input,
+            output,
+            error,
+            interactive,
+            handle_signals,
+        ),
         Some(Command::Settings { command, .. }) => settings::run(command, app, output),
         // `main` runs these through `run_desktop`, with the desktop environment.
         Some(Command::Desktop { .. }) => {
@@ -795,15 +810,15 @@ mod tests {
     use clap::Parser;
     use tempfile::TempDir;
 
+    use crate::platform::paths::shown;
     use crate::test_executable::write_executable;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::backend::{docker::join_group_words, remote_command};
     use crate::{
         app::{App, ContainerPrograms},
-        backend::{
-            docker::{SHELL_SCRIPT, join_group_words},
-            remote_command,
-        },
+        backend::docker::SHELL_SCRIPT,
         domain::host::Host,
         domain::managed::{ConfigPaths, ManagedStore},
         domain::openssh::OpenSsh,
@@ -1005,6 +1020,7 @@ mod tests {
     }
 
     const LISTING: &str = r#"{"id":"aaaa1111","name":"web","image":"nginx","status":"Up"}"#;
+    #[cfg(unix)]
     const DENIED: &str = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock";
 
     /// An app whose local container programs are fakes in a temporary directory. Each fake
@@ -1054,6 +1070,7 @@ mod tests {
 
     /// Docker refuses the socket; the probe reports `me` outside the docker group until
     /// `sudo` has run, and `sg` lists once it has.
+    #[cfg(unix)]
     fn refused_until_joined(dir: &TempDir) {
         let joined = dir.path().join("joined");
         behave(dir, "docker", &format!("echo '{DENIED}' >&2\nexit 1\n"));
@@ -1069,6 +1086,7 @@ mod tests {
         behave(dir, "sg", &format!("echo '{LISTING}'\n"));
     }
 
+    #[cfg(unix)]
     fn run_containers(app: &App, answer: &[u8]) -> (ExitCode, String, String) {
         let mut output = Vec::new();
         let mut error = Vec::new();
@@ -1090,6 +1108,8 @@ mod tests {
         )
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn join_offer_accepted_runs_sudo_then_lists() {
         let (dir, app) = container_app();
@@ -1116,6 +1136,8 @@ mod tests {
         );
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn join_offer_declined_lists_options() {
         let (dir, app) = container_app();
@@ -1135,6 +1157,8 @@ mod tests {
         assert!(error.contains("\n  Or use rootless Docker: "), "{error}");
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_failed_fix_stops_without_listing_again() {
         let (dir, app) = container_app();
@@ -1154,6 +1178,8 @@ mod tests {
         );
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn start_daemon_offer_runs_systemctl_through_sudo() {
         let (dir, app) = container_app();
@@ -1406,7 +1432,7 @@ fi
             .map(|row| row.extra[0].as_str())
             .collect();
         assert_eq!(extra, ["managed", "external"]);
-        assert!(picker.seen[0].1[1].extra[1].ends_with(".ssh/config"));
+        assert!(picker.seen[0].1[1].extra[1].ends_with(&shown(".ssh/config")));
     }
 
     #[test]
@@ -1684,9 +1710,9 @@ fi
         assert_eq!(
             picker.seen[0].1,
             vec![
-                row(&["one"], &["~/.ssh/config"]),
-                row(&["two"], &["~/.ssh/config"]),
-                row(&["three"], &["~/.ssh/config"]),
+                row(&["one"], &[shown("~/.ssh/config").as_str()]),
+                row(&["two"], &[shown("~/.ssh/config").as_str()]),
+                row(&["three"], &[shown("~/.ssh/config").as_str()]),
             ]
         );
         assert!(output.contains("Adopt 2 hosts? [y/N] "), "{output}");
@@ -1703,7 +1729,9 @@ fi
 
         assert_eq!(
             output,
-            "Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            shown(
+                "Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            )
         );
         assert_eq!(picker.labels(0), ["one", "two", "three"]);
     }
@@ -1739,7 +1767,9 @@ fi
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         assert_eq!(
             output,
-            "No host can be adopted.\nNot eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            shown(
+                "No host can be adopted.\nNot eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            )
         );
         let (exit, output, _) = run_command(&app, &["adopt", "--all", "-y"], "", false);
         assert_eq!(exit, std::process::ExitCode::SUCCESS);

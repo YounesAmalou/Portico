@@ -26,7 +26,10 @@ pub(crate) fn render_host(host: &Host, comments: Option<&HostComments>) -> Strin
     if let Some(identity_file) = host.identity_file() {
         directive(
             HostField::IdentityFile,
-            format!("IdentityFile {}", quote(identity_file)),
+            format!(
+                "IdentityFile {}",
+                quote(&crate::platform::paths::openssh_text(identity_file))
+            ),
         );
     }
     if let Some(proxy_jump) = host.proxy_jump() {

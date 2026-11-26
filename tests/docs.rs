@@ -89,7 +89,7 @@ fn security_policy_names_a_private_reporting_channel() {
 #[test]
 fn manual_runs_never_release_or_publish() {
     let workflow = read(".github/workflows/release.yml");
-    for job in ["release", "crates", "aur", "homebrew"] {
+    for job in ["release", "crates", "aur", "homebrew", "winget"] {
         let section = workflow
             .split(&format!("\n  {job}:\n"))
             .nth(1)
@@ -367,7 +367,24 @@ fn release_artifacts_are_built_verified_checksummed_and_attested() {
         );
     }
     assert_eq!(macos.matches("uses: actions/attest@").count(), 2);
-    assert!(release_job("checksums").contains("needs: [verify-packages, build-macos]"));
+
+    let windows = release_job("build-windows");
+    for expected in [
+        "target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]",
+        "runs-on: windows-latest",
+        "scripts/build-release.sh",
+        "--version",
+        "sbom-path:",
+    ] {
+        assert!(
+            windows.contains(expected),
+            "the build-windows job lacks {expected}"
+        );
+    }
+    assert_eq!(windows.matches("uses: actions/attest@").count(), 2);
+    assert!(
+        release_job("checksums").contains("needs: [verify-packages, build-macos, build-windows]")
+    );
 
     let verify = release_job("verify-packages");
     assert!(verify.contains("runner: ubuntu-24.04-arm"));
@@ -390,6 +407,8 @@ fn release_artifacts_are_built_verified_checksummed_and_attested() {
         "crates",
         "aur",
         "homebrew",
+        "winget-manifests",
+        "winget",
     ] {
         let section = release_job(job);
         assert!(
@@ -397,7 +416,7 @@ fn release_artifacts_are_built_verified_checksummed_and_attested() {
             "{job} must not be able to attest"
         );
     }
-    for job in ["build", "build-macos", "checksums"] {
+    for job in ["build", "build-macos", "build-windows", "checksums"] {
         let section = release_job(job);
         assert!(
             section.contains("id-token: write") && section.contains("attestations: write"),
@@ -674,6 +693,7 @@ fn the_homebrew_tap_is_updated_with_its_own_secret_only_after_the_release() {
     for other in [
         "CARGO_REGISTRY_TOKEN",
         "AUR_SSH_PRIVATE_KEY",
+        "WINGET_TOKEN",
         "contents: write",
     ] {
         assert!(
@@ -681,4 +701,44 @@ fn the_homebrew_tap_is_updated_with_its_own_secret_only_after_the_release() {
             "the homebrew job must not use {other}"
         );
     }
+}
+
+#[test]
+fn winget_gets_a_pull_request_with_its_own_secret_only_after_the_release() {
+    let winget = release_job("winget");
+    for expected in [
+        "needs: [verify, release]",
+        "environment: winget",
+        "WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}",
+        "scripts/winget-manifest.sh",
+        "UPSTREAM: microsoft/winget-pkgs",
+    ] {
+        assert!(winget.contains(expected), "the winget job lacks {expected}");
+    }
+    for other in [
+        "CARGO_REGISTRY_TOKEN",
+        "AUR_SSH_PRIVATE_KEY",
+        "HOMEBREW_TAP_TOKEN",
+        "contents: write",
+    ] {
+        assert!(
+            !winget.contains(other),
+            "the winget job must not use {other}"
+        );
+    }
+
+    // A rehearsal validates the manifests it renders, and publishes nothing.
+    let rehearsal = release_job("winget-manifests");
+    for expected in [
+        "if: github.event_name == 'workflow_dispatch'",
+        "runs-on: windows-latest",
+        "scripts/winget-manifest.sh",
+        "winget validate --manifest",
+    ] {
+        assert!(
+            rehearsal.contains(expected),
+            "the winget-manifests job lacks {expected}"
+        );
+    }
+    assert!(!rehearsal.contains("secrets."));
 }

@@ -167,6 +167,43 @@ jobs:
       - run: scripts/ci-checks.sh ${{ matrix.check }}
         timeout-minutes: 12
 
+  # The same Rust checks on Windows, as the runner's own user, in Git for Windows' bash (which
+  # also runs the tests' shell-script fakes): clippy for the Windows code, the tests, and the
+  # end-to-end suite against Windows' own OpenSSH server, whose capability `e2e` adds first
+  # where the image lacks it. The workflow's CARGO_HOME and RUSTUP_HOME are the Linux
+  # container's, so the runner's own are named here. The limits make a hung test fail with the
+  # log of what was running, instead of after GitHub's six hours.
+  windows:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [clippy, test, e2e]
+    env:
+      CARGO_HOME: C:\Users\runneradmin\.cargo
+      RUSTUP_HOME: C:\Users\runneradmin\.rustup
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Add the OpenSSH server
+        if: ${{ matrix.check == 'e2e' }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path C:\Windows\System32\OpenSSH\sshd.exe)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Host
+          }
+      - run: scripts/ci-checks.sh ${{ matrix.check }}
+        timeout-minutes: 20
+
   msrv:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}

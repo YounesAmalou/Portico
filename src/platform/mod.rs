@@ -1,9 +1,12 @@
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!(
-    "Portico supports Linux and macOS only for now; Windows is planned in ROADMAP.md (v5)."
-);
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("Portico supports Linux, macOS and Windows only.");
 
+mod common;
+
+#[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -16,7 +19,11 @@ use linux as os;
 #[cfg(target_os = "macos")]
 use macos as os;
 
+#[cfg(windows)]
+pub mod console;
 pub mod fs;
 pub mod launcher;
+pub mod net;
 pub mod paths;
 pub mod process;
+pub mod time;

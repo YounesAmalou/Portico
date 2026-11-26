@@ -750,18 +750,13 @@ impl TunnelStatus {
 
 /// `HH:MM` in local time of a Unix time.
 fn clock(unix: u64) -> String {
-    // `time_t` is inferred: naming it is deprecated on musl, where it changes size.
-    let Ok(time) = unix.try_into() else {
-        return "--:--".into();
-    };
-    // SAFETY: `localtime_r` only writes the `tm` it is given.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&time, &mut tm).is_null() {
-            return "--:--".into();
-        }
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-    }
+    i64::try_from(unix)
+        .ok()
+        .and_then(crate::platform::time::local)
+        .map_or_else(
+            || "--:--".into(),
+            |time| format!("{:02}:{:02}", time.hour, time.minute),
+        )
 }
 
 /// Something about a saved tunnel worth knowing that does not stop it from being listed.
@@ -798,21 +793,32 @@ pub struct TunnelReport {
     pub warnings: Vec<TunnelWarning>,
 }
 
-/// The `ssh` arguments that start `forward` through `host` in the background, logging to `log`.
-pub fn start_args(log: &Path, host: &str, forward: &Forward) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec!["-f".into(), "-N".into()];
+/// The `ssh` arguments that start `forward` through `host`, logging to `log`: in the background
+/// (`-f`) when `background`, with `-E <log>`; otherwise in the foreground with the log level
+/// raised to the lowest that logs the authentication, by which the start sees the forward come
+/// up (see `runtime::ready`), logging on standard error, which the caller sends to `log`, and
+/// naming `log` in a `LocalCommand` that never runs (`process::tunnel_marker`).
+pub fn start_args(log: &Path, host: &str, forward: &Forward, background: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    if background {
+        args.push("-f".into());
+    }
+    args.push("-N".into());
+    let verbose = (!background).then_some("LogLevel=VERBOSE");
     for option in [
         "ExitOnForwardFailure=yes",
         "BatchMode=yes",
         "ControlMaster=no",
         "ControlPath=none",
         "RemoteCommand=none",
-    ] {
+    ]
+    .into_iter()
+    .chain(verbose)
+    {
         args.push("-o".into());
         args.push(option.into());
     }
-    args.push("-E".into());
-    args.push(log.into());
+    args.extend(crate::platform::process::tunnel_marker(log, background));
     args.push(forward.kind.flag().into());
     args.push(forward.spec().into());
     args.push("--".into());
@@ -1163,7 +1169,7 @@ mod tests {
     #[test]
     fn start_args_are_the_documented_command_line() {
         let forward = local("127.0.0.1:5432:localhost:5432");
-        let args = start_args(Path::new("/run/t/db.log"), "prod-db", &forward);
+        let args = start_args(Path::new("/run/t/db.log"), "prod-db", &forward, true);
         let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
         assert_eq!(
             args,
@@ -1188,6 +1194,44 @@ mod tests {
                 "prod-db"
             ]
         );
+    }
+
+    #[test]
+    fn start_args_without_background_drop_f_raise_log_level_and_mark_the_log() {
+        let forward = local("127.0.0.1:5432:localhost:5432");
+        let log = Path::new("/run/t/db.log");
+        let args = start_args(log, "prod-db", &forward, false);
+        let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-N",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "RemoteCommand=none",
+                "-o",
+                "LogLevel=VERBOSE",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "LocalCommand=portico-tunnel /run/t/db.log",
+                "-L",
+                "127.0.0.1:5432:localhost:5432",
+                "--",
+                "prod-db"
+            ]
+        );
+        // In the background, the list stays exactly as before (see the test above).
+        let background = start_args(log, "prod-db", &forward, true);
+        assert_eq!(background[0], "-f");
+        assert!(!background.iter().any(|arg| arg == "LogLevel=VERBOSE"));
     }
 
     #[test]

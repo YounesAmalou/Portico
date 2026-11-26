@@ -2,7 +2,6 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     io::{self, Read, Write},
-    os::unix::process::CommandExt,
     path::Path,
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -21,7 +20,9 @@ use crate::domain::probe::{
     test_args,
 };
 use crate::platform::launcher::{Launch, launch};
-use crate::platform::process::{has_exited, terminate_process_group, terminate_process_tree};
+use crate::platform::process::{
+    has_exited, own_group, terminate_process_group, terminate_process_tree,
+};
 
 /// How a watched ssh run ended.
 pub(super) enum Watched {
@@ -95,12 +96,13 @@ impl OpenSsh {
         cancelled: &AtomicBool,
         deadline: Duration,
     ) -> Result<Watched, OpenSshError> {
-        let mut child = Command::new(&self.ssh)
+        let mut command = Command::new(&self.ssh);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0)
+            .stderr(Stdio::piped());
+        let mut child = own_group(&mut command)
             .spawn()
             .map_err(|source| OpenSshError::Io {
                 program: self.ssh.clone(),
@@ -548,7 +550,7 @@ mod tests {
             "cancellation blocked for {:?}",
             started.elapsed()
         );
-        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)), "{result:?}");
         assert!(pin_failure_injected(), "ssh's pin opened");
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
@@ -584,7 +586,7 @@ mod tests {
         let result = openssh.connect_mirrored("dev", Box::new(io::sink()), Some(&cancelled));
 
         cancel.join().unwrap();
-        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)), "{result:?}");
         assert!(pin_failure_injected(), "every descendant's pin opened");
         for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
             assert_dies(pid);
@@ -940,7 +942,7 @@ mod tests {
         let result = openssh.probe(None, "dev", Route::Direct, &cancelled);
 
         cancel.join().unwrap();
-        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)), "{result:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "cancellation blocked for {:?}",
@@ -1036,6 +1038,7 @@ mod tests {
         assert!(mirrored.tail.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_descendant_holding_stderr_open_does_not_block_the_return() {
         let fake = fake_ssh();

@@ -1373,7 +1373,10 @@ pub(super) mod tests {
             .join("\n");
         assert!(text.contains("│> prod "), "{text}");
         assert!(text.contains("managed"), "{text}");
-        assert!(text.contains("~/.ssh/config"), "{text}");
+        assert!(
+            text.contains(&crate::platform::paths::shown("~/.ssh/config")),
+            "{text}"
+        );
         screen.handle_key(ctrl(' '));
         assert!(screen.form.suggestions.is_some());
         // Ctrl+Space elsewhere does nothing.

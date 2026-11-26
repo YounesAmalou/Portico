@@ -8,7 +8,6 @@ use std::{
     fs,
     io::Write,
     net::TcpListener,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::{Path, PathBuf},
 };
 
@@ -32,8 +31,9 @@ struct Fixture {
     /// Holds the busy tunnel's port.
     _busy: TcpListener,
     busy_port: u16,
-    /// The agent's socket.
-    _agent: UnixListener,
+    /// The agent's socket. Windows' agents listen on named pipes instead.
+    #[cfg(unix)]
+    _agent: std::os::unix::net::UnixListener,
 }
 
 fn calls(env: &TestEnv, name: &str) -> PathBuf {
@@ -54,7 +54,8 @@ if [ "$1" = -G ]; then
   exit 0
 fi
 printf '%s\n' "$*" >> '{ssh_calls}'
-if [ "$1" = -f ]; then
+if [ "$1" = -f ] || [ "$1" = -N ]; then
+  elog=/dev/stderr
   prev=
   for arg do
     [ "$prev" = -E ] && elog=$arg
@@ -149,14 +150,21 @@ fn setup() -> Fixture {
         ),
     )
     .unwrap();
-    fs::set_permissions(ssh.join("id_ed25519"), fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        ssh.join("id_ed25519"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     fs::write(
         ssh.join("id_ed25519.pub"),
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIprod deploy@prod\n",
     )
     .unwrap();
     fs::create_dir_all(env.home().join(".1password")).unwrap();
-    let agent = UnixListener::bind(env.home().join(".1password/agent.sock")).unwrap();
+    #[cfg(unix)]
+    let agent =
+        std::os::unix::net::UnixListener::bind(env.home().join(".1password/agent.sock")).unwrap();
     env.install_program(
         "ssh-add",
         "#!/bin/sh\nprintf '256 SHA256:YmF6cXV4Zm9vYmFycXV1eGNvcmdlZ3JhdWx0Z2FycGx5 deploy@prod (ED25519)\\n256 SHA256:Zm9vYmFyYmF6cXV4cXV1eGNvcmdlZ3JhdWx0Z2FycGx5 work laptop (ED25519)\\n'\n",
@@ -173,6 +181,7 @@ fn setup() -> Fixture {
         env,
         _busy: busy,
         busy_port,
+        #[cfg(unix)]
         _agent: agent,
     }
 }
@@ -195,13 +204,30 @@ impl Fixture {
 
 /// Replaces what changes from run to run (the home, the busy port, PIDs and times), so the
 /// golden files are stable.
+/// On Windows, paths are also spelled with `/`, an exit status and a tunnel's ssh command as on
+/// Unix, so that one golden file serves every system.
 fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
-    let mut text = text.replace(&home.display().to_string(), HOME);
-    if let Some(port) = busy_port {
-        text = text.replace(&port.to_string(), BUSY_PORT);
-    }
-    let mut document: Value = serde_json::from_str(&text).unwrap();
-    fn walk(value: &mut Value) {
+    let mut document: Value = serde_json::from_str(text).unwrap();
+    let home = home.display().to_string();
+    // The home first: its temporary name may hold the port's digits.
+    let walk_text = |text: &mut String| {
+        *text = text.replace(&home, HOME);
+        if let Some(port) = busy_port {
+            *text = text.replace(&port.to_string(), BUSY_PORT);
+        }
+        if cfg!(windows) {
+            *text = text
+                .replace('\\', "/")
+                .replace("exit code: ", "exit status: ");
+        }
+    };
+    let busy_port = busy_port.map(u64::from);
+    let walk_number = |value: &mut Value| {
+        if value.as_u64().is_some() && value.as_u64() == busy_port {
+            *value = BUSY_PORT.parse::<u64>().unwrap().into();
+        }
+    };
+    fn walk(value: &mut Value, walk_text: &dyn Fn(&mut String), walk_number: &dyn Fn(&mut Value)) {
         match value {
             Value::Object(map) => {
                 for (key, value) in map.iter_mut() {
@@ -209,16 +235,54 @@ fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
                         ("pid", Value::Number(_)) => *value = 41237.into(),
                         ("started", Value::Number(_)) => *value = 1781860921u64.into(),
                         ("finished", Value::Number(_)) => *value = 1781861043u64.into(),
-                        _ => walk(value),
+                        ("command", Value::Array(_)) if cfg!(windows) => {
+                            unix_start(value);
+                            walk(value, walk_text, walk_number);
+                        }
+                        _ => walk(value, walk_text, walk_number),
                     }
                 }
             }
-            Value::Array(values) => values.iter_mut().for_each(walk),
+            Value::Array(values) => values
+                .iter_mut()
+                .for_each(|value| walk(value, walk_text, walk_number)),
+            Value::String(text) => walk_text(text),
+            Value::Number(_) => walk_number(value),
             _ => {}
         }
     }
-    walk(&mut document);
+    walk(&mut document, &walk_text, &walk_number);
     document
+}
+
+/// A tunnel's ssh command as Portico starts it on Unix: Windows' ssh cannot background itself,
+/// so there it runs without `-f`, logs at `LogLevel=VERBOSE` (by which the start sees it
+/// authenticate) on standard error, and names its log in a `LocalCommand` instead of `-E`.
+fn unix_start(command: &mut Value) {
+    let Value::Array(words) = command else {
+        return;
+    };
+    if let Some(at) = words
+        .windows(2)
+        .position(|pair| pair[0] == "-o" && pair[1] == "LogLevel=VERBOSE")
+    {
+        words.drain(at..at + 2);
+    }
+    // `-o PermitLocalCommand=no -o "LocalCommand=portico-tunnel <log>"` in place of `-E <log>`.
+    if let Some(at) = words
+        .iter()
+        .position(|word| word == "PermitLocalCommand=no")
+        && let Some(log) = words
+            .get(at + 2)
+            .and_then(Value::as_str)
+            .and_then(|command| command.strip_prefix("LocalCommand=portico-tunnel "))
+            .map(|log| log.replace("%%", "%"))
+    {
+        words.splice(at - 1..at + 3, ["-E".into(), log.into()]);
+    }
+    if words.first().is_some_and(|word| word == "ssh") && words.get(1) != Some(&"-f".into()) {
+        words.insert(1, "-f".into());
+    }
 }
 
 fn golden_path(name: &str) -> PathBuf {
@@ -298,6 +362,9 @@ fn hosts_runs_no_ssh_and_asks_no_agent() {
     assert!(!ran.exists(), "{}", fs::read_to_string(&ran).unwrap());
 }
 
+/// Unix-only: the host's agent is the fixture's Unix socket (1Password's); Windows' agents
+/// listen on named pipes.
+#[cfg(unix)]
 #[test]
 fn show_of_a_managed_host() {
     let fixture = setup();
@@ -317,6 +384,9 @@ fn show_of_an_external_host_that_does_not_resolve() {
     assert_eq!(document["host"]["resolved"], Value::Null);
 }
 
+/// Unix-only: the fixture's agent is a Unix socket (1Password's); Windows' agents listen on
+/// named pipes.
+#[cfg(unix)]
 #[test]
 fn identities() {
     let fixture = setup();
@@ -342,6 +412,9 @@ fn containers_on_a_host_run_ssh_in_batch_mode() {
     assert!(ssh.contains("BatchMode=yes"), "{ssh}");
 }
 
+/// Unix-only: the offers are local Docker access through Unix groups, which Windows lacks
+/// (`UNIX_GROUPS` is false).
+#[cfg(unix)]
 #[test]
 fn docker_offers_are_reported_and_never_run() {
     let fixture = setup();
@@ -462,6 +535,9 @@ fn podman_containers() {
     assert_eq!(document["containers"][0]["project"], "shop");
 }
 
+/// Unix-only: the listing names the user (`deploy`) through its shell script, which Windows,
+/// with no `sh`, does not run; there `podman ps` runs directly and names no one.
+#[cfg(unix)]
 #[test]
 fn podman_without_subordinate_ids_says_how_to_add_them() {
     let fixture = setup();
@@ -619,7 +695,7 @@ fn an_unknown_host_is_an_error_document() {
 fn an_unreadable_config_is_an_error_document_on_stdout() {
     let fixture = setup();
     let config = fixture.env.ssh_config();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+    support::deny_read(&config);
     for args in [
         &["hosts", "--json"][..],
         &["show", "prod", "--json"],
@@ -627,7 +703,7 @@ fn an_unreadable_config_is_an_error_document_on_stdout() {
         &["containers", "--on", "prod", "--json"],
     ] {
         let output = fixture.run(args);
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        support::allow_read(&config);
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         assert!(output.stderr.is_empty(), "{args:?}");
         let document: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -637,12 +713,12 @@ fn an_unreadable_config_is_an_error_document_on_stdout() {
             document["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains(".ssh/config"),
+                .contains(&support::shown(".ssh/config")),
             "{args:?}: {document}"
         );
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+        support::deny_read(&config);
     }
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    support::allow_read(&config);
 }
 
 #[test]
@@ -654,9 +730,11 @@ fn json_is_refused_where_it_is_not_offered() {
 
 #[test]
 fn an_unset_home_is_an_error_document() {
+    // Windows' home is `USERPROFILE`.
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_portico"))
         .args(["hosts", "--json"])
-        .env_remove("HOME")
+        .env_remove(variable)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -665,30 +743,33 @@ fn an_unset_home_is_an_error_document() {
     assert_eq!(
         document,
         serde_json::json!({
-            "error": { "kind": "other", "message": "HOME is not set", "next": [] },
+            "error": { "kind": "other", "message": format!("{variable} is not set"), "next": [] },
             "schema": 1,
         })
     );
     // Without --json it stays text on stderr.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_portico"))
         .arg("hosts")
-        .env_remove("HOME")
+        .env_remove(variable)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"error: HOME is not set\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("error: {variable} is not set\n")
+    );
 }
 
 #[test]
 fn start_and_stop_with_an_unreadable_tunnels_file_report_per_name() {
     let fixture = setup();
     let tunnels = fixture.env.home().join(".ssh/portico/tunnels");
-    fs::set_permissions(&tunnels, fs::Permissions::from_mode(0o000)).unwrap();
+    support::deny_read(&tunnels);
     let start = fixture.run(&["tunnel", "start", "db", "--json"]);
     let stop = fixture.run(&["tunnel", "stop", "db", "--json"]);
     let stop_all = fixture.run(&["tunnel", "stop", "--all", "--json"]);
-    fs::set_permissions(&tunnels, fs::Permissions::from_mode(0o600)).unwrap();
+    support::allow_read(&tunnels);
 
     for (output, name) in [(&start, "start"), (&stop, "stop")] {
         assert_eq!(output.status.code(), Some(1), "{name}");

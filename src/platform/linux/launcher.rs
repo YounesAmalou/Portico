@@ -3,12 +3,12 @@
 
 use std::{ffi::OsString, io, path::Path};
 
-use super::super::unix::launcher::{Launch, run};
+use super::super::common::launcher::{Launch, run};
 
 /// The terminal launcher run when none is configured.
 pub const DEFAULT_LAUNCHER: &str = "xdg-terminal-exec";
 
-/// Runs `launcher` with `command` as its arguments; see `unix::launcher::run`.
+/// Runs `launcher` with `command` as its arguments; see `common::launcher::run`.
 pub fn launch(launcher: &Path, command: &[OsString]) -> io::Result<Launch> {
     run(launcher, command)
 }

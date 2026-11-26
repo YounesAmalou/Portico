@@ -1791,9 +1791,9 @@ mod tests {
 
     #[test]
     fn shell_and_fix_status_lines() {
-        use std::os::unix::process::ExitStatusExt;
-        let ok = std::process::ExitStatus::from_raw(0);
-        let failed = std::process::ExitStatus::from_raw(256);
+        use crate::platform::process::exit_status;
+        let ok = exit_status(0);
+        let failed = exit_status(1);
         let exited = |status, explanation| {
             Ok(Ok(ConnectionOutcome::Exited {
                 alias: "dev".into(),
@@ -1805,7 +1805,8 @@ mod tests {
         assert_eq!(shell_status(&dev, exited(ok, None)), "Shell on dev closed");
         assert_eq!(
             shell_status(&dev, exited(failed, None)),
-            "Shell on dev exited with exit status: 1"
+            // "exit status: 1" on Unix, "exit code: 1" on Windows.
+            format!("Shell on dev exited with {failed}")
         );
         let explanation = Explanation {
             headline: "the connection was refused".into(),
@@ -1824,7 +1825,7 @@ mod tests {
         );
         assert_eq!(
             shell_status(&dev, Ok(Ok(ConnectionOutcome::LaunchFailed(failed)))),
-            "Could not open a terminal: exit status: 1"
+            format!("Could not open a terminal: {failed}")
         );
         assert_eq!(
             shell_status(&dev, Ok(Err(issue(None)))),
@@ -1839,7 +1840,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "{} exited with exit status: 1",
+                "{} exited with {failed}",
                 remote_command(&start_daemon_offer(&host("dev")).words)
             )
         );

@@ -1,0 +1,502 @@
+//! Windows process control. There are no signals to send: a handle pins a process's identity
+//! (`Pin`) and ends it with `TerminateProcess`, the Toolhelp snapshot lists processes and their
+//! parents, and a process group is a new console process group, out of reach of Ctrl+C.
+
+mod pin;
+mod proc;
+mod tree;
+
+use std::{
+    ffi::OsStr,
+    io,
+    os::windows::{io::AsRawHandle, process::CommandExt},
+    path::{Component, Path, PathBuf},
+    process::{Child, Command, ExitStatus},
+};
+
+use windows_sys::Win32::{
+    Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation},
+    System::{
+        Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+        Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, GetCurrentProcess},
+    },
+};
+
+use pin::{is_gone, open_pin};
+pub(crate) use proc::arg_path;
+pub use proc::{Proc, Stat};
+pub use tree::kill_process_tree;
+
+/// A user, as the string form of their security identifier (`S-1-5-21-…`).
+pub type Uid = String;
+
+/// Whether `ssh -f` backgrounds itself once its forwards are up: Windows' OpenSSH has no
+/// background mode and stays in the foreground, so Portico detaches it and waits for the
+/// forward itself.
+pub const SSH_BACKGROUNDS: bool = false;
+
+/// Whether access to a local service is granted through Unix groups: not here, where Docker
+/// Desktop and Podman have no `docker` group or socket group to join.
+pub const UNIX_GROUPS: bool = false;
+
+/// Whether this machine has the Unix tools Portico's container listings expect (a POSIX `sh`
+/// on `PATH`, Docker and Podman from the system's packages): not here, where `podman.exe`
+/// runs directly and Docker Desktop and Podman Desktop provide the programs.
+pub const UNIX_TOOLS: bool = false;
+
+/// The signals that end a session, which Portico treats alike: the console's Ctrl+C and
+/// Ctrl+Break reach the C runtime as these. Windows has no hang-up signal.
+pub const HANGUP_SIGNALS: &[i32] = &[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM];
+
+/// A process's exit status as Portico's: its code, which no signal ever replaces on Windows.
+/// `None` when that is not a valid exit code (above 255, or an `NTSTATUS` such as a crash).
+pub fn exit_code(status: ExitStatus) -> Option<u8> {
+    status.code().and_then(|code| u8::try_from(code).ok())
+}
+
+/// The status of a process that exited with `code`.
+#[cfg(test)]
+pub fn exit_status(code: i32) -> ExitStatus {
+    std::os::windows::process::ExitStatusExt::from_raw(code as u32)
+}
+
+/// Puts the process `command` starts in a console process group of its own, out of reach of
+/// the console's Ctrl+C.
+pub fn own_group(command: &mut Command) -> &mut Command {
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP)
+}
+
+/// A command that runs `program`, a path or a name looked up on `PATH` in its order, as on
+/// Unix. Windows' own search tries its system folders before `PATH`, so a copy there (GitHub's
+/// runners keep a `docker.exe` in `System32`) would shadow the program the user put on `PATH`.
+/// A name found nowhere on `PATH` is left to Windows' search.
+pub fn command(program: impl AsRef<OsStr>) -> Command {
+    let program = program.as_ref();
+    Command::new(
+        on_path(program, std::env::var_os("PATH").as_deref()).unwrap_or_else(|| program.into()),
+    )
+}
+
+/// The first `program` (with `.exe` appended when it has no extension, as the standard library
+/// does) in the directories of `path`, when `program` is a bare name.
+fn on_path(program: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name = Path::new(program);
+    if name.components().count() != 1
+        || !matches!(name.components().next(), Some(Component::Normal(_)))
+    {
+        return None;
+    }
+    let file = if name.extension().is_some() {
+        name.to_path_buf()
+    } else {
+        name.with_extension("exe")
+    };
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Makes the process `command` starts independent of this one's console, so it outlives
+/// Portico and the console window, and holds none of this process's standard handles (the
+/// caller sets the child's own).
+///
+/// The process gets a console of its own that is never shown (`CREATE_NO_WINDOW`), in its own
+/// process group, so Ctrl+C in Portico's console does not reach it. It is not started without
+/// a console (`DETACHED_PROCESS`, with which Windows ignores `CREATE_NO_WINDOW`): a console
+/// program it starts in turn, such as a `ProxyCommand` or the `ssh -W` of a `ProxyJump`,
+/// inherits the hidden console instead of opening a visible window that would end the tunnel
+/// when closed.
+pub fn detach(command: &mut Command) -> &mut Command {
+    keep_standard_handles();
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+}
+
+/// Stops this process's standard handles from being inherited. The standard library creates
+/// every process with handle inheritance on, so a long-lived child would otherwise inherit
+/// them when they are inheritable (a pipe Portico's output goes to, under `| jq` or a test
+/// harness), and the reader would never see the end of the output. Children given
+/// `Stdio::inherit` are unaffected: the standard library hands them a fresh inheritable
+/// duplicate of the handle at each spawn (`Stdio::to_handle` in its
+/// `sys/process/windows.rs`: `io.duplicate(0, true, DUPLICATE_SAME_ACCESS)`).
+pub(in crate::platform) fn keep_standard_handles() {
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` has no preconditions, and `SetHandleInformation` only
+        // changes the flags of a handle this process holds. A failure leaves the handle as it
+        // was, which is no worse.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// The current user.
+pub fn current_uid() -> Uid {
+    // Reading this process's own token cannot fail in practice; an empty SID would match no
+    // process.
+    // SAFETY: `GetCurrentProcess` has no preconditions; its pseudo handle needs no closing.
+    proc::user_sid(unsafe { GetCurrentProcess() }).unwrap_or_default()
+}
+
+/// The user the process acts as: on Windows the same as `current_uid`.
+pub fn effective_uid() -> Uid {
+    current_uid()
+}
+
+/// Whether `child` has exited. Windows keeps an exited process for as long as a handle to it
+/// is open, which `child` holds, so its ID cannot be reused meanwhile.
+pub fn has_exited(child: &Child) -> io::Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::{WAIT_FAILED, WAIT_OBJECT_0},
+        System::Threading::WaitForSingleObject,
+    };
+    // SAFETY: waiting with no timeout only reads the state of the handle `child` owns.
+    match unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        _ => Ok(false),
+    }
+}
+
+/// Ends the process group `own_group` gave `child` (its process tree on Windows) and waits for
+/// `child`.
+pub fn terminate_process_group(child: &mut Child) {
+    if kill_process_tree(child.id()).is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+pub fn kill_direct_child(child: &mut Child) -> io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(_) if has_exited(child).unwrap_or(false) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// How long a stopped tunnel has to exit once it was terminated.
+pub const TERM_GRACE_MS: u32 = 3000;
+
+/// Ends `pid`, with its descendants, if `verify` still recognises it once a pin holds it.
+/// Returns whether it was ended. Because the pin is taken before `verify` runs, and a pinned
+/// process is never ended once it has exited, a process that passes `verify` is the one the
+/// pin refers to (and the pin keeps its ID from passing to another while the tree is ended).
+/// Windows' ssh has no graceful stop Portico can ask of a detached process, and a tunnel holds
+/// nothing to flush, so the process is terminated at once; terminated, ssh cannot end what it
+/// started (a ProxyCommand, such as the `ssh -W` of a jump host), so that ends with it.
+pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool> {
+    let pin = match open_pin(pid) {
+        Ok(pin) => pin,
+        Err(error) if is_gone(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !verify() {
+        return Ok(false);
+    }
+    match kill_process_tree(pid) {
+        Ok(()) => {}
+        Err(error) if is_gone(&error) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    pin.wait_exit(TERM_GRACE_MS);
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::super::super::common::process::terminate_process_tree;
+    use super::pin::Pin;
+    use super::proc::process_table;
+    use super::*;
+
+    /// A process that runs for half a minute unless it is ended, with `marker` on its command
+    /// line.
+    fn long_lived(marker: &str) -> Child {
+        quiet(Command::new("cmd").raw_arg(format!("/c ping -n 30 127.0.0.1 >nul & rem {marker}")))
+    }
+
+    /// Spawns `command` holding none of the test's standard handles, so a `ping` left running
+    /// by a test that ends only `cmd` keeps no output of the test open.
+    fn quiet(command: &mut Command) -> Child {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn end(mut child: Child) {
+        let _ = terminate_process_tree(&mut child);
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Run by `a_detached_child_does_not_hold_the_output_of_its_parent` as a separate process
+    /// whose standard output is a pipe: starts a detached `ping` and prints its PID.
+    #[test]
+    #[ignore = "a helper process of another test"]
+    fn detached_child_helper() {
+        if std::env::var_os("PORTICO_DETACH_HELPER").is_none() {
+            return;
+        }
+        // Left running on purpose: the other test checks it outlives this helper.
+        #[allow(clippy::zombie_processes)]
+        let child = detach(Command::new("ping").args(["-n", "30", "127.0.0.1"]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        println!("detached pid {}", child.id());
+    }
+
+    #[test]
+    fn a_detached_child_does_not_hold_the_output_of_its_parent() {
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::windows::process::tests::detached_child_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PORTICO_DETACH_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = helper.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = sender.send(text);
+        });
+        // The output ends when the helper exits, unless the detached ping holds the pipe for
+        // its 30 seconds.
+        let text = receiver.recv_timeout(Duration::from_secs(15));
+        let _ = helper.wait();
+        let pid = text.as_ref().ok().and_then(|text| {
+            // The test harness prints the helper's name on the same line first.
+            text.lines()
+                .find_map(|line| line.split_once("detached pid "))
+                .and_then(|(_, pid)| pid.trim().parse::<u32>().ok())
+        });
+        if let Some(pid) = pid {
+            let _ = kill_process_tree(pid);
+        }
+        let text = text.expect("the detached child kept its parent's output open");
+        assert!(pid.is_some(), "the helper did not start the child: {text}");
+    }
+
+    /// Run by `a_detached_child_has_a_console_of_its_own` as the detached process: writes to
+    /// the file `PORTICO_CONSOLE_HELPER` names whether it is attached to a console.
+    #[test]
+    #[ignore = "a helper process of another test"]
+    fn detached_console_helper() {
+        let Some(path) = std::env::var_os("PORTICO_CONSOLE_HELPER") else {
+            return;
+        };
+        // A console created with `CREATE_NO_WINDOW` has no window (`GetConsoleWindow` is null),
+        // so being attached to one is read from its process list, which fails without one.
+        let mut processes = [0u32; 8];
+        // SAFETY: the buffer holds the number of entries passed.
+        let attached = unsafe {
+            windows_sys::Win32::System::Console::GetConsoleProcessList(
+                processes.as_mut_ptr(),
+                processes.len() as u32,
+            )
+        };
+        let text = if attached == 0 { "none" } else { "console" };
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A detached tunnel ssh has a (hidden) console, so the console programs it starts (a
+    /// `ProxyCommand`, a `ProxyJump`'s `ssh -W`) share it instead of opening a window.
+    #[test]
+    fn a_detached_child_has_a_console_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("console");
+        let mut child = detach(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::windows::process::tests::detached_console_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("PORTICO_CONSOLE_HELPER", &report),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "console");
+    }
+
+    #[test]
+    fn programs_are_found_on_path_in_its_order() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(second.path().join("tool.exe"), "").unwrap();
+        std::fs::write(second.path().join("tool.cmd"), "").unwrap();
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let found = |program: &str| on_path(OsStr::new(program), Some(&path));
+        assert_eq!(found("tool"), Some(second.path().join("tool.exe")));
+        assert_eq!(found("tool.cmd"), Some(second.path().join("tool.cmd")));
+        std::fs::write(first.path().join("tool.exe"), "").unwrap();
+        assert_eq!(found("tool"), Some(first.path().join("tool.exe")));
+        assert_eq!(found("missing"), None);
+        // A path is run as it is.
+        assert_eq!(found(r"sub\tool"), None);
+        assert_eq!(found(r"C:\tool"), None);
+        assert_eq!(on_path(OsStr::new("tool"), None), None);
+    }
+
+    #[test]
+    fn exit_codes_above_255_are_failures() {
+        assert_eq!(exit_code(exit_status(0)), Some(0));
+        assert_eq!(exit_code(exit_status(255)), Some(255));
+        assert_eq!(exit_code(exit_status(256)), None);
+        // STATUS_CONTROL_C_EXIT, as a process ended by Ctrl+C reports it.
+        assert_eq!(exit_code(exit_status(0xC000013A_u32 as i32)), None);
+    }
+
+    #[test]
+    fn proc_reads_own_command_line() {
+        let child = long_lived("portico-marker-7f3a");
+        let proc = Proc::system();
+        let args = proc.cmdline(child.id()).unwrap();
+        assert!(
+            args.iter().any(|arg| arg == b"portico-marker-7f3a"),
+            "{args:?}"
+        );
+        assert_eq!(proc.uid(child.id()), Some(current_uid()));
+        assert!(current_uid().starts_with("S-1-"), "{}", current_uid());
+        assert!(proc.pids().contains(&child.id()));
+        end(child);
+    }
+
+    #[test]
+    fn stat_start_is_stable_and_differs_between_processes() {
+        let (first, second) = (long_lived("first"), long_lived("second"));
+        let proc = Proc::system();
+        let stat = proc.stat(first.id()).unwrap();
+        assert_eq!(stat.state, 'R');
+        assert_eq!(proc.stat(first.id()), Some(stat));
+        assert_ne!(proc.stat(second.id()).unwrap().start, stat.start);
+        end(first);
+        end(second);
+    }
+
+    #[test]
+    fn started_at_is_close_to_now() {
+        let child = long_lived("started");
+        let proc = Proc::system();
+        let start = proc.stat(child.id()).unwrap().start;
+        let started = proc.started_at(start).unwrap();
+        assert!(started.abs_diff(now()) < 60, "{started}");
+        end(child);
+    }
+
+    #[test]
+    fn boot_id_is_read_and_stable() {
+        let proc = Proc::system();
+        let boot = proc.boot_id().expect("the registry's BootId");
+        assert!(boot.parse::<u32>().is_ok(), "{boot}");
+        assert_eq!(proc.boot_id(), Some(boot));
+    }
+
+    #[test]
+    fn an_unreadable_boot_id_falls_back_to_a_fixed_token() {
+        let proc = Proc::without_boot_id();
+        assert_eq!(proc.boot_id().as_deref(), Some(proc::FALLBACK_BOOT_ID));
+        assert_eq!(proc.boot_id(), proc.boot_id());
+    }
+
+    /// A `cmd` running a long `ping`.
+    fn cmd_with_ping() -> Child {
+        quiet(Command::new("cmd").raw_arg("/c ping -n 30 127.0.0.1 >nul"))
+    }
+
+    /// A pin on the `ping` that `cmd`, from `cmd_with_ping`, runs.
+    fn ping_of(cmd: &Child) -> Pin {
+        let proc = Proc::system();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // cmd starts ping a moment after it starts; the console host may be a child too.
+        loop {
+            let ping = process_table().unwrap().into_iter().find(|&(pid, parent)| {
+                parent == cmd.id()
+                    && proc
+                        .cmdline(pid)
+                        .is_some_and(|args| args.iter().any(|arg| arg == b"127.0.0.1"))
+            });
+            if let Some((pid, _)) = ping {
+                return Pin::open(pid).unwrap();
+            }
+            assert!(Instant::now() < deadline, "ping never started");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn kill_process_tree_ends_children() {
+        let mut child = cmd_with_ping();
+        let ping = ping_of(&child);
+        terminate_process_tree(&mut child).unwrap();
+        assert!(ping.wait_exit(5000), "the grandchild survived");
+    }
+
+    #[test]
+    fn stop_process_ends_the_children_too() {
+        let mut child = cmd_with_ping();
+        let ping = ping_of(&child);
+        assert!(stop_process(child.id(), || true).unwrap());
+        assert!(has_exited(&child).unwrap());
+        assert!(ping.wait_exit(5000), "the child survived");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn stop_process_refuses_when_verify_fails() {
+        let mut child = long_lived("stop");
+        assert!(!stop_process(child.id(), || false).unwrap());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "an unverified process was ended"
+        );
+        assert!(stop_process(child.id(), || true).unwrap());
+        assert!(has_exited(&child).unwrap());
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn pin_reports_an_exited_process_as_gone() {
+        let mut child = long_lived("pin");
+        let pin = Pin::open(child.id()).unwrap();
+        assert!(!pin.wait_exit(0), "a running process counted as exited");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(child);
+        // With `child` gone, the pin alone holds the process and its ID.
+        assert!(pin.wait_exit(2000), "the exit was not seen");
+        assert!(is_gone(&pin.terminate().unwrap_err()));
+    }
+}

@@ -6,7 +6,6 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -24,6 +23,9 @@ use crate::{
         IdentityInventory, InventoryAgent, InventoryFile, PublicKey, Socket,
     },
     domain::openssh::{OpenSsh, OpenSshError, ResolvedConfig},
+    platform::fs::is_agent_endpoint,
+    platform::paths::DEFAULT_AGENT,
+    platform::process::current_uid,
 };
 
 /// How long `ssh-add` or `ssh-keygen` may run before it is killed.
@@ -32,8 +34,9 @@ pub(crate) const TOOL_DEADLINE: Duration = Duration::from_secs(3);
 /// What one `App` has learnt about identities: the defaults once, each agent's listing once,
 /// and each public key file's fingerprint once, until `App::forget_identities`.
 pub(crate) struct IdentityState {
-    /// Replaces the environment's `SSH_AUTH_SOCK` when set. Unit tests start with no agent, so
-    /// the developer's own agent never shows up in their results.
+    /// Replaces the environment's `SSH_AUTH_SOCK` (or the system's default agent) when set.
+    /// Unit tests start with no agent, so the developer's own agent never shows up in their
+    /// results.
     auth_sock: Option<Option<String>>,
     defaults: OnceLock<Option<Vec<String>>>,
     /// One slot per socket. Its own lock is held while the agent is asked, so a second caller
@@ -57,9 +60,18 @@ impl Default for IdentityState {
 
 impl IdentityState {
     fn env(&self, name: &str) -> Option<String> {
+        if name == "SSH_AUTH_SOCK" {
+            return self.session_agent().map(|(socket, _)| socket);
+        }
+        std::env::var(name).ok()
+    }
+
+    /// The agent ssh uses when a host names none, and whether `SSH_AUTH_SOCK` names it: without
+    /// the variable, ssh uses the system's default agent, if it has one (`false`).
+    fn session_agent(&self) -> Option<(String, bool)> {
         match &self.auth_sock {
-            Some(socket) if name == "SSH_AUTH_SOCK" => socket.clone(),
-            _ => std::env::var(name).ok(),
+            Some(socket) => socket.clone().map(|socket| (socket, true)),
+            None => session_agent(std::env::var("SSH_AUTH_SOCK").ok(), DEFAULT_AGENT),
         }
     }
 
@@ -74,6 +86,15 @@ impl IdentityState {
     fn deadline(&self) -> Duration {
         self.deadline.unwrap_or(TOOL_DEADLINE)
     }
+}
+
+/// The socket `variable` (`SSH_AUTH_SOCK`'s value) names (`true`), or else the system's
+/// `default` agent (`false`).
+fn session_agent(variable: Option<String>, default: Option<&str>) -> Option<(String, bool)> {
+    variable
+        .filter(|value| !value.is_empty())
+        .map(|socket| (socket, true))
+        .or_else(|| default.map(|socket| (socket.to_owned(), false)))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -123,15 +144,13 @@ fn list_agent(openssh: &OpenSsh, socket: &Path, deadline: Duration) -> Agent {
         provider,
         reason,
     };
-    match fs::metadata(socket) {
+    match is_agent_endpoint(socket) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return unavailable(AgentProblem::NoSuchSocket);
         }
         Err(error) => return unavailable(AgentProblem::Refused(error.to_string())),
-        Ok(metadata) if !metadata.file_type().is_socket() => {
-            return unavailable(AgentProblem::NotASocket);
-        }
-        Ok(_) => {}
+        Ok(false) => return unavailable(AgentProblem::NotASocket),
+        Ok(true) => {}
     }
     let mut command = Command::new(openssh.ssh_add_program());
     command
@@ -273,8 +292,7 @@ impl App {
         let context = Expansion {
             home: self.home(),
             local_user: &user,
-            // SAFETY: `getuid` has no preconditions and cannot fail.
-            uid: unsafe { libc::getuid() },
+            uid: current_uid().to_string(),
             hostname: &resolved.hostname,
             remote_user: &remote_user,
             port: resolved.port.unwrap_or(22),
@@ -342,15 +360,14 @@ impl App {
         let hosts = self.hosts()?;
         let home = self.home().to_owned();
         let mut inventory = IdentityInventory::default();
-        let environment = self
+        let session = self
             .identities
-            .env("SSH_AUTH_SOCK")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        if let Some(socket) = &environment {
+            .session_agent()
+            .filter(|(socket, _)| !socket.is_empty());
+        if let Some((socket, environment)) = session {
             inventory.agents.push(InventoryAgent {
-                agent: self.agent(Socket::Path(socket.clone())),
-                environment: true,
+                agent: self.agent(Socket::Path(PathBuf::from(socket))),
+                environment,
                 used_by: Vec::new(),
             });
         }
@@ -509,21 +526,27 @@ fn public_keys_in(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::domain::identity::MissingReason;
     use crate::{
-        domain::identity::{Availability, MissingReason},
+        domain::identity::Availability,
         domain::managed::{ConfigPaths, ManagedStore},
         test_executable::write_executable,
     };
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
     use std::time::Instant;
     use tempfile::TempDir;
 
     struct Fixture {
+        #[cfg_attr(windows, allow(dead_code))]
         dir: TempDir,
         app: App,
     }
 
     impl Fixture {
+        #[cfg(unix)]
         fn path(&self, name: &str) -> PathBuf {
             self.dir.path().join(name)
         }
@@ -554,11 +577,14 @@ mod tests {
             .with_ssh_add(add)
             .with_keygen(keygen);
         let mut app = App::new(ManagedStore::new(ConfigPaths::from_home(&home)), openssh);
-        app.identities = IdentityState::with_deadline(Duration::from_millis(500));
+        // Shorter than the real deadline, so a listing that never answers ends soon, yet long
+        // enough for a shell fake to answer on a busy machine.
+        app.identities = IdentityState::with_deadline(Duration::from_secs(2));
         Fixture { dir, app }
     }
 
     /// What a public key file starts with.
+    #[cfg(unix)]
     const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 test\n";
 
     fn resolved(text: &str) -> ResolvedConfig {
@@ -587,12 +613,30 @@ mod tests {
         config
     }
 
+    #[cfg(unix)]
     fn socket(fixture: &Fixture) -> (PathBuf, UnixListener) {
         let path = fixture.path("agent.sock");
         let listener = UnixListener::bind(&path).unwrap();
         (path, listener)
     }
 
+    #[test]
+    fn the_session_agent_is_the_variable_s_or_else_the_system_default() {
+        let pipe = r"\\.\pipe\openssh-ssh-agent";
+        assert_eq!(
+            session_agent(Some("/run/agent".into()), Some(pipe)),
+            Some(("/run/agent".into(), true))
+        );
+        for unset in [None, Some(String::new())] {
+            assert_eq!(
+                session_agent(unset.clone(), Some(pipe)),
+                Some((pipe.into(), false))
+            );
+            assert_eq!(session_agent(unset, None), None);
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn classifies_a_hosts_identities_against_its_agent() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -638,6 +682,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_listing_is_asked_once_per_socket_until_forgotten() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -660,6 +705,7 @@ mod tests {
         assert_eq!(fs::read_to_string(log.path()).unwrap(), "asked\nasked\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_listing_past_the_deadline_is_killed() {
         let pid = tempfile::NamedTempFile::new().unwrap();
@@ -690,6 +736,7 @@ mod tests {
         assert!(!alive, "ssh-add {pid} is still running");
     }
 
+    #[cfg(unix)]
     #[test]
     fn reports_missing_sockets_and_refusals_without_listing() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -765,6 +812,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn never_fingerprints_a_private_key() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -813,6 +861,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn inventory_merges_hosts_ssh_keys_and_agents() {
         let fixture = fixture(
