@@ -38,6 +38,28 @@ e2e() {
     cargo test --test e2e -- --ignored
 }
 
+# TEMPORARY DIAGNOSTIC (Ruling G): how often the unit tests' process group is sent SIGHUP,
+# with and without the tunnel start cancellation test.
+diag_rounds() {
+    local phase round skip code out
+    out=$(mktemp)
+    for phase in without with; do
+        skip=
+        [ "$phase" = without ] && skip=cancelling_a_start_kills_ssh_and_its_proxy_child
+        for round in 1 2 3 4 5 6 7 8; do
+            set -m
+            cargo test --lib -q -- ${skip:+--skip "$skip"} >"$out" 2>&1 </dev/null &
+            local job=$!
+            set +m
+            code=0
+            wait "$job" || code=$?
+            echo "DIAG $phase the cancellation test, round $round: exit $code"
+            [ "$code" = 0 ] || tail -n 5 "$out"
+        done
+    done
+    rm -f -- "$out"
+}
+
 # The test suite. On macOS the tests write to a file the step prints as it grows, not to the
 # step's own output, and get TEST_LIMIT seconds (300 by default) once built: a test that hangs,
 # or a process that never exits while holding the output, then ends the step with the tests
@@ -48,37 +70,11 @@ tests() {
         return
     fi
     cargo test --all-targets --no-run
+    diag_rounds
     local log status=0 waited=0 limit=${TEST_LIMIT:-300}
     log=$(mktemp)
-    # TEMPORARY DIAGNOSTIC (Ruling G): who sends the tests' process group SIGHUP.
-    echo "DIAG step shell $$, terminal: $(tty 2>&1)"
-    ps -U "$(id -u)" -o pid,ppid,pgid,sess,tpgid,tt,stat,command
     set -m
-    (
-        perl -MPOSIX=:signal_h -e '
-            my $action = POSIX::SigAction->new(sub {
-                my ($signal, $info) = @_;
-                printf STDERR "DIAG SIGHUP from pid %s (code %s, uid %s)\n",
-                    $info->{pid}, $info->{code}, $info->{uid};
-                my $columns = "pid,ppid,pgid,sess,tpgid,tt,stat,etime,command";
-                print STDERR `ps -o $columns -p $info->{pid}`;
-                print STDERR `ps -U $< -o $columns`;
-                exit 0;
-            }, POSIX::SigSet->new, SA_SIGINFO);
-            $action->safe(0);
-            sigaction(SIGHUP, $action) or die "sigaction: $!";
-            sleep 1 while 1;
-        ' &
-        sentinel=$!
-        for round in 1 2 3 4 5 6 7 8; do
-            echo "DIAG round $round"
-            cargo test --lib -- --test-threads=1
-            code=$?
-            [ "$code" = 0 ] || break
-        done
-        kill "$sentinel"
-        exit "$code"
-    ) >"$log" 2>&1 </dev/null &
+    cargo test --all-targets --no-fail-fast >"$log" 2>&1 </dev/null &
     local tests=$!
     set +m
     tail -n +1 -f "$log" &
@@ -96,10 +92,6 @@ tests() {
     fi
     wait "$tests" || status=$?
     sleep 1
-    if [ "$status" -gt 128 ]; then
-        echo "DIAG the tests ended by signal $((status - 128)); processes:"
-        ps -U "$(id -u)" -o pid,ppid,pgid,sess,tpgid,tt,stat,etime,command
-    fi
     kill "$tail" 2>/dev/null || true
     rm -f -- "$log"
     return "$status"
