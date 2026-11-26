@@ -11,10 +11,12 @@ use docker::Docker;
 use podman::Podman;
 use proxmox::Proxmox;
 
-pub use listing::{Container, Group, Listing, ResolveError, display_name, group, resolve};
+pub use listing::{
+    Container, Group, Listing, ResolveError, display_name, group, remember_key, resolve,
+};
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Target {
     Local,
     Host(String),
@@ -91,7 +93,7 @@ pub struct ContainerList {
 }
 
 /// A container backend. Docker is the default: the backend of a held shell named without one.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum BackendId {
     #[default]
     Docker,
