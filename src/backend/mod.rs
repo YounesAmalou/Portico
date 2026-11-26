@@ -59,8 +59,6 @@ impl Via {
 /// Runs bash when the container has it, and sh otherwise.
 pub const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
 
-/// Quotes one word for a POSIX shell: words made only of safe characters
-/// stay as they are, anything else is single-quoted.
 /// How to install `engine` (Docker, Podman) for `target`: from the distribution's packages,
 /// or, on this machine where it has no Unix tools (Windows), with its desktop app.
 pub(crate) fn install_hint(engine: &str, target: &Target) -> String {
@@ -75,6 +73,8 @@ fn install_hint_with(engine: &str, target: &Target, unix_tools: bool) -> String 
     }
 }
 
+/// Quotes one word for a POSIX shell: words made only of safe characters
+/// stay as they are, anything else is single-quoted.
 pub fn quote(word: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
     if !word.is_empty() && word.chars().all(safe) {

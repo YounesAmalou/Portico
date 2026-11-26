@@ -283,10 +283,11 @@ fn write_named_new(path: &Path, contents: &[u8]) -> io::Result<()> {
 ///
 /// `MoveFileExW` with write-through comes first, so the move has reached the disk when it
 /// returns. It refuses with "access denied" a target that is open (even by a reader sharing
-/// its deletion) or read-only; the standard library's rename then retries with POSIX
-/// semantics, which replace such a target the way Unix does. A target held open without
-/// sharing its deletion (an antivirus scan, say) still refuses; that is retried for up to a
-/// second before the error is reported.
+/// its deletion); the standard library's rename then retries with POSIX semantics, which
+/// replace such a target the way Unix does. A read-only target is refused by both (the
+/// standard library does not ask to ignore the read-only attribute), as is a target held open
+/// without sharing its deletion (an antivirus scan, say); either is retried for up to a second
+/// before the error is reported.
 pub(in crate::platform) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     let from_wide = wide(from)?;
     let to_wide = wide(to)?;
