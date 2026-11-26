@@ -78,6 +78,15 @@ if [ "$(uname -s)" = Darwin ]; then
     TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)/
     export TMPDIR
 fi
+# Windows often names the temporary directory by its short 8.3 name (C:\Users\RUNNER~1\...),
+# and resolving a path gives the long one, so the tests get the long spelling from the start.
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        TMP=$(cygpath --windows --long-name "${TMP:-/tmp}")
+        TEMP=$TMP
+        export TMP TEMP
+        ;;
+esac
 
 [ $# -eq 1 ] || usage
 case "$1" in
