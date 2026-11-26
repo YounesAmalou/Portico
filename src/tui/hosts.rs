@@ -912,10 +912,11 @@ fn push_rows(text: &mut String, rows: &[DetailRow]) {
 /// conflicts, and `ssh -G` reports `~` paths already expanded against `home`.
 fn declared_in_effect(declared: &DetailRow, effective: &DetailRow, home: &Path) -> bool {
     declared.values.iter().all(|value| {
-        effective
-            .values
-            .iter()
-            .any(|used| used == value || *used == crate::platform::paths::expand(value, home))
+        effective.values.iter().any(|used| {
+            // As paths, so that `\` and `/` (both of which `ssh -G` may print on Windows) match.
+            used == value
+                || Path::new(used) == Path::new(&crate::platform::paths::expand(value, home))
+        })
     })
 }
 
@@ -1015,12 +1016,12 @@ mod tests {
                 format!("Include ~/.ssh/portico/config\nInclude missing.conf\n{external}"),
             )
             .unwrap();
+            // An ssh that fails, on every system.
+            let ssh = dir.path().join("ssh");
+            crate::test_executable::write_executable(&ssh, "#!/bin/sh\nexit 1\n");
             let app = App::new(
                 store,
-                crate::domain::openssh::OpenSsh::new(
-                    "/usr/bin/false".into(),
-                    "/usr/bin/false".into(),
-                ),
+                crate::domain::openssh::OpenSsh::new(ssh, "/usr/bin/false".into()),
             );
             let mut state = UiState::new(app.hosts().unwrap(), false);
 
@@ -1263,6 +1264,13 @@ mod tests {
             &DetailRow::new("IdentityFile", ["~/.ssh/other".to_owned()]),
             &effective,
             home
+        ));
+        // Windows' `ssh -G` may print the home with `\` and the rest with `/`.
+        #[cfg(windows)]
+        assert!(declared_in_effect(
+            &declared,
+            &DetailRow::new("IdentityFile", [r"C:\Users\me/.ssh/id".to_owned()]),
+            Path::new(r"C:\Users\me")
         ));
     }
 
