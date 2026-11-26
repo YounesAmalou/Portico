@@ -553,7 +553,7 @@ VMID       Status     Lock         Name                \n\
                 "id",
                 &format!("case \"$1\" in -u) echo {uid} ;; -un) echo deploy ;; esac"),
             );
-            let output = std::process::Command::new("/bin/sh")
+            let output = std::process::Command::new(crate::test_executable::posix_sh())
                 .args(["-c", LIST_SCRIPT])
                 .env("PATH", dir.path())
                 .output()

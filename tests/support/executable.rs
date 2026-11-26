@@ -10,7 +10,7 @@
 //!
 //! Windows runs only `.exe` files: the script goes to `<path>.sh` and a small
 //! launcher (`sh_shim.rs`, compiled with `rustc` on first use) to `<path>.exe`,
-//! which runs the script with `sh`. Running a program by name or by its path
+//! which runs the script with `sh`, the arguments passed through a prelude at its top. Running a program by name or by its path
 //! without the extension finds the `.exe`.
 
 #[cfg(windows)]
@@ -35,6 +35,29 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
+/// The POSIX `sh` that runs the fakes: `/bin/sh`, or on Windows the one `sh_shim` uses (the
+/// `SH` variable, else Git for Windows' own).
+#[allow(dead_code, reason = "only some tests run a script themselves")]
+pub fn posix_sh() -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("SH").map_or_else(|| r"C:\Program Files\Git\bin\sh.exe".into(), Into::into)
+    } else {
+        "/bin/sh".into()
+    }
+}
+
+/// Removes the executable script `write_executable` made at `path`.
+#[allow(dead_code, reason = "only some tests remove a fake")]
+pub fn remove_executable(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    fs::remove_file(path).unwrap();
+    #[cfg(windows)]
+    for suffix in [".exe", ".sh"] {
+        fs::remove_file(with_suffix(path, suffix)).unwrap();
+    }
+}
+
 /// Creates or replaces the executable script at `path`.
 #[cfg(unix)]
 pub fn write_executable(path: impl AsRef<Path>, contents: &str) {
@@ -58,12 +81,36 @@ pub fn write_executable(path: impl AsRef<Path>, contents: &str) {
 #[cfg(windows)]
 pub fn write_executable(path: impl AsRef<Path>, contents: &str) {
     let path = path.as_ref();
-    fs::write(with_suffix(path, ".sh"), contents).unwrap();
+    // The prelude goes after the `#!` line, before the script's first command.
+    let (shebang, body) = match contents.strip_prefix("#!") {
+        Some(_) => contents.split_at(contents.find('\n').map_or(contents.len(), |end| end + 1)),
+        None => ("", contents),
+    };
+    fs::write(
+        with_suffix(path, ".sh"),
+        format!("{shebang}{SHIM_PRELUDE}{body}"),
+    )
+    .unwrap();
     let launcher = with_suffix(path, ".exe");
     if !launcher.exists() {
         fs::copy(shim(), &launcher).unwrap();
     }
 }
+
+/// Rebuilds `"$@"` from the arguments `sh_shim` passes in the environment, and removes them
+/// from it, so that a fake the script starts gets only its own; restores the `HOME` the shim
+/// was given.
+#[cfg(windows)]
+const SHIM_PRELUDE: &str = r#"if [ -n "${PORTICO_SHIM_HOME+set}" ]; then HOME=$PORTICO_SHIM_HOME; fi
+unset PORTICO_SHIM_HOME
+portico_shim_i=1
+while [ "$portico_shim_i" -le "${PORTICO_SHIM_ARGC:-0}" ]; do
+  eval "set -- \"\$@\" \"\$PORTICO_SHIM_ARG_$portico_shim_i\""
+  unset "PORTICO_SHIM_ARG_$portico_shim_i"
+  portico_shim_i=$((portico_shim_i + 1))
+done
+unset portico_shim_i PORTICO_SHIM_ARGC
+"#;
 
 /// `path` with `suffix` appended, keeping any dot already in its name.
 #[cfg(windows)]

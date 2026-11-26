@@ -342,11 +342,14 @@ mod tests {
         };
         assert_eq!(
             detail_lines(&identities, Path::new("/home/me")),
-            "Agent        1Password · 2 keys  ~/.1password/agent.sock\n\
+            format!(
+                "Agent        1Password · 2 keys  {}\n\
              IdentityFile ~/.ssh/github.pub  ✓ in agent  GitHub\n\
              \x20            ~/.ssh/id_work  ✗ missing (no such file)\n\
              \x20            ~/.ssh/%C  ? unchecked (Portico does not expand %C)\n\
-             Also offered SHA256:abcdefgh…\n"
+             Also offered SHA256:abcdefgh…\n",
+                crate::platform::paths::shown("~/.1password/agent.sock")
+            )
         );
     }
 

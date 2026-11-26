@@ -531,6 +531,7 @@ pub(super) fn format_warning(warning: &DiscoveryWarning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::shown;
 
     #[test]
     fn field_change_rejects_setting_and_unsetting_together() {
@@ -627,11 +628,12 @@ mod tests {
         assert_eq!(
             shown_details(Some(identities)),
             format!(
-                "{before}Agent: 1Password, ~/.1password/agent.sock, 2 keys\n\
+                "{before}Agent: 1Password, {}, 2 keys\n\
                  Identity: ~/.ssh/github.pub: in agent (ED25519 SHA256:gh \"GitHub\")\n\
                  Identity: ~/.ssh/id_work: missing (no such file)\n\
                  IdentitiesOnly: yes\n\
-                 PKCS#11 provider: /usr/lib/p11.so\n"
+                 PKCS#11 provider: /usr/lib/p11.so\n",
+                shown("~/.1password/agent.sock")
             )
         );
     }
@@ -650,14 +652,15 @@ mod tests {
             also_offered: vec![key("SHA256:vps", "VPS"), key("SHA256:x", "")],
             pkcs11_provider: None,
         };
-        let shown = shown_details(Some(identities));
+        let details = shown_details(Some(identities));
         assert!(
-            shown.ends_with(
-                "Agent: SSH agent, /run/agent, 2 keys\n\
+            details.ends_with(&format!(
+                "Agent: SSH agent, {}, 2 keys\n\
                  Identity: OpenSSH defaults: none present\n\
-                 Also offered by the agent: 2 (VPS, SHA256:x)\n"
-            ),
-            "{shown}"
+                 Also offered by the agent: 2 (VPS, SHA256:x)\n",
+                shown("/run/agent")
+            )),
+            "{details}"
         );
     }
 
@@ -708,16 +711,20 @@ mod tests {
         print_inventory(&mut output, &inventory, Path::new("/home/me")).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Agents\n\
-             \x20 1Password  ~/.1password/agent.sock  2 keys  (SSH_AUTH_SOCK, used by 2 hosts)\n\
+            format!(
+                "Agents\n\
+             \x20 1Password  {}  2 keys  (SSH_AUTH_SOCK, used by 2 hosts)\n\
              \x20   ED25519  SHA256:gh   GitHub  ~/.ssh/github.pub\n\
              \x20   ED25519  SHA256:vps  VPS\n\
-             \x20 SSH agent  /run/gone  unavailable: no such socket  (used by 1 host)\n\
+             \x20 SSH agent  {}  unavailable: no such socket  (used by 1 host)\n\
              \n\
              Identity files\n\
              \x20 ~/.ssh/github.pub  in agent  used by: a, b\n\
              \x20 ~/.ssh/old         key file  used by: -\n\
-             Warning: z: could not resolve: boom\n"
+             Warning: z: could not resolve: boom\n",
+                shown("~/.1password/agent.sock"),
+                shown("/run/gone")
+            )
         );
     }
 }

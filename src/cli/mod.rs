@@ -786,15 +786,15 @@ mod tests {
     use clap::Parser;
     use tempfile::TempDir;
 
+    use crate::platform::paths::shown;
     use crate::test_executable::write_executable;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::backend::{docker::join_group_words, remote_command};
     use crate::{
         app::{App, ContainerPrograms},
-        backend::{
-            docker::{SHELL_SCRIPT, join_group_words},
-            remote_command,
-        },
+        backend::docker::SHELL_SCRIPT,
         domain::host::Host,
         domain::managed::{ConfigPaths, ManagedStore},
         domain::openssh::OpenSsh,
@@ -996,6 +996,7 @@ mod tests {
     }
 
     const LISTING: &str = r#"{"id":"aaaa1111","name":"web","image":"nginx","status":"Up"}"#;
+    #[cfg(unix)]
     const DENIED: &str = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock";
 
     /// An app whose local container programs are fakes in a temporary directory. Each fake
@@ -1045,6 +1046,7 @@ mod tests {
 
     /// Docker refuses the socket; the probe reports `me` outside the docker group until
     /// `sudo` has run, and `sg` lists once it has.
+    #[cfg(unix)]
     fn refused_until_joined(dir: &TempDir) {
         let joined = dir.path().join("joined");
         behave(dir, "docker", &format!("echo '{DENIED}' >&2\nexit 1\n"));
@@ -1060,6 +1062,7 @@ mod tests {
         behave(dir, "sg", &format!("echo '{LISTING}'\n"));
     }
 
+    #[cfg(unix)]
     fn run_containers(app: &App, answer: &[u8]) -> (ExitCode, String, String) {
         let mut output = Vec::new();
         let mut error = Vec::new();
@@ -1081,6 +1084,8 @@ mod tests {
         )
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn join_offer_accepted_runs_sudo_then_lists() {
         let (dir, app) = container_app();
@@ -1107,6 +1112,8 @@ mod tests {
         );
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn join_offer_declined_lists_options() {
         let (dir, app) = container_app();
@@ -1126,6 +1133,8 @@ mod tests {
         assert!(error.contains("\n  Or use rootless Docker: "), "{error}");
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_failed_fix_stops_without_listing_again() {
         let (dir, app) = container_app();
@@ -1145,6 +1154,8 @@ mod tests {
         );
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn start_daemon_offer_runs_systemctl_through_sudo() {
         let (dir, app) = container_app();
@@ -1397,7 +1408,7 @@ fi
             .map(|row| row.extra[0].as_str())
             .collect();
         assert_eq!(extra, ["managed", "external"]);
-        assert!(picker.seen[0].1[1].extra[1].ends_with(".ssh/config"));
+        assert!(picker.seen[0].1[1].extra[1].ends_with(&shown(".ssh/config")));
     }
 
     #[test]
@@ -1675,9 +1686,9 @@ fi
         assert_eq!(
             picker.seen[0].1,
             vec![
-                row(&["one"], &["~/.ssh/config"]),
-                row(&["two"], &["~/.ssh/config"]),
-                row(&["three"], &["~/.ssh/config"]),
+                row(&["one"], &[shown("~/.ssh/config").as_str()]),
+                row(&["two"], &[shown("~/.ssh/config").as_str()]),
+                row(&["three"], &[shown("~/.ssh/config").as_str()]),
             ]
         );
         assert!(output.contains("Adopt 2 hosts? [y/N] "), "{output}");
@@ -1694,7 +1705,9 @@ fi
 
         assert_eq!(
             output,
-            "Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            shown(
+                "Not eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            )
         );
         assert_eq!(picker.labels(0), ["one", "two", "three"]);
     }
@@ -1730,7 +1743,9 @@ fi
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         assert_eq!(
             output,
-            "No host can be adopted.\nNot eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            shown(
+                "No host can be adopted.\nNot eligible:\n  multi  ~/.ssh/config: Host line declares 2 aliases\n  other  ~/.ssh/config: Host line declares 2 aliases\n"
+            )
         );
         let (exit, output, _) = run_command(&app, &["adopt", "--all", "-y"], "", false);
         assert_eq!(exit, std::process::ExitCode::SUCCESS);

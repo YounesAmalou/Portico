@@ -146,15 +146,12 @@ mod tests {
             bind_probe(busy).unwrap_err().kind(),
             io::ErrorKind::AddrInUse
         );
-        // A listener on every address holds the port on loopback too.
+        // Unlike Unix, Windows lets a socket bind loopback on a port an ordinary listener on
+        // every address holds, and gives the more specific one the connections: ssh can listen
+        // there, so the probe finds the address free.
         let wildcard = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let port = wildcard.local_addr().unwrap().port();
-        assert_eq!(
-            bind_probe(SocketAddr::from(([127, 0, 0, 1], port)))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AddrInUse
-        );
+        assert!(bind_probe(SocketAddr::from(([127, 0, 0, 1], port))).is_ok());
         assert!(bind_probe("127.0.0.1:0".parse().unwrap()).is_ok());
     }
 

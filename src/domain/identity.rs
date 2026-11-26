@@ -881,7 +881,10 @@ mod tests {
                 keys: vec![key("SHA256:a")],
             }
             .describe(home),
-            "1Password, ~/.1password/agent.sock, 1 key"
+            format!(
+                "1Password, {}, 1 key",
+                crate::platform::paths::shown("~/.1password/agent.sock")
+            )
         );
         assert_eq!(
             Agent::Unavailable {

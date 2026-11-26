@@ -357,18 +357,22 @@ impl RunResult {
     }
 }
 
-/// A fake receives its arguments as given, its standard input, and exits with the script's
-/// code, also on Windows, where it runs through the launcher and `sh` parses its own command
-/// line.
+/// A fake receives its arguments and `HOME` as given, its standard input, and exits with the
+/// script's code, also on Windows, where it runs through the launcher, and `sh` parses its own
+/// command line and rewrites `HOME`.
 #[test]
 fn shim_passes_arguments_and_exit_code() {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
     let fake = dir.path().join("fake");
-    write_executable(&fake, "#!/bin/sh\nprintf '%s\\n' \"$@\"\ncat\nexit 7\n");
+    write_executable(
+        &fake,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$HOME\"\ncat\nexit 7\n",
+    );
     let args = ["a b", "c", "*", "it's", "\"q\"", "", "trail\\", "@x"];
     let mut child = Command::new(&fake)
         .args(args)
+        .env("HOME", dir.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -377,7 +381,10 @@ fn shim_passes_arguments_and_exit_code() {
     let output = child.wait_with_output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "a b\nc\n*\nit's\n\"q\"\n\ntrail\\\n@x\nin\n"
+        format!(
+            "a b\nc\n*\nit's\n\"q\"\n\ntrail\\\n@x\n{}\nin\n",
+            dir.path().display()
+        )
     );
     assert_eq!(output.status.code(), Some(7));
 }

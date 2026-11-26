@@ -44,24 +44,48 @@ extern "system" {
 /// Puts this process in a new job whose processes all end when its last handle closes,
 /// which is when this process ends; the children it starts join the job. The handle is
 /// deliberately never closed. Without a job the script still runs, only unguarded.
-pub fn join_own() {
+pub fn join_own() -> Option<Job> {
     // SAFETY: plain calls with valid arguments; `limits` is zeroed plain data of the
     // size passed, and a null job handle is checked.
     unsafe {
         let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
         if job.is_null() {
-            return;
+            return None;
         }
-        let mut limits: ExtendedLimits = std::mem::zeroed();
-        limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let set = SetInformationJobObject(
-            job,
-            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            (&mut limits as *mut ExtendedLimits).cast(),
-            size_of::<ExtendedLimits>() as u32,
-        );
-        if set != 0 {
-            AssignProcessToJobObject(job, GetCurrentProcess());
+        let job = Job(job);
+        if job.set_limits(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+            && AssignProcessToJobObject(job.0, GetCurrentProcess()) != 0
+        {
+            Some(job)
+        } else {
+            None
+        }
+    }
+}
+
+/// The job `join_own` made.
+pub struct Job(Handle);
+
+impl Job {
+    /// Lets the job's other processes outlive this one, as a Unix program's background
+    /// children outlive it when it exits on its own. A program that is terminated never
+    /// gets here, so its job still ends them.
+    #[allow(dead_code, reason = "not every program that includes this lets go")]
+    pub fn let_go(&self) {
+        self.set_limits(0);
+    }
+
+    fn set_limits(&self, flags: u32) -> bool {
+        // SAFETY: `limits` is zeroed plain data of the size passed, and `self.0` is a job.
+        unsafe {
+            let mut limits: ExtendedLimits = std::mem::zeroed();
+            limits.basic.limit_flags = flags;
+            SetInformationJobObject(
+                self.0,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&mut limits as *mut ExtendedLimits).cast(),
+                size_of::<ExtendedLimits>() as u32,
+            ) != 0
         }
     }
 }

@@ -2823,7 +2823,12 @@ mod tests {
             reason: "expected a boolean".into(),
         };
         let line = settings_problem(&error, Path::new("/home/test"));
-        assert!(line.contains("~/.config/portico/settings.toml"), "{line}");
+        assert!(
+            line.contains(&crate::platform::paths::shown(
+                "~/.config/portico/settings.toml"
+            )),
+            "{line}"
+        );
         assert!(!line.contains("/home/test"), "{line}");
     }
 
@@ -3473,7 +3478,12 @@ mod tests {
         let overlay = state.settings.as_ref().unwrap();
         let error = overlay.error.as_deref().unwrap();
         assert!(error.contains("line 1"), "{error}");
-        assert!(error.contains("~/.config/portico/settings.toml"), "{error}");
+        assert!(
+            error.contains(&crate::platform::paths::shown(
+                "~/.config/portico/settings.toml"
+            )),
+            "{error}"
+        );
         assert!(overlay.tabs.podman);
         assert!(rendered(&state).contains("line 1"));
         press(&mut state, KeyCode::Esc);
@@ -3568,7 +3578,9 @@ mod tests {
             )
         );
         assert!(
-            message.contains("~/.config/portico/settings.toml"),
+            message.contains(&crate::platform::paths::shown(
+                "~/.config/portico/settings.toml"
+            )),
             "{message}"
         );
         assert_eq!(

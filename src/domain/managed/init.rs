@@ -1003,12 +1003,12 @@ mod tests {
             substitute_include(entry.as_bytes(), &paths, &candidate).unwrap();
 
         assert_eq!(portico_lines, [1, 3]);
+        // Inside OpenSSH's quotes a backslash (Windows' separator) is escaped.
+        let quoted = candidate.to_string_lossy().replace('\\', "\\\\");
         assert_eq!(
             String::from_utf8(substituted).unwrap(),
             format!(
-                "Include \"{}\" first.conf\nHost unrelated\nInclude second.conf \"{}\" third.conf\n",
-                candidate.display(),
-                candidate.display()
+                "Include \"{quoted}\" first.conf\nHost unrelated\nInclude second.conf \"{quoted}\" third.conf\n"
             )
         );
     }

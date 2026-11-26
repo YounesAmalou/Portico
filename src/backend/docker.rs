@@ -836,6 +836,9 @@ mod tests {
 
     const DENIED: &str = "permission denied while trying to connect to the docker daemon socket at unix:///var/run/docker.sock";
 
+    // The tests of the probe call `list` with Unix groups, so that they run on every system;
+    // `local_windows_target_offers_nothing` covers a machine without them.
+
     #[test]
     fn a_cancelled_probe_stops_the_listing() {
         let mut run = scripted(vec![
@@ -843,7 +846,7 @@ mod tests {
             Err(RunFailure::Cancelled("cancelled")),
         ]);
         assert!(matches!(
-            Docker.list(&Target::Local, &mut run),
+            list(&Target::Local, &mut run, true),
             Err(ListFailure::Run("cancelled"))
         ));
     }
@@ -854,7 +857,7 @@ mod tests {
             Ok(exited(1, "", DENIED)),
             Err(RunFailure::Failed("ssh hiccup")),
         ]);
-        let Err(ListFailure::Issue(issue)) = Docker.list(&Target::Local, &mut run) else {
+        let Err(ListFailure::Issue(issue)) = list(&Target::Local, &mut run, true) else {
             panic!("expected an issue");
         };
         assert_eq!(issue.problem, Problem::PermissionDenied);
@@ -910,7 +913,7 @@ mod tests {
     fn join_offer_keeps_its_key_hint_and_prompt() {
         let probe = "user=me\nprocess=me\ndatabase=me wheel\ngroup=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\nsg=yes\nsystemctl=yes\n";
         let mut run = scripted(vec![Ok(exited(1, "", DENIED)), Ok(exited(0, probe, ""))]);
-        let Err(ListFailure::Issue(issue)) = Docker.list(&Target::Local, &mut run) else {
+        let Err(ListFailure::Issue(issue)) = list(&Target::Local, &mut run, true) else {
             panic!("expected an issue");
         };
         let offer = issue.offer.unwrap();
@@ -929,7 +932,7 @@ mod tests {
         let stopped = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
         let probe = "user=me\nprocess=me docker\ndatabase=me docker\ngroup=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\nsg=yes\nsystemctl=yes\n";
         let mut run = scripted(vec![Ok(exited(1, "", stopped)), Ok(exited(0, probe, ""))]);
-        let Err(ListFailure::Issue(issue)) = Docker.list(&Target::Local, &mut run) else {
+        let Err(ListFailure::Issue(issue)) = list(&Target::Local, &mut run, true) else {
             panic!("expected an issue");
         };
         let offer = issue.offer.unwrap();

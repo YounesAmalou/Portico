@@ -494,6 +494,7 @@ impl Explanation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::shown;
     use crate::{
         domain::config_error::ConfigRejection,
         domain::probe::{Route, diagnose},
@@ -553,7 +554,7 @@ mod tests {
             [
                 "dev: failed \u{2014} the server refused the login",
                 "  user:    user@127.0.0.1:22999",
-                "  offered: /tmp/portico-fixture/wrong (file)",
+                shown("  offered: /tmp/portico-fixture/wrong (file)").as_str(),
                 "  next:    check User and IdentityFile for dev, and that the public key is in the",
                 "           server's authorized_keys",
             ]
@@ -566,8 +567,8 @@ mod tests {
             render("passphrase-key", Operation::Test),
             [
                 "dev: failed \u{2014} the key needs a passphrase",
-                "  key:  /tmp/portico-fixture/pass",
-                "  next: load it with `ssh-add /tmp/portico-fixture/pass`",
+                shown("  key:  /tmp/portico-fixture/pass").as_str(),
+                shown("  next: load it with `ssh-add /tmp/portico-fixture/pass`").as_str(),
             ]
         );
     }
@@ -587,8 +588,8 @@ mod tests {
             by_hand(failure, Operation::Test),
             [
                 "dev: failed \u{2014} the key needs a passphrase",
-                "  key:  ~/.ssh/work",
-                "  next: load it with `ssh-add ~/.ssh/work`",
+                shown("  key:  ~/.ssh/work").as_str(),
+                shown("  next: load it with `ssh-add ~/.ssh/work`").as_str(),
             ]
         );
     }
@@ -605,7 +606,7 @@ mod tests {
             explain(&diagnosis, &context(&home, Operation::Test, &files)).render("dev", false),
             [
                 "dev: failed \u{2014} no key was offered",
-                "  key:  ~/.ssh/gone (does not exist)",
+                shown("  key:  ~/.ssh/gone (does not exist)").as_str(),
                 "  next: set IdentityFile for dev, or load a key in an agent",
             ]
         );
@@ -796,7 +797,7 @@ mod tests {
             render("host-key-changed", Operation::Test),
             [
                 "dev: failed \u{2014} the host key changed, which can mean an attack",
-                "  file: /tmp/portico-fixture/kh_bad:1",
+                shown("  file: /tmp/portico-fixture/kh_bad:1").as_str(),
                 "  next: once the new key is confirmed with the server's administrator, remove",
                 "        the old one with `ssh-keygen -R [127.0.0.1]:22999`",
             ]
@@ -815,7 +816,7 @@ mod tests {
             by_hand(user_file, Operation::Test),
             [
                 "dev: failed \u{2014} OpenSSH rejected the configuration",
-                "  file: ~/.ssh/config",
+                shown("  file: ~/.ssh/config").as_str(),
                 "  line: 12 (Bad configuration option: bogus)",
                 "  next: fix that line, then try again",
             ]
@@ -964,10 +965,10 @@ mod tests {
         assert_eq!(
             lines[1..],
             [
-                "  jump: file: ~/.ssh/known_hosts:7",
+                shown("  jump: file: ~/.ssh/known_hosts:7").as_str(),
                 "  next: run `portico test bastion` to check the jump host on its own",
                 "        once the new key is confirmed with the server's administrator, remove",
-                "        the old entry at ~/.ssh/known_hosts:7",
+                shown("        the old entry at ~/.ssh/known_hosts:7").as_str(),
             ]
         );
         let lines = explained(
@@ -981,9 +982,9 @@ mod tests {
         assert_eq!(
             lines[1..],
             [
-                "  jump: file: ~/.ssh/known_hosts:7",
+                shown("  jump: file: ~/.ssh/known_hosts:7").as_str(),
                 "  next: once the new key is confirmed with the server's administrator, remove",
-                "        the old entry at ~/.ssh/known_hosts:7",
+                shown("        the old entry at ~/.ssh/known_hosts:7").as_str(),
             ]
         );
     }
@@ -1028,7 +1029,7 @@ mod tests {
             explained(Failure::ConfigRejected(rejection), &[], &context),
             [
                 "dev: failed \u{2014} OpenSSH rejected the configuration",
-                "  file: ~/.config/portico/hosts.conf",
+                shown("  file: ~/.config/portico/hosts.conf").as_str(),
                 "  line: Port (Bad port '99999')",
                 "  next: change it with `portico edit web`",
             ]

@@ -411,6 +411,7 @@ mod tests {
 
     const LISTING: &str = r#"{"id":"abc123","name":"web","image":"nginx","status":"Up"}"#;
     const DENIED: &str = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: dial unix /var/run/docker.sock: connect: permission denied";
+    #[cfg(unix)]
     const DAEMON_DOWN: &str = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
     const SOCKET: &str = "/var/run/docker.sock";
 
@@ -504,6 +505,7 @@ mod tests {
     }
 
     const ALL_TOOLS: &str = "sg=yes\\nnewgrp=yes\\nsystemctl=yes\\n";
+    #[cfg(unix)]
     const NO_TOOLS: &str = "sg=no\\nnewgrp=no\\nsystemctl=no\\n";
 
     fn fails_with(message: &str) -> String {
@@ -946,7 +948,7 @@ mod tests {
     #[test]
     fn a_local_podman_shell_without_podman_is_not_installed() {
         let fixture = fixture();
-        fs::remove_file(fixture.path("podman")).unwrap();
+        crate::test_executable::remove_executable(fixture.path("podman"));
 
         let issue = match fixture.app.container_shell(
             &Target::Local,
@@ -1056,6 +1058,8 @@ mod tests {
         ));
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_session_older_than_the_group_reruns_the_listing_through_sg() {
         let fixture = fixture();
@@ -1125,21 +1129,27 @@ mod tests {
         );
         assert_eq!(issue.stderr, format!("{DENIED}\n"));
 
-        fixture.behave("docker", &fails_with(DENIED));
-        fixture.behave("sh", &probe_output("me", "no", SOCKET, "root", ALL_TOOLS));
-        let issue = docker_issue(fixture.app.containers(
-            &Target::Local,
-            &backend::AUTOMATIC,
-            false,
-            None,
-        ));
-        assert_eq!(
-            issue.headline,
-            "me cannot use Docker on this machine: permission denied on /var/run/docker.sock."
-        );
-        assert_eq!(issue.next[2], "Or run sudo docker yourself");
+        // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+        #[cfg(unix)]
+        {
+            fixture.behave("docker", &fails_with(DENIED));
+            fixture.behave("sh", &probe_output("me", "no", SOCKET, "root", ALL_TOOLS));
+            let issue = docker_issue(fixture.app.containers(
+                &Target::Local,
+                &backend::AUTOMATIC,
+                false,
+                None,
+            ));
+            assert_eq!(
+                issue.headline,
+                "me cannot use Docker on this machine: permission denied on /var/run/docker.sock."
+            );
+            assert_eq!(issue.next[2], "Or run sudo docker yourself");
+        }
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_session_older_than_the_group_without_sg_needs_a_login() {
         let fixture = fixture();
@@ -1170,6 +1180,8 @@ mod tests {
         assert_eq!(issue.offer, None);
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_socket_of_another_group_gets_no_offer() {
         let fixture = fixture();
@@ -1194,6 +1206,8 @@ mod tests {
         assert_eq!(issue.offer, None);
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_socket_that_is_not_local_gets_no_offer() {
         let fixture = fixture();
@@ -1237,6 +1251,8 @@ mod tests {
         assert_eq!(issue.stderr, format!("{DENIED}\n"));
     }
 
+    // Local Docker access through Unix groups, which Windows lacks (UNIX_GROUPS is false).
+    #[cfg(unix)]
     #[test]
     fn a_stopped_daemon_is_offered_a_start_when_systemctl_exists() {
         let fixture = fixture();

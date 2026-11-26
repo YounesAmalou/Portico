@@ -1805,7 +1805,8 @@ mod tests {
         assert_eq!(shell_status(&dev, exited(ok, None)), "Shell on dev closed");
         assert_eq!(
             shell_status(&dev, exited(failed, None)),
-            "Shell on dev exited with exit status: 1"
+            // "exit status: 1" on Unix, "exit code: 1" on Windows.
+            format!("Shell on dev exited with {failed}")
         );
         let explanation = Explanation {
             headline: "the connection was refused".into(),

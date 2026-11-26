@@ -265,11 +265,11 @@ mod tests {
         assert_eq!(origin_label(&Origin::Managed, Some(home)), "managed");
         assert_eq!(
             origin_label(&Origin::External("/home/me/.ssh/config".into()), Some(home)),
-            "~/.ssh/config"
+            crate::platform::paths::shown("~/.ssh/config")
         );
         assert_eq!(
             origin_label(&Origin::External("/etc/ssh/ssh_config".into()), Some(home)),
-            "/etc/ssh/ssh_config"
+            crate::platform::paths::shown("/etc/ssh/ssh_config")
         );
     }
 

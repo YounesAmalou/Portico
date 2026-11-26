@@ -5,14 +5,22 @@
 //! with the script's exit code. Tests compile it with `rustc` on first use; it is never part of
 //! Portico.
 //!
-//! The shim and everything the script starts share a job that ends with the shim: Portico
-//! stops a program by terminating the process it started, here the shim, and Git's `sh.exe`
-//! is itself a wrapper, so without the job the script and its children (a `sleep` standing in
-//! for a tunnel) would outlive it, holding files and the caller's pipes open.
+//! The arguments travel in the environment, not on `sh`'s command line: MSYS programs parse
+//! their own command line, and no quoting survives that parse for every argument (a `"` inside
+//! an argument loses its escape). The shim sets `PORTICO_SHIM_ARGC` and
+//! `PORTICO_SHIM_ARG_<n>`, and the prelude `write_executable` puts at the top of the script
+//! turns them back into `"$@"`, and restores `HOME` as given. MSYS's conversion of path-like arguments for native programs
+//! is turned off, so a script passes its arguments on to other programs as it got them.
+//!
+//! The shim and everything the script starts share a job that ends with the shim when it is
+//! terminated: Portico stops a program by terminating the process it started, here the shim,
+//! and Git's `sh.exe` is itself a wrapper, so without the job the script and its children (a
+//! `sleep` standing in for a tunnel) would outlive it, holding files and the caller's pipes
+//! open. When the script exits on its own, the job lets its background children go on, as
+//! they would on Unix.
 
 use std::{
     env,
-    ffi::OsStr,
     path::PathBuf,
     process::{exit, Command},
 };
@@ -29,62 +37,38 @@ fn main() {
         .or_else(|| Some(PathBuf::from(GIT_SH)).filter(|path| path.is_file()))
         .unwrap_or_else(|| PathBuf::from("sh"));
     #[cfg(windows)]
-    job::join_own();
+    let job = job::join_own();
     let mut command = Command::new(&sh);
-    // MSYS programs parse their own command line, globbing `*` and `?` and reading `'` and a
-    // leading `@`: every word goes in double quotes, and globbing is off besides.
-    quoted_arg(&mut command, script.as_os_str());
-    for arg in env::args_os().skip(1) {
-        quoted_arg(&mut command, &arg);
+    command
+        .arg(&script)
+        .env("MSYS_NO_PATHCONV", "1")
+        .env("MSYS2_ARG_CONV_EXCL", "*");
+    let mut count = 0;
+    for (index, arg) in env::args_os().skip(1).enumerate() {
+        command.env(format!("PORTICO_SHIM_ARG_{}", index + 1), arg);
+        count = index + 1;
     }
-    let mut msys = env::var_os("MSYS").unwrap_or_default();
-    if !msys.is_empty() {
-        msys.push(" ");
+    // MSYS rewrites `HOME` into its own spelling (`/c/Users/…`); the prelude puts back the
+    // one this program was given, which is what Portico and Windows' programs read.
+    if let Some(home) = env::var_os("HOME") {
+        command.env("PORTICO_SHIM_HOME", home);
     }
-    msys.push("noglob");
-    let status = command.env("MSYS", msys).status().unwrap_or_else(|error| {
-        eprintln!(
-            "sh_shim: cannot run {} {}: {error}",
-            sh.display(),
-            script.display()
-        );
-        exit(127)
-    });
+    let status = command
+        .env("PORTICO_SHIM_ARGC", count.to_string())
+        .status()
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "sh_shim: cannot run {} {}: {error}",
+                sh.display(),
+                script.display()
+            );
+            exit(127)
+        });
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.let_go();
+    }
     exit(status.code().unwrap_or(1));
-}
-
-/// Adds `arg` in double quotes, by the rules of the Microsoft C runtime: a quote is escaped
-/// with a backslash, and the backslashes before a quote, or before the closing one, are
-/// doubled.
-#[cfg(windows)]
-fn quoted_arg(command: &mut Command, arg: &OsStr) {
-    use std::os::windows::process::CommandExt;
-    let text = arg.to_str().expect("arguments are Unicode");
-    let mut quoted = String::from('"');
-    let mut backslashes = 0;
-    for character in text.chars() {
-        match character {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(std::iter::repeat_n('\\', backslashes));
-                quoted.push(character);
-                backslashes = 0;
-            }
-        }
-    }
-    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    command.raw_arg(quoted);
-}
-
-#[cfg(not(windows))]
-fn quoted_arg(command: &mut Command, arg: &OsStr) {
-    command.arg(arg);
 }
 
 #[cfg(windows)]

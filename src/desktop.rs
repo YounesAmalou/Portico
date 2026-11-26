@@ -709,6 +709,8 @@ mod tests {
         )
     }
 
+    // XDG base directories (absolute Unix paths, `:`-separated lists) belong to the Linux desktop, which Windows lacks.
+    #[cfg(unix)]
     #[test]
     fn follows_the_xdg_base_directories() {
         let plain = env(&[]);

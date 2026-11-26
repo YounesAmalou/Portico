@@ -131,6 +131,7 @@ pub(crate) fn diff(path: &Path, old: &str, new: &str) -> FilePreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::paths::shown;
 
     fn lines(old: &str, new: &str) -> Vec<PreviewLine> {
         diff(Path::new("f"), old, new).lines
@@ -199,7 +200,11 @@ mod tests {
         assert_eq!(preview.to_string(), expected);
         assert_eq!(
             preview.render(Some(Path::new("/home/me"))),
-            "~/.ssh/config\n  -2: b\n\n/etc/ssh/ssh_config\n  +2: y\n"
+            format!(
+                "{}\n  -2: b\n\n{}\n  +2: y\n",
+                shown("~/.ssh/config"),
+                shown("/etc/ssh/ssh_config")
+            )
         );
     }
 }
