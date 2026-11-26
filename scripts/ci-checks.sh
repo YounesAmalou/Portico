@@ -38,9 +38,10 @@ e2e() {
     cargo test --test e2e -- --ignored
 }
 
-# Runs a command as the leader of a new session (macOS has no setsid(1)).
+# Runs a command as the leader of a new session (macOS has no setsid(1)). The function's shell
+# becomes the command, so a background `in_own_session` leaves the session's ID in `$!`.
 in_own_session() {
-    perl -MPOSIX -e 'POSIX::setsid() != -1 or die "setsid: $!\n"; exec @ARGV or die "exec: $!\n"' "$@"
+    exec perl -MPOSIX -e 'POSIX::setsid() != -1 or die "setsid: $!\n"; exec @ARGV or die "exec: $!\n"' "$@"
 }
 
 # The test suite. On macOS it runs in a session of its own, and so in a process group of its own.
