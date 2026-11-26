@@ -91,7 +91,7 @@ src/platform/
                 process: Pin (process handle),
                 Proc (Toolhelp, GetProcessTimes, the token's SID, the command line from ntdll,
                 the registry's BootId),
-                tree walk by creation time and parent, stop_process by TerminateProcess
+                tree walk by creation time and parent, stop_process by ending the tree
 ```
 
 A system provides what `unix` calls (`Pin` with `open`, `signal` and `wait_exit`; `children`; `wait_until_stopped`; `Proc` with `stat`, `uid`, `cmdline`, `pids`, `boot_id` and `started_at`) and the per-system items of `paths` and `launcher`. A record's `start` is whatever the system's `Proc::stat` reports (clock ticks after boot on Linux, microseconds since the epoch on macOS, the creation `FILETIME` on Windows); records never move between systems.

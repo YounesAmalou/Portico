@@ -175,11 +175,13 @@ pub fn kill_direct_child(child: &mut Child) -> io::Result<()> {
 /// How long a stopped tunnel has to exit once it was terminated.
 pub const TERM_GRACE_MS: u32 = 3000;
 
-/// Ends `pid` if `verify` still recognises it once a pin holds it. Returns whether it was
-/// ended. Because the pin is taken before `verify` runs, and a pinned process is never ended
-/// once it has exited, a process that passes `verify` is the one the pin refers to. Windows'
-/// ssh has no graceful stop Portico can ask of a detached process, and a tunnel holds nothing
-/// to flush, so the process is terminated at once.
+/// Ends `pid`, with its descendants, if `verify` still recognises it once a pin holds it.
+/// Returns whether it was ended. Because the pin is taken before `verify` runs, and a pinned
+/// process is never ended once it has exited, a process that passes `verify` is the one the
+/// pin refers to (and the pin keeps its ID from passing to another while the tree is ended).
+/// Windows' ssh has no graceful stop Portico can ask of a detached process, and a tunnel holds
+/// nothing to flush, so the process is terminated at once; terminated, ssh cannot end what it
+/// started (a ProxyCommand, such as the `ssh -W` of a jump host), so that ends with it.
 pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool> {
     let pin = match open_pin(pid) {
         Ok(pin) => pin,
@@ -189,7 +191,7 @@ pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool>
     if !verify() {
         return Ok(false);
     }
-    match pin.terminate() {
+    match kill_process_tree(pid) {
         Ok(()) => {}
         Err(error) if is_gone(&error) => return Ok(true),
         Err(error) => return Err(error),
@@ -370,27 +372,47 @@ mod tests {
         assert_eq!(proc.boot_id(), Some(boot));
     }
 
-    #[test]
-    fn kill_process_tree_ends_children() {
-        let mut child = quiet(Command::new("cmd").raw_arg("/c ping -n 30 127.0.0.1 >nul"));
+    /// A `cmd` running a long `ping`.
+    fn cmd_with_ping() -> Child {
+        quiet(Command::new("cmd").raw_arg("/c ping -n 30 127.0.0.1 >nul"))
+    }
+
+    /// A pin on the `ping` that `cmd`, from `cmd_with_ping`, runs.
+    fn ping_of(cmd: &Child) -> Pin {
         let proc = Proc::system();
         let deadline = Instant::now() + Duration::from_secs(10);
         // cmd starts ping a moment after it starts; the console host may be a child too.
-        let ping = loop {
+        loop {
             let ping = process_table().unwrap().into_iter().find(|&(pid, parent)| {
-                parent == child.id()
+                parent == cmd.id()
                     && proc
                         .cmdline(pid)
                         .is_some_and(|args| args.iter().any(|arg| arg == b"127.0.0.1"))
             });
             if let Some((pid, _)) = ping {
-                break Pin::open(pid).unwrap();
+                return Pin::open(pid).unwrap();
             }
             assert!(Instant::now() < deadline, "ping never started");
             thread::sleep(Duration::from_millis(10));
-        };
+        }
+    }
+
+    #[test]
+    fn kill_process_tree_ends_children() {
+        let mut child = cmd_with_ping();
+        let ping = ping_of(&child);
         terminate_process_tree(&mut child).unwrap();
         assert!(ping.wait_exit(5000), "the grandchild survived");
+    }
+
+    #[test]
+    fn stop_process_ends_the_children_too() {
+        let mut child = cmd_with_ping();
+        let ping = ping_of(&child);
+        assert!(stop_process(child.id(), || true).unwrap());
+        assert!(has_exited(&child).unwrap());
+        assert!(ping.wait_exit(5000), "the child survived");
+        let _ = child.wait();
     }
 
     #[test]
