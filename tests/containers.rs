@@ -172,6 +172,9 @@ fn no_containers_message() {
         .assert_stdout_contains("No running containers on this machine.\n");
 }
 
+/// Unix-only: Windows also finds a program in its system folders, whatever `PATH` says, so a
+/// `docker.exe` there (GitHub's runners have one in `System32`) cannot be hidden.
+#[cfg(unix)]
 #[test]
 fn docker_missing_is_explained() {
     let env = TestEnv::new();

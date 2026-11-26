@@ -47,6 +47,11 @@ pub fn exit_status(code: i32) -> ExitStatus {
     ExitStatus::from_raw(code << 8)
 }
 
+/// A command that runs `program`, a path or a name looked up on `PATH`.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
+}
+
 /// Puts the process `command` starts in a process group of its own, out of reach of the
 /// terminal's Ctrl+C.
 pub fn own_group(command: &mut Command) -> &mut Command {

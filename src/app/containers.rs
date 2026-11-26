@@ -325,7 +325,7 @@ impl App {
 
     /// `words` as a command on this machine, its first word replaced by the configured program.
     fn local_command(&self, words: &[String]) -> Command {
-        let mut command = Command::new(self.local_program(&words[0]));
+        let mut command = crate::platform::process::command(self.local_program(&words[0]));
         command.args(&words[1..]);
         command
     }

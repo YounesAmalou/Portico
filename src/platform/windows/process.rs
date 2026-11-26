@@ -7,8 +7,10 @@ mod proc;
 mod tree;
 
 use std::{
+    ffi::OsStr,
     io,
     os::windows::{io::AsRawHandle, process::CommandExt},
+    path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus},
 };
 
@@ -59,6 +61,36 @@ pub fn exit_status(code: i32) -> ExitStatus {
 /// the console's Ctrl+C.
 pub fn own_group(command: &mut Command) -> &mut Command {
     command.creation_flags(CREATE_NEW_PROCESS_GROUP)
+}
+
+/// A command that runs `program`, a path or a name looked up on `PATH` in its order, as on
+/// Unix. Windows' own search tries its system folders before `PATH`, so a copy there (GitHub's
+/// runners keep a `docker.exe` in `System32`) would shadow the program the user put on `PATH`.
+/// A name found nowhere on `PATH` is left to Windows' search.
+pub fn command(program: impl AsRef<OsStr>) -> Command {
+    let program = program.as_ref();
+    Command::new(
+        on_path(program, std::env::var_os("PATH").as_deref()).unwrap_or_else(|| program.into()),
+    )
+}
+
+/// The first `program` (with `.exe` appended when it has no extension, as the standard library
+/// does) in the directories of `path`, when `program` is a bare name.
+fn on_path(program: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name = Path::new(program);
+    if name.components().count() != 1
+        || !matches!(name.components().next(), Some(Component::Normal(_)))
+    {
+        return None;
+    }
+    let file = if name.extension().is_some() {
+        name.to_path_buf()
+    } else {
+        name.with_extension("exe")
+    };
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Makes the process `command` starts independent of this one's console, so it outlives
@@ -249,15 +281,34 @@ mod tests {
         let text = receiver.recv_timeout(Duration::from_secs(15));
         let _ = helper.wait();
         let pid = text.as_ref().ok().and_then(|text| {
+            // The test harness prints the helper's name on the same line first.
             text.lines()
-                .find_map(|line| line.strip_prefix("detached pid "))
-                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .find_map(|line| line.split_once("detached pid "))
+                .and_then(|(_, pid)| pid.trim().parse::<u32>().ok())
         });
         if let Some(pid) = pid {
             let _ = kill_process_tree(pid);
         }
         let text = text.expect("the detached child kept its parent's output open");
         assert!(pid.is_some(), "the helper did not start the child: {text}");
+    }
+
+    #[test]
+    fn programs_are_found_on_path_in_its_order() {
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(second.path().join("tool.exe"), "").unwrap();
+        std::fs::write(second.path().join("tool.cmd"), "").unwrap();
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let found = |program: &str| on_path(OsStr::new(program), Some(&path));
+        assert_eq!(found("tool"), Some(second.path().join("tool.exe")));
+        assert_eq!(found("tool.cmd"), Some(second.path().join("tool.cmd")));
+        std::fs::write(first.path().join("tool.exe"), "").unwrap();
+        assert_eq!(found("tool"), Some(first.path().join("tool.exe")));
+        assert_eq!(found("missing"), None);
+        // A path is run as it is.
+        assert_eq!(found(r"sub\tool"), None);
+        assert_eq!(found(r"C:\tool"), None);
+        assert_eq!(on_path(OsStr::new("tool"), None), None);
     }
 
     #[test]
