@@ -30,7 +30,7 @@ use crate::{
         append_known_hosts,
     },
     domain::probe::{Diagnosis, Failure, ProbeResult, diagnose, known_hosts_path},
-    domain::settings::{self, Key, Settings, SettingsError},
+    domain::settings::{self, Key, Settings, SettingsError, UserKey},
     domain::tunnel::{
         TunnelError,
         runtime::RuntimeDir,
@@ -240,6 +240,16 @@ impl App {
     /// Writes one setting; `Ok(true)` when the file changed.
     pub fn set_setting(&self, key: Key, value: bool) -> Result<bool, SettingsError> {
         settings::set(&self.settings_path, key, value)
+    }
+
+    /// Remembers the user of a container's shell (`None` forgets it); `Ok(true)` when the file
+    /// changed.
+    pub fn remember_container_user(
+        &self,
+        key: &UserKey,
+        user: Option<&str>,
+    ) -> Result<bool, SettingsError> {
+        settings::remember_user(&self.settings_path, key, user)
     }
 
     /// Replaces the programs container commands run on this machine.
@@ -991,6 +1001,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::backend::{BackendId, Target};
 
     struct TestApp {
         _dir: TempDir,
@@ -1024,6 +1035,20 @@ mod tests {
         );
         assert!(t.app.set_setting(Key::TabsProxmox, false).unwrap());
         assert!(!t.app.settings().unwrap().tabs.proxmox);
+    }
+
+    #[test]
+    fn remember_container_user_round_trips() {
+        let t = test_app(None, None);
+        let key = UserKey {
+            target: Target::Local,
+            backend: BackendId::Docker,
+            container: "shop/api".into(),
+        };
+        assert!(t.app.remember_container_user(&key, Some("deploy")).unwrap());
+        assert_eq!(t.app.settings().unwrap().user(&key), Some("deploy"));
+        assert!(t.app.remember_container_user(&key, None).unwrap());
+        assert_eq!(t.app.settings().unwrap().user(&key), None);
     }
 
     fn test_app(
