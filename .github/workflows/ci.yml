@@ -167,6 +167,16 @@ jobs:
       - run: scripts/ci-checks.sh ${{ matrix.check }}
         timeout-minutes: 12
 
+  # Temporary: proves which sshd can serve the Windows end-to-end tests (removed again
+  # once the Windows job exists).
+  windows-spike:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: ./scripts/windows-sshd-spike.ps1
+        shell: pwsh
+
   msrv:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
