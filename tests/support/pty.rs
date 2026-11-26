@@ -490,6 +490,9 @@ fn act(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
             );
             let settings = fs::read_to_string(&settings_path).unwrap();
             assert!(settings.contains("[users.local.docker]"), "{settings}");
+            // The user is remembered before the shell runs: the TUI is back only once it says
+            // the shell closed, and a key sent earlier would have gone to the shell's terminal.
+            terminal.read_screen("this machine closed");
             terminal.read_screen("user: deploy");
         }
         RememberedUserRestored => {
