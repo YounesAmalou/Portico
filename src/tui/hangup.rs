@@ -53,28 +53,22 @@ pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
 #[cfg(windows)]
 pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
     use crate::platform::console;
-    diag::peek();
-    let bare = console::wait_for_input(timeout).and_then(|queued| {
-        if queued {
-            console::take_bare_key().map(Some)
-        } else {
-            Ok(None)
-        }
-    });
-    let input = match bare {
-        Ok(None) => Ok(Input::Idle),
-        Ok(Some(Some(key))) => Ok(Input::Event(Event::Key(bare_key(
+    let bare = match console::wait_for_input(timeout) {
+        Ok(false) => return Ok(Input::Idle),
+        Ok(true) => console::take_bare_key(),
+        Err(error) => Err(error),
+    };
+    match bare {
+        Ok(Some(key)) => Ok(Input::Event(Event::Key(bare_key(
             key.character,
             key.alt,
             key.shift,
         )))),
-        // Queued input crossterm reads, one record at a time.
-        Ok(Some(None)) => next_event_from(event::poll, event::read, Duration::ZERO),
+        // Anything else queued is crossterm's to read, one record at a time.
+        Ok(None) => next_event_from(event::poll, event::read, Duration::ZERO),
         Err(error) if is_closed(&error) => Ok(Input::Closed),
         Err(error) => Err(error),
-    };
-    diag::log(&format!("{input:?}"));
-    input
+    }
 }
 
 /// Waits for the console's next event, however long that takes; its end is `UnexpectedEof`.
@@ -125,96 +119,6 @@ fn bare_key(character: u8, alt: bool, shift: bool) -> event::KeyEvent {
         modifiers |= KeyModifiers::SHIFT;
     }
     event::KeyEvent::new(code, modifiers)
-}
-
-// TEMPORARY DIAGNOSTIC (Ruling G): logs the console's raw input records and the events read.
-#[cfg(windows)]
-mod diag {
-    use std::{
-        io::Write,
-        sync::{Mutex, OnceLock},
-        time::Instant,
-    };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, INPUT_RECORD, PeekConsoleInputW, STD_INPUT_HANDLE,
-    };
-
-    struct Log {
-        file: std::fs::File,
-        start: Instant,
-        last: String,
-    }
-
-    fn log_file() -> &'static Option<Mutex<Log>> {
-        static LOG: OnceLock<Option<Mutex<Log>>> = OnceLock::new();
-        LOG.get_or_init(|| {
-            let path = std::env::var_os("PORTICO_INPUT_LOG")?;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok()?;
-            Some(Mutex::new(Log {
-                file,
-                start: Instant::now(),
-                last: String::new(),
-            }))
-        })
-    }
-
-    pub(super) fn log(line: &str) {
-        if let Some(log) = log_file()
-            && let Ok(mut log) = log.lock()
-        {
-            if line.contains("Idle") {
-                return;
-            }
-            let elapsed = log.start.elapsed().as_millis();
-            let _ = writeln!(log.file, "{elapsed} {line}");
-        }
-    }
-
-    pub(super) fn peek() {
-        let Some(log) = log_file() else { return };
-        let mut records: [INPUT_RECORD; 32] = unsafe { std::mem::zeroed() };
-        let mut count = 0u32;
-        let ok = unsafe {
-            PeekConsoleInputW(
-                GetStdHandle(STD_INPUT_HANDLE),
-                records.as_mut_ptr(),
-                32,
-                &mut count,
-            )
-        };
-        let mut text = String::new();
-        if ok == 0 {
-            text = format!("peek failed: {}", std::io::Error::last_os_error());
-        }
-        for record in &records[..count as usize] {
-            if record.EventType == 1 {
-                let key = unsafe { record.Event.KeyEvent };
-                text.push_str(&format!(
-                    "[key down={} rep={} vk={:#x} sc={:#x} ch={:#x} ctrl={:#x}] ",
-                    key.bKeyDown,
-                    key.wRepeatCount,
-                    key.wVirtualKeyCode,
-                    key.wVirtualScanCode,
-                    unsafe { key.uChar.UnicodeChar },
-                    key.dwControlKeyState
-                ));
-            } else {
-                text.push_str(&format!("[type {:#x}] ", record.EventType));
-            }
-        }
-        if let Ok(mut log) = log.lock()
-            && !text.is_empty()
-            && text != log.last
-        {
-            let elapsed = log.start.elapsed().as_millis();
-            let _ = writeln!(log.file, "{elapsed} peek {text}");
-            log.last = text;
-        }
-    }
 }
 
 fn next_event_from(

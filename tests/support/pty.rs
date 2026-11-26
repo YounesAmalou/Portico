@@ -673,19 +673,17 @@ fn wait_for_file(path: &Path, failure: &str) {
     }
 }
 
-/// The shell, parent, worker thread and child of the blocked connection, as its fake records
-/// them once it has started.
-/// The processes of the blocked connection: its `ssh`, the script it runs and that script's
-/// child. The worker thread's ID is left out: only Linux numbers threads like processes (macOS
-/// gives a thread an ID no process has, or one an unrelated process has).
+/// The processes of the blocked connection: its shell, the script's process and the child of
+/// its worker thread. The thread's own ID is left out: only Linux numbers threads like
+/// processes, while macOS gives a thread an ID that can be an unrelated process's.
 #[cfg(unix)]
 fn connection_processes(home: &Path) -> [u32; 3] {
-    let [ssh, script, _worker, child] = connection_pids(home);
-    [ssh, script, child]
+    let [shell, parent, _worker, child] = connection_pids(home);
+    [shell, parent, child]
 }
 
-/// What the blocked connection recorded: its `ssh`, the script it runs, the script's worker
-/// thread and the child that thread started.
+/// The shell, parent, worker thread and child of the blocked connection, as its fake records
+/// them once it has started.
 #[cfg(unix)]
 fn connection_pids(home: &Path) -> [u32; 4] {
     let marker = home.join("connection-started");
@@ -695,27 +693,6 @@ fn connection_pids(home: &Path) -> [u32; 4] {
         .split_whitespace()
         .map(|pid| pid.parse().unwrap())
         .collect();
-    // TEMPORARY DIAGNOSTIC (Ruling G): what each recorded number names, written past the capture.
-    {
-        let listed: Vec<String> = pids.iter().map(u32::to_string).collect();
-        let ps = std::process::Command::new("ps")
-            .args([
-                "-o",
-                "pid,ppid,pgid,user,stat,command",
-                "-p",
-                &listed.join(","),
-            ])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default();
-        let _ = std::io::stderr().write_all(
-            format!(
-                "DIAG connection pids {text:?} (test pid {}):\n{ps}\n",
-                std::process::id()
-            )
-            .as_bytes(),
-        );
-    }
     pids.try_into().unwrap()
 }
 
@@ -811,10 +788,6 @@ struct Terminal {
     before: libc::termios,
     #[cfg(unix)]
     before_stty: String,
-    // TEMPORARY DIAGNOSTIC (Ruling G).
-    input_log: std::path::PathBuf,
-    writes: Vec<String>,
-    started: Instant,
 }
 
 impl Terminal {
@@ -874,15 +847,6 @@ impl Terminal {
             }
         }
         command.cwd(env.home());
-        let input_log = std::env::temp_dir().join(format!(
-            "portico-input-{}-{scenario:?}-{}.log",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        command.env("PORTICO_INPUT_LOG", &input_log);
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
 
@@ -917,15 +881,10 @@ impl Terminal {
             before,
             #[cfg(unix)]
             before_stty,
-            input_log,
-            writes: Vec::new(),
-            started: Instant::now(),
         }
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        let at = self.started.elapsed().as_millis();
-        self.writes.push(format!("{at} {}", bytes.escape_ascii()));
         self.writer.write_all(bytes).unwrap();
         self.writer.flush().unwrap();
     }
@@ -1111,11 +1070,8 @@ impl Terminal {
 
     #[track_caller]
     fn fail(&self, what: &str) -> ! {
-        // TEMPORARY DIAGNOSTIC (Ruling G).
-        let input_log = fs::read_to_string(&self.input_log).unwrap_or_default();
-        let writes = self.writes.join(" | ");
         panic!(
-            "{:?}: {what}\n--- input log ---\n{input_log}\n--- writes ---\n{writes}\n--- screen ---\n{}\n--- output ---\n{}",
+            "{:?}: {what}\n--- screen ---\n{}\n--- output ---\n{}",
             self.scenario,
             self.screen(),
             self.transcript.escape_ascii()
