@@ -83,6 +83,17 @@ pub fn expand(value: &str, home: &Path) -> String {
     }
 }
 
+/// A configured path as written into an OpenSSH file: with `/` between its parts, which
+/// OpenSSH reads on every system, where a `\` in Windows' spelling could read as an escape.
+/// Unix text is kept as it is, since `\` is an ordinary character in a Unix file name.
+pub fn openssh_text(value: &str) -> String {
+    if MAIN_SEPARATOR == '/' {
+        value.into()
+    } else {
+        value.replace(MAIN_SEPARATOR, "/")
+    }
+}
+
 /// `path` as written into an OpenSSH file (an `IdentityFile` Portico suggests, say): `~/`
 /// in place of a leading `home`, and `/` between the parts, which OpenSSH reads on every
 /// system. On Unix this is what `tilde` shows.
@@ -146,6 +157,17 @@ mod tests {
         let home = Path::new("/home/me");
         assert_eq!(expand("~\\a", home), home.join("a").to_str().unwrap());
         assert_eq!(expand("~/a", home), home.join("a").to_str().unwrap());
+    }
+
+    #[test]
+    fn openssh_text_uses_forward_slashes_on_windows() {
+        let expected = if cfg!(windows) {
+            "C:/Users/me/.ssh/id"
+        } else {
+            r"C:\Users\me\.ssh/id"
+        };
+        assert_eq!(openssh_text(r"C:\Users\me\.ssh/id"), expected);
+        assert_eq!(openssh_text("~/.ssh/id"), "~/.ssh/id");
     }
 
     #[test]
