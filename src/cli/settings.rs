@@ -20,7 +20,7 @@ pub(super) enum SettingsCommand {
         #[arg(value_parser = value_argument)]
         value: String,
     },
-    /// Forget the user remembered for a container, so its shell asks again.
+    /// Forget the user remembered for a container, so its shells use the image's user again.
     Forget {
         /// The host the container runs on; this machine when left out.
         #[arg(long, value_name = "ALIAS")]
@@ -28,7 +28,7 @@ pub(super) enum SettingsCommand {
         /// The container's backend.
         #[arg(long, value_parser = backend_argument, default_value = "docker")]
         backend: BackendId,
-        /// The container's name, as `portico shell` takes it.
+        /// The container as `portico settings` lists it: `project/service`, or its name outside Compose.
         container: String,
     },
 }
@@ -98,7 +98,8 @@ pub(super) fn run(
                         ]
                     })
                     .collect();
-                let width = |column: usize| rows.iter().map(|row| row[column].len()).max();
+                let width =
+                    |column: usize| rows.iter().map(|row| row[column].chars().count()).max();
                 let (a, b, c) = (width(0), width(1), width(2));
                 writeln!(output, "\nRemembered container users:").map_err(io)?;
                 for row in &rows {
