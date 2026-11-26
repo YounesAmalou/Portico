@@ -332,13 +332,16 @@ fn write_session(dir: &Path) -> PathBuf {
 
 /// Writes the session script `ForceCommand` runs in `dir` and returns its path: a batch file,
 /// as Win32-OpenSSH's server runs the command with `cmd.exe /c`. It prints a banner, reads one
-/// line and echoes it back.
+/// line, echoes it back and ends a second later: ConPTY sends the terminal only what its screen
+/// holds when it next paints, so an answer the TUI's screen replaced at once might never be
+/// shown.
 #[cfg(windows)]
 fn write_session(dir: &Path) -> PathBuf {
     let session = dir.join("session.cmd");
     fs::write(
         &session,
-        "@echo off\r\necho portico-e2e ready\r\nset /p line=\r\necho portico-e2e got %line%\r\n",
+        "@echo off\r\necho portico-e2e ready\r\nset /p line=\r\necho portico-e2e got %line%\r\n\
+         ping -n 2 127.0.0.1 >nul\r\n",
     )
     .unwrap();
     session
