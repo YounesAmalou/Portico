@@ -19,8 +19,8 @@ use crate::domain::managed::{
     HostComments, ManagedConfig, ManagedStore, TransactionError, render_host,
 };
 use crate::platform::fs::{
-    PendingFile, acquire_lock, has_other_links, mode_of, normalize_path, open_lock, owner_is,
-    symlink_target, sync_dir, writable, write_unique,
+    PendingFile, acquire_lock, canonicalize, has_other_links, mode_of, normalize_path, open_lock,
+    owner_is, symlink_target, sync_dir, writable, write_unique,
 };
 use crate::platform::process::{Uid, effective_uid};
 
@@ -170,7 +170,7 @@ fn file_key(file: PathBuf) -> PathBuf {
     } else {
         dir
     };
-    match fs::canonicalize(dir) {
+    match canonicalize(dir) {
         Ok(dir) => dir.join(name),
         Err(_) => normalize_path(&file),
     }
@@ -1061,7 +1061,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    use crate::platform::fs::{mode_of, set_mode};
+    #[cfg(unix)]
+    use crate::platform::fs::mode_of;
+    use crate::platform::fs::set_mode;
 
     fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
         crate::platform::fs::symlink(target.as_ref(), link.as_ref())
@@ -1322,8 +1324,10 @@ mod tests {
         let preview = plan.preview(&["dev".into()]).unwrap();
         assert_eq!(
             preview.render(Some(fixture.home())),
-            "~/.ssh/portico/config\n  +2: \n  +3: # box\n  +4: Host dev\n  +5:     HostName d\n  +6:     User bob\n\n\
-             ~/.ssh/config\n  -3: # box\n  -4: Host dev\n  -5:   HostName d\n  -6:   User bob\n  -7: \n"
+            shown_headers(
+                "~/.ssh/portico/config\n  +2: \n  +3: # box\n  +4: Host dev\n  +5:     HostName d\n  +6:     User bob\n\n\
+                 ~/.ssh/config\n  -3: # box\n  -4: Host dev\n  -5:   HostName d\n  -6:   User bob\n  -7: \n"
+            ),
         );
         assert_eq!(
             fs::read_to_string(&fixture.paths.managed).unwrap(),
@@ -1343,9 +1347,11 @@ mod tests {
         let preview = plan.preview(&["C".into(), "a".into(), "b".into()]).unwrap();
         assert_eq!(
             preview.render(Some(fixture.home())),
-            "~/.ssh/portico/config\n  +2: \n  +3: Host a\n  +4:     HostName a\n  +5: \n  +6: Host b\n  +7:     HostName b\n  +8: \n  +9: Host c\n  +10:     HostName c\n\n\
-             ~/.ssh/config\n  -3: Host a\n  -4:   HostName a\n\n\
-             ~/.ssh/extra.conf\n  -1: Host b\n  -2:   HostName b\n  -3: \n  -4: Host c\n  -5:   HostName c\n"
+            shown_headers(
+                "~/.ssh/portico/config\n  +2: \n  +3: Host a\n  +4:     HostName a\n  +5: \n  +6: Host b\n  +7:     HostName b\n  +8: \n  +9: Host c\n  +10:     HostName c\n\n\
+                 ~/.ssh/config\n  -3: Host a\n  -4:   HostName a\n\n\
+                 ~/.ssh/extra.conf\n  -1: Host b\n  -2:   HostName b\n  -3: \n  -4: Host c\n  -5:   HostName c\n"
+            ),
         );
     }
 
@@ -1380,8 +1386,10 @@ mod tests {
         let preview = plan.preview(&["dev".into()]).unwrap();
         assert_eq!(
             preview.render(Some(fixture.home())),
-            "~/.ssh/config\n  +2: # box\n  +3: Host dev\n  +4:     HostName d\n  +5:     User bob\n  +6: \n\n\
-             ~/.ssh/portico/config\n  -2: \n  -3: # box\n  -4: Host dev\n  -5:     HostName d\n  -6:     User bob\n"
+            shown_headers(
+                "~/.ssh/config\n  +2: # box\n  +3: Host dev\n  +4:     HostName d\n  +5:     User bob\n  +6: \n\n\
+                 ~/.ssh/portico/config\n  -2: \n  -3: # box\n  -4: Host dev\n  -5:     HostName d\n  -6:     User bob\n"
+            ),
         );
         assert_no_staged_files(&fixture.paths);
     }
@@ -1496,16 +1504,34 @@ mod tests {
             )
         );
     }
+    /// A rendered preview's expected text with the file names, its lines that start with `~`
+    /// or `/`, spelled as this system shows paths.
+    fn shown_headers(text: &str) -> String {
+        text.split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with(['~', '/']) {
+                    crate::platform::paths::shown(line)
+                } else {
+                    line.into()
+                }
+            })
+            .collect()
+    }
+
     /// Every file under the temporary home with its bytes, apart from Portico's lock and the
     /// managed fragment's `config.bak`; comparing two of these also proves no temporary file
     /// was left behind.
     fn tree(paths: &ConfigPaths) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn walk(dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        fn walk(dir: &Path, paths: &ConfigPaths, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
+                // Windows refuses to read a locked file, and another thread may hold the lock.
+                if path == paths.lock || path == paths.backup {
+                    continue;
+                }
                 let kind = fs::symlink_metadata(&path).unwrap().file_type();
                 if kind.is_dir() {
-                    walk(&path, files);
+                    walk(&path, paths, files);
                 } else if kind.is_symlink() {
                     let target = fs::read_link(&path).unwrap();
                     files.insert(path, target.into_os_string().into_encoded_bytes());
@@ -1515,9 +1541,7 @@ mod tests {
             }
         }
         let mut files = BTreeMap::new();
-        walk(&paths.ssh_dir, &mut files);
-        files.remove(&paths.lock);
-        files.remove(&paths.backup);
+        walk(&paths.ssh_dir, paths, &mut files);
         files
     }
 
@@ -1591,6 +1615,8 @@ mod tests {
             "Include ~/.ssh/portico/config\nInclude extra.conf\n"
         );
         assert_eq!(read(&extra), "Host c\n  HostName c\n# tail\n");
+        // Windows keeps only the read-only attribute of a mode.
+        #[cfg(unix)]
         assert_eq!(mode_of(&fs::metadata(&extra).unwrap()) & 0o7777, 0o640);
         assert_eq!(
             read(&fixture.paths.managed),

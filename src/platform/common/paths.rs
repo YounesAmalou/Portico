@@ -51,6 +51,13 @@ fn native(text: String) -> String {
     }
 }
 
+/// `text`, a path written with `/`, as Portico shows it to people on this system: lets a test
+/// write one expectation for every system.
+#[cfg(test)]
+pub fn shown(text: &str) -> String {
+    native(text.into())
+}
+
 /// A configured value with a leading `home` shown as `~`; other spellings are kept.
 pub fn tilde_text(value: &str, home: &Path) -> String {
     let home = home.to_string_lossy();

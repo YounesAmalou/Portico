@@ -6,6 +6,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::platform::fs::canonicalize;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalHost {
     pub alias: String,
@@ -165,15 +167,13 @@ pub(crate) fn parse_directive_bytes(
 
 pub fn discover(entry: &Path, managed: &Path) -> Result<Discovery, DiscoveryError> {
     let root = entry.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let canonical = entry
-        .canonicalize()
-        .map_err(|source| DiscoveryError::EntryRead {
-            path: entry.into(),
-            source,
-        })?;
+    let canonical = canonicalize(entry).map_err(|source| DiscoveryError::EntryRead {
+        path: entry.into(),
+        source,
+    })?;
     let mut scanner = Scanner {
         root,
-        managed: managed.canonicalize().ok(),
+        managed: canonicalize(managed).ok(),
         visited: HashMap::new(),
         includes: Vec::new(),
         stack: vec![canonical.clone()],
@@ -213,7 +213,7 @@ impl Scanner {
     }
 
     fn scan_include(&mut self, path: PathBuf, conditional: bool) {
-        let canonical = match path.canonicalize() {
+        let canonical = match canonicalize(&path) {
             Ok(path) => path,
             Err(error) => return self.warn_include(path, error.to_string()),
         };
@@ -249,11 +249,7 @@ impl Scanner {
                 continue;
             }
             for host in &mut self.discovery.hosts {
-                if host
-                    .source
-                    .canonicalize()
-                    .is_ok_and(|source| source == file)
-                {
+                if canonicalize(&host.source).is_ok_and(|source| source == file) {
                     host.conditional = true;
                 }
             }
@@ -626,7 +622,12 @@ mod tests {
     #[test]
     fn glob_characters_in_the_ssh_directory_are_literal() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("me[work]*?");
+        // Windows file names cannot hold `*` or `?`.
+        let home = dir.path().join(if cfg!(windows) {
+            "me[work]"
+        } else {
+            "me[work]*?"
+        });
         let ssh = home.join(".ssh");
         fs::create_dir_all(ssh.join("conf.d")).unwrap();
         fs::write(
@@ -893,10 +894,10 @@ mod tests {
         // `../shared` is relative to the entry config's directory, not to the file including
         // it, so it does not exist: it is watched where it would appear.
         let file = |path: PathBuf| Input::File(path);
-        let glob = format!(
-            "{}/conf.d/*.conf",
-            glob::Pattern::escape(&ssh.to_string_lossy())
-        );
+        let glob = Path::new(&glob::Pattern::escape(&ssh.to_string_lossy()))
+            .join("conf.d/*.conf")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             result.inputs,
             [

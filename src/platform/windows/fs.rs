@@ -135,15 +135,64 @@ pub fn owner_is(_metadata: &Metadata, _uid: &Uid) -> bool {
     true
 }
 
+/// `path` with every link and `..` resolved, as the filesystem sees it, in the spelling people
+/// and other programs use: `C:\Users\me\.ssh\config`, without the `\\?\` prefix that
+/// Windows' own resolution adds, whenever the path means the same without it.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path).map(|resolved| without_verbatim_prefix(&resolved))
+}
+
+/// `path` without its `\\?\` (or `\\?\UNC\`) prefix, unless the path needs it: longer than
+/// Windows' usual limit, or with a part that Windows would read differently without it (a
+/// trailing dot or space, a device name such as `NUL`).
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    const MAX_PATH: usize = 260;
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let Some(text) = path.to_str() else {
+        return path.into();
+    };
+    let plain = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{share}")
+    } else if let Some(disk) = text.strip_prefix(r"\\?\") {
+        let bytes = disk.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b":\\" {
+            return path.into();
+        }
+        disk.into()
+    } else {
+        return path.into();
+    };
+    let ordinary = |part: &str| {
+        let stem = part.split('.').next().unwrap_or(part).trim_end();
+        !part.ends_with(['.', ' '])
+            && !DEVICES
+                .iter()
+                .any(|device| stem.eq_ignore_ascii_case(device))
+    };
+    if plain.len() < MAX_PATH && plain.split('\\').skip(1).all(ordinary) {
+        plain.into()
+    } else {
+        path.into()
+    }
+}
+
 /// Creates a symbolic link at `link` that points to `target`: a directory link when `target`
 /// (relative to the link's folder) is a directory, a file link otherwise. Windows needs
-/// Developer Mode or the symbolic link privilege for either.
+/// Developer Mode or the symbolic link privilege for either. A link Windows stores with `/` in
+/// it does not resolve, so the target is stored with `\`.
 pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
-    let resolved = link.parent().unwrap_or(Path::new("")).join(target);
+    let target = match target.to_str() {
+        Some(text) if text.contains('/') => PathBuf::from(text.replace('/', "\\")),
+        _ => target.to_path_buf(),
+    };
+    let resolved = link.parent().unwrap_or(Path::new("")).join(&target);
     if fs::metadata(resolved).is_ok_and(|metadata| metadata.is_dir()) {
-        symlink_dir(target, link)
+        symlink_dir(&target, link)
     } else {
-        symlink_file(target, link)
+        symlink_file(&target, link)
     }
 }
 
@@ -350,6 +399,47 @@ fn unix_time(ticks: i64) -> (i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_paths_keep_the_usual_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        fs::write(&file, "a").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let resolved = canonicalize(&dir.path().join(r"sub\..\config")).unwrap();
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            resolved.display()
+        );
+        assert!(resolved.ends_with("config"));
+        assert_eq!(fs::read_to_string(&resolved).unwrap(), "a");
+
+        let unchanged = [r"\\?\C:\a\nul", r"\\?\C:\a\b.", r"\\?\Volume{x}\a"];
+        for path in unchanged {
+            assert_eq!(without_verbatim_prefix(Path::new(path)), Path::new(path));
+        }
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(without_verbatim_prefix(Path::new(&long)), Path::new(&long));
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\UNC\server\share\a")),
+            Path::new(r"\\server\share\a")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\D:\Users\Jane Doe\.ssh")),
+            Path::new(r"D:\Users\Jane Doe\.ssh")
+        );
+    }
+
+    #[test]
+    fn a_link_written_with_slashes_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("dotfiles")).unwrap();
+        fs::write(dir.path().join("dotfiles").join("config"), "a").unwrap();
+        let link = dir.path().join("config");
+        symlink(Path::new("dotfiles/config"), &link).unwrap();
+        assert_eq!(fs::read_to_string(&link).unwrap(), "a");
+    }
 
     #[test]
     fn stamp_changes_when_rewritten() {

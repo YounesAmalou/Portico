@@ -83,6 +83,11 @@ pub fn owner_is(metadata: &Metadata, uid: &Uid) -> bool {
     metadata.uid() == *uid
 }
 
+/// `path` with every link and `..` resolved, as the filesystem sees it.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path)
+}
+
 /// Creates a symbolic link at `link` that points to `target`.
 pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
