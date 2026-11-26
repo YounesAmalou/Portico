@@ -807,10 +807,12 @@ mod tests {
             issue.headline,
             "Docker is not installed on this machine, or it is not on the PATH of a non-interactive shell there."
         );
-        assert_eq!(
-            issue.next,
-            ["Install Docker from the distribution's packages, then list again."]
-        );
+        let install = if cfg!(windows) {
+            "Install Docker Desktop, then list again."
+        } else {
+            "Install Docker from the distribution's packages, then list again."
+        };
+        assert_eq!(issue.next, [install]);
         assert_eq!(issue.offer, None);
     }
 
@@ -899,10 +901,21 @@ mod tests {
     #[test]
     fn a_local_podman_listing_runs_the_script_with_sh() {
         let fixture = fixture();
-        fixture.behave(
-            "sh",
-            &format!("printf 'portico-user=me\\n%s\\n' '{PODMAN_LISTING}'\n"),
-        );
+        // Windows has no sh: there podman itself lists.
+        let (program, behaviour, words) = if cfg!(windows) {
+            (
+                "podman",
+                format!("printf '%s\\n' '{PODMAN_LISTING}'\n"),
+                call(&["ps", "--format", "json"]),
+            )
+        } else {
+            (
+                "sh",
+                format!("printf 'portico-user=me\\n%s\\n' '{PODMAN_LISTING}'\n"),
+                call(&podman::list_words()[1..]),
+            )
+        };
+        fixture.behave(program, &behaviour);
 
         let list = fixture
             .app
@@ -911,7 +924,7 @@ mod tests {
 
         assert_eq!(list.backend, BackendId::Podman);
         assert_eq!(list.listing.containers.len(), 1);
-        assert_eq!(fixture.calls("sh"), call(&podman::list_words()[1..]));
+        assert_eq!(fixture.calls(program), words);
         assert_eq!(fixture.calls("docker"), "");
     }
 

@@ -41,6 +41,11 @@ pub const SSH_BACKGROUNDS: bool = false;
 /// Desktop and Podman have no `docker` group or socket group to join.
 pub const UNIX_GROUPS: bool = false;
 
+/// Whether this machine has the Unix tools Portico's container listings expect (a POSIX `sh`
+/// on `PATH`, Docker and Podman from the system's packages): not here, where `podman.exe`
+/// runs directly and Docker Desktop and Podman Desktop provide the programs.
+pub const UNIX_TOOLS: bool = false;
+
 /// The signals that end a session, which Portico treats alike: the console's Ctrl+C and
 /// Ctrl+Break reach the C runtime as these. Windows has no hang-up signal.
 pub const HANGUP_SIGNALS: &[i32] = &[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM];

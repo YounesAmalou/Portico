@@ -468,7 +468,7 @@ fn plain_issue(target: &Target, problem: Problem, stderr: String) -> BackendIssu
             format!(
                 "Docker is not installed on {target}, or it is not on the PATH of a non-interactive shell there."
             ),
-            vec!["Install Docker from the distribution's packages, then list again.".into()],
+            vec![super::install_hint("Docker", target)],
         ),
         Problem::ServiceDown => return daemon_down(target, false, stderr),
         Problem::PermissionDenied => (

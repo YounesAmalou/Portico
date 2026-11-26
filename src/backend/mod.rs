@@ -61,6 +61,20 @@ pub const SHELL_SCRIPT: &str = "command -v bash >/dev/null 2>&1 && exec bash || 
 
 /// Quotes one word for a POSIX shell: words made only of safe characters
 /// stay as they are, anything else is single-quoted.
+/// How to install `engine` (Docker, Podman) for `target`: from the distribution's packages,
+/// or, on this machine where it has no Unix tools (Windows), with its desktop app.
+pub(crate) fn install_hint(engine: &str, target: &Target) -> String {
+    install_hint_with(engine, target, crate::platform::process::UNIX_TOOLS)
+}
+
+fn install_hint_with(engine: &str, target: &Target, unix_tools: bool) -> String {
+    if unix_tools || !matches!(target, Target::Local) {
+        format!("Install {engine} from the distribution's packages, then list again.")
+    } else {
+        format!("Install {engine} Desktop, then list again.")
+    }
+}
+
 pub fn quote(word: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
     if !word.is_empty() && word.chars().all(safe) {
@@ -287,6 +301,24 @@ pub fn plain_issue(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_windows_machine_is_told_to_install_the_desktop_app() {
+        let host = Target::Host("dev".into());
+        assert_eq!(
+            install_hint_with("Docker", &Target::Local, true),
+            "Install Docker from the distribution's packages, then list again."
+        );
+        assert_eq!(
+            install_hint_with("Podman", &Target::Local, false),
+            "Install Podman Desktop, then list again."
+        );
+        // A host is a Linux machine whatever this one is.
+        assert_eq!(
+            install_hint_with("Docker", &host, false),
+            "Install Docker from the distribution's packages, then list again."
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -25,6 +25,10 @@ pub const SSH_BACKGROUNDS: bool = true;
 /// Whether access to a local service is granted through Unix groups, as Docker's socket is.
 pub const UNIX_GROUPS: bool = true;
 
+/// Whether this machine has the Unix tools Portico's container listings expect: a POSIX `sh`
+/// on `PATH` for their scripts, and Docker and Podman installed from the system's packages.
+pub const UNIX_TOOLS: bool = true;
+
 /// The signals that hang up or end a session, which Portico treats alike.
 pub const HANGUP_SIGNALS: &[i32] = &[
     signal_hook::consts::SIGINT,
