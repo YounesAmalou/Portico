@@ -1,6 +1,6 @@
 # Portico
 
-Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux and macOS. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
+Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux, macOS and Windows. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
 Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker and Podman containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
