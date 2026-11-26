@@ -226,7 +226,9 @@ fn a_tunnel_starts_in_the_background_and_stops() {
     env.run(["tunnel", "start", "socks"])
         .assert_stdout_contains("Started socks (socks 127.0.0.1:");
     let call = fs::read_to_string(&calls).unwrap();
-    let runtime = env.home().join(".ssh/portico/run/tunnels");
+    let runtime = [".ssh", "portico", "run", "tunnels"]
+        .iter()
+        .fold(env.home().to_path_buf(), |path, part| path.join(part));
     assert_eq!(
         call.trim(),
         format!(

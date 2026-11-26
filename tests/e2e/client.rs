@@ -159,11 +159,12 @@ impl Client {
         let mut logs = String::new();
         for path in entries.flatten().map(|entry| entry.path()) {
             if path.extension().is_some_and(|extension| extension == "log") {
-                logs.push_str(&format!(
-                    "--- {} ---\n{}\n",
-                    path.display(),
-                    fs::read_to_string(&path).unwrap_or_default()
-                ));
+                // Escaped, so that a stray byte or a failed read shows.
+                let text = match fs::read(&path) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).escape_debug().to_string(),
+                    Err(error) => format!("<cannot read: {error}>"),
+                };
+                logs.push_str(&format!("--- {} ---\n{text}\n", path.display()));
             }
         }
         logs

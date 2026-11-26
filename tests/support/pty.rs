@@ -151,7 +151,9 @@ fn run(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
                 terminal.read_until(b"\x1b[?1049h", 0, Duration::from_secs(5));
             }
             let started = home.join("resolver-started");
-            terminal.wait_until(|| started.exists(), "resolver did not start");
+            terminal.wait_until(|| started.exists(), &|| {
+                format!("resolver did not start; {}", listing(home))
+            });
         }
         BlockedInitLock => {
             terminal.read_screen("y initialize");
@@ -468,7 +470,13 @@ fn act(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
                     fs::read_to_string(&settings_path)
                         .is_ok_and(|settings| settings.contains("\"shop/api\" = \"deploy\""))
                 },
-                "the user was not remembered",
+                &|| {
+                    format!(
+                        "the user was not remembered: {:?}; {}",
+                        fs::read_to_string(&settings_path),
+                        listing(home)
+                    )
+                },
             );
             let settings = fs::read_to_string(&settings_path).unwrap();
             assert!(settings.contains("[users.local.docker]"), "{settings}");
@@ -626,6 +634,24 @@ fn clean_up(home: &Path, scenario: Scenario, managed_before: Option<&str>) {
         CtrlEnter => remove("launcher-args"),
         _ => {}
     }
+}
+
+/// The files under `home`, for a failure message.
+fn listing(home: &Path) -> String {
+    let mut files = Vec::new();
+    let mut pending = vec![home.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path.display().to_string());
+            }
+        }
+    }
+    files.sort();
+    format!("files under {}: {files:#?}", home.display())
 }
 
 /// Waits up to five seconds for the file at `path`.
@@ -859,7 +885,7 @@ impl Terminal {
 
     /// Waits up to five seconds for `done`; fails with the screen when it never holds. What
     /// Portico prints meanwhile is read only then, so the scenario reads it as before.
-    fn wait_until(&mut self, mut done: impl FnMut() -> bool, failure: &str) {
+    fn wait_until(&mut self, mut done: impl FnMut() -> bool, failure: &dyn Fn() -> String) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
             if Instant::now() >= deadline {
@@ -867,7 +893,7 @@ impl Terminal {
                 while Instant::now() < shown {
                     self.pump(shown);
                 }
-                self.fail(failure);
+                self.fail(&failure());
             }
             thread::sleep(Duration::from_millis(10));
         }
