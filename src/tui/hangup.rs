@@ -71,7 +71,15 @@ pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
     }
 }
 
+/// Waits for the terminal's next event, however long that takes, for a reader outside the TUI
+/// (the CLI's pickers): crossterm's own read on Unix.
+#[cfg(unix)]
+pub(crate) fn read_event() -> io::Result<Event> {
+    event::read()
+}
+
 /// Waits for the console's next event, however long that takes; its end is `UnexpectedEof`.
+/// It also reads the keys ConPTY reports in a form crossterm drops (see `next_event`).
 #[cfg(windows)]
 pub(crate) fn read_event() -> io::Result<Event> {
     loop {

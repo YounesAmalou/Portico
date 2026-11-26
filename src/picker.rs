@@ -108,13 +108,9 @@ fn interact(state: &mut impl State) -> Result<Option<Vec<usize>>, String> {
         },
     )
     .map_err(failed)?;
-    // Windows' console keys go through the TUI's reader, which also reads the ones ConPTY
-    // reports in a form crossterm drops.
-    #[cfg(unix)]
-    let read = crossterm::event::read;
-    #[cfg(windows)]
-    let read = crate::tui::read_event;
-    let outcome = run(&mut terminal, state, read);
+    // The TUI's reader, which on Windows also reads the keys ConPTY reports in a form
+    // crossterm drops.
+    let outcome = run(&mut terminal, state, crate::tui::read_event);
     drop(terminal);
     drop(raw);
     outcome
