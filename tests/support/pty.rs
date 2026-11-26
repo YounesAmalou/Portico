@@ -419,8 +419,10 @@ fn act(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
             terminal.write(b"a");
             terminal.read_screen("Enter save");
             terminal.enter_text("own");
+            terminal.read_screen("Alias: own");
             terminal.write(b"\t");
             terminal.enter_text("own.example");
+            terminal.read_screen("own.example");
             terminal.write(b"\r");
             terminal.read_screen("Saved own");
             thread::sleep(Duration::from_secs(2));
