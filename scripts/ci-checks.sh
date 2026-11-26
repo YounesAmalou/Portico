@@ -38,6 +38,42 @@ e2e() {
     cargo test --test e2e -- --ignored
 }
 
+# The test suite. On macOS the tests write to a file the step prints as it grows, not to the
+# step's own output, and get TEST_LIMIT seconds (300 by default) once built: a test that hangs,
+# or a process that never exits while holding the output, then ends the step with the tests
+# still running and a process listing, instead of a job that times out with no log at all.
+tests() {
+    if [ "$(uname -s)" != Darwin ]; then
+        cargo test --all-targets --no-fail-fast
+        return
+    fi
+    cargo test --all-targets --no-run
+    local log status=0 waited=0 limit=${TEST_LIMIT:-300}
+    log=$(mktemp)
+    set -m
+    cargo test --all-targets --no-fail-fast >"$log" 2>&1 </dev/null &
+    local tests=$!
+    set +m
+    tail -n +1 -f "$log" &
+    local tail=$!
+    while kill -0 "$tests" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$tests" 2>/dev/null; then
+        sleep 1
+        echo "::error::the tests were still running after $limit seconds; the processes left:"
+        ps -U "$(id -u)" -o pid,ppid,pgid,stat,etime,command
+        kill -KILL -- "-$tests" 2>/dev/null || true
+        status=1
+    fi
+    wait "$tests" || status=$?
+    sleep 1
+    kill "$tail" 2>/dev/null || true
+    rm -f -- "$log"
+    return "$status"
+}
+
 # The desktop panel (desktop/quickshell): Qt 6's qmllint on every QML file, and
 # portico.js against the golden files with Qt Quick Test, in Qt's own
 # JavaScript engine. Needs qt6-declarative and quickshell.
@@ -92,7 +128,7 @@ esac
 case "$1" in
     fmt) cargo fmt --check ;;
     clippy) cargo clippy --all-targets --all-features -- -D warnings ;;
-    test) cargo test --all-targets --no-fail-fast ;;
+    test) tests ;;
     e2e) e2e ;;
     docs) cargo test --test docs ;;
     msrv) msrv ;;
