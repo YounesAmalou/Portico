@@ -1,7 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
     process::Command,
     sync::atomic::AtomicBool,
@@ -10,7 +9,7 @@ use std::{
 use super::connect::Watched;
 use super::{OpenSsh, OpenSshError};
 use crate::domain::probe::{Failure, Route, TEST_DEADLINE, classify, fetch_key_args};
-use crate::platform::fs::write_unique;
+use crate::platform::fs::{private, write_unique};
 
 /// One line of `ssh-keygen -l`: `<bits> <fingerprint> <host> (<TYPE>)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,12 +126,11 @@ fn parse_fingerprint(line: &str) -> Result<KeyFingerprint, OpenSshError> {
 /// Appends `lines` to the known-hosts file at `path`, starting on a new line
 /// and creating the file private to the user when it is missing.
 pub(crate) fn append_known_hosts(path: &Path, lines: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = private(
+        OpenOptions::new().read(true).append(true).create(true),
+        0o600,
+    )
+    .open(path)?;
     let mut contents = Vec::with_capacity(lines.len() + 1);
     if file.metadata()?.len() > 0 {
         let mut last = [0];
@@ -225,6 +223,7 @@ mod tests {
         assert!(!Path::new(&fs::read_to_string(ssh.log()).unwrap()).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn append_adds_a_separating_newline_and_creates_missing_files_private() {
         use std::os::unix::fs::PermissionsExt;

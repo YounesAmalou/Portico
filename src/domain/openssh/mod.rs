@@ -1,6 +1,5 @@
 use std::{
     io,
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -12,7 +11,7 @@ use thiserror::Error;
 
 use crate::domain::explain::Explanation;
 use crate::platform::launcher::DEFAULT_LAUNCHER;
-use crate::platform::process::terminate_process_group;
+use crate::platform::process::{own_group, terminate_process_group};
 
 mod config;
 mod connect;
@@ -194,7 +193,7 @@ impl OpenSsh {
     ) -> Result<Output, OpenSshError> {
         let program = PathBuf::from(command.get_program());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        command.process_group(0);
+        own_group(command);
         let mut child = command.spawn().map_err(|source| OpenSshError::Io {
             program: program.clone(),
             source,

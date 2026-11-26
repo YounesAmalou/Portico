@@ -6,13 +6,68 @@
 use std::{
     ffi::OsStr,
     io,
-    os::unix::ffi::OsStrExt,
+    os::unix::{
+        ffi::OsStrExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::PathBuf,
+    process::{Command, ExitStatus},
     thread,
     time::{Duration, Instant},
 };
 
 use super::super::os::process::{Pin, Proc, children, wait_until_stopped};
+
+/// A user as the process table names one: the numeric UID.
+pub type Uid = u32;
+
+/// The signals that hang up or end a session, which Portico treats alike.
+pub const HANGUP_SIGNALS: &[i32] = &[
+    signal_hook::consts::SIGINT,
+    signal_hook::consts::SIGTERM,
+    signal_hook::consts::SIGHUP,
+];
+
+/// A process's exit status as Portico's: its code, or 128 plus the signal that killed it, as a
+/// shell reports it. `None` when that is not a valid exit code.
+pub fn exit_code(status: ExitStatus) -> Option<u8> {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .and_then(|code| u8::try_from(code).ok())
+}
+
+/// The status of a process that exited with `code`.
+#[cfg(test)]
+pub fn exit_status(code: i32) -> ExitStatus {
+    ExitStatus::from_raw(code << 8)
+}
+
+/// Puts the process `command` starts in a process group of its own, out of reach of the
+/// terminal's Ctrl+C.
+pub fn own_group(command: &mut Command) -> &mut Command {
+    command.process_group(0)
+}
+
+/// Makes the process `command` starts lead a session of its own, as `ssh -f` does.
+pub fn detach(command: &mut Command) -> &mut Command {
+    // SAFETY: `setsid` is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+/// Whether Portico runs as root, which is not subject to file permissions.
+pub fn is_superuser() -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
 
 pub fn terminate_process_group(child: &mut std::process::Child) {
     kill_process_group(child);
@@ -218,7 +273,7 @@ impl Proc {
     /// Every live process of `uid` that leads its own session (as `ssh -f` does once it has put
     /// itself in the background) and whose command line has `-E <path>`: what a status listing
     /// searches for tunnels without a record, read once however many tunnels it lists.
-    pub fn scan(&self, uid: u32) -> Vec<Logged> {
+    pub fn scan(&self, uid: &Uid) -> Vec<Logged> {
         self.pids()
             .into_iter()
             .filter_map(|pid| {
@@ -232,7 +287,7 @@ impl Proc {
                 // Only a backgrounded ssh counts: a foreground one may still fail to connect.
                 (!matches!(stat.state, 'Z' | 'X' | 'x')
                     && stat.session == pid
-                    && self.uid(pid) == Some(uid))
+                    && self.uid(pid).as_ref() == Some(uid))
                 .then_some(Logged {
                     pid,
                     start: stat.start,
@@ -252,7 +307,7 @@ pub struct Logged {
 }
 
 /// The current user's real UID.
-pub fn current_uid() -> u32 {
+pub fn current_uid() -> Uid {
     // SAFETY: `getuid` has no preconditions.
     unsafe { libc::getuid() }
 }

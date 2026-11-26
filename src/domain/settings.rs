@@ -456,6 +456,7 @@ fn invalid(path: &Path, text: &str, span: Option<Range<usize>>, reason: &str) ->
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -544,6 +545,7 @@ mod tests {
         assert!(!tabs.podman && !tabs.docker && tabs.tunnels);
     }
 
+    #[cfg(unix)]
     #[test]
     fn set_writes_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
@@ -579,6 +581,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn set_creates_the_file_and_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -781,6 +784,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "[tabs\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn remember_user_writes_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();

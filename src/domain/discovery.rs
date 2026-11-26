@@ -741,6 +741,7 @@ mod tests {
         assert!(result.aliases_complete, "{:?}", result.warnings);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_entry_keeps_lexical_include_roots() {
         let dir = tempfile::tempdir().unwrap();

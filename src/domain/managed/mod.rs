@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 
 use crate::domain::host::{Host, HostError, HostField};
-use crate::platform::paths::SYSTEM_SSH_CONFIG;
+use crate::platform::paths::system_ssh_config;
 
 mod config;
 mod init;
@@ -102,7 +102,7 @@ impl ConfigPaths {
             managed: portico_dir.join("config"),
             backup: portico_dir.join("config.bak"),
             lock: portico_dir.join("config.lock"),
-            system_config: PathBuf::from(SYSTEM_SSH_CONFIG),
+            system_config: system_ssh_config(),
             ssh_dir,
             entry,
             portico_dir,

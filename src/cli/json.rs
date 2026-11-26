@@ -644,7 +644,9 @@ pub(super) fn report(report: &TunnelReport) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
     use super::*;
     use crate::{
@@ -830,6 +832,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_external_host_declares_nothing_and_a_failed_resolution_says_why() {
         let value = details(&HostDetails {

@@ -265,12 +265,7 @@ impl From<ViaArg> for Via {
 /// ssh's exit status as Portico's: its code, or 128 plus the signal that killed it, as a shell
 /// reports it.
 fn exit_code(status: std::process::ExitStatus) -> ExitCode {
-    use std::os::unix::process::ExitStatusExt;
-    status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from)
+    crate::platform::process::exit_code(status).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 /// The exit status of a `portico test` that a signal cancelled, as for SIGINT.
@@ -307,11 +302,7 @@ impl Interrupts {
             signal_after: std::cell::Cell::new(0),
         };
         if handle_signals {
-            for signal in [
-                signal_hook::consts::SIGINT,
-                signal_hook::consts::SIGTERM,
-                signal_hook::consts::SIGHUP,
-            ] {
+            for &signal in crate::platform::process::HANGUP_SIGNALS {
                 signal_hook::flag::register_conditional_default(
                     signal,
                     Arc::clone(&interrupts.default_action),

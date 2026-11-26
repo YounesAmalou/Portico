@@ -56,6 +56,46 @@ fn next_event_from(
     }
 }
 
+/// Waits for a line on the terminal, an end of input, or `terminated` (Ctrl+C, a signal or a
+/// hang-up).
+///
+/// Reads the descriptor directly: `main` holds the lock of `io::stdin()` for the whole session,
+/// so reading through it would wait for ever. One byte at a time, so nothing after the line is
+/// taken from the terminal.
+pub(super) fn wait_for_enter(terminated: &AtomicBool, tick: Duration) {
+    use std::{
+        io::Read,
+        os::fd::{AsFd, AsRawFd},
+    };
+    let Ok(fd) = io::stdin().as_fd().try_clone_to_owned() else {
+        return;
+    };
+    let mut input = std::fs::File::from(fd);
+    let mut byte = [0];
+    while !terminated.load(Ordering::Relaxed) {
+        let mut poll = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads and writes only the one `pollfd` it is given.
+        let ready = unsafe { libc::poll(&mut poll, 1, tick.as_millis() as libc::c_int) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+        if ready <= 0 {
+            continue;
+        }
+        match input.read(&mut byte) {
+            Ok(0) => return,
+            Ok(_) if matches!(byte[0], b'\n' | b'\r') => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
 /// Watches the terminal until dropped.
 pub(super) struct HangupWatch {
     // Dropping it wakes the watcher, which then returns.

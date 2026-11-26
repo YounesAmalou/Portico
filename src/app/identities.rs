@@ -6,7 +6,6 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -24,6 +23,8 @@ use crate::{
         IdentityInventory, InventoryAgent, InventoryFile, PublicKey, Socket,
     },
     domain::openssh::{OpenSsh, OpenSshError, ResolvedConfig},
+    platform::fs::is_socket,
+    platform::process::current_uid,
 };
 
 /// How long `ssh-add` or `ssh-keygen` may run before it is killed.
@@ -128,7 +129,7 @@ fn list_agent(openssh: &OpenSsh, socket: &Path, deadline: Duration) -> Agent {
             return unavailable(AgentProblem::NoSuchSocket);
         }
         Err(error) => return unavailable(AgentProblem::Refused(error.to_string())),
-        Ok(metadata) if !metadata.file_type().is_socket() => {
+        Ok(metadata) if !is_socket(&metadata) => {
             return unavailable(AgentProblem::NotASocket);
         }
         Ok(_) => {}
@@ -273,8 +274,7 @@ impl App {
         let context = Expansion {
             home: self.home(),
             local_user: &user,
-            // SAFETY: `getuid` has no preconditions and cannot fail.
-            uid: unsafe { libc::getuid() },
+            uid: current_uid().to_string(),
             hostname: &resolved.hostname,
             remote_user: &remote_user,
             port: resolved.port.unwrap_or(22),
@@ -509,12 +509,16 @@ fn public_keys_in(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::domain::identity::MissingReason;
     use crate::{
-        domain::identity::{Availability, MissingReason},
+        domain::identity::Availability,
         domain::managed::{ConfigPaths, ManagedStore},
         test_executable::write_executable,
     };
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -587,12 +591,14 @@ mod tests {
         config
     }
 
+    #[cfg(unix)]
     fn socket(fixture: &Fixture) -> (PathBuf, UnixListener) {
         let path = fixture.path("agent.sock");
         let listener = UnixListener::bind(&path).unwrap();
         (path, listener)
     }
 
+    #[cfg(unix)]
     #[test]
     fn classifies_a_hosts_identities_against_its_agent() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -638,6 +644,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_listing_is_asked_once_per_socket_until_forgotten() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -660,6 +667,7 @@ mod tests {
         assert_eq!(fs::read_to_string(log.path()).unwrap(), "asked\nasked\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_listing_past_the_deadline_is_killed() {
         let pid = tempfile::NamedTempFile::new().unwrap();
@@ -690,6 +698,7 @@ mod tests {
         assert!(!alive, "ssh-add {pid} is still running");
     }
 
+    #[cfg(unix)]
     #[test]
     fn reports_missing_sockets_and_refusals_without_listing() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -765,6 +774,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn never_fingerprints_a_private_key() {
         let log = tempfile::NamedTempFile::new().unwrap();
@@ -813,6 +823,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn inventory_merges_hosts_ssh_keys_and_agents() {
         let fixture = fixture(

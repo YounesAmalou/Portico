@@ -1791,9 +1791,9 @@ mod tests {
 
     #[test]
     fn shell_and_fix_status_lines() {
-        use std::os::unix::process::ExitStatusExt;
-        let ok = std::process::ExitStatus::from_raw(0);
-        let failed = std::process::ExitStatus::from_raw(256);
+        use crate::platform::process::exit_status;
+        let ok = exit_status(0);
+        let failed = exit_status(1);
         let exited = |status, explanation| {
             Ok(Ok(ConnectionOutcome::Exited {
                 alias: "dev".into(),

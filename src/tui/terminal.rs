@@ -24,6 +24,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::Backend, layout::Rect};
 
 use super::TuiError;
+use crate::platform::process::HANGUP_SIGNALS;
 
 /// Clears the alternate screen and forgets what was drawn, so the next frame repaints everything.
 ///
@@ -74,7 +75,11 @@ impl Signals {
             terminated: Arc::new(AtomicBool::new(false)),
             child_in_foreground: Arc::new(AtomicBool::new(false)),
         };
-        for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
+        // SIGINT is handled below: it only ends the interface when no child holds the terminal.
+        for &signal in HANGUP_SIGNALS
+            .iter()
+            .filter(|&&signal| signal != signal_hook::consts::SIGINT)
+        {
             signal_hook::flag::register(signal, Arc::clone(&signals.terminated))?;
         }
         let terminated = Arc::clone(&signals.terminated);
@@ -497,6 +502,7 @@ mod tests {
         assert!(signals.flag().load(Ordering::Relaxed));
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigterm_and_sighup_end_the_tui_even_while_a_child_runs() {
         let _lock = signal_test_lock();

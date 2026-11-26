@@ -112,7 +112,9 @@ impl TunnelStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc, thread};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{sync::Arc, thread};
 
     use super::*;
     use crate::domain::tunnel::{Forward, Kind, Tunnel};
@@ -128,6 +130,7 @@ mod tests {
         assert_eq!(store.load().unwrap(), TunnelsFile::default());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_change_is_written_privately_with_a_backup() {
         let dir = tempfile::tempdir().unwrap();

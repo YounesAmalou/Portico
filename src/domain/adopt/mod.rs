@@ -5,12 +5,9 @@ mod scan;
 pub(crate) use scan::*;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::ops::Range;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,8 +19,10 @@ use crate::domain::managed::{
     HostComments, ManagedConfig, ManagedStore, TransactionError, render_host,
 };
 use crate::platform::fs::{
-    PendingFile, acquire_lock, normalize_path, open_lock, symlink_target, sync_dir, write_unique,
+    PendingFile, acquire_lock, has_other_links, mode_of, normalize_path, open_lock, owner_is,
+    symlink_target, sync_dir, writable, write_unique,
 };
+use crate::platform::process::{Uid, current_uid};
 
 /// Whether hosts move into the managed fragment or out of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,7 +235,7 @@ fn lossless_reason(
 /// The first rule `path` breaks as a file to rewrite: a regular file without other hard links
 /// (replacing it would detach them), valid UTF-8, owned by `euid`, and writable along with its
 /// directory.
-fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
+fn source_problem(path: &Path, contents: &[u8], euid: &Uid) -> Option<String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => return Some(format!("cannot inspect {}: {error}", path.display())),
@@ -244,13 +243,13 @@ fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
     if !metadata.is_file() {
         return Some("not a regular file".into());
     }
-    if metadata.nlink() > 1 {
+    if has_other_links(&metadata) {
         return Some("has other hard links".into());
     }
     if std::str::from_utf8(contents).is_err() {
         return Some("not valid UTF-8".into());
     }
-    if metadata.uid() != euid {
+    if !owner_is(&metadata, euid) {
         return Some("owned by another user".into());
     }
     let dir = match path.parent() {
@@ -258,32 +257,18 @@ fn source_problem(path: &Path, contents: &[u8], euid: u32) -> Option<String> {
         _ => Path::new("."),
     };
     for (what, path) in [("file", path), ("directory", dir)] {
-        if let Err(error) = writable(path) {
-            return Some(match error.raw_os_error() {
-                Some(libc::EACCES | libc::EPERM | libc::EROFS) => format!("{what} is read-only"),
-                _ => format!(
+        match writable(path) {
+            Ok(true) => {}
+            Ok(false) => return Some(format!("{what} is read-only")),
+            Err(error) => {
+                return Some(format!(
                     "cannot check whether {} is writable: {error}",
                     path.display()
-                ),
-            });
+                ));
+            }
         }
     }
     None
-}
-
-fn writable(path: &Path) -> io::Result<()> {
-    let path = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: `path` is a NUL-terminated string that outlives the call.
-    if unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
 }
 
 /// Managed blocks as export writes them below the Include and the global directives after it:
@@ -309,7 +294,7 @@ struct Source {
 }
 
 impl Source {
-    fn read(path: &Path, euid: u32, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) -> Self {
+    fn read(path: &Path, euid: &Uid, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) -> Self {
         let target = match symlink_target(path) {
             Ok(target) => file_key(target),
             Err((at, error)) => {
@@ -369,14 +354,14 @@ impl ManagedStore {
                 _ => None,
             })
             .collect::<BTreeMap<_, _>>();
-        let euid = effective_uid();
+        let euid = current_uid();
         let mut sources = BTreeMap::new();
         let mut candidates = Vec::new();
         let mut moves = BTreeMap::new();
         for external in &discovery.hosts {
             let source = sources
                 .entry(external.source.clone())
-                .or_insert_with(|| Source::read(&external.source, euid, &mut snapshot));
+                .or_insert_with(|| Source::read(&external.source, &euid, &mut snapshot));
             let key = external.alias.to_ascii_lowercase();
             let eligibility = (|| {
                 let blocks = source.blocks.as_ref().map_err(Clone::clone)?;
@@ -451,7 +436,7 @@ impl ManagedStore {
         let (managed_bytes, config) = self.read_managed()?;
         let entry = file_key(self.entry_file()?);
         let entry_bytes = fs::read(&entry).map_err(|source| io_error(&entry, source))?;
-        let problem = source_problem(&entry, &entry_bytes, effective_uid());
+        let problem = source_problem(&entry, &entry_bytes, &current_uid());
 
         let mut candidates = Vec::new();
         let mut moves = BTreeMap::new();
@@ -696,11 +681,7 @@ impl ManagedStore {
             let mode = if managed {
                 0o600
             } else {
-                fs::metadata(path)
-                    .map_err(|source| io_error(path, source))?
-                    .permissions()
-                    .mode()
-                    & 0o7777
+                mode_of(&fs::metadata(path).map_err(|source| io_error(path, source))?) & 0o7777
             };
             let dir = parent_dir(path);
             let candidate = write_unique(&dir, &temporary_stem(path, "candidate"), contents, mode)
@@ -1077,6 +1058,7 @@ mod tests {
     use crate::domain::managed::{ConfigPaths, ManagedStore};
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1167,6 +1149,7 @@ mod tests {
         assert_no_staged_files(&fixture.paths);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reasons_follow_the_spec_order() {
         let fixture = fixture_with(
@@ -1243,18 +1226,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_file_owned_by_another_user_is_refused() {
         let fixture = fixture("");
         let path = fixture.write("hosts.conf", b"Host a\n  HostName a\n");
         let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&path).unwrap());
-        assert_eq!(source_problem(&path, b"Host a\n", uid), None);
+        assert_eq!(source_problem(&path, b"Host a\n", &uid), None);
         assert_eq!(
-            source_problem(&path, b"Host a\n", uid.wrapping_add(1)).as_deref(),
+            source_problem(&path, b"Host a\n", &uid.wrapping_add(1)).as_deref(),
             Some("owned by another user")
         );
         assert_eq!(
-            source_problem(&fixture.paths.ssh_dir, b"", uid).as_deref(),
+            source_problem(&fixture.paths.ssh_dir, b"", &uid).as_deref(),
             Some("not a regular file")
         );
     }
@@ -1331,6 +1315,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_source_is_previewed_at_its_target() {
         let fixture = fixture("Include linked.conf\n");
@@ -1387,6 +1372,7 @@ mod tests {
         assert_eq!(reasons(&plan), [("dev".into(), None)]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn preview_rejects_unknown_and_ineligible_aliases() {
         let fixture = fixture("Host dev\n  HostName d\nHost fwd\n  ForwardAgent yes\n");
@@ -1425,6 +1411,7 @@ mod tests {
             Err(AdoptError::Transaction(TransactionError::NotInitialized))
         ));
     }
+    #[cfg(unix)]
     #[test]
     fn snapshot_keys_name_each_file_once() {
         let fixture = fixture("Include linked.conf\n");
@@ -1558,6 +1545,7 @@ mod tests {
         assert_no_temporary_files(&fixture.paths);
     }
 
+    #[cfg(unix)]
     #[test]
     fn adopting_from_an_included_file_and_the_entry_in_one_go() {
         let fixture = fixture("Include extra.conf\nHost a\n  HostName a\n");
@@ -1623,6 +1611,7 @@ mod tests {
         assert!(!fixture.paths.backup.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_retargeted_entry_link_is_stale() {
         let fixture = fixture("Host dev\n  HostName d\n");
@@ -1990,6 +1979,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_source_keeps_the_link() {
         let fixture = fixture("");
@@ -2074,6 +2064,7 @@ mod tests {
         assert_no_temporary_files(&fixture.paths);
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_through_a_symlinked_entry_keeps_the_link() {
         let fixture = fixture_with("", "\nHost dev\n    HostName d\n");

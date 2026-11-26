@@ -6,14 +6,14 @@ use std::{
     ffi::OsStr,
     fs, io,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
 };
 
 use crate::{
-    platform::fs::{cloexec_socket, create_private_dir, sync_dir, write_unique},
+    platform::fs::{create_private_dir, sync_dir, write_unique},
+    platform::net::bind_probe,
     platform::paths::runtime_dir,
-    platform::process::{Logged, Proc},
+    platform::process::{Logged, Proc, Uid},
 };
 
 /// The directory holding the records and logs of started tunnels.
@@ -194,19 +194,19 @@ pub fn find_in(processes: &[Logged], log: &Path, since: Option<u64>) -> Option<(
 impl Proc {
     /// Whether `pid` is a live process of `uid` whose command line names `log` after `-E`, and,
     /// when `start` is given, that started at that time.
-    pub fn is_tunnel(&self, pid: u32, start: Option<u64>, log: &Path, uid: u32) -> bool {
+    pub fn is_tunnel(&self, pid: u32, start: Option<u64>, log: &Path, uid: &Uid) -> bool {
         let Some(stat) = self.stat(pid) else {
             return false;
         };
         !matches!(stat.state, 'Z' | 'X' | 'x')
             && start.is_none_or(|start| start == stat.start)
-            && self.uid(pid) == Some(uid)
+            && self.uid(pid).as_ref() == Some(uid)
             && self.cmdline(pid).is_some_and(|args| names_log(&args, log))
     }
 
     /// The newest live process of `uid` whose command line names `log` after `-E`, started no
     /// earlier than `since` (clock ticks after boot) when given, with its start time.
-    pub fn find_tunnel(&self, log: &Path, uid: u32, since: Option<u64>) -> Option<(u32, u64)> {
+    pub fn find_tunnel(&self, log: &Path, uid: &Uid, since: Option<u64>) -> Option<(u32, u64)> {
         find_in(&self.scan(uid), log, since)
     }
 
@@ -231,7 +231,7 @@ impl Proc {
     }
 
     /// Whether `record`'s process is still the tunnel it was started as.
-    pub fn identify(&self, record: &RunningRecord, log: &Path, uid: u32) -> Identity {
+    pub fn identify(&self, record: &RunningRecord, log: &Path, uid: &Uid) -> Identity {
         if self.boot_id().as_deref() != Some(record.boot.as_str()) {
             return Identity::Stale;
         }
@@ -245,7 +245,7 @@ impl Proc {
 
 /// Whether the arguments contain `-E` followed by `log`.
 fn names_log(args: &[Vec<u8>], log: &Path) -> bool {
-    let log = log.as_os_str().as_bytes();
+    let log = log.as_os_str().as_encoded_bytes();
     args.windows(2)
         .any(|pair| pair[0] == b"-E" && pair[1] == log)
 }
@@ -306,70 +306,6 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
     Bind::Free
 }
 
-/// Binds `address` and closes it again: an IPv6 address with `IPV6_V6ONLY`, as ssh listens
-/// (the standard library's listener is dual-stack and would also collide with IPv4
-/// listeners), and `SO_REUSEADDR` on Linux only (see `try_bind`).
-fn bind_probe(address: SocketAddr) -> io::Result<()> {
-    let one: libc::c_int = 1;
-    let mut options = Vec::new();
-    let domain = match address {
-        SocketAddr::V4(_) => libc::AF_INET,
-        SocketAddr::V6(_) => {
-            options.push((libc::IPPROTO_IPV6, libc::IPV6_V6ONLY));
-            libc::AF_INET6
-        }
-    };
-    if cfg!(target_os = "linux") {
-        options.push((libc::SOL_SOCKET, libc::SO_REUSEADDR));
-    }
-    // SAFETY: plain socket calls on a descriptor owned here, with properly sized socket
-    // addresses and option values that outlive each call.
-    unsafe {
-        let socket = cloexec_socket(domain, libc::SOCK_STREAM)?;
-        for option in options {
-            if libc::setsockopt(
-                socket.as_raw_fd(),
-                option.0,
-                option.1,
-                (&raw const one).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        let bound = match address {
-            SocketAddr::V4(address) => {
-                let mut raw: libc::sockaddr_in = std::mem::zeroed();
-                raw.sin_family = libc::AF_INET as libc::sa_family_t;
-                raw.sin_port = address.port().to_be();
-                raw.sin_addr.s_addr = u32::from(*address.ip()).to_be();
-                libc::bind(
-                    socket.as_raw_fd(),
-                    (&raw const raw).cast(),
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            }
-            SocketAddr::V6(address) => {
-                let mut raw: libc::sockaddr_in6 = std::mem::zeroed();
-                raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                raw.sin6_port = address.port().to_be();
-                raw.sin6_addr.s6_addr = address.ip().octets();
-                raw.sin6_scope_id = address.scope_id();
-                libc::bind(
-                    socket.as_raw_fd(),
-                    (&raw const raw).cast(),
-                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                )
-            }
-        };
-        if bound != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
 /// The last line of a tunnel's log that says something, debug output left out.
 pub fn log_reason(log: &Path) -> Option<String> {
     log_tail(log, 1).pop()
@@ -393,6 +329,7 @@ pub fn log_tail(log: &Path, count: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -505,7 +442,7 @@ mod tests {
         let (dir, proc) = fake_proc();
         add_process(dir.path(), 41, 500, 'S', 1000, &tunnel_args());
         assert_eq!(
-            proc.identify(&record(41, 500), Path::new(LOG), 1000),
+            proc.identify(&record(41, 500), Path::new(LOG), &1000),
             Identity::Alive
         );
     }
@@ -516,7 +453,7 @@ mod tests {
         let (dir, proc) = fake_proc();
         add_process(dir.path(), 41, 501, 'S', 1000, &tunnel_args());
         assert_eq!(
-            proc.identify(&record(41, 500), Path::new(LOG), 1000),
+            proc.identify(&record(41, 500), Path::new(LOG), &1000),
             Identity::Gone
         );
     }
@@ -528,7 +465,7 @@ mod tests {
         add_process(dir.path(), 41, 500, 'S', 1000, &tunnel_args());
         let mut old = record(41, 500);
         old.boot = "another".into();
-        assert_eq!(proc.identify(&old, Path::new(LOG), 1000), Identity::Stale);
+        assert_eq!(proc.identify(&old, Path::new(LOG), &1000), Identity::Stale);
     }
 
     #[cfg(target_os = "linux")]
@@ -537,7 +474,7 @@ mod tests {
         let (dir, proc) = fake_proc();
         add_process(dir.path(), 41, 500, 'S', 0, &tunnel_args());
         assert_eq!(
-            proc.identify(&record(41, 500), Path::new(LOG), 1000),
+            proc.identify(&record(41, 500), Path::new(LOG), &1000),
             Identity::Gone
         );
     }
@@ -548,7 +485,7 @@ mod tests {
         let (dir, proc) = fake_proc();
         add_process(dir.path(), 41, 500, 'Z', 1000, &tunnel_args());
         assert_eq!(
-            proc.identify(&record(41, 500), Path::new(LOG), 1000),
+            proc.identify(&record(41, 500), Path::new(LOG), &1000),
             Identity::Gone
         );
     }
@@ -566,12 +503,12 @@ mod tests {
             &["sleep", "-E", "/other.log"],
         );
         assert_eq!(
-            proc.identify(&record(41, 500), Path::new(LOG), 1000),
+            proc.identify(&record(41, 500), Path::new(LOG), &1000),
             Identity::Gone
         );
         // A missing process is gone too.
         assert_eq!(
-            proc.identify(&record(43, 500), Path::new(LOG), 1000),
+            proc.identify(&record(43, 500), Path::new(LOG), &1000),
             Identity::Gone
         );
     }
@@ -583,11 +520,11 @@ mod tests {
         add_process(dir.path(), 40, 300, 'S', 1000, &["bash"]);
         add_process(dir.path(), 41, 500, 'S', 1000, &tunnel_args());
         assert_eq!(
-            proc.find_tunnel(Path::new(LOG), 1000, None),
+            proc.find_tunnel(Path::new(LOG), &1000, None),
             Some((41, 500))
         );
         assert_eq!(
-            proc.find_tunnel(Path::new(LOG), 1000, Some(400)),
+            proc.find_tunnel(Path::new(LOG), &1000, Some(400)),
             Some((41, 500))
         );
     }
@@ -597,10 +534,10 @@ mod tests {
     fn scan_ignores_a_foreground_ssh_that_is_still_connecting() {
         let (dir, proc) = fake_proc();
         add_in_session(dir.path(), 41, 7, 500, 'S', 1000, &tunnel_args());
-        assert_eq!(proc.find_tunnel(Path::new(LOG), 1000, None), None);
+        assert_eq!(proc.find_tunnel(Path::new(LOG), &1000, None), None);
         add_process(dir.path(), 42, 510, 'S', 1000, &tunnel_args());
         assert_eq!(
-            proc.find_tunnel(Path::new(LOG), 1000, None),
+            proc.find_tunnel(Path::new(LOG), &1000, None),
             Some((42, 510))
         );
     }
@@ -612,13 +549,13 @@ mod tests {
         add_process(dir.path(), 41, 500, 'S', 1000, &tunnel_args());
         add_process(dir.path(), 42, 900, 'S', 0, &tunnel_args());
         add_process(dir.path(), 43, 950, 'Z', 1000, &tunnel_args());
-        assert_eq!(proc.find_tunnel(Path::new(LOG), 1000, Some(600)), None);
+        assert_eq!(proc.find_tunnel(Path::new(LOG), &1000, Some(600)), None);
         assert_eq!(
-            proc.find_tunnel(Path::new(LOG), 1000, None),
+            proc.find_tunnel(Path::new(LOG), &1000, None),
             Some((41, 500))
         );
         assert_eq!(
-            proc.find_tunnel(Path::new("/run/other.log"), 1000, None),
+            proc.find_tunnel(Path::new("/run/other.log"), &1000, None),
             None
         );
     }
@@ -628,7 +565,7 @@ mod tests {
     fn rediscovers_a_tunnel_without_a_record() {
         let (dir, proc) = fake_proc();
         add_process(dir.path(), 41, 500, 'S', 1000, &tunnel_args());
-        let (pid, start) = proc.find_tunnel(Path::new(LOG), 1000, None).unwrap();
+        let (pid, start) = proc.find_tunnel(Path::new(LOG), &1000, None).unwrap();
         let rebuilt = proc.rebuild_record(pid, start).unwrap();
         let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap();
         assert_eq!(
@@ -639,7 +576,7 @@ mod tests {
             }
         );
         assert_eq!(
-            proc.identify(&rebuilt, Path::new(LOG), 1000),
+            proc.identify(&rebuilt, Path::new(LOG), &1000),
             Identity::Alive
         );
     }
@@ -648,9 +585,7 @@ mod tests {
     /// started tunnel's, in its own session as `ssh -f` puts itself.
     #[test]
     fn a_live_tunnel_process_is_recognised_rebuilt_and_stopped() {
-        use std::os::unix::process::CommandExt;
-
-        use crate::platform::process::{current_uid, stop_process};
+        use crate::platform::process::{current_uid, detach, stop_process};
 
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("db.log");
@@ -659,47 +594,39 @@ mod tests {
             .args(["-c", "sleep 30; :", "ssh", "-E"])
             .arg(&log)
             .args(["-L", "5432:db:5432", "--", "prod-db"]);
-        // SAFETY: `setsid` is async-signal-safe.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().unwrap();
+        let mut child = detach(&mut command).spawn().unwrap();
         let (proc, uid) = (Proc::system(), current_uid());
 
-        let (pid, start) = proc.find_tunnel(&log, uid, None).unwrap();
+        let (pid, start) = proc.find_tunnel(&log, &uid, None).unwrap();
         assert_eq!(pid, child.id());
-        assert_eq!(proc.find_tunnel(&log, uid, Some(start + 1)), None);
+        assert_eq!(proc.find_tunnel(&log, &uid, Some(start + 1)), None);
         let record = proc.rebuild_record(pid, start).unwrap();
         assert_eq!(record.host, "prod-db");
         assert_eq!(record.forward, "-L 5432:db:5432");
         assert!(record.started.abs_diff(now()) < 60, "{record:?}");
-        assert_eq!(proc.identify(&record, &log, uid), Identity::Alive);
+        assert_eq!(proc.identify(&record, &log, &uid), Identity::Alive);
         let restarted = RunningRecord {
             start: start + 1,
             ..record.clone()
         };
-        assert_eq!(proc.identify(&restarted, &log, uid), Identity::Gone);
+        assert_eq!(proc.identify(&restarted, &log, &uid), Identity::Gone);
         let rebooted = RunningRecord {
             boot: "another-boot".into(),
             ..record.clone()
         };
-        assert_eq!(proc.identify(&rebooted, &log, uid), Identity::Stale);
+        assert_eq!(proc.identify(&rebooted, &log, &uid), Identity::Stale);
         assert_eq!(
-            proc.identify(&record, &dir.path().join("other.log"), uid),
+            proc.identify(&record, &dir.path().join("other.log"), &uid),
             Identity::Gone
         );
 
-        assert!(stop_process(pid, || proc.is_tunnel(pid, Some(start), &log, uid)).unwrap());
+        assert!(stop_process(pid, || proc.is_tunnel(pid, Some(start), &log, &uid)).unwrap());
         child.wait().unwrap();
-        assert_eq!(proc.identify(&record, &log, uid), Identity::Gone);
-        assert_eq!(proc.find_tunnel(&log, uid, None), None);
+        assert_eq!(proc.identify(&record, &log, &uid), Identity::Gone);
+        assert_eq!(proc.find_tunnel(&log, &uid, None), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn record_round_trip() {
         let running = Record::Running(record(41, 500));

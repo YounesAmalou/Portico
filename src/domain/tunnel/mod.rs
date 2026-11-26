@@ -750,18 +750,13 @@ impl TunnelStatus {
 
 /// `HH:MM` in local time of a Unix time.
 fn clock(unix: u64) -> String {
-    // `time_t` is inferred: naming it is deprecated on musl, where it changes size.
-    let Ok(time) = unix.try_into() else {
-        return "--:--".into();
-    };
-    // SAFETY: `localtime_r` only writes the `tm` it is given.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&time, &mut tm).is_null() {
-            return "--:--".into();
-        }
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-    }
+    i64::try_from(unix)
+        .ok()
+        .and_then(crate::platform::time::local)
+        .map_or_else(
+            || "--:--".into(),
+            |time| format!("{:02}:{:02}", time.hour, time.minute),
+        )
 }
 
 /// Something about a saved tunnel worth knowing that does not stop it from being listed.

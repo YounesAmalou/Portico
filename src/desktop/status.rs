@@ -212,6 +212,7 @@ mod tests {
         assert_eq!(s.lines[0].text, "not installed");
     }
 
+    #[cfg(unix)]
     #[test]
     fn after_install_everything_is_installed() {
         let (_dir, env) = omarchy();

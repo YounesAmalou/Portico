@@ -1,7 +1,6 @@
 use std::{
     fs::{self, File},
     io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -16,8 +15,8 @@ use super::{
 use crate::domain::config_error::ConfigRejection;
 use crate::domain::discovery::{ConfigDirective, parse_directive_bytes, split_comment};
 use crate::platform::fs::{
-    acquire_lock, create_private_dir, normalize_path, open_lock, symlink_target, sync_dir,
-    write_unique,
+    acquire_lock, create_private_dir, mode_of, normalize_path, open_lock, set_mode, symlink_target,
+    sync_dir, write_unique,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,7 +122,7 @@ impl ManagedStore {
                     ),
                 ));
             }
-            Ok(metadata) => Some(metadata.permissions().mode() & 0o777),
+            Ok(metadata) => Some(mode_of(&metadata) & 0o777),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(source) => return Err(init_io(&self.paths.portico_dir, source)),
         };
@@ -143,7 +142,7 @@ impl ManagedStore {
                     io::Error::new(io::ErrorKind::InvalidInput, "managed config is not a file"),
                 ));
             }
-            Ok(metadata) => Some(metadata.permissions().mode() & 0o777),
+            Ok(metadata) => Some(mode_of(&metadata) & 0o777),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(source) => return Err(init_io(&self.paths.managed, source)),
         };
@@ -235,24 +234,22 @@ impl ManagedStore {
         let entry_mode = if plan.create_entry {
             None
         } else {
-            Some(
-                fs::metadata(&entry_path)
-                    .map_err(|source| init_io(&entry_path, source))?
-                    .permissions(),
-            )
+            Some(mode_of(
+                &fs::metadata(&entry_path).map_err(|source| init_io(&entry_path, source))?,
+            ))
         };
         let managed_mode = if plan.create_managed {
             None
         } else {
-            Some(
-                fs::metadata(&self.paths.managed)
-                    .map_err(|source| init_io(&self.paths.managed, source))?
-                    .permissions(),
-            )
+            Some(mode_of(
+                &fs::metadata(&self.paths.managed)
+                    .map_err(|source| init_io(&self.paths.managed, source))?,
+            ))
         };
-        let directory_mode = fs::metadata(&self.paths.portico_dir)
-            .map_err(|source| init_io(&self.paths.portico_dir, source))?
-            .permissions();
+        let directory_mode = mode_of(
+            &fs::metadata(&self.paths.portico_dir)
+                .map_err(|source| init_io(&self.paths.portico_dir, source))?,
+        );
         let managed = self.init_managed()?;
         let change_entry = plan.create_entry || plan.insert_include || plan.reposition_include;
         let final_entry = analyze_entry(&entry_contents, &self.paths)?.normalized;
@@ -261,10 +258,7 @@ impl ManagedStore {
                 &self.paths.ssh_dir,
                 "config.portico-backup",
                 &entry_contents,
-                entry_mode
-                    .as_ref()
-                    .expect("existing entry has permissions")
-                    .mode(),
+                entry_mode.expect("existing entry has permissions"),
             )
             .map_err(|source| init_io(&self.paths.entry, source))?;
             let path = backup.keep();
@@ -283,7 +277,7 @@ impl ManagedStore {
                     entry_dir,
                     ".config.portico-init",
                     &final_entry,
-                    entry_mode.as_ref().map_or(0o600, PermissionsExt::mode),
+                    entry_mode.unwrap_or(0o600),
                 )
                 .and_then(|candidate| candidate.rename_to(&entry_path))
                 .map_err(|source| init_io(&entry_path, source))?;
@@ -291,7 +285,7 @@ impl ManagedStore {
                 sync_dir(entry_dir).map_err(|source| init_io(entry_dir, source))?;
             }
             if plan.fix_portico_permissions {
-                fs::set_permissions(&self.paths.portico_dir, fs::Permissions::from_mode(0o700))
+                set_mode(&self.paths.portico_dir, 0o700)
                     .map_err(|source| init_io(&self.paths.portico_dir, source))?;
             }
             if plan.create_managed {
@@ -305,7 +299,7 @@ impl ManagedStore {
                 .map_err(|source| init_io(&self.paths.managed, source))?;
                 managed_written = true;
             } else if plan.fix_managed_permissions {
-                fs::set_permissions(&self.paths.managed, fs::Permissions::from_mode(0o600))
+                set_mode(&self.paths.managed, 0o600)
                     .and_then(|()| File::open(&self.paths.managed)?.sync_all())
                     .map_err(|source| init_io(&self.paths.managed, source))?;
             }
@@ -322,14 +316,9 @@ impl ManagedStore {
                 }
             };
             if entry_written {
-                let restored = if let Some(mode) = &entry_mode {
-                    write_unique(
-                        entry_dir,
-                        ".config.portico-rollback",
-                        &entry_contents,
-                        mode.mode(),
-                    )
-                    .and_then(|candidate| candidate.rename_to(&entry_path))
+                let restored = if let Some(mode) = entry_mode {
+                    write_unique(entry_dir, ".config.portico-rollback", &entry_contents, mode)
+                        .and_then(|candidate| candidate.rename_to(&entry_path))
                 } else {
                     fs::remove_file(&entry_path)
                 };
@@ -343,7 +332,7 @@ impl ManagedStore {
             {
                 record(
                     &self.paths.managed,
-                    fs::set_permissions(&self.paths.managed, mode)
+                    set_mode(&self.paths.managed, mode)
                         .and_then(|()| File::open(&self.paths.managed)?.sync_all()),
                 );
             }
@@ -351,7 +340,7 @@ impl ManagedStore {
             if plan.fix_portico_permissions {
                 record(
                     &self.paths.portico_dir,
-                    fs::set_permissions(&self.paths.portico_dir, directory_mode),
+                    set_mode(&self.paths.portico_dir, directory_mode),
                 );
             }
             if rollback.is_empty() {
@@ -567,6 +556,8 @@ fn init_io(path: &Path, source: io::Error) -> InitError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::domain::managed::tests::initialized_store;
@@ -681,6 +672,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_init_repairs_a_missing_symlink_target() {
         use std::os::unix::fs::symlink;
@@ -707,6 +699,7 @@ mod tests {
         assert!(paths.init_backups().unwrap().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_init_validates_installed_files_after_writes_close() {
         let dir = tempfile::tempdir().unwrap();
@@ -742,6 +735,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_init_prepends_without_changing_user_bytes_or_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -817,6 +811,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_init_repairs_symlink_target_and_keeps_exact_backups() {
         use std::os::unix::fs::symlink;
@@ -855,6 +850,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_init_validation_failure_restores_entry_and_managed_state() {
         use std::os::unix::fs::symlink;
@@ -908,6 +904,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_init_write_failure_names_path_and_remedy() {
         let dir = tempfile::tempdir().unwrap();
@@ -1048,6 +1045,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_only_init_rollback_preserves_entry_symlink() {
         use std::os::unix::fs::symlink;
@@ -1157,6 +1155,7 @@ mod tests {
         assert!(!paths.managed.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn initialization_successful_rollback_restores_entry_bytes_and_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -1182,6 +1181,7 @@ mod tests {
         assert!(!paths.managed.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn created_paths_have_restrictive_modes() {
         use std::os::unix::fs::PermissionsExt;
@@ -1209,6 +1209,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn existing_managed_paths_are_repaired_to_private_modes() {
         use std::os::unix::fs::PermissionsExt;
@@ -1246,6 +1247,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_portico_directory_is_rejected() {
         use std::os::unix::fs::symlink;

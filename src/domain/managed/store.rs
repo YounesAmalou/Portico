@@ -1,7 +1,6 @@
 use std::{
     fs::{self, File},
     io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -18,8 +17,8 @@ use super::{
 };
 use crate::domain::config_error::{ConfigFiles, ConfigRejection, StagedEntry, interpret};
 use crate::platform::fs::{
-    PendingFile, acquire_lock, open_lock, read_lossy, reject_symlink, symlink_target, sync_dir,
-    write_unique,
+    PendingFile, acquire_lock, mode_of, open_lock, read_lossy, reject_symlink, symlink_target,
+    sync_dir, write_unique,
 };
 
 #[derive(Debug, Error)]
@@ -250,10 +249,10 @@ impl ManagedStore {
         let (validation_entry, portico_lines) =
             substitute_include(&entry, &self.paths, candidate.path())
                 .map_err(transaction_entry_error)?;
-        let entry_mode = fs::metadata(&self.paths.entry)
-            .map_err(|source| transaction_io(&self.paths.entry, source))?
-            .permissions()
-            .mode();
+        let entry_mode = mode_of(
+            &fs::metadata(&self.paths.entry)
+                .map_err(|source| transaction_io(&self.paths.entry, source))?,
+        );
         let validation_file = write_unique(
             &self.paths.ssh_dir,
             ".config.portico-validation",
@@ -358,10 +357,10 @@ impl ManagedStore {
                 .as_bytes(),
             );
         }
-        let mode = fs::metadata(&self.paths.entry)
-            .map_err(|source| transaction_io(&self.paths.entry, source))?
-            .permissions()
-            .mode();
+        let mode = mode_of(
+            &fs::metadata(&self.paths.entry)
+                .map_err(|source| transaction_io(&self.paths.entry, source))?,
+        );
         let file = write_unique(&self.paths.ssh_dir, stem, &contents, mode)
             .map_err(|source| transaction_io(&self.paths.ssh_dir, source))?;
         Ok((file, portico_lines))
@@ -456,7 +455,9 @@ mod tests {
         ConfigPaths, ManagedConfig, ManagedStore,
         tests::{InitializedStore, initialized_store},
     };
-    use crate::platform::fs::{fail_next_directory_sync, fail_next_transaction_rollback_write};
+    use crate::platform::fs::fail_next_directory_sync;
+    #[cfg(unix)]
+    use crate::platform::fs::fail_next_transaction_rollback_write;
 
     #[test]
     fn failed_validation_preserves_active_bytes() {
@@ -732,6 +733,7 @@ mod tests {
         assert_eq!(std::fs::read(&fixture.paths.managed).unwrap(), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn rollback_failure_reports_uncertain_state_and_recovery_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -773,6 +775,7 @@ mod tests {
         assert_eq!(std::fs::read(&fixture.paths.backup).unwrap(), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn rollback_directory_sync_failure_reports_uncertain_state() {
         use std::os::unix::fs::PermissionsExt;

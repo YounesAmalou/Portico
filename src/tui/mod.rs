@@ -61,7 +61,7 @@ use containers::{
 };
 use events::{Step, TerminalEvents};
 use form::{FORM_FIELDS, FormState, IDENTITY_FILE, PROXY_JUMP};
-use hangup::HangupWatch;
+use hangup::{HangupWatch, wait_for_enter};
 use hosts::{DetailsCache, PendingTrust, PerHost, TestMark, details_for_selected, render_hosts};
 use identities::Indexer;
 use init::confirm_initialization;
@@ -377,7 +377,7 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Ok(exe) => {
                         let pause = || {
                             signals.child_finished();
-                            wait_for_enter(terminated);
+                            wait_for_enter(terminated, IDLE_TICK);
                         };
                         let child = || Ok(run_desktop(&exe, run, pause));
                         match suspended(terminal, session, signals, child)? {
@@ -582,46 +582,6 @@ fn run_desktop(exe: &Path, run: DesktopRun, pause: impl FnOnce()) -> Result<(), 
         Ok(())
     } else {
         Err(failed(exit.to_string()))
-    }
-}
-
-/// Waits for a line on the terminal, an end of input, or `terminated` (Ctrl+C, a signal or a
-/// hang-up).
-///
-/// Reads the descriptor directly: `main` holds the lock of `io::stdin()` for the whole session,
-/// so reading through it would wait for ever. One byte at a time, so nothing after the line is
-/// taken from the terminal.
-fn wait_for_enter(terminated: &AtomicBool) {
-    use std::{
-        io::Read,
-        os::fd::{AsFd, AsRawFd},
-    };
-    let Ok(fd) = io::stdin().as_fd().try_clone_to_owned() else {
-        return;
-    };
-    let mut input = std::fs::File::from(fd);
-    let mut byte = [0];
-    while !terminated.load(Ordering::Relaxed) {
-        let mut poll = libc::pollfd {
-            fd: input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `poll` reads and writes only the one `pollfd` it is given.
-        let ready = unsafe { libc::poll(&mut poll, 1, IDLE_TICK.as_millis() as libc::c_int) };
-        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return;
-        }
-        if ready <= 0 {
-            continue;
-        }
-        match input.read(&mut byte) {
-            Ok(0) => return,
-            Ok(_) if matches!(byte[0], b'\n' | b'\r') => return,
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
-        }
     }
 }
 
@@ -1725,15 +1685,14 @@ pub(super) fn keep_end(text: &str, columns: usize) -> String {
 
 /// The current local time as `HH:MM`.
 fn local_time() -> String {
-    // SAFETY: `time` accepts a null pointer, and `localtime_r` only writes the `tm` it is given.
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
-            return "--:--".into();
-        }
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok());
+    now.and_then(crate::platform::time::local).map_or_else(
+        || "--:--".into(),
+        |time| format!("{:02}:{:02}", time.hour, time.minute),
+    )
 }
 
 #[cfg(test)]
@@ -2522,10 +2481,9 @@ mod tests {
         alias: &str,
         explanation: Option<crate::domain::explain::Explanation>,
     ) -> ConnectionOutcome {
-        use std::os::unix::process::ExitStatusExt;
         ConnectionOutcome::Exited {
             alias: alias.into(),
-            status: std::process::ExitStatus::from_raw(255 << 8),
+            status: crate::platform::process::exit_status(255),
             explanation,
         }
     }

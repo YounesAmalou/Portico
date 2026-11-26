@@ -5,7 +5,6 @@ use std::{
     cell::OnceCell,
     fs::{File, OpenOptions},
     io,
-    os::unix::fs::OpenOptionsExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -29,7 +28,7 @@ use crate::{
         },
         start_args,
     },
-    platform::fs::{acquire_lock, open_lock},
+    platform::fs::{acquire_lock, open_lock, private},
     platform::process::{Logged, current_uid, kill_process_tree, stop_process},
 };
 
@@ -316,13 +315,12 @@ impl App {
         );
         Record::remove(&record_path).map_err(runtime_error(record_path.clone()))?;
         let create = |path: &PathBuf| {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(runtime_error(path.clone()))
+            private(
+                OpenOptions::new().write(true).create(true).truncate(true),
+                0o600,
+            )
+            .open(path)
+            .map_err(runtime_error(path.clone()))
         };
         create(&log)?;
         // stderr goes to a file, not a pipe: a ProxyCommand child (`ssh -W`, `nc`) inherits it and
@@ -364,7 +362,7 @@ impl App {
         let _ = Record::remove(&stderr_path);
         let uid = current_uid();
         if status.success()
-            && let Some((pid, start)) = self.proc.find_tunnel(&log, uid, since)
+            && let Some((pid, start)) = self.proc.find_tunnel(&log, &uid, since)
         {
             let record = Record::Running(RunningRecord {
                 pid,
@@ -420,7 +418,7 @@ impl App {
                 Some(Record::Running(record)) => {
                     let uid = current_uid();
                     stop_process(record.pid, || {
-                        self.proc.identify(&record, &log, uid) == Identity::Alive
+                        self.proc.identify(&record, &log, &uid) == Identity::Alive
                     })
                     .map_err(runtime_error(record_path.clone()))?
                 }
@@ -503,7 +501,7 @@ impl App {
         let (record_path, log) = (self.runtime.record(name), self.runtime.log(name));
         match Record::read(&record_path) {
             Some(Record::Running(record)) => {
-                match self.proc.identify(&record, &log, current_uid()) {
+                match self.proc.identify(&record, &log, &current_uid()) {
                     Identity::Alive => {
                         return TunnelStatus::Running {
                             pid: record.pid,
@@ -550,7 +548,7 @@ impl App {
     ) -> Option<TunnelStatus> {
         let log = self.runtime.log(name);
         let (pid, start) = find_in(
-            scan.get_or_init(|| self.proc.scan(current_uid())),
+            scan.get_or_init(|| self.proc.scan(&current_uid())),
             &log,
             None,
         )?;

@@ -21,5 +21,7 @@ use macos as os;
 
 pub mod fs;
 pub mod launcher;
+pub mod net;
 pub mod paths;
 pub mod process;
+pub mod time;

@@ -5,9 +5,16 @@
 
 use std::path::PathBuf;
 
+use super::super::os::paths::SYSTEM_SSH_CONFIG;
+
 /// The home directory from `HOME`, if it is set.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The system-wide `ssh_config`.
+pub fn system_ssh_config() -> PathBuf {
+    PathBuf::from(SYSTEM_SSH_CONFIG)
 }
 
 #[cfg(test)]

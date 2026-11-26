@@ -977,10 +977,11 @@ fn stderr_of(error: OpenSshError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         fs,
         ops::Deref,
-        os::unix::fs::PermissionsExt,
         panic,
         sync::{
             Arc, Condvar, Mutex,
@@ -1550,6 +1551,7 @@ exit 255
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn inaccessible_include_parent_blocks_mutation() {
         let app = test_app_with_external("Include locked/hidden.conf\n");

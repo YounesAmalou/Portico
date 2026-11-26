@@ -1,6 +1,7 @@
 //! Linux process control: pidfds pin a process's identity, and `/proc` lists children and
 //! describes processes.
 
+use super::super::unix::process::Uid;
 use std::{
     fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -238,7 +239,7 @@ impl Proc {
     }
 
     /// The real UID of `pid`.
-    pub fn uid(&self, pid: u32) -> Option<u32> {
+    pub fn uid(&self, pid: u32) -> Option<Uid> {
         fs::read_to_string(self.root.join(format!("{pid}/status")))
             .ok()?
             .lines()

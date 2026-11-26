@@ -1,6 +1,7 @@
 //! macOS process control: kqueue exit watches pin a process's identity, and `sysctl` and
 //! libproc list children and describe processes.
 
+use super::super::unix::process::Uid;
 use std::{
     cell::Cell,
     ffi::{CStr, c_void},
@@ -251,7 +252,7 @@ impl Proc {
     }
 
     /// The real UID of `pid`.
-    pub fn uid(&self, pid: u32) -> Option<u32> {
+    pub fn uid(&self, pid: u32) -> Option<Uid> {
         bsd_info(libc::pid_t::try_from(pid).ok()?).map(|info| info.pbi_ruid)
     }
 

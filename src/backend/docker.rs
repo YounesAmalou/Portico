@@ -558,12 +558,10 @@ fn no_offer(target: &Target, probe: &Probe, stderr: String) -> BackendIssue {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        os::unix::process::ExitStatusExt,
-        process::{ExitStatus, Output},
-    };
+    use std::process::Output;
 
     use super::*;
+    use crate::platform::process::exit_status;
 
     #[test]
     fn parses_a_ps_line() {
@@ -815,7 +813,7 @@ mod tests {
 
     fn exited(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
-            status: ExitStatus::from_raw(code << 8),
+            status: exit_status(code),
             stdout: stdout.into(),
             stderr: stderr.into(),
         }

@@ -1,11 +1,15 @@
 //! Unix files (Linux and macOS): permissions, symbolic links, descriptors and file identity.
 
 use std::{
-    fs::{self, OpenOptions},
+    ffi::CString,
+    fs::{self, Metadata, OpenOptions},
     io::{self, Write},
     os::{
         fd::{FromRawFd, OwnedFd, RawFd},
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
     },
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -14,6 +18,7 @@ use std::{
 use super::super::common::fs::{PendingFile, Stamp};
 #[cfg(test)]
 use super::super::common::fs::{take_directory_sync_failure, take_rollback_write_failure};
+use super::process::Uid;
 
 /// Follows the symbolic link chain at `path` to the file a write must replace, which may not
 /// exist yet. An error names the path it occurred at.
@@ -40,6 +45,72 @@ pub fn symlink_target(start: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
             start.display()
         )),
     ))
+}
+
+/// Makes the file `options` creates private to its owner: Unix applies `mode`, which Windows
+/// has no use for (a new file there inherits the access rules of its folder).
+pub fn private(options: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
+    options.mode(mode)
+}
+
+/// The permission bits of a file: what `ls -l` shows, setuid and sticky bits included.
+pub fn mode_of(metadata: &Metadata) -> u32 {
+    metadata.permissions().mode()
+}
+
+/// Sets the permission bits of the file at `path`.
+pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// Whether the file can be run by someone.
+pub fn is_executable(metadata: &Metadata) -> bool {
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Whether the file is a Unix domain socket.
+pub fn is_socket(metadata: &Metadata) -> bool {
+    metadata.file_type().is_socket()
+}
+
+/// Whether other names refer to the same file, so replacing it would detach them.
+pub fn has_other_links(metadata: &Metadata) -> bool {
+    metadata.nlink() > 1
+}
+
+/// Whether the file belongs to `uid`.
+pub fn owner_is(metadata: &Metadata, uid: &Uid) -> bool {
+    metadata.uid() == *uid
+}
+
+/// Creates a symbolic link at `link` that points to `target`.
+pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Whether the current user may write to `path`, as `access(2)` answers (which, unlike the
+/// permission bits, also knows about read-only file systems). An error that is not a refusal
+/// (the path is missing, say) is returned.
+pub fn writable(path: &Path) -> io::Result<bool> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if is_read_only_error(&error) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Whether `error` says a file cannot be written to: no permission, or a read-only file system.
+pub fn is_read_only_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES | libc::EPERM | libc::EROFS)
+    )
 }
 
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
@@ -104,7 +175,7 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
 
 /// A new socket that is closed on `exec`. Linux sets the flag atomically; macOS has no
 /// `SOCK_CLOEXEC`, so it is set straight after (Portico starts no process between the two).
-pub fn cloexec_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<OwnedFd> {
+pub(super) fn cloexec_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<OwnedFd> {
     #[cfg(target_os = "linux")]
     let kind = kind | libc::SOCK_CLOEXEC;
     // SAFETY: `socket` has no preconditions; a valid descriptor is owned at once.
