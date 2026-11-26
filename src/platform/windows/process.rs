@@ -18,9 +18,7 @@ use windows_sys::Win32::{
     Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation},
     System::{
         Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
-        Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess,
-        },
+        Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, GetCurrentProcess},
     },
 };
 
@@ -101,9 +99,16 @@ fn on_path(program: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
 /// Makes the process `command` starts independent of this one's console, so it outlives
 /// Portico and the console window, and holds none of this process's standard handles (the
 /// caller sets the child's own).
+///
+/// The process gets a console of its own that is never shown (`CREATE_NO_WINDOW`), in its own
+/// process group, so Ctrl+C in Portico's console does not reach it. It is not started without
+/// a console (`DETACHED_PROCESS`, with which Windows ignores `CREATE_NO_WINDOW`): a console
+/// program it starts in turn, such as a `ProxyCommand` or the `ssh -W` of a `ProxyJump`,
+/// inherits the hidden console instead of opening a visible window that would end the tunnel
+/// when closed.
 pub fn detach(command: &mut Command) -> &mut Command {
     keep_standard_handles();
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
 }
 
 /// Stops this process's standard handles from being inherited. The standard library creates
@@ -298,6 +303,45 @@ mod tests {
         }
         let text = text.expect("the detached child kept its parent's output open");
         assert!(pid.is_some(), "the helper did not start the child: {text}");
+    }
+
+    /// Run by `a_detached_child_has_a_console_of_its_own` as the detached process: writes to
+    /// the file `PORTICO_CONSOLE_HELPER` names whether it has a console.
+    #[test]
+    #[ignore = "a helper process of another test"]
+    fn detached_console_helper() {
+        let Some(path) = std::env::var_os("PORTICO_CONSOLE_HELPER") else {
+            return;
+        };
+        // SAFETY: `GetConsoleWindow` has no preconditions.
+        let window = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+        let text = if window.is_null() { "none" } else { "console" };
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A detached tunnel ssh has a (hidden) console, so the console programs it starts (a
+    /// `ProxyCommand`, a `ProxyJump`'s `ssh -W`) share it instead of opening a window.
+    #[test]
+    fn a_detached_child_has_a_console_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("console");
+        let mut child = detach(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::windows::process::tests::detached_console_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("PORTICO_CONSOLE_HELPER", &report),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "console");
     }
 
     #[test]
