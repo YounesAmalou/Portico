@@ -5,11 +5,11 @@ use std::{
     cell::OnceCell,
     fs::{File, OpenOptions},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -24,12 +24,15 @@ use crate::{
         Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
         check_args, collide, collisions, listeners_in_effective_config,
         runtime::{
-            Bind, Identity, Record, RunningRecord, find_in, log_reason, log_tail, now, try_bind,
+            Bind, Identity, Record, RunningRecord, authenticated, find_in, log_reason, log_tail,
+            now, ready, try_bind,
         },
         start_args,
     },
     platform::fs::{acquire_lock, open_lock, private},
-    platform::process::{Logged, current_uid, kill_process_tree, stop_process},
+    platform::process::{
+        Logged, SSH_BACKGROUNDS, current_uid, detach, kill_process_tree, stop_process,
+    },
 };
 
 /// Why a tunnel operation was refused before anything changed.
@@ -182,6 +185,7 @@ impl App {
                 &self.runtime.log(&tunnel.name),
                 &tunnel.host,
                 &tunnel.forward,
+                SSH_BACKGROUNDS,
             ))
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
@@ -302,7 +306,8 @@ impl App {
         self.launch(&tunnel, cancelled, in_tui)
     }
 
-    /// Runs the tunnel's ssh, waits for it to background itself, and records the result.
+    /// Runs the tunnel's ssh, waits for it to background itself (or, where ssh cannot, for its
+    /// forward to come up while it runs detached), and records the result.
     fn launch(
         &self,
         tunnel: &Tunnel,
@@ -327,24 +332,50 @@ impl App {
         // lives as long as the tunnel, so a pipe would never reach end of file.
         let stderr_path = self.runtime.stderr(&tunnel.name);
         let stderr_file = create(&stderr_path)?;
-        let mut child = Command::new(self.openssh.ssh_program())
-            .args(start_args(&log, &tunnel.host, &tunnel.forward))
+        let mut command = Command::new(self.openssh.ssh_program());
+        command
+            .args(start_args(
+                &log,
+                &tunnel.host,
+                &tunnel.forward,
+                SSH_BACKGROUNDS,
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(stderr_file)
-            .spawn()
-            .map_err(|source| OpenSshError::Io {
-                program: self.openssh.ssh_program().to_path_buf(),
-                source,
-            })?;
+            .stderr(stderr_file);
+        if !SSH_BACKGROUNDS {
+            // This ssh is the tunnel: it must outlive Portico and its console.
+            detach(&mut command);
+        }
+        let mut child = command.spawn().map_err(|source| OpenSshError::Io {
+            program: self.openssh.ssh_program().to_path_buf(),
+            source,
+        })?;
         // The background ssh is forked from this one, so it cannot have started earlier.
         let since = self.proc.stat(child.id()).map(|stat| stat.start);
+        let mut authenticated_at = None;
         let status = loop {
+            // Judged before ssh is seen running, so a forward is up only while its ssh runs.
+            let up = !SSH_BACKGROUNDS && {
+                if authenticated_at.is_none() && authenticated(&log) {
+                    authenticated_at = Some(Instant::now());
+                }
+                ready(&tunnel.forward, &log, authenticated_at)
+            };
             if let Some(status) = child.try_wait().map_err(|source| OpenSshError::Io {
                 program: self.openssh.ssh_program().to_path_buf(),
                 source,
             })? {
                 break status;
+            }
+            // The foreground ssh is the tunnel itself, so no search for it is needed.
+            if up
+                && let Some(start) =
+                    since.or_else(|| self.proc.stat(child.id()).map(|stat| stat.start))
+            {
+                // ssh keeps writing to its open file; the name is no longer needed.
+                let _ = Record::remove(&stderr_path);
+                return self.record_started(tunnel, &record_path, child.id(), start);
             }
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
                 // A ProxyCommand child would outlive ssh, so the whole tree goes.
@@ -364,18 +395,7 @@ impl App {
         if status.success()
             && let Some((pid, start)) = self.proc.find_tunnel(&log, &uid, since)
         {
-            let record = Record::Running(RunningRecord {
-                pid,
-                start,
-                boot: self.proc.boot_id().unwrap_or_default(),
-                started: now(),
-                host: tunnel.host.clone(),
-                forward: format!("{} {}", tunnel.forward.kind.flag(), tunnel.forward.spec()),
-            });
-            record
-                .write(&record_path)
-                .map_err(runtime_error(record_path))?;
-            return Ok(StartOutcome::Started { pid });
+            return self.record_started(tunnel, &record_path, pid, start);
         }
         let mut text = log_tail(&log, 200).join("\n");
         text.push('\n');
@@ -399,6 +419,27 @@ impl App {
             reason,
             explanation,
         })
+    }
+
+    /// Records that `tunnel` runs as `pid`, which started at `start`.
+    fn record_started(
+        &self,
+        tunnel: &Tunnel,
+        record_path: &Path,
+        pid: u32,
+        start: u64,
+    ) -> Result<StartOutcome, AppError> {
+        Record::Running(RunningRecord {
+            pid,
+            start,
+            boot: self.proc.boot_id().unwrap_or_default(),
+            started: now(),
+            host: tunnel.host.clone(),
+            forward: format!("{} {}", tunnel.forward.kind.flag(), tunnel.forward.spec()),
+        })
+        .write(record_path)
+        .map_err(runtime_error(record_path.to_path_buf()))?;
+        Ok(StartOutcome::Started { pid })
     }
 
     /// Stops a tunnel: its process when one is running, and its record and log in any case.

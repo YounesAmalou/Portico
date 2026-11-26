@@ -4,13 +4,14 @@ use std::{io, mem::size_of, net::SocketAddr};
 
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SO_EXCLUSIVEADDRUSE,
-    SOCK_STREAM, SOCKADDR_IN, SOCKADDR_IN6, SOCKET, SOL_SOCKET, WSACleanup, WSADATA,
-    WSAGetLastError, WSAStartup, bind, closesocket, setsockopt, socket,
+    SOCK_STREAM, SOCKADDR_IN, SOCKADDR_IN6, SOCKET, SOL_SOCKET, WSACleanup, WSADATA, WSAEACCES,
+    WSAEADDRINUSE, WSAGetLastError, WSAStartup, bind, closesocket, setsockopt, socket,
 };
 
 /// Binds `address` and closes it again: with `SO_EXCLUSIVEADDRUSE`, which refuses an address
 /// anyone else listens on (Windows otherwise lets some sockets share it), and an IPv6 address
-/// with `IPV6_V6ONLY`, as ssh listens.
+/// with `IPV6_V6ONLY`, as ssh listens. An address someone holds fails as `AddrInUse`, however
+/// Windows refuses it (see `bind_error`).
 pub fn bind_probe(address: SocketAddr) -> io::Result<()> {
     let _winsock = Winsock::start()?;
     let one: i32 = 1;
@@ -72,10 +73,23 @@ pub fn bind_probe(address: SocketAddr) -> io::Result<()> {
             }
         };
         if bound != 0 {
-            return Err(last_error());
+            return Err(bind_error(last_error()));
         }
     }
     Ok(())
+}
+
+/// A failed bind's error, with `WSAEACCES` read as the address being in use. Windows has no
+/// privileged ports: it refuses a bind with `WSAEACCES` when another socket holds the address
+/// with `SO_EXCLUSIVEADDRUSE` (as this probe binds) or the system reserved the port, both of
+/// which leave the address to someone else, and the free-port check and a tunnel's readiness
+/// must both see it as taken.
+fn bind_error(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(WSAEACCES) {
+        io::Error::from_raw_os_error(WSAEADDRINUSE)
+    } else {
+        error
+    }
 }
 
 /// The last Windows Sockets error of this thread.
@@ -120,13 +134,35 @@ impl Drop for Socket {
 
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::Networking::WinSock::WSAEADDRNOTAVAIL;
+
     use super::*;
 
     #[test]
-    fn bind_probe_sees_a_listening_port_as_busy() {
+    fn bind_probe_sees_a_listening_port_as_in_use() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = listener.local_addr().unwrap();
-        assert!(bind_probe(busy).is_err());
+        assert_eq!(
+            bind_probe(busy).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        // A listener on every address holds the port on loopback too.
+        let wildcard = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        assert_eq!(
+            bind_probe(SocketAddr::from(([127, 0, 0, 1], port)))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse
+        );
         assert!(bind_probe("127.0.0.1:0".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn an_exclusively_held_address_is_in_use_not_denied() {
+        let denied = bind_error(io::Error::from_raw_os_error(WSAEACCES));
+        assert_eq!(denied.kind(), io::ErrorKind::AddrInUse);
+        let other = bind_error(io::Error::from_raw_os_error(WSAEADDRNOTAVAIL));
+        assert_eq!(other.raw_os_error(), Some(WSAEADDRNOTAVAIL));
     }
 }

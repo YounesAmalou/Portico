@@ -19,6 +19,9 @@ use super::super::os::process::{Pin, Stat, children, wait_until_stopped};
 /// A user as the process table names one: the numeric UID.
 pub type Uid = u32;
 
+/// Whether `ssh -f` backgrounds itself once its forwards are up, which OpenSSH does here.
+pub const SSH_BACKGROUNDS: bool = true;
+
 /// The signals that hang up or end a session, which Portico treats alike.
 pub const HANGUP_SIGNALS: &[i32] = &[
     signal_hook::consts::SIGINT,

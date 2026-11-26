@@ -24,6 +24,11 @@ pub use tree::kill_process_tree;
 /// A user, as the string form of their security identifier (`S-1-5-21-…`).
 pub type Uid = String;
 
+/// Whether `ssh -f` backgrounds itself once its forwards are up: Windows' OpenSSH has no
+/// background mode and stays in the foreground, so Portico detaches it and waits for the
+/// forward itself.
+pub const SSH_BACKGROUNDS: bool = false;
+
 /// The signals that end a session, which Portico treats alike: the console's Ctrl+C and
 /// Ctrl+Break reach the C runtime as these. Windows has no hang-up signal.
 pub const HANGUP_SIGNALS: &[i32] = &[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM];

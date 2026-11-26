@@ -7,8 +7,10 @@ use std::{
     fs, io,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
+use super::Forward;
 use crate::{
     platform::fs::{create_private_dir, sync_dir, write_unique},
     platform::net::bind_probe,
@@ -306,6 +308,39 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
     Bind::Free
 }
 
+/// How long a foreground ssh must keep running after it authenticated before its forward
+/// counts as up: with `ExitOnForwardFailure=yes` a forward that cannot be opened ends ssh well
+/// within it (a local listener is opened right after authentication, a remote forward is
+/// refused in one round trip).
+const SURVIVAL: Duration = Duration::from_secs(1);
+
+/// Whether a foreground ssh (one that cannot background itself, as on Windows) has opened
+/// `forward`, given its log and when it was first seen authenticated while running.
+///
+/// Every kind needs the log's authentication line and ssh alive [`SURVIVAL`] after it; a
+/// local or dynamic forward also needs one of its listen addresses bound. Since a start checks
+/// that every listen address is free first, a bound address could otherwise only be another
+/// program's that took it while ssh connected, and then ssh exits on the forward failure
+/// within that time.
+pub fn ready(forward: &Forward, log: &Path, alive_since_auth: Option<Instant>) -> bool {
+    alive_since_auth.is_some_and(|since| since.elapsed() >= SURVIVAL)
+        && authenticated(log)
+        && (!forward.kind.listens_locally()
+            || forward
+                .listen_addresses()
+                .iter()
+                .any(|address| try_bind(address, forward.bind_port) == Bind::InUse))
+}
+
+/// Whether a tunnel's log shows ssh authenticated, which it logs from `LogLevel=VERBOSE` on.
+pub fn authenticated(log: &Path) -> bool {
+    fs::read(log).is_ok_and(|bytes| {
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .any(|line| line.starts_with("Authenticated to "))
+    })
+}
+
 /// The last line of a tunnel's log that says something, debug output left out.
 pub fn log_reason(log: &Path) -> Option<String> {
     log_tail(log, 1).pop()
@@ -333,6 +368,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::domain::tunnel::Kind;
     #[cfg(target_os = "linux")]
     use crate::platform::process::Stat;
 
@@ -745,6 +781,65 @@ mod tests {
             assert_eq!(try_bind("::1", port), Bind::InUse);
             assert_eq!(try_bind("::", port), Bind::InUse);
         }
+    }
+
+    /// A log as ssh writes it at `LogLevel=VERBOSE`, authenticated when `authenticated`.
+    fn verbose_log(dir: &Path, authenticated: bool) -> PathBuf {
+        let log = dir.join("db.log");
+        let mut text = String::from("Connecting to prod.example [192.0.2.1] port 22.\r\n");
+        if authenticated {
+            text.push_str(
+                "Authenticated to prod.example ([192.0.2.1]:22) using \"publickey\".\r\n",
+            );
+        }
+        fs::write(&log, text).unwrap();
+        log
+    }
+
+    fn ago(millis: u64) -> Option<Instant> {
+        Instant::now().checked_sub(Duration::from_millis(millis))
+    }
+
+    #[test]
+    fn ready_for_local_forward_once_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = verbose_log(dir.path(), true);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bound = Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:db:5432")).unwrap();
+        assert!(ready(&bound, &log, ago(1100)));
+        let socks = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{port}")).unwrap();
+        assert!(ready(&socks, &log, ago(1100)));
+        // A port held before ssh authenticated, or by a program that took it while ssh still
+        // could exit on the forward failure, is not ssh's.
+        assert!(!ready(&bound, &verbose_log(dir.path(), false), ago(1100)));
+        assert!(!ready(&bound, &verbose_log(dir.path(), true), ago(200)));
+        assert!(!ready(&bound, &log, None));
+        drop(listener);
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let free = Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:db:5432")).unwrap();
+        assert!(!ready(&free, &log, ago(1100)));
+    }
+
+    #[test]
+    fn ready_for_remote_forward_after_auth_and_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Forward::parse(Kind::Remote, "8080:localhost:3000").unwrap();
+        let log = verbose_log(dir.path(), true);
+        assert!(ready(&remote, &log, ago(1100)));
+        assert!(!ready(&remote, &log, ago(200)));
+        assert!(!ready(&remote, &verbose_log(dir.path(), false), ago(1100)));
+        assert!(!ready(&remote, &dir.path().join("missing.log"), ago(1100)));
+    }
+
+    #[test]
+    fn the_log_shows_authentication_from_its_verbose_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(authenticated(&verbose_log(dir.path(), true)));
+        assert!(!authenticated(&verbose_log(dir.path(), false)));
+        assert!(!authenticated(&dir.path().join("missing.log")));
     }
 
     #[test]

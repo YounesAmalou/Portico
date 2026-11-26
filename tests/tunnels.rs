@@ -5,13 +5,16 @@ use std::{fs, net::TcpListener, path::PathBuf};
 use support::TestEnv;
 
 /// A fake `ssh`: `-G` answers like OpenSSH (refusing the alias `rejected`), and a tunnel start
-/// (`-f`) logs its arguments and leaves a background stand-in that carries them, as the real
-/// ssh's background process does, unless `fail-start` exists, when it fails as ssh would on a
-/// busy remote port.
+/// (`-f`, or `-N` where ssh cannot background itself) logs its arguments and leaves a
+/// background stand-in that carries them, as the real ssh's background process does (or, with
+/// `-N`, stays in the foreground authenticated), unless `fail-start` exists, when it fails as
+/// ssh would on a busy remote port, or `exit-after-auth`, when it does so half a second after
+/// authenticating.
 fn tunnel_env() -> (TestEnv, PathBuf) {
     let env = TestEnv::new();
     let log = env.home().parent().unwrap().join("ssh-calls");
     let fail = env.home().parent().unwrap().join("fail-start");
+    let exit_after_auth = env.home().parent().unwrap().join("exit-after-auth");
     env.install_program(
         "ssh",
         &format!(
@@ -25,7 +28,7 @@ if [ "$1" = -G ]; then
   printf 'hostname resolved.example\nuser resolved\nport 22\n'
   exit 0
 fi
-if [ "$1" = -f ]; then
+if [ "$1" = -f ] || [ "$1" = -N ]; then
   printf '%s\n' "$*" >> '{log}'
   prev=
   for arg do
@@ -35,6 +38,17 @@ if [ "$1" = -f ]; then
   if [ -f '{fail}' ]; then
     printf '\033[31mError: remote port forwarding failed for listen port 8080\033[0m\a\n' >> "$elog"
     exit 255
+  fi
+  if [ -f '{exit_after_auth}' ]; then
+    printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
+    sleep 0.5
+    printf 'Error: remote port forwarding failed for listen port 8080\n' >> "$elog"
+    exit 255
+  fi
+  if [ "$1" = -N ]; then
+    printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
+    sleep 60
+    exit 0
   fi
   # Like ssh -f, the background process leads its own session. macOS has no setsid command,
   # so Perl forks it there, and returns only once it leads its session and carries the
@@ -54,6 +68,7 @@ exit 0
 "#,
             log = log.display(),
             fail = fail.display(),
+            exit_after_auth = exit_after_auth.display(),
         ),
     );
     env.run(["init", "-y"]).assert_success();
@@ -305,6 +320,59 @@ fn a_failed_start_is_recorded_and_explained() {
     env.run(["tunnel", "stop", "preview"])
         .assert_stdout_contains("preview is not running.");
     assert!(stdout(&env, &["tunnels"]).contains("stopped"));
+}
+
+#[test]
+fn a_tunnel_whose_ssh_exits_while_waiting_is_failed() {
+    let (env, _) = tunnel_env();
+    let _stop = StopAll(&env);
+    // ssh authenticates, then the server refuses the forward: where ssh runs in the foreground,
+    // the start is still waiting for it to stay up.
+    fs::write(env.home().parent().unwrap().join("exit-after-auth"), "").unwrap();
+    env.run([
+        "tunnel",
+        "add",
+        "preview",
+        "--on",
+        "prod",
+        "-R",
+        "8080:localhost:3000",
+    ])
+    .assert_success();
+    env.run(["tunnel", "start", "preview"])
+        .assert_failure_stderr_contains("the server refused the remote forward");
+    let record =
+        fs::read_to_string(env.home().join(".ssh/portico/run/tunnels/preview.run")).unwrap();
+    assert!(record.starts_with("state failed\n"), "{record}");
+    let list = stdout(&env, &["tunnels"]);
+    assert!(
+        list.contains("failed  the server refused the remote forward on port 8080"),
+        "{list}"
+    );
+    let show = stdout(&env, &["tunnel", "show", "preview"]);
+    assert!(
+        show.contains("Error: remote port forwarding failed for listen port 8080"),
+        "{show}"
+    );
+}
+
+#[test]
+fn a_busy_local_port_is_not_mistaken_for_ready() {
+    let (env, calls) = tunnel_env();
+    let _stop = StopAll(&env);
+    // Another program listens on every address; the tunnel wants the port on loopback only. A
+    // start that let ssh run would see the port bound and could take it for ssh's.
+    let held = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let spec = format!("127.0.0.1:{port}");
+    env.run(["tunnel", "add", "socks", "--on", "prod", "-D", &spec])
+        .assert_success();
+    env.run(["tunnel", "start", "socks"])
+        .assert_failure_stderr_contains(&format!("port {port} on 127.0.0.1 is in use"));
+    assert!(!calls.exists(), "ssh was started");
+    let list = stdout(&env, &["tunnels"]);
+    assert!(!list.contains("running"), "{list}");
+    drop(held);
 }
 
 /// Needs a second loopback address: macOS answers on `127.0.0.1` only.
