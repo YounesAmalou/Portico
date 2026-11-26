@@ -68,9 +68,9 @@ pub fn is_executable(_path: &Path, metadata: &Metadata) -> bool {
     metadata.permissions().mode() & 0o111 != 0
 }
 
-/// Whether the file is a Unix domain socket.
-pub fn is_socket(metadata: &Metadata) -> bool {
-    metadata.file_type().is_socket()
+/// Whether `path` is where an ssh agent can listen: a Unix domain socket.
+pub fn is_agent_endpoint(path: &Path) -> io::Result<bool> {
+    fs::metadata(path).map(|metadata| metadata.file_type().is_socket())
 }
 
 /// Whether other names refer to the file at `_path`, so replacing it would detach them.

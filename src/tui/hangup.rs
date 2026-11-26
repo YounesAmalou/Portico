@@ -8,19 +8,26 @@
 //!
 //! crossterm-rs/crossterm#1067 fixes the loop by returning `UnexpectedEof` instead, so the
 //! terminal's events are read through `next_event`, which takes that error for a hang-up too.
+//!
+//! The watcher is Unix-only. On Windows crossterm reads console input events, and closing the
+//! console ends the process (`CTRL_CLOSE_EVENT`), so nothing is watched; an error from the
+//! console is taken for its end.
 
 use std::{
     io,
-    os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
-        unix::net::UnixStream,
-    },
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{self, JoinHandle},
     time::Duration,
+};
+#[cfg(unix)]
+use std::{
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+        unix::net::UnixStream,
+    },
+    thread::{self, JoinHandle},
 };
 
 use crossterm::event::{self, Event};
@@ -51,9 +58,15 @@ fn next_event_from(
     };
     match event {
         Ok(event) => Ok(Input::Event(event)),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Input::Closed),
+        Err(error) if is_closed(&error) => Ok(Input::Closed),
         Err(error) => Err(error),
     }
+}
+
+/// Whether `error`, from waiting for or reading the terminal, means it is gone: end of file, or
+/// on Windows any error from the console.
+fn is_closed(error: &io::Error) -> bool {
+    cfg!(windows) || error.kind() == io::ErrorKind::UnexpectedEof
 }
 
 /// Waits for a line on the terminal, an end of input, or `terminated` (Ctrl+C, a signal or a
@@ -62,6 +75,7 @@ fn next_event_from(
 /// Reads the descriptor directly: `main` holds the lock of `io::stdin()` for the whole session,
 /// so reading through it would wait for ever. One byte at a time, so nothing after the line is
 /// taken from the terminal.
+#[cfg(unix)]
 pub(super) fn wait_for_enter(terminated: &AtomicBool, tick: Duration) {
     use std::{
         io::Read,
@@ -96,13 +110,45 @@ pub(super) fn wait_for_enter(terminated: &AtomicBool, tick: Duration) {
     }
 }
 
+/// Waits for Enter on the console, the console's end, or `terminated` (Ctrl+C or a signal).
+///
+/// Reads the console's input events, as the interface does, so only key presses count.
+#[cfg(windows)]
+pub(super) fn wait_for_enter(terminated: &AtomicBool, tick: Duration) {
+    use crossterm::event::{KeyCode, KeyEventKind};
+    while !terminated.load(Ordering::Relaxed) {
+        match next_event(tick) {
+            Ok(Input::Event(Event::Key(key)))
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter =>
+            {
+                return;
+            }
+            Ok(Input::Event(_) | Input::Idle) => {}
+            Ok(Input::Closed) | Err(_) => return,
+        }
+    }
+}
+
+/// Nothing to watch on Windows: closing the console ends the process.
+#[cfg(windows)]
+pub(super) struct HangupWatch;
+
+#[cfg(windows)]
+impl HangupWatch {
+    pub(super) fn start(_terminated: Arc<AtomicBool>) -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
 /// Watches the terminal until dropped.
+#[cfg(unix)]
 pub(super) struct HangupWatch {
     // Dropping it wakes the watcher, which then returns.
     stop: Option<UnixStream>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl HangupWatch {
     /// Watches standard input, the terminal crossterm reads when standard input is one.
     ///
@@ -142,6 +188,7 @@ impl HangupWatch {
     }
 }
 
+#[cfg(unix)]
 impl Drop for HangupWatch {
     fn drop(&mut self) {
         drop(self.stop.take());
@@ -151,6 +198,7 @@ impl Drop for HangupWatch {
     }
 }
 
+#[cfg(unix)]
 /// Sleeps until `tty` hangs up (true) or `stopped`'s peer is dropped (false).
 fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     // Hang-ups and errors are always reported, so the terminal asks for no events: its
@@ -197,6 +245,7 @@ fn wait_for_hangup(tty: &OwnedFd, stopped: &UnixStream) -> bool {
     }
 }
 
+#[cfg(unix)]
 /// Whether a terminal that polled readable holds no input and stays that way: reading it would
 /// return end of file, as a hung-up terminal does. Input the interface reads between two looks
 /// also leaves the terminal empty, but then no longer readable, so it is looked at a few times.
@@ -228,6 +277,7 @@ fn stays_readable_and_empty(tty: &OwnedFd) -> bool {
     true
 }
 
+#[cfg(unix)]
 /// Points `target` at the read end of a pipe that stays empty and open, so reading it fails
 /// with `WouldBlock` instead of returning end of file.
 fn replace_with_quiet_pipe(target: RawFd) -> io::Result<()> {
@@ -248,6 +298,7 @@ fn replace_with_quiet_pipe(target: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::{
         fs::File,
         io::Read,
@@ -294,6 +345,7 @@ mod tests {
         assert!(matches!(read, Ok(Input::Closed)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn other_errors_are_still_failures() {
         let input = next_event_from(
@@ -304,6 +356,18 @@ mod tests {
         assert_eq!(input.unwrap_err().to_string(), "Input/output error");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn any_console_error_is_a_closed_console() {
+        let input = next_event_from(
+            |_| Err(io::Error::other("The handle is invalid.")),
+            || panic!("nothing to read after a failed wait"),
+            Duration::ZERO,
+        );
+        assert!(matches!(input, Ok(Input::Closed)));
+    }
+
+    #[cfg(unix)]
     /// A pseudo-terminal: the controlling side and the side a program reads.
     fn pty() -> (OwnedFd, File) {
         let (mut master, mut slave) = (-1, -1);
@@ -321,6 +385,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait_until(flag: &AtomicBool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !flag.load(Ordering::Relaxed) {
@@ -332,6 +397,7 @@ mod tests {
         true
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_hang_up_raises_the_flag_and_leaves_reads_that_would_block() {
         let (master, mut slave) = pty();
@@ -347,6 +413,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
+    #[cfg(unix)]
     #[test]
     fn input_on_a_live_terminal_leaves_it_alone() {
         let (master, mut slave) = pty();
@@ -366,6 +433,7 @@ mod tests {
         assert!(!terminated.load(Ordering::Relaxed));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_the_watch_stops_it_promptly() {
         let (_master, slave) = pty();

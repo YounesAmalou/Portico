@@ -23,7 +23,8 @@ use crate::{
         IdentityInventory, InventoryAgent, InventoryFile, PublicKey, Socket,
     },
     domain::openssh::{OpenSsh, OpenSshError, ResolvedConfig},
-    platform::fs::is_socket,
+    platform::fs::is_agent_endpoint,
+    platform::paths::DEFAULT_AGENT,
     platform::process::current_uid,
 };
 
@@ -33,8 +34,9 @@ pub(crate) const TOOL_DEADLINE: Duration = Duration::from_secs(3);
 /// What one `App` has learnt about identities: the defaults once, each agent's listing once,
 /// and each public key file's fingerprint once, until `App::forget_identities`.
 pub(crate) struct IdentityState {
-    /// Replaces the environment's `SSH_AUTH_SOCK` when set. Unit tests start with no agent, so
-    /// the developer's own agent never shows up in their results.
+    /// Replaces the environment's `SSH_AUTH_SOCK` (or the system's default agent) when set.
+    /// Unit tests start with no agent, so the developer's own agent never shows up in their
+    /// results.
     auth_sock: Option<Option<String>>,
     defaults: OnceLock<Option<Vec<String>>>,
     /// One slot per socket. Its own lock is held while the agent is asked, so a second caller
@@ -60,6 +62,11 @@ impl IdentityState {
     fn env(&self, name: &str) -> Option<String> {
         match &self.auth_sock {
             Some(socket) if name == "SSH_AUTH_SOCK" => socket.clone(),
+            // Without `SSH_AUTH_SOCK`, ssh uses the system's agent, if it has one.
+            None if name == "SSH_AUTH_SOCK" => std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| DEFAULT_AGENT.map(String::from)),
             _ => std::env::var(name).ok(),
         }
     }
@@ -124,15 +131,13 @@ fn list_agent(openssh: &OpenSsh, socket: &Path, deadline: Duration) -> Agent {
         provider,
         reason,
     };
-    match fs::metadata(socket) {
+    match is_agent_endpoint(socket) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return unavailable(AgentProblem::NoSuchSocket);
         }
         Err(error) => return unavailable(AgentProblem::Refused(error.to_string())),
-        Ok(metadata) if !is_socket(&metadata) => {
-            return unavailable(AgentProblem::NotASocket);
-        }
-        Ok(_) => {}
+        Ok(false) => return unavailable(AgentProblem::NotASocket),
+        Ok(true) => {}
     }
     let mut command = Command::new(openssh.ssh_add_program());
     command

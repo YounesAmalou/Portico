@@ -22,6 +22,9 @@ pub type Uid = u32;
 /// Whether `ssh -f` backgrounds itself once its forwards are up, which OpenSSH does here.
 pub const SSH_BACKGROUNDS: bool = true;
 
+/// Whether access to a local service is granted through Unix groups, as Docker's socket is.
+pub const UNIX_GROUPS: bool = true;
+
 /// The signals that hang up or end a session, which Portico treats alike.
 pub const HANGUP_SIGNALS: &[i32] = &[
     signal_hook::consts::SIGINT,

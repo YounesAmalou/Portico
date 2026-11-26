@@ -14,6 +14,10 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
+/// The agent Windows' ssh uses when `SSH_AUTH_SOCK` is not set: the OpenSSH Authentication
+/// Agent service's named pipe.
+pub const DEFAULT_AGENT: Option<&str> = Some(r"\\.\pipe\openssh-ssh-agent");
+
 /// The system-wide `ssh_config`: `%ProgramData%\ssh\ssh_config`, where Windows' OpenSSH
 /// reads it.
 pub fn system_ssh_config() -> PathBuf {

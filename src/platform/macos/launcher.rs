@@ -9,9 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::super::unix::{
-    fs::write_unique,
-    launcher::{Launch, run},
+use super::super::{
+    common::launcher::{Launch, run},
+    unix::fs::write_unique,
 };
 
 /// The launcher run when none is configured: `open(1)`, which Portico drives itself.

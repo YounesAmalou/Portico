@@ -35,6 +35,10 @@ pub type Uid = String;
 /// forward itself.
 pub const SSH_BACKGROUNDS: bool = false;
 
+/// Whether access to a local service is granted through Unix groups: not here, where Docker
+/// Desktop and Podman have no `docker` group or socket group to join.
+pub const UNIX_GROUPS: bool = false;
+
 /// The signals that end a session, which Portico treats alike: the console's Ctrl+C and
 /// Ctrl+Break reach the C runtime as these. Windows has no hang-up signal.
 pub const HANGUP_SIGNALS: &[i32] = &[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM];

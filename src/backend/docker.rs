@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::platform::process::UNIX_GROUPS;
+
 use super::{
     Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, Offer,
     Problem, RunFailure, RunResult, Target, Via, remote_command,
@@ -334,50 +336,7 @@ impl Backend for Docker {
         target: &Target,
         run: &mut dyn FnMut(&[String]) -> RunResult<E>,
     ) -> Result<ContainerList, ListFailure<E>> {
-        let words = ps_words();
-        let output = run(&words).map_err(stopped)?;
-        if output.status.success() {
-            return Ok(listed(target.clone(), &output.stdout, None));
-        }
-        let stderr = lossy(&output.stderr);
-        let problem = classify(output.status.code(), &stderr);
-        if !matches!(problem, Problem::PermissionDenied | Problem::ServiceDown) {
-            return Err(failed(plain_issue(target, problem, stderr)));
-        }
-        // A probe that fails is no answer; only a cancellation stops the listing.
-        let probe = match run(&["sh", "-c", PROBE_SCRIPT].map(String::from)) {
-            Ok(output) if output.status.success() => parse_probe(&lossy(&output.stdout)),
-            Err(RunFailure::Cancelled(error)) => return Err(ListFailure::Run(error)),
-            _ => None,
-        };
-        let Some(probe) = probe else {
-            return Err(failed(plain_issue(target, problem, stderr)));
-        };
-        if problem == Problem::ServiceDown {
-            return Err(failed(daemon_down(target, probe.has_systemctl, stderr)));
-        }
-        let issue = match decide(&probe) {
-            Access::RerunInGroup(tool) => {
-                let output = run(&in_group(tool, &words)).map_err(stopped)?;
-                if output.status.success() {
-                    return Ok(listed(target.clone(), &output.stdout, Some(tool)));
-                }
-                let stderr = lossy(&output.stderr);
-                plain_issue(target, classify(output.status.code(), &stderr), stderr)
-            }
-            Access::NeedsLogin => BackendIssue {
-                headline: format!(
-                    "{} is in the docker group on {target}, but this session started before that and sg is not available.",
-                    probe.user
-                ),
-                next: vec!["Log out and back in, then list again.".into()],
-                ..issue(target, problem, stderr)
-            },
-            // An empty socket is not a local path, so its group cannot be fixed.
-            Access::OfferJoin if !probe.socket.is_empty() => join_offer(target, &probe, stderr),
-            Access::OfferJoin | Access::NoOffer => no_offer(target, &probe, stderr),
-        };
-        Err(failed(issue))
+        list(target, run, UNIX_GROUPS)
     }
 
     /// `docker exec` into container `id`, through `via` when the listing needed it.
@@ -392,6 +351,62 @@ impl Backend for Docker {
     fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue {
         plain_issue(target, problem, stderr)
     }
+}
+
+/// `Docker::list`, where this machine grants access through Unix groups when `unix_groups`.
+/// Without them the probe, a shell script about groups and sockets, does not apply here, so a
+/// local failure is explained without it and offers nothing. Remote hosts are always probed.
+fn list<E>(
+    target: &Target,
+    run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    unix_groups: bool,
+) -> Result<ContainerList, ListFailure<E>> {
+    let words = ps_words();
+    let output = run(&words).map_err(stopped)?;
+    if output.status.success() {
+        return Ok(listed(target.clone(), &output.stdout, None));
+    }
+    let stderr = lossy(&output.stderr);
+    let problem = classify(output.status.code(), &stderr);
+    if !matches!(problem, Problem::PermissionDenied | Problem::ServiceDown)
+        || (!unix_groups && matches!(target, Target::Local))
+    {
+        return Err(failed(plain_issue(target, problem, stderr)));
+    }
+    // A probe that fails is no answer; only a cancellation stops the listing.
+    let probe = match run(&["sh", "-c", PROBE_SCRIPT].map(String::from)) {
+        Ok(output) if output.status.success() => parse_probe(&lossy(&output.stdout)),
+        Err(RunFailure::Cancelled(error)) => return Err(ListFailure::Run(error)),
+        _ => None,
+    };
+    let Some(probe) = probe else {
+        return Err(failed(plain_issue(target, problem, stderr)));
+    };
+    if problem == Problem::ServiceDown {
+        return Err(failed(daemon_down(target, probe.has_systemctl, stderr)));
+    }
+    let issue = match decide(&probe) {
+        Access::RerunInGroup(tool) => {
+            let output = run(&in_group(tool, &words)).map_err(stopped)?;
+            if output.status.success() {
+                return Ok(listed(target.clone(), &output.stdout, Some(tool)));
+            }
+            let stderr = lossy(&output.stderr);
+            plain_issue(target, classify(output.status.code(), &stderr), stderr)
+        }
+        Access::NeedsLogin => BackendIssue {
+            headline: format!(
+                "{} is in the docker group on {target}, but this session started before that and sg is not available.",
+                probe.user
+            ),
+            next: vec!["Log out and back in, then list again.".into()],
+            ..issue(target, problem, stderr)
+        },
+        // An empty socket is not a local path, so its group cannot be fixed.
+        Access::OfferJoin if !probe.socket.is_empty() => join_offer(target, &probe, stderr),
+        Access::OfferJoin | Access::NoOffer => no_offer(target, &probe, stderr),
+    };
+    Err(failed(issue))
 }
 
 /// A command that did not run, whether cancelled or failed, stops the listing.
@@ -844,6 +859,36 @@ mod tests {
         };
         assert_eq!(issue.problem, Problem::PermissionDenied);
         assert_eq!(issue.offer, None);
+    }
+
+    #[test]
+    fn local_windows_target_offers_nothing() {
+        // Without Unix groups the probe is never run: a second command would find no reply.
+        for (stderr, problem) in [
+            (DENIED, Problem::PermissionDenied),
+            (
+                "Cannot connect to the Docker daemon at npipe:////./pipe/docker_engine. Is the docker daemon running?",
+                Problem::ServiceDown,
+            ),
+        ] {
+            let mut run = scripted(vec![Ok(exited(1, "", stderr))]);
+            let Err(ListFailure::Issue(issue)) = list(&Target::Local, &mut run, false) else {
+                panic!("expected an issue");
+            };
+            assert_eq!(issue.problem, problem);
+            assert_eq!(issue.offer, None);
+        }
+    }
+
+    #[test]
+    fn a_remote_target_is_probed_without_local_unix_groups() {
+        let probe = "user=me\nprocess=me\ndatabase=me wheel\ngroup=yes\nsocket=/var/run/docker.sock\nsocket_group=docker\nsg=yes\nsystemctl=yes\n";
+        let mut run = scripted(vec![Ok(exited(1, "", DENIED)), Ok(exited(0, probe, ""))]);
+        let Err(ListFailure::Issue(issue)) = list(&Target::Host("web".into()), &mut run, false)
+        else {
+            panic!("expected an issue");
+        };
+        assert!(issue.offer.is_some());
     }
 
     #[test]

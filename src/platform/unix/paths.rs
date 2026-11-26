@@ -12,6 +12,9 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// The agent ssh uses when `SSH_AUTH_SOCK` is not set: none.
+pub const DEFAULT_AGENT: Option<&str> = None;
+
 /// The system-wide `ssh_config`.
 pub fn system_ssh_config() -> PathBuf {
     PathBuf::from(SYSTEM_SSH_CONFIG)

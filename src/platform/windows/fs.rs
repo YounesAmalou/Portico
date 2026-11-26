@@ -99,10 +99,20 @@ pub fn is_executable(path: &Path, _metadata: &Metadata) -> bool {
         })
 }
 
-/// Always false. Windows' Unix domain sockets are reparse points whose tag the standard
-/// library does not report, and Windows' ssh agent listens on a named pipe instead.
-pub fn is_socket(_metadata: &Metadata) -> bool {
-    false
+/// Whether `path` is where an ssh agent can listen: a named pipe (`\\.\pipe\…`), as the
+/// OpenSSH Authentication Agent's. The pipe is not opened, since that would take one of the
+/// agent's connections, and its owner is not checked, since its access rules admit only the
+/// user: an agent that is not running shows when `ssh-add` asks it. Any other file is no
+/// agent's.
+pub fn is_agent_endpoint(path: &Path) -> io::Result<bool> {
+    let pipe = path
+        .to_str()
+        .and_then(|path| path.get(..9))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\.\pipe\"));
+    if pipe {
+        return Ok(true);
+    }
+    fs::metadata(path).map(|_| false)
 }
 
 /// Whether other names refer to the file at `path`, so replacing it would detach them. A file
