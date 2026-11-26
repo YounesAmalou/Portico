@@ -29,12 +29,12 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 
 | Module | Holds |
 |---|---|
-| `platform::process` | Process control: killing process trees, stopping a recognised process, reading the process table (`Proc`); `Proc::scan` and `Logged` know how a started tunnel's `ssh` looks (`-E <log>`). The algorithms are shared (`unix`); each system pins a process (`Pin`: a pidfd on Linux, a kqueue exit watch on macOS) and reads its process table (`/proc` on Linux, `sysctl` and libproc on macOS) |
+| `platform::process` | Process control: killing process trees, stopping a recognised process, reading the process table (`Proc`); `Uid`, `current_uid` and `effective_uid`, `exit_code`, `own_group`, `detach` and `HANGUP_SIGNALS`; `Proc::scan` and `Logged` know how a started tunnel's `ssh` looks (`-E <log>`). The algorithms are shared (`unix`); each system pins a process (`Pin`: a pidfd on Linux, a kqueue exit watch on macOS) and reads its process table (`/proc` on Linux, `sysctl` and libproc on macOS) |
 | `platform::launcher` | Opening a command in a new terminal window: `xdg-terminal-exec` on Linux; on macOS, `open(1)` with the terminal named by `PORTICO_TERMINAL`, else the one Portico runs in (`TERM_PROGRAM`), else Terminal |
 | `platform::paths` | The home directory, `~` display and the well-known locations under it (shared), `config_dir` (shared), `system_ssh_config` and `runtime_dir` (per system) |
 | `platform::net` | `bind_probe`: whether a local address can be listened on, as ssh binds it |
 | `platform::time` | `local`: a Unix time as local calendar time (`LocalTime`) |
-| `platform::fs` | Locking, atomic writes, permissions and ownership checks (`private`, `mode_of`, `set_mode`, `is_executable`, `owner_is`, `writable`), symlinks, directory sync and file identity (`Stamp`, `stamp`), and descriptors created closed on `exec` (`cloexec_socket`, `nonblocking_pipe`); shared by Linux and macOS |
+| `platform::fs` | Locking, atomic writes, permissions and ownership checks (`private`, `mode_of`, `set_mode`, `is_executable`, `owner_is`, `has_other_links`, `writable`, `is_read_only_error`), symlinks (`symlink`, `symlink_target`, `is_socket`), directory sync, file identity (`Stamp`, `stamp`) and `nonblocking_pipe`; the Unix parts are shared by Linux and macOS |
 | `domain::host`, `domain::discovery` | Hosts, and reading the inventory from the OpenSSH configuration |
 | `domain::managed` | The managed host file: store and transactions (`store`), parser (`config`), renderer (`render`), setup of the entry config (`init`) |
 | `domain::openssh` | `ssh -G` resolution (`config`), connection outcomes (`connect`), `known_hosts` and key fetch (`keys`), reading a child's output pipes (`pipes`) |

@@ -626,7 +626,6 @@ mod tests {
         assert_eq!(proc.find_tunnel(&log, &uid, None), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn record_round_trip() {
         let running = Record::Running(record(41, 500));
@@ -649,6 +648,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.run");
         running.write(&path).unwrap();
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

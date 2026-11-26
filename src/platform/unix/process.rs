@@ -63,12 +63,6 @@ pub fn detach(command: &mut Command) -> &mut Command {
     command
 }
 
-/// Whether Portico runs as root, which is not subject to file permissions.
-pub fn is_superuser() -> bool {
-    // SAFETY: `geteuid` has no preconditions.
-    unsafe { libc::geteuid() == 0 }
-}
-
 pub fn terminate_process_group(child: &mut std::process::Child) {
     kill_process_group(child);
     let _ = child.wait();
@@ -304,6 +298,12 @@ pub struct Logged {
     pub pid: u32,
     pub start: u64,
     pub log: PathBuf,
+}
+
+/// The user the process acts as: the effective UID, which decides who owns the files it creates.
+pub fn effective_uid() -> Uid {
+    // SAFETY: `geteuid` has no preconditions.
+    unsafe { libc::geteuid() }
 }
 
 /// The current user's real UID.

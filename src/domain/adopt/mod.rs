@@ -22,7 +22,7 @@ use crate::platform::fs::{
     PendingFile, acquire_lock, has_other_links, mode_of, normalize_path, open_lock, owner_is,
     symlink_target, sync_dir, writable, write_unique,
 };
-use crate::platform::process::{Uid, current_uid};
+use crate::platform::process::{Uid, effective_uid};
 
 /// Whether hosts move into the managed fragment or out of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,7 +354,7 @@ impl ManagedStore {
                 _ => None,
             })
             .collect::<BTreeMap<_, _>>();
-        let euid = current_uid();
+        let euid = effective_uid();
         let mut sources = BTreeMap::new();
         let mut candidates = Vec::new();
         let mut moves = BTreeMap::new();
@@ -436,7 +436,7 @@ impl ManagedStore {
         let (managed_bytes, config) = self.read_managed()?;
         let entry = file_key(self.entry_file()?);
         let entry_bytes = fs::read(&entry).map_err(|source| io_error(&entry, source))?;
-        let problem = source_problem(&entry, &entry_bytes, &current_uid());
+        let problem = source_problem(&entry, &entry_bytes, &effective_uid());
 
         let mut candidates = Vec::new();
         let mut moves = BTreeMap::new();
@@ -1058,10 +1058,14 @@ mod tests {
     use crate::domain::managed::{ConfigPaths, ManagedStore};
     use std::collections::BTreeMap;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    use crate::platform::fs::{mode_of, set_mode};
+
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+        crate::platform::fs::symlink(target.as_ref(), link.as_ref())
+    }
 
     const HEADER: &str = "# Managed by Portico. Do not edit manually.\n";
 
@@ -1149,7 +1153,6 @@ mod tests {
         assert_no_staged_files(&fixture.paths);
     }
 
-    #[cfg(unix)]
     #[test]
     fn reasons_follow_the_spec_order() {
         let fixture = fixture_with(
@@ -1169,15 +1172,15 @@ mod tests {
             "readonly.conf",
             b"Host ro\n  HostName r\nHost rofwd\n  ForwardAgent yes\n",
         );
-        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o444)).unwrap();
+        set_mode(&readonly, 0o444).unwrap();
         fixture.write("latin.conf", b"Host latin\n  HostName l\n# caf\xe9\n");
         let locked = fixture.write("locked/hosts.conf", b"Host locked\n  HostName k\n");
         let locked_dir = locked.parent().unwrap().to_path_buf();
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        set_mode(&locked_dir, 0o555).unwrap();
         fixture.write("cond.conf", b"Host cond\n  HostName c\n");
 
         let plan = fixture.store.adoption_plan(same());
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        set_mode(&locked_dir, 0o755).unwrap();
         let plan = plan.unwrap();
 
         let reason = |text: &str| Some(text.to_owned());
@@ -1315,7 +1318,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_source_is_previewed_at_its_target() {
         let fixture = fixture("Include linked.conf\n");
@@ -1372,7 +1374,6 @@ mod tests {
         assert_eq!(reasons(&plan), [("dev".into(), None)]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn preview_rejects_unknown_and_ineligible_aliases() {
         let fixture = fixture("Host dev\n  HostName d\nHost fwd\n  ForwardAgent yes\n");
@@ -1390,7 +1391,7 @@ mod tests {
         assert!(plan.preview(&[]).unwrap().files.is_empty());
 
         let fixture = fixture_with("", "\nHost dev\n    HostName d\n");
-        fs::set_permissions(&fixture.paths.entry, fs::Permissions::from_mode(0o444)).unwrap();
+        set_mode(&fixture.paths.entry, 0o444).unwrap();
         let plan = fixture.store.export_plan(same()).unwrap();
         assert_eq!(
             plan.preview(&["dev".into()]).unwrap_err().to_string(),
@@ -1411,7 +1412,6 @@ mod tests {
             Err(AdoptError::Transaction(TransactionError::NotInitialized))
         ));
     }
-    #[cfg(unix)]
     #[test]
     fn snapshot_keys_name_each_file_once() {
         let fixture = fixture("Include linked.conf\n");
@@ -1545,7 +1545,6 @@ mod tests {
         assert_no_temporary_files(&fixture.paths);
     }
 
-    #[cfg(unix)]
     #[test]
     fn adopting_from_an_included_file_and_the_entry_in_one_go() {
         let fixture = fixture("Include extra.conf\nHost a\n  HostName a\n");
@@ -1553,7 +1552,7 @@ mod tests {
             "extra.conf",
             b"Host b\n  HostName b\n\nHost c\n  HostName c\n# tail\n",
         );
-        fs::set_permissions(&extra, fs::Permissions::from_mode(0o640)).unwrap();
+        set_mode(&extra, 0o640).unwrap();
         let plan = fixture.store.adoption_plan(same()).unwrap();
         assert_eq!(migrate(&fixture, &plan, &["b", "a"]).unwrap(), ["a", "b"]);
         assert_eq!(
@@ -1561,10 +1560,7 @@ mod tests {
             "Include ~/.ssh/portico/config\nInclude extra.conf\n"
         );
         assert_eq!(read(&extra), "Host c\n  HostName c\n# tail\n");
-        assert_eq!(
-            fs::metadata(&extra).unwrap().permissions().mode() & 0o7777,
-            0o640
-        );
+        assert_eq!(mode_of(&fs::metadata(&extra).unwrap()) & 0o7777, 0o640);
         assert_eq!(
             read(&fixture.paths.managed),
             format!("{HEADER}\nHost a\n    HostName a\n\nHost b\n    HostName b\n")
@@ -1611,7 +1607,6 @@ mod tests {
         assert!(!fixture.paths.backup.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_retargeted_entry_link_is_stale() {
         let fixture = fixture("Host dev\n  HostName d\n");
@@ -1979,7 +1974,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_source_keeps_the_link() {
         let fixture = fixture("");
@@ -2064,7 +2058,6 @@ mod tests {
         assert_no_temporary_files(&fixture.paths);
     }
 
-    #[cfg(unix)]
     #[test]
     fn export_through_a_symlinked_entry_keeps_the_link() {
         let fixture = fixture_with("", "\nHost dev\n    HostName d\n");
