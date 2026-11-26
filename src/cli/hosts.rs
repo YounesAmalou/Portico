@@ -15,6 +15,7 @@ use crate::{
     domain::managed::InitPlan,
     domain::openssh::{ConnectionOutcome, OpenSshError, PresentedKey},
     picker::{Picker, Row},
+    platform::paths::DEFAULT_AGENT,
 };
 
 use super::{CANCELLED, Interrupts, Step, confirm, exit_code};
@@ -418,16 +419,7 @@ pub(super) fn print_inventory(
             ),
             Agent::Disabled | Agent::NotConfigured { .. } => continue,
         };
-        let mut uses = Vec::new();
-        if known.environment {
-            uses.push("SSH_AUTH_SOCK".to_owned());
-        }
-        if !known.used_by.is_empty() {
-            uses.push(format!(
-                "used by {}",
-                identity::count(known.used_by.len(), "host")
-            ));
-        }
+        let uses = agent_uses(known, DEFAULT_AGENT);
         text.push_str(&format!("  {name}  {socket}  {state}"));
         if !uses.is_empty() {
             text.push_str(&format!("  ({})", uses.join(", ")));
@@ -496,6 +488,26 @@ pub(super) fn print_inventory(
     output
         .write_all(text.as_bytes())
         .map_err(|error| error.to_string())
+}
+
+/// What the inventory says of `known`: whether ssh uses it by default, through `SSH_AUTH_SOCK`
+/// or as the system's `default_agent` (Windows' agent pipe, used without the variable), and
+/// how many hosts name it.
+fn agent_uses(known: &identity::InventoryAgent, default_agent: Option<&str>) -> Vec<String> {
+    let mut uses = Vec::new();
+    if known.environment {
+        uses.push("SSH_AUTH_SOCK".to_owned());
+    } else if default_agent.is_some_and(|default| known.agent.socket() == Some(Path::new(default)))
+    {
+        uses.push("default agent".to_owned());
+    }
+    if !known.used_by.is_empty() {
+        uses.push(format!(
+            "used by {}",
+            identity::count(known.used_by.len(), "host")
+        ));
+    }
+    uses
 }
 
 fn print_optional(output: &mut impl Write, label: &str, value: Option<&str>) -> Result<(), String> {
@@ -661,6 +673,28 @@ mod tests {
                 shown("/run/agent")
             )),
             "{details}"
+        );
+    }
+
+    #[test]
+    fn the_system_default_agent_is_labelled_as_such() {
+        let pipe = r"\\.\pipe\openssh-ssh-agent";
+        let mut known = identity::InventoryAgent {
+            agent: Agent::Listed {
+                socket: pipe.into(),
+                provider: identity::Provider::Generic,
+                keys: Vec::new(),
+            },
+            environment: false,
+            used_by: Vec::new(),
+        };
+        assert_eq!(agent_uses(&known, Some(pipe)), ["default agent"]);
+        assert!(agent_uses(&known, None).is_empty());
+        known.environment = true;
+        known.used_by = vec!["a".into()];
+        assert_eq!(
+            agent_uses(&known, Some(pipe)),
+            ["SSH_AUTH_SOCK", "used by 1 host"]
         );
     }
 

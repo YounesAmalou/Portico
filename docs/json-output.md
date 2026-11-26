@@ -318,7 +318,7 @@ When the host does not resolve, the command still succeeds:
 }
 ```
 
-`agents[]` have the fields of a host's agent, with `keys[]` (the public keys; empty when `unavailable`) instead of `key_count`, plus `environment` (it is the agent `SSH_AUTH_SOCK` names) and `used_by` (the hosts that use it). `files[]` have the fields of a host's identity plus `used_by`.
+`agents[]` have the fields of a host's agent, with `keys[]` (the public keys; empty when `unavailable`) instead of `key_count`, plus `environment` (it is the agent `SSH_AUTH_SOCK` names) and `used_by` (the hosts that use it). On Windows, when `SSH_AUTH_SOCK` is not set, the agent ssh uses by default, the OpenSSH Authentication Agent at `\\.\pipe\openssh-ssh-agent`, is listed with `environment` `false` (the human output labels it `default agent`). `files[]` have the fields of a host's identity plus `used_by`.
 
 ## Containers
 

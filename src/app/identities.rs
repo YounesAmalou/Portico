@@ -60,14 +60,18 @@ impl Default for IdentityState {
 
 impl IdentityState {
     fn env(&self, name: &str) -> Option<String> {
+        if name == "SSH_AUTH_SOCK" {
+            return self.session_agent().map(|(socket, _)| socket);
+        }
+        std::env::var(name).ok()
+    }
+
+    /// The agent ssh uses when a host names none, and whether `SSH_AUTH_SOCK` names it: without
+    /// the variable, ssh uses the system's default agent, if it has one (`false`).
+    fn session_agent(&self) -> Option<(String, bool)> {
         match &self.auth_sock {
-            Some(socket) if name == "SSH_AUTH_SOCK" => socket.clone(),
-            // Without `SSH_AUTH_SOCK`, ssh uses the system's agent, if it has one.
-            None if name == "SSH_AUTH_SOCK" => std::env::var(name)
-                .ok()
-                .filter(|value| !value.is_empty())
-                .or_else(|| DEFAULT_AGENT.map(String::from)),
-            _ => std::env::var(name).ok(),
+            Some(socket) => socket.clone().map(|socket| (socket, true)),
+            None => session_agent(std::env::var("SSH_AUTH_SOCK").ok(), DEFAULT_AGENT),
         }
     }
 
@@ -82,6 +86,15 @@ impl IdentityState {
     fn deadline(&self) -> Duration {
         self.deadline.unwrap_or(TOOL_DEADLINE)
     }
+}
+
+/// The socket `variable` (`SSH_AUTH_SOCK`'s value) names (`true`), or else the system's
+/// `default` agent (`false`).
+fn session_agent(variable: Option<String>, default: Option<&str>) -> Option<(String, bool)> {
+    variable
+        .filter(|value| !value.is_empty())
+        .map(|socket| (socket, true))
+        .or_else(|| default.map(|socket| (socket.to_owned(), false)))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -347,15 +360,14 @@ impl App {
         let hosts = self.hosts()?;
         let home = self.home().to_owned();
         let mut inventory = IdentityInventory::default();
-        let environment = self
+        let session = self
             .identities
-            .env("SSH_AUTH_SOCK")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        if let Some(socket) = &environment {
+            .session_agent()
+            .filter(|(socket, _)| !socket.is_empty());
+        if let Some((socket, environment)) = session {
             inventory.agents.push(InventoryAgent {
-                agent: self.agent(Socket::Path(socket.clone())),
-                environment: true,
+                agent: self.agent(Socket::Path(PathBuf::from(socket))),
+                environment,
                 used_by: Vec::new(),
             });
         }
@@ -606,6 +618,22 @@ mod tests {
         let path = fixture.path("agent.sock");
         let listener = UnixListener::bind(&path).unwrap();
         (path, listener)
+    }
+
+    #[test]
+    fn the_session_agent_is_the_variable_s_or_else_the_system_default() {
+        let pipe = r"\\.\pipe\openssh-ssh-agent";
+        assert_eq!(
+            session_agent(Some("/run/agent".into()), Some(pipe)),
+            Some(("/run/agent".into(), true))
+        );
+        for unset in [None, Some(String::new())] {
+            assert_eq!(
+                session_agent(unset.clone(), Some(pipe)),
+                Some((pipe.into(), false))
+            );
+            assert_eq!(session_agent(unset, None), None);
+        }
     }
 
     #[cfg(unix)]
