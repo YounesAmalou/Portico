@@ -1164,13 +1164,15 @@ mod tests {
         };
         let output = std::process::Command::new("icacls")
             .arg(path)
-            .args([action, &rule])
+            .args([action, rule.as_str()])
             .output()
             .unwrap();
         assert!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
+            "icacls {} {action} {rule}: {}{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

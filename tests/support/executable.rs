@@ -101,16 +101,29 @@ fn shim() -> &'static Path {
             .arg(&source)
             .output()
             .unwrap_or_else(|error| panic!("cannot run {rustc:?}: {error}"));
-        assert!(
-            output.status.success(),
-            "cannot compile {}:\n{}",
-            source.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if fs::rename(&partial, &shim).is_err() {
-            // Another test binary put its own copy there first.
-            assert!(shim.exists(), "cannot rename {}", partial.display());
+        if !output.status.success() {
             let _ = fs::remove_file(&partial);
+            panic!(
+                "cannot compile {}:\n{}",
+                source.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // A virus scanner may hold the new file for a moment, so a failed rename is retried.
+        let mut attempts = 0;
+        while let Err(error) = fs::rename(&partial, &shim) {
+            if shim.exists() {
+                // Another test binary put its own copy there first.
+                let _ = fs::remove_file(&partial);
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts < 50,
+                "cannot rename {}: {error}",
+                partial.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         shim
     })

@@ -26,6 +26,8 @@ use super::TestEnv;
 const ROWS: u16 = 24;
 const COLUMNS: u16 = 120;
 
+/// A query for the cursor position, which a terminal answers with `ESC [ row ; column R`.
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 /// Whether the raw output carries the escape sequences the checks look for.
 const RAW_SEQUENCES: bool = cfg!(unix);
 /// The Esc key: with the kitty keyboard protocol a lone escape byte is not a key, on Windows
@@ -211,7 +213,9 @@ fn run(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
         terminal.read_until(b"\x1b[?25h", left, Duration::from_secs(5));
         terminal.wait_draining(Duration::from_secs(5))
     } else {
-        terminal.wait_draining(timeout)
+        // `timeout` bounds leaving the screen, which only the raw output shows; the exit has
+        // the same five seconds as on Unix.
+        terminal.wait_draining(Duration::from_secs(5))
     };
     assert!(
         status.success(),
@@ -719,7 +723,8 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 /// Portico in a pseudo-terminal, with what it printed so far.
 struct Terminal {
     // Dropping the master closes the terminal, so it lives as long as the child.
-    _master: Box<dyn MasterPty + Send>,
+    #[cfg_attr(windows, allow(dead_code))]
+    master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     output: Receiver<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
@@ -761,7 +766,10 @@ impl Terminal {
                 .unwrap()
         };
         #[cfg(unix)]
-        let before = termios(&slave);
+        let before = {
+            use std::os::fd::AsRawFd;
+            tcgetattr(slave.as_raw_fd()).unwrap()
+        };
         #[cfg(unix)]
         let before_stty = {
             let output = std::process::Command::new("stty")
@@ -808,7 +816,7 @@ impl Terminal {
         });
         let writer = pair.master.take_writer().unwrap();
         Self {
-            _master: pair.master,
+            master: pair.master,
             writer,
             output,
             child,
@@ -891,8 +899,14 @@ impl Terminal {
     }
 
     fn feed(&mut self, data: &[u8]) {
+        let searched = self.transcript.len().saturating_sub(CURSOR_QUERY.len() - 1);
         self.transcript.extend_from_slice(data);
         self.parser.process(data);
+        // Answer each cursor position query: ConPTY asks one at start-up (portable-pty lets
+        // it inherit the cursor) and waits for the answer before it runs anything.
+        for _ in 0..count(&self.transcript[searched..], CURSOR_QUERY) {
+            self.write(b"\x1b[1;1R");
+        }
     }
 
     /// Waits for raw terminal output, such as a mode switch.
@@ -961,26 +975,28 @@ impl Terminal {
     /// Whether the terminal reads keys one at a time, without echoing them.
     #[cfg(unix)]
     fn is_raw(&self) -> bool {
-        termios(&self.slave).c_lflag & (libc::ICANON | libc::ECHO) == 0
+        self.termios().c_lflag & (libc::ICANON | libc::ECHO) == 0
     }
 
     #[cfg(unix)]
     fn termios_restored(&self) -> bool {
-        let after = termios(&self.slave);
-        let before = &self.before;
-        (
-            after.c_iflag,
-            after.c_oflag,
-            after.c_cflag,
-            after.c_lflag,
-            after.c_cc,
-        ) == (
-            before.c_iflag,
-            before.c_oflag,
-            before.c_cflag,
-            before.c_lflag,
-            before.c_cc,
-        )
+        settings(&self.termios()) == settings(&self.before)
+    }
+
+    /// The terminal's settings, read through its other end. macOS revokes that end once the
+    /// session leader that controlled it exits; the master side reads the same settings.
+    #[cfg(unix)]
+    fn termios(&self) -> libc::termios {
+        use std::os::fd::AsRawFd;
+        tcgetattr(self.slave.as_raw_fd())
+            .or_else(|_| {
+                tcgetattr(
+                    self.master
+                        .as_raw_fd()
+                        .expect("the master has a descriptor"),
+                )
+            })
+            .unwrap_or_else(|error| panic!("tcgetattr: {error}"))
     }
 
     #[track_caller]
@@ -1001,16 +1017,40 @@ impl Drop for Terminal {
 }
 
 #[cfg(unix)]
-fn termios(terminal: &fs::File) -> libc::termios {
-    use std::os::fd::AsRawFd;
+fn tcgetattr(fd: std::os::fd::RawFd) -> std::io::Result<libc::termios> {
     // SAFETY: `termios` is plain data that `tcgetattr` fills in.
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: the descriptor is open for the call and `termios` is a valid location.
-    assert_eq!(
-        unsafe { libc::tcgetattr(terminal.as_raw_fd(), &mut termios) },
-        0,
-        "tcgetattr: {}",
-        std::io::Error::last_os_error()
-    );
-    termios
+    // SAFETY: `termios` is a valid location; a closed or revoked descriptor is an error.
+    if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
+        Ok(termios)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// What `tcgetattr` reports, as comparable values: the modes, the control characters and the
+/// speeds.
+#[cfg(unix)]
+fn settings(
+    termios: &libc::termios,
+) -> (
+    libc::tcflag_t,
+    libc::tcflag_t,
+    libc::tcflag_t,
+    libc::tcflag_t,
+    Vec<libc::cc_t>,
+    libc::speed_t,
+    libc::speed_t,
+) {
+    // SAFETY: both read a valid `termios`.
+    let (input, output) = unsafe { (libc::cfgetispeed(termios), libc::cfgetospeed(termios)) };
+    (
+        termios.c_iflag,
+        termios.c_oflag,
+        termios.c_cflag,
+        termios.c_lflag,
+        termios.c_cc.to_vec(),
+        input,
+        output,
+    )
 }

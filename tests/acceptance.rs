@@ -115,8 +115,6 @@ fn managed_strings_round_trip_through_openssh() {
     }
 }
 
-/// Unix-only: a symbolic link on Windows needs a privilege the tests do not have.
-#[cfg(unix)]
 #[test]
 fn symlinked_entry_discovery_agrees_with_openssh() {
     let env = TestEnv::new();
@@ -134,7 +132,14 @@ fn symlinked_entry_discovery_agrees_with_openssh() {
         "Host 'tilde'\n HostName 203.0.113.10\n",
     )
     .unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&target, env.ssh_config()).unwrap();
+    // Windows needs a privilege (or developer mode) to create a symbolic link.
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, env.ssh_config()) {
+        eprintln!("skipped: cannot create a symbolic link: {error}");
+        return;
+    }
     let inventory =
         portico::domain::discovery::discover(&env.ssh_config(), &env.managed_config()).unwrap();
     assert!(inventory.aliases_complete, "{:?}", inventory.warnings);
@@ -155,6 +160,8 @@ fn symlinked_entry_discovery_agrees_with_openssh() {
             .arg(env.ssh_config())
             .arg(alias)
             .env("HOME", env.home())
+            // Windows' OpenSSH finds `~` there.
+            .env("USERPROFILE", env.home())
             .output()
             .unwrap();
         assert!(
