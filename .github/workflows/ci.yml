@@ -180,10 +180,16 @@ jobs:
   windows-lib:
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      CARGO_HOME: C:\Users\runneradmin\.cargo
+      RUSTUP_HOME: C:\Users\runneradmin\.rustup
     steps:
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cargo clippy --lib -- -D warnings
       - run: cargo test --lib
+      - if: ${{ !cancelled() }}
+        run: cargo test --tests --no-fail-fast
 
   msrv:
     needs: changes
