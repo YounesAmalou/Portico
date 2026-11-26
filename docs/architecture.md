@@ -67,22 +67,27 @@ Adapters are compiled in and chosen at run time through the `BackendId` enum. No
 
 ### Add a platform
 
-Each platform concern is a module whose functions exist once per operating system, chosen at compile time with `cfg(target_os = ...)`, without trait objects. Linux and macOS are implemented:
+Each platform concern is a module whose functions exist once per operating system, chosen at compile time with `cfg(target_os = ...)` or `cfg(unix)` / `cfg(windows)`, without trait objects. Linux and macOS are implemented; the `windows` module is a stub for now:
 
 ```
 src/platform/
-  mod.rs        selects the system (`os`); compile_error! for any other target
-  fs.rs, paths.rs, process.rs, launcher.rs   re-export `unix` and the system's own module
-  unix/         shared by Linux and macOS: files, home paths, the process algorithms
-                (tree walk, stop_process, scan), running a launcher program
+  mod.rs        selects the system (`os` on Unix); compile_error! for any target that is not Linux, macOS or Windows
+  fs.rs, paths.rs, process.rs, launcher.rs   re-export `common` (fs, paths) plus `unix` and the
+                system's own module on Unix, or `windows` on Windows
+  common/       portable on every system: `~` display and expansion, config_dir, path
+                normalisation, locking, PendingFile, Stamp and the test fault hooks
+  unix/         shared by Linux and macOS: permissions, symlinks, descriptors, file identity,
+                the home directory (HOME), the process algorithms (tree walk, stop_process,
+                scan), running a launcher program
   linux/        Pin (pidfd), children and stopped state (/proc), Proc, xdg-terminal-exec,
                 runtime_dir (XDG_RUNTIME_DIR)
   macos/        Pin (kqueue NOTE_EXIT), children and stopped state (libproc), Proc (sysctl),
                 open(1) and its terminals, runtime_dir (~/.ssh/portico/run/tunnels)
+  windows/      fs, paths, process and launcher for Windows (empty modules until implemented)
 ```
 
 A system provides what `unix` calls (`Pin` with `open`, `signal` and `wait_exit`; `children`; `wait_until_stopped`; `Proc` with `stat`, `uid`, `cmdline`, `pids`, `boot_id` and `started_at`) and the per-system items of `paths` and `launcher`. A record's `start` is whatever the system's `Proc::stat` reports (clock ticks after boot on Linux, microseconds since the epoch on macOS); records never move between systems.
 
-1. Add a sibling of `src/platform/linux/` (for example `src/platform/windows/`). A system that is not a Unix also replaces what `unix` provides, so `fs.rs`, `paths.rs`, `process.rs` and `launcher.rs` select it instead.
+1. Add a sibling of `src/platform/linux/` (for example `src/platform/windows/`). A system that is not a Unix also replaces what `unix` provides, so `fs.rs`, `paths.rs`, `process.rs` and `launcher.rs` select it instead; what is portable belongs in `common/`.
 2. Add its `cfg` selection in `src/platform/mod.rs`, which refuses to compile on other systems.
 3. Revisit the `libc` calls left in `domain` (see the layer rules above) and the Linux-only `desktop` module.
