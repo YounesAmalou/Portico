@@ -6,7 +6,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -24,8 +24,8 @@ use crate::{
         Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
         check_args, collide, collisions, listeners_in_effective_config,
         runtime::{
-            Bind, Identity, Record, RunningRecord, authenticated, find_in, log_reason, log_tail,
-            now, ready, try_bind,
+            Bind, Identity, READY_BOUND, Record, RunningRecord, authenticated, find_in, listening,
+            log_reason, log_tail, now, ready, try_bind, up_at_bound,
         },
         start_args,
     },
@@ -351,16 +351,27 @@ impl App {
             program: self.openssh.ssh_program().to_path_buf(),
             source,
         })?;
+        let spawned = Instant::now();
         // The background ssh is forked from this one, so it cannot have started earlier.
         let since = self.proc.stat(child.id()).map(|stat| stat.start);
         let mut authenticated_at = None;
         let status = loop {
-            // Judged before ssh is seen running, so a forward is up only while its ssh runs.
-            let up = !SSH_BACKGROUNDS && {
+            // A foreground ssh is the tunnel: its forward is judged before ssh is seen running,
+            // so it counts as up only while ssh runs.
+            let (up, timed_out) = if SSH_BACKGROUNDS {
+                (false, false)
+            } else {
                 if authenticated_at.is_none() && authenticated(&log) {
                     authenticated_at = Some(Instant::now());
                 }
-                ready(&tunnel.forward, &log, authenticated_at)
+                let timed_out = spawned.elapsed() >= READY_BOUND;
+                let up = ready(
+                    &tunnel.forward,
+                    authenticated_at.is_some(),
+                    authenticated_at,
+                ) || (timed_out
+                    && up_at_bound(&tunnel.forward, listening(&tunnel.forward)));
+                (up, timed_out)
             };
             if let Some(status) = child.try_wait().map_err(|source| OpenSshError::Io {
                 program: self.openssh.ssh_program().to_path_buf(),
@@ -377,12 +388,27 @@ impl App {
                 let _ = Record::remove(&stderr_path);
                 return self.record_started(tunnel, &record_path, child.id(), start);
             }
-            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
-                // A ProxyCommand child would outlive ssh, so the whole tree goes.
-                if kill_process_tree(child.id()).is_err() {
-                    let _ = child.kill();
+            if timed_out {
+                end_tree(&mut child);
+                let _ = Record::remove(&stderr_path);
+                let reason = format!(
+                    "ssh did not report the forward up within {} s",
+                    READY_BOUND.as_secs()
+                );
+                Record::Failed {
+                    reason: reason.clone(),
+                    exit: None,
+                    finished: now(),
                 }
-                let _ = child.wait();
+                .write(&record_path)
+                .map_err(runtime_error(record_path))?;
+                return Ok(StartOutcome::Failed {
+                    reason,
+                    explanation: None,
+                });
+            }
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+                end_tree(&mut child);
                 let _ = Record::remove(&stderr_path);
                 return Err(OpenSshError::Cancelled.into());
             }
@@ -758,6 +784,15 @@ impl App {
             }
         }
     }
+}
+
+/// Ends a start's ssh and what it started: a ProxyCommand child would outlive ssh, so the
+/// whole tree goes.
+fn end_tree(child: &mut Child) {
+    if kill_process_tree(child.id()).is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 #[cfg(test)]

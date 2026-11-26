@@ -314,22 +314,37 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
 /// refused in one round trip).
 const SURVIVAL: Duration = Duration::from_secs(1);
 
+/// How long a start waits for a foreground ssh's forward to come up.
+pub const READY_BOUND: Duration = Duration::from_secs(30);
+
 /// Whether a foreground ssh (one that cannot background itself, as on Windows) has opened
-/// `forward`, given its log and when it was first seen authenticated while running.
+/// `forward`, given whether its log shows it authenticated and since when it has run so.
 ///
-/// Every kind needs the log's authentication line and ssh alive [`SURVIVAL`] after it; a
-/// local or dynamic forward also needs one of its listen addresses bound. Since a start checks
-/// that every listen address is free first, a bound address could otherwise only be another
-/// program's that took it while ssh connected, and then ssh exits on the forward failure
-/// within that time.
-pub fn ready(forward: &Forward, log: &Path, alive_since_auth: Option<Instant>) -> bool {
-    alive_since_auth.is_some_and(|since| since.elapsed() >= SURVIVAL)
-        && authenticated(log)
-        && (!forward.kind.listens_locally()
-            || forward
-                .listen_addresses()
-                .iter()
-                .any(|address| try_bind(address, forward.bind_port) == Bind::InUse))
+/// Every kind needs the authentication and ssh alive [`SURVIVAL`] after it; a local or dynamic
+/// forward also needs one of its listen addresses bound. Since a start checks that every
+/// listen address is free first, a bound address could otherwise only be another program's
+/// that took it while ssh connected, and then ssh exits on the forward failure within that
+/// time.
+pub fn ready(forward: &Forward, authenticated: bool, alive_since_auth: Option<Instant>) -> bool {
+    authenticated
+        && alive_since_auth.is_some_and(|since| since.elapsed() >= SURVIVAL)
+        && (!forward.kind.listens_locally() || listening(forward))
+}
+
+/// Whether a forward whose foreground ssh still runs at [`READY_BOUND`] without having been
+/// seen [`ready`] counts as up: a local or dynamic forward whose listen address is in use,
+/// which the start proved free under its lock before spawning ssh, so ssh holds it. A remote
+/// forward has no such evidence and never does.
+pub fn up_at_bound(forward: &Forward, listening: bool) -> bool {
+    forward.kind.listens_locally() && listening
+}
+
+/// Whether one of `forward`'s local listen addresses is in use now.
+pub fn listening(forward: &Forward) -> bool {
+    forward
+        .listen_addresses()
+        .iter()
+        .any(|address| try_bind(address, forward.bind_port) == Bind::InUse)
 }
 
 /// Whether a tunnel's log shows ssh authenticated, which it logs from `LogLevel=VERBOSE` on.
@@ -802,36 +817,44 @@ mod tests {
 
     #[test]
     fn ready_for_local_forward_once_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = verbose_log(dir.path(), true);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let bound = Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:db:5432")).unwrap();
-        assert!(ready(&bound, &log, ago(1100)));
+        assert!(ready(&bound, true, ago(1100)));
         let socks = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{port}")).unwrap();
-        assert!(ready(&socks, &log, ago(1100)));
+        assert!(ready(&socks, true, ago(1100)));
         // A port held before ssh authenticated, or by a program that took it while ssh still
         // could exit on the forward failure, is not ssh's.
-        assert!(!ready(&bound, &verbose_log(dir.path(), false), ago(1100)));
-        assert!(!ready(&bound, &verbose_log(dir.path(), true), ago(200)));
-        assert!(!ready(&bound, &log, None));
+        assert!(!ready(&bound, false, ago(1100)));
+        assert!(!ready(&bound, true, ago(200)));
+        assert!(!ready(&bound, true, None));
         drop(listener);
         let free = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = free.local_addr().unwrap().port();
         drop(free);
         let free = Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:db:5432")).unwrap();
-        assert!(!ready(&free, &log, ago(1100)));
+        assert!(!ready(&free, true, ago(1100)));
     }
 
     #[test]
     fn ready_for_remote_forward_after_auth_and_a_second() {
-        let dir = tempfile::tempdir().unwrap();
         let remote = Forward::parse(Kind::Remote, "8080:localhost:3000").unwrap();
-        let log = verbose_log(dir.path(), true);
-        assert!(ready(&remote, &log, ago(1100)));
-        assert!(!ready(&remote, &log, ago(200)));
-        assert!(!ready(&remote, &verbose_log(dir.path(), false), ago(1100)));
-        assert!(!ready(&remote, &dir.path().join("missing.log"), ago(1100)));
+        assert!(ready(&remote, true, ago(1100)));
+        assert!(!ready(&remote, true, ago(200)));
+        assert!(!ready(&remote, false, ago(1100)));
+    }
+
+    #[test]
+    fn at_the_bound_only_a_listening_local_forward_is_up() {
+        let local = Forward::parse(Kind::Local, "5432:db:5432").unwrap();
+        let socks = Forward::parse(Kind::Dynamic, "1080").unwrap();
+        let remote = Forward::parse(Kind::Remote, "8080:localhost:3000").unwrap();
+        assert!(up_at_bound(&local, true));
+        assert!(up_at_bound(&socks, true));
+        assert!(!up_at_bound(&local, false));
+        assert!(!up_at_bound(&socks, false));
+        assert!(!up_at_bound(&remote, true));
+        assert!(!up_at_bound(&remote, false));
     }
 
     #[test]
