@@ -550,7 +550,7 @@ mod tests {
             "cancellation blocked for {:?}",
             started.elapsed()
         );
-        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)), "{result:?}");
         assert!(pin_failure_injected(), "ssh's pin opened");
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
@@ -586,7 +586,7 @@ mod tests {
         let result = openssh.connect_mirrored("dev", Box::new(io::sink()), Some(&cancelled));
 
         cancel.join().unwrap();
-        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)), "{result:?}");
         assert!(pin_failure_injected(), "every descendant's pin opened");
         for pid in fs::read_to_string(marker).unwrap().split_whitespace() {
             assert_dies(pid);
@@ -942,7 +942,7 @@ mod tests {
         let result = openssh.probe(None, "dev", Route::Direct, &cancelled);
 
         cancel.join().unwrap();
-        assert!(matches!(result, Err(OpenSshError::Cancelled)));
+        assert!(matches!(result, Err(OpenSshError::Cancelled)), "{result:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "cancellation blocked for {:?}",

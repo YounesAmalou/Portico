@@ -109,6 +109,9 @@ pub(super) fn parent_id(handle: &OwnedHandle) -> io::Result<u32> {
     u32::try_from(information.parent).map_err(|_| io::Error::other("invalid parent process ID"))
 }
 
+/// How long a process that refuses to be ended may take to finish exiting.
+const EXITING_WAIT_MS: u32 = 500;
+
 /// A process handle that can end the process and wait for its exit; it never reaches a later
 /// process with the same ID.
 pub(crate) struct Pin {
@@ -146,8 +149,10 @@ impl Pin {
             return Ok(());
         }
         let error = io::Error::last_os_error();
-        // A process that exits meanwhile refuses with access denied.
-        Err(if has_exited(raw(&self.handle)) {
+        // A process that is exiting refuses with access denied until its exit is complete,
+        // which takes a moment on a busy machine (a parent whose child was just ended exits
+        // by itself).
+        Err(if self.wait_exit(EXITING_WAIT_MS) {
             gone()
         } else {
             error
