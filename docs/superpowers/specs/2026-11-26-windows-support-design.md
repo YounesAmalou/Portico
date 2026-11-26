@@ -1,6 +1,6 @@
 # Windows Support Design
 
-**Status:** Approved; being implemented
+**Status:** Implemented
 
 ## Purpose
 

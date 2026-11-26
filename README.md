@@ -9,7 +9,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Lists Portico-managed and existing OpenSSH hosts in one inventory.
 - Adds, edits, inspects, renames, and removes managed hosts.
 - Shows the effective configuration reported by `ssh -G`.
-- Connects in the current terminal or in a new terminal window (`xdg-terminal-exec` on Linux; Terminal, iTerm2, Ghostty, WezTerm, kitty or Alacritty on macOS).
+- Connects in the current terminal or in a new terminal window (`xdg-terminal-exec` on Linux; Terminal, iTerm2, Ghostty, WezTerm, kitty or Alacritty on macOS; Windows Terminal on Windows).
 - Adopts hosts from your own SSH configuration into Portico, and exports them back, with a preview first.
 - Tests on demand whether a host's login works, without opening a shell.
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
@@ -27,13 +27,12 @@ Private keys remain where they already live. Portico stores identity-file refere
 
 ## Requirements
 
-- Linux on x86_64 or aarch64 (verified on Arch Linux), or macOS on Apple silicon or Intel (Windows is on the [roadmap](ROADMAP.md))
-- OpenSSH client tools (`ssh`)
+- Linux on x86_64 or aarch64 (verified on Arch Linux), macOS on Apple silicon or Intel, or Windows 10 or newer on x64 or arm64
+- OpenSSH client tools (`ssh`); on Windows, the OpenSSH Client optional feature, which current Windows installs include
 - `xdg-terminal-exec` for the new-terminal option only, on Linux
 - Only for container shells, on this machine or on the host: `docker`, `podman`, or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
 - Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel) (Linux only)
 - Rust 1.88 or newer, only when building from source
-- Python 3 and `stty` to run the complete PTY integration test
 
 ## Install
 
@@ -53,9 +52,25 @@ brew install younesamalou/tap/portico
 
 The formula installs the release's prebuilt binary for Apple silicon or Intel. macOS ships the OpenSSH client Portico needs. The release tarballs (`portico-vX.Y.Z-aarch64-apple-darwin.tar.gz`, `…-x86_64-apple-darwin.tar.gz`) hold the same binary; it is not notarized, so a copy downloaded with a browser must have its quarantine removed (`xattr -d com.apple.quarantine portico`) before macOS runs it.
 
+### Windows (winget)
+
+```powershell
+winget install YounesAmalou.Portico
+```
+
+The package installs the release's `portico.exe` for x64 or arm64 and puts `portico` on your `PATH`. Microsoft's moderators review the first submission of the package, so it may not be available yet; until then, use the zip from the release (below). Windows already ships the OpenSSH client Portico needs. The binary is not code-signed, so Windows SmartScreen may warn about a copy downloaded with a browser.
+
+On Windows:
+
+- Container shells work with Docker Desktop in its Linux containers mode, and with Podman Desktop. Windows containers mode is not supported, and neither is Docker Engine installed inside a WSL distribution without Docker Desktop: in that case run Portico inside the distribution, as a Linux program.
+- A new terminal window opens in Windows Terminal (`wt`), or in a new console window when it is not installed. `PORTICO_TERMINAL` overrides this: `cmd` for a console window, or the path of a launcher program that takes the command as its arguments.
+- Tunnels work with the Windows OpenSSH client, and `portico tunnel stop` ends the tunnel's `ssh` process and the processes it started.
+- Portico keeps its files under your user profile: `%USERPROFILE%\.ssh\portico\` for the managed hosts and tunnels, and `%APPDATA%\portico\settings.toml` for settings. Agent keys are listed from the OpenSSH Authentication Agent service.
+- The [desktop panel](#desktop-panel) is Linux only.
+
 ### Release packages and binaries
 
-Every [release](https://github.com/YounesAmalou/Portico/releases/latest) attaches packages for x86_64 and aarch64 (`.deb`, `.rpm`, and for x86_64 an Arch Linux `.pkg.tar.zst`) and static tarballs that run on any distribution. Each needs only the OpenSSH client. Install the package for your distribution with its package manager, for example:
+Every [release](https://github.com/YounesAmalou/Portico/releases/latest) attaches packages for x86_64 and aarch64 (`.deb`, `.rpm`, and for x86_64 an Arch Linux `.pkg.tar.zst`), static tarballs that run on any distribution, macOS tarballs and Windows zips (`portico-vX.Y.Z-x86_64-pc-windows-msvc.zip`, `…-aarch64-pc-windows-msvc.zip`, each holding `portico.exe`). Each needs only the OpenSSH client. Install the package for your distribution with its package manager, for example:
 
 ```sh
 sudo apt install ./portico_X.Y.Z-1_amd64.deb          # Debian, Ubuntu
@@ -232,6 +247,8 @@ New-terminal connections are handed to `xdg-terminal-exec` (on macOS, see below)
 
 On macOS, a new terminal window opens in the terminal named by `PORTICO_TERMINAL` (`Terminal`, `iTerm2`, `Ghostty`, `WezTerm`, `kitty` or `Alacritty`, or the path of a launcher program that takes the command as its arguments, like `xdg-terminal-exec`), otherwise in the terminal Portico itself runs in, otherwise in Terminal. Terminal and iTerm2 are handed a private, self-deleting `.command` script, so no Automation permission is asked for.
 
+On Windows, a new terminal window opens in Windows Terminal (`wt`), or in a new console window when `wt` is not on your `PATH`. `PORTICO_TERMINAL` can be `cmd` (a console window) or the path of a launcher program that takes the command as its arguments.
+
 Test a connection:
 
 ```sh
@@ -323,7 +340,7 @@ portico tunnel stop db
 
 `stop` signals only the process Portico started: it recognises it by its PID together with its start time, the boot and its command line, so a PID reused by another process is never signalled. `start` and `stop` succeed when the tunnel is already in that state, so scripts can call them directly. A running tunnel cannot be edited or removed; stop it first. Without a name, `show`, `edit`, `remove`, `start` and `stop` pick a tunnel with the picker.
 
-Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory (always, on macOS); if the record is lost while the tunnel runs, Portico finds the process again.
+Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory (always, on macOS and Windows); if the record is lost while the tunnel runs, Portico finds the process again.
 
 ### Machine-readable output
 
