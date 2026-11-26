@@ -4,15 +4,24 @@
 //! random port of `127.0.0.1`, with every file in a temporary directory.
 //! Interactive sessions never reach the user's login shell: `ForceCommand`
 //! runs a script that prints a banner, echoes one line back and exits.
+//!
+//! On Windows the server is Win32-OpenSSH's `sshd.exe`, which serves its own
+//! user's key logins without running as a service. It runs `ForceCommand`
+//! through the user's default shell, `cmd.exe`, so there the script is a batch
+//! file. Its keys and its `authorized_keys` are readable by the user alone, as
+//! Win32-OpenSSH requires.
 
+#[cfg(unix)]
 use std::{
     ffi::CStr,
-    fs,
-    net::{Ipv4Addr, TcpListener, TcpStream},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::fs::PermissionsExt,
     },
+};
+use std::{
+    fs,
+    net::{Ipv4Addr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -21,26 +30,56 @@ use std::{
 
 use tempfile::TempDir;
 
+/// Where OpenSSH's server is when `SSHD` does not say: `scripts/ci-checks.sh e2e` sets `SSHD`
+/// to the same default.
 #[cfg(target_os = "linux")]
-const SSHD: &str = "/usr/bin/sshd";
-#[cfg(not(target_os = "linux"))]
-const SSHD: &str = "/usr/sbin/sshd";
-const KEYGEN: &str = "/usr/bin/ssh-keygen";
+const DEFAULT_SSHD: &str = "/usr/bin/sshd";
+#[cfg(all(unix, not(target_os = "linux")))]
+const DEFAULT_SSHD: &str = "/usr/sbin/sshd";
+#[cfg(windows)]
+const DEFAULT_SSHD: &str = r"C:\Windows\System32\OpenSSH\sshd.exe";
 
 /// The passphrase of [`Sshd::locked_key`].
 pub const LOCKED_KEY_PASSPHRASE: &str = "pw";
 
+/// OpenSSH's server: `$SSHD`, or the system's usual place.
+pub fn sshd_program() -> PathBuf {
+    std::env::var_os("SSHD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SSHD))
+}
+
+/// OpenSSH's client program `name` (`ssh`, `ssh-keygen`, `ssh-add`).
+#[cfg(unix)]
+pub fn openssh_program(name: &str) -> PathBuf {
+    Path::new("/usr/bin").join(name)
+}
+
+/// OpenSSH's client program `name` (`ssh`, `ssh-keygen`, `ssh-add`): Win32-OpenSSH installs
+/// its client beside its server, and Git for Windows' own OpenSSH, often first on `PATH`,
+/// is not the one Portico supports.
+#[cfg(windows)]
+pub fn openssh_program(name: &str) -> PathBuf {
+    sshd_program()
+        .parent()
+        .expect("the server's path has a directory")
+        .join(format!("{name}.exe"))
+}
+
 /// Fails the test, rather than skipping it, when OpenSSH's server is missing:
 /// a suite that skipped everything would pass CI without testing anything.
 pub fn require_sshd() {
+    let sshd = sshd_program();
     assert!(
-        Path::new(SSHD).exists(),
-        "{SSHD} is missing: install OpenSSH's server to run the end-to-end tests"
+        sshd.exists(),
+        "{} is missing: install OpenSSH's server to run the end-to-end tests",
+        sshd.display()
     );
 }
 
 /// The user's name and home directory from the password database, which is
 /// where OpenSSH looks, whatever `$HOME` says.
+#[cfg(unix)]
 pub fn current_user() -> (String, PathBuf) {
     // SAFETY: `getpwuid` returns null or a pointer to a static entry, read
     // before any other call can overwrite it.
@@ -56,12 +95,21 @@ pub fn current_user() -> (String, PathBuf) {
     }
 }
 
+/// The user's name and profile directory, where Win32-OpenSSH looks.
+#[cfg(windows)]
+pub fn current_user() -> (String, PathBuf) {
+    let name = std::env::var("USERNAME").expect("USERNAME is set");
+    let home = std::env::var_os("USERPROFILE").expect("USERPROFILE is set");
+    (name, PathBuf::from(home))
+}
+
 /// A port of `127.0.0.1` that refuses connections for as long as this value
 /// lives. On Linux it is bound but never listened on, so no other test's
 /// server can be given it in the meantime. macOS lets a connection to such a
-/// port time out instead of refusing it, so there the port is released at
-/// once and only refuses until something else takes it.
+/// port time out instead of refusing it, so there, as on Windows, the port is
+/// released at once and only refuses until something else takes it.
 pub struct ClosedPort {
+    #[cfg(unix)]
     _socket: Option<OwnedFd>,
     port: u16,
 }
@@ -72,6 +120,15 @@ impl ClosedPort {
     }
 }
 
+#[cfg(windows)]
+pub fn closed_port() -> ClosedPort {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    ClosedPort {
+        port: listener.local_addr().unwrap().port(),
+    }
+}
+
+#[cfg(unix)]
 pub fn closed_port() -> ClosedPort {
     // SAFETY: plain socket calls on a descriptor this function owns, with
     // properly sized `sockaddr_in` buffers.
@@ -104,7 +161,7 @@ pub fn closed_port() -> ClosedPort {
 pub fn keygen(path: &Path, passphrase: &str) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("pub"));
-    let status = Command::new(KEYGEN)
+    let status = Command::new(openssh_program("ssh-keygen"))
         .args([
             "-q",
             "-t",
@@ -119,6 +176,40 @@ pub fn keygen(path: &Path, passphrase: &str) {
         .status()
         .unwrap();
     assert!(status.success(), "ssh-keygen failed");
+    restrict_to_user(path);
+}
+
+/// Makes `path` readable by the current user alone; OpenSSH refuses private keys, and
+/// Win32-OpenSSH's server the files it reads, that others may read. A new file in a temporary
+/// directory is already private on Unix.
+#[cfg(unix)]
+fn restrict_to_user(_path: &Path) {}
+
+#[cfg(windows)]
+fn restrict_to_user(path: &Path) {
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{}:F", current_user().0))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "icacls {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// `path` as OpenSSH's configuration files take it: Win32-OpenSSH reads `/` in a Windows path,
+/// where a `\` may start an escape.
+fn config_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,35 +237,30 @@ impl Sshd {
         keygen(&path.join("host_key"), "");
         keygen(&path.join("client_key"), "");
         keygen(&path.join("locked_key"), LOCKED_KEY_PASSPHRASE);
-        fs::write(
-            path.join("authorized_keys"),
-            fs::read_to_string(path.join("client_key.pub")).unwrap()
-                + &fs::read_to_string(path.join("locked_key.pub")).unwrap(),
-        )
-        .unwrap();
-        let session = path.join("session.sh");
-        fs::write(
-            &session,
-            "#!/bin/sh\necho portico-e2e ready\nread line\necho \"portico-e2e got $line\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&session, fs::Permissions::from_mode(0o755)).unwrap();
+        write_authorized_keys(
+            &path.join("authorized_keys"),
+            &(fs::read_to_string(path.join("client_key.pub")).unwrap()
+                + &fs::read_to_string(path.join("locked_key.pub")).unwrap()),
+        );
+        let session = write_session(path);
         let (pubkey, password) = if options.password_only {
             ("no", "yes")
         } else {
             ("yes", "no")
         };
+        // Win32-OpenSSH has no PAM.
+        let pam = if cfg!(windows) { "" } else { "UsePAM no\n" };
         fs::write(
             path.join("sshd_config.base"),
             format!(
                 "ListenAddress 127.0.0.1\nHostKey {host}\nPidFile {pid}\n\
-                 AuthorizedKeysFile {authorized}\nStrictModes no\nUsePAM no\n\
+                 AuthorizedKeysFile {authorized}\nStrictModes no\n{pam}\
                  PubkeyAuthentication {pubkey}\nPasswordAuthentication {password}\n\
                  KbdInteractiveAuthentication no\nForceCommand {session}\nLogLevel ERROR\n",
-                host = path.join("host_key").display(),
-                pid = path.join("sshd.pid").display(),
-                authorized = path.join("authorized_keys").display(),
-                session = session.display(),
+                host = config_path(&path.join("host_key")),
+                pid = config_path(&path.join("sshd.pid")),
+                authorized = config_path(&path.join("authorized_keys")),
+                session = config_path(&session),
             ),
         )
         .unwrap();
@@ -208,7 +294,7 @@ impl Sshd {
 
     /// Makes the server refuse every client key.
     pub fn revoke_all_keys(&self) {
-        fs::write(self.dir.path().join("authorized_keys"), "").unwrap();
+        write_authorized_keys(&self.dir.path().join("authorized_keys"), "");
     }
 
     /// Gives the server a new host key and restarts it on the same port.
@@ -222,6 +308,40 @@ impl Sshd {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Writes the server's `authorized_keys`, readable by the user alone.
+fn write_authorized_keys(path: &Path, keys: &str) {
+    fs::write(path, keys).unwrap();
+    restrict_to_user(path);
+}
+
+/// Writes the session script `ForceCommand` runs in `dir` and returns its path: it prints a
+/// banner, reads one line and echoes it back.
+#[cfg(unix)]
+fn write_session(dir: &Path) -> PathBuf {
+    let session = dir.join("session.sh");
+    fs::write(
+        &session,
+        "#!/bin/sh\necho portico-e2e ready\nread line\necho \"portico-e2e got $line\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&session, fs::Permissions::from_mode(0o755)).unwrap();
+    session
+}
+
+/// Writes the session script `ForceCommand` runs in `dir` and returns its path: a batch file,
+/// as Win32-OpenSSH's server runs the command with `cmd.exe /c`. It prints a banner, reads one
+/// line and echoes it back.
+#[cfg(windows)]
+fn write_session(dir: &Path) -> PathBuf {
+    let session = dir.join("session.cmd");
+    fs::write(
+        &session,
+        "@echo off\r\necho portico-e2e ready\r\nset /p line=\r\necho portico-e2e got %line%\r\n",
+    )
+    .unwrap();
+    session
 }
 
 impl Drop for Sshd {
@@ -248,7 +368,7 @@ fn spawn(dir: &Path, port: u16) -> Result<Child, String> {
     // the server answering on the port is this one.
     let pid_file = dir.join("sshd.pid");
     let _ = fs::remove_file(&pid_file);
-    let mut child = Command::new(SSHD)
+    let mut child = Command::new(sshd_program())
         .args(["-D", "-e", "-f"])
         .arg(&config)
         .stdin(Stdio::null())

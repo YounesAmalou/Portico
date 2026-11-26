@@ -73,60 +73,73 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The compiled launcher, built once per source text into the temporary directory and shared
-/// by every test binary.
+/// The compiled launcher, shared by every test binary.
 #[cfg(windows)]
 fn shim() -> &'static Path {
     static SHIM: OnceLock<PathBuf> = OnceLock::new();
-    SHIM.get_or_init(|| {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/sh_shim.rs");
-        let text = fs::read(&source)
-            .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
-        let mut hasher = DefaultHasher::new();
+    SHIM.get_or_init(|| compile_program("tests/support/sh_shim.rs"))
+}
+
+/// Compiles the test program at `source` (relative to the crate) with `rustc`, once per source
+/// text into the temporary directory, and returns its path. Every test program may include
+/// `tests/support/job.rs`, so that file's text counts as part of each one's source.
+#[cfg(windows)]
+#[allow(
+    dead_code,
+    reason = "only some test binaries compile programs of their own"
+)]
+pub fn compile_program(source: &str) -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = root.join(source);
+    let mut hasher = DefaultHasher::new();
+    for file in [source.as_path(), &root.join("tests/support/job.rs")] {
+        let text = fs::read(file)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", file.display()));
         text.hash(&mut hasher);
-        std::env::consts::ARCH.hash(&mut hasher);
-        let dir = std::env::temp_dir().join("portico-sh-shim");
-        let shim = dir.join(format!("sh_shim-{:016x}.exe", hasher.finish()));
-        if shim.exists() {
-            return shim;
-        }
-        fs::create_dir_all(&dir).unwrap();
-        // Built under a name of its own, then renamed into place whole, as other test
-        // binaries may be building it at the same time.
-        let partial = dir.join(format!("sh_shim-{}.exe", std::process::id()));
-        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-        let output = Command::new(&rustc)
-            .args(["--edition", "2021", "-C", "debuginfo=0", "-o"])
-            .arg(&partial)
-            .arg(&source)
-            .output()
-            .unwrap_or_else(|error| panic!("cannot run {rustc:?}: {error}"));
-        if !output.status.success() {
+    }
+    std::env::consts::ARCH.hash(&mut hasher);
+    let dir = std::env::temp_dir().join("portico-test-programs");
+    let stem = source.file_stem().unwrap().to_string_lossy();
+    let program = dir.join(format!("{stem}-{:016x}.exe", hasher.finish()));
+    if program.exists() {
+        return program;
+    }
+    fs::create_dir_all(&dir).unwrap();
+    // Built under a name of its own, then renamed into place whole, as other test binaries
+    // may be building it at the same time.
+    let partial = dir.join(format!("{stem}-{}.exe", std::process::id()));
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(&rustc)
+        .args(["--edition", "2021", "-C", "debuginfo=0", "-o"])
+        .arg(&partial)
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {rustc:?}: {error}"));
+    if !output.status.success() {
+        let _ = fs::remove_file(&partial);
+        panic!(
+            "cannot compile {}:\n{}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // A virus scanner may hold the new file for a moment, so a failed rename is retried.
+    let mut attempts = 0;
+    while let Err(error) = fs::rename(&partial, &program) {
+        if program.exists() {
+            // Another test binary put its own copy there first.
             let _ = fs::remove_file(&partial);
-            panic!(
-                "cannot compile {}:\n{}",
-                source.display(),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            break;
         }
-        // A virus scanner may hold the new file for a moment, so a failed rename is retried.
-        let mut attempts = 0;
-        while let Err(error) = fs::rename(&partial, &shim) {
-            if shim.exists() {
-                // Another test binary put its own copy there first.
-                let _ = fs::remove_file(&partial);
-                break;
-            }
-            attempts += 1;
-            assert!(
-                attempts < 50,
-                "cannot rename {}: {error}",
-                partial.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        shim
-    })
+        attempts += 1;
+        assert!(
+            attempts < 50,
+            "cannot rename {}: {error}",
+            partial.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    program
 }
 
 #[cfg(target_os = "macos")]

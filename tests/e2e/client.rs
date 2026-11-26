@@ -7,22 +7,25 @@
 //! `Host *` block that keeps known hosts in the temporary home and leaves the
 //! agent alone. Those defaults live in the file rather than on the command
 //! line so that Portico's own `-o` options still win.
+//!
+//! Windows' OpenSSH gets the same flattened configuration, as its `~` need not follow
+//! `USERPROFILE`. Windows runs only `.exe` files, so there the wrapper is a small program
+//! (`ssh_wrapper.rs`) that does what the script does, and Win32-OpenSSH's directory comes next
+//! on `PATH` for `ssh-keygen` and `ssh-add`.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     ffi::OsString,
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
 
 use tempfile::TempDir;
 
-use crate::{
-    executable::write_executable,
-    sshd::{Sshd, current_user},
-};
+use crate::sshd::{Sshd, current_user};
 
 pub struct Client {
     _dir: TempDir,
@@ -39,42 +42,14 @@ impl Client {
         fs::create_dir_all(&bin).unwrap();
         let runtime = dir.path().join("run");
         fs::create_dir_all(&runtime).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         assert_ne!(
             home,
             current_user().1,
             "the test home must not be the real home"
         );
-        write_executable(
-            bin.join("ssh"),
-            r#"#!/bin/sh
-for arg do
-  [ "$arg" = -F ] && exec /usr/bin/ssh "$@"
-done
-# Portico runs several ssh processes at once: each writes its own copy and
-# renames it into place, so none reads a copy another one is writing.
-flat="$HOME/.ssh/e2e-flat-config"
-partial="$flat.$$"
-mkdir -p "$HOME/.ssh"
-if [ -f "$HOME/.ssh/config" ]; then
-  sed "s|~/|$HOME/|g" "$HOME/.ssh/config" > "$partial"
-else
-  : > "$partial"
-fi
-printf '\nHost *\n  UserKnownHostsFile %s\n  GlobalKnownHostsFile /dev/null\n  IdentityAgent none\n  IdentitiesOnly yes\n' \
-  "$HOME/.ssh/known_hosts" >> "$partial"
-mv -f "$partial" "$flat"
-exec /usr/bin/ssh -F "$flat" "$@"
-"#,
-        );
-        write_executable(
-            bin.join("ssh-keygen"),
-            "#!/bin/sh\nexec /usr/bin/ssh-keygen \"$@\"\n",
-        );
-        write_executable(
-            bin.join("ssh-add"),
-            "#!/bin/sh\nexec /usr/bin/ssh-add \"$@\"\n",
-        );
+        write_wrappers(&bin);
         Self {
             _dir: dir,
             home,
@@ -100,7 +75,8 @@ exec /usr/bin/ssh -F "$flat" "$@"
         if cfg!(target_os = "linux") {
             self.runtime().join("portico/tunnels")
         } else {
-            // macOS has no runtime directory: records stay under the temporary home.
+            // macOS and Windows have no runtime directory: records stay under the temporary
+            // home.
             self.home.join(".ssh/portico/run/tunnels")
         }
     }
@@ -118,15 +94,33 @@ exec /usr/bin/ssh -F "$flat" "$@"
     pub fn env(&self) -> Vec<(OsString, OsString)> {
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.bin.clone()];
+        if cfg!(windows) {
+            let ssh = crate::sshd::openssh_program("ssh");
+            paths.push(ssh.parent().unwrap().to_owned());
+        }
         paths.extend(std::env::split_paths(&inherited));
-        vec![
+        let mut env: Vec<(OsString, OsString)> = vec![
             ("HOME".into(), self.home.clone().into()),
             ("PATH".into(), std::env::join_paths(paths).unwrap()),
             // Tunnel records go to a temporary runtime directory, never the real one.
             ("XDG_RUNTIME_DIR".into(), self.runtime().into()),
             // Settings go to the temporary home, never the developer's own.
             ("XDG_CONFIG_HOME".into(), self.home.join(".config").into()),
-        ]
+        ];
+        if cfg!(windows) {
+            env.extend([
+                // Windows' home and settings directory, the settings where the other systems
+                // put them.
+                ("USERPROFILE".into(), self.home.clone().into()),
+                ("APPDATA".into(), self.home.join(".config").into()),
+                // The real ssh the wrapper runs.
+                (
+                    "PORTICO_E2E_SSH".into(),
+                    crate::sshd::openssh_program("ssh").into(),
+                ),
+            ]);
+        }
+        env
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
@@ -207,6 +201,53 @@ exec /usr/bin/ssh -F "$flat" "$@"
             .write_all(text.as_bytes())
             .unwrap();
     }
+}
+
+/// Writes the wrappers that run the real OpenSSH client into `bin`.
+#[cfg(unix)]
+fn write_wrappers(bin: &Path) {
+    use crate::executable::write_executable;
+    write_executable(
+        bin.join("ssh"),
+        r#"#!/bin/sh
+for arg do
+  [ "$arg" = -F ] && exec /usr/bin/ssh "$@"
+done
+# Portico runs several ssh processes at once: each writes its own copy and
+# renames it into place, so none reads a copy another one is writing.
+flat="$HOME/.ssh/e2e-flat-config"
+partial="$flat.$$"
+mkdir -p "$HOME/.ssh"
+if [ -f "$HOME/.ssh/config" ]; then
+  sed "s|~/|$HOME/|g" "$HOME/.ssh/config" > "$partial"
+else
+  : > "$partial"
+fi
+printf '\nHost *\n  UserKnownHostsFile %s\n  GlobalKnownHostsFile /dev/null\n  IdentityAgent none\n  IdentitiesOnly yes\n' \
+  "$HOME/.ssh/known_hosts" >> "$partial"
+mv -f "$partial" "$flat"
+exec /usr/bin/ssh -F "$flat" "$@"
+"#,
+    );
+    write_executable(
+        bin.join("ssh-keygen"),
+        "#!/bin/sh\nexec /usr/bin/ssh-keygen \"$@\"\n",
+    );
+    write_executable(
+        bin.join("ssh-add"),
+        "#!/bin/sh\nexec /usr/bin/ssh-add \"$@\"\n",
+    );
+}
+
+/// Puts the compiled `ssh` wrapper into `bin`; `Client::env` names the real ssh and puts
+/// Win32-OpenSSH's directory, with `ssh-keygen` and `ssh-add`, after `bin` on `PATH`.
+#[cfg(windows)]
+fn write_wrappers(bin: &Path) {
+    use std::sync::OnceLock;
+    static WRAPPER: OnceLock<PathBuf> = OnceLock::new();
+    let wrapper =
+        WRAPPER.get_or_init(|| crate::executable::compile_program("tests/e2e/ssh_wrapper.rs"));
+    fs::copy(wrapper, bin.join("ssh.exe")).unwrap();
 }
 
 /// Everything a command printed, stdout then stderr.

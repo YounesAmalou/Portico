@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -260,13 +260,7 @@ fn a_tunnel_killed_outside_portico_shows_as_failed() {
     );
     run_ok(&client, &["tunnel", "start", "socks"]);
     let pid = pid_of(&client, "socks");
-    assert!(
-        Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
+    kill(pid);
     wait_gone(pid);
     let list = run_ok(&client, &["tunnels"]);
     assert!(list.contains("failed"), "{list}");
@@ -274,8 +268,38 @@ fn a_tunnel_killed_outside_portico_shows_as_failed() {
     assert!(stop.contains("socks is not running."), "{stop}");
 }
 
-/// A `sleep` that dies with the test.
+/// Ends `pid` at once, as something outside Portico would.
+fn kill(pid: u32) {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("taskkill");
+        command.args(["/F", "/PID"]);
+        command
+    } else {
+        let mut command = Command::new("kill");
+        command.arg("-KILL");
+        command
+    };
+    let output = command.arg(pid.to_string()).output().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+}
+
+/// A process that waits half a minute, unless it dies with the test.
 struct Stranger(Child);
+
+impl Stranger {
+    fn spawn() -> Self {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        Self(command.stdout(Stdio::null()).spawn().unwrap())
+    }
+}
 
 impl Drop for Stranger {
     fn drop(&mut self) {
@@ -292,7 +316,7 @@ fn stop_never_signals_a_stranger() {
         &client,
         &["tunnel", "add", "db", "--on", "box", "-D", "1080"],
     );
-    let mut stranger = Stranger(Command::new("sleep").arg("30").spawn().unwrap());
+    let mut stranger = Stranger::spawn();
     let pid = stranger.0.id();
     let (start, boot) = crate::procs::start_and_boot(pid);
     fs::create_dir_all(client.tunnel_runtime()).unwrap();

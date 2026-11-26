@@ -22,6 +22,22 @@ ensure_tool() {
     command -v "cargo-$1" >/dev/null || cargo install --locked "cargo-$1"
 }
 
+# The end-to-end suite against OpenSSH's server at $SSHD, which the tests read too. Git for
+# Windows' bash runs this script on Windows, where the server is Win32-OpenSSH's sshd.exe,
+# named the way the tests (native Windows programs) read a path.
+e2e() {
+    if [ -z "${SSHD:-}" ]; then
+        case "$(uname -s)" in
+            Linux) SSHD=/usr/bin/sshd ;;
+            MINGW* | MSYS* | CYGWIN*) SSHD=C:/Windows/System32/OpenSSH/sshd.exe ;;
+            *) SSHD=/usr/sbin/sshd ;;
+        esac
+    fi
+    [ -f "$SSHD" ] || { echo "$SSHD is missing: install OpenSSH's server" >&2; exit 1; }
+    export SSHD
+    cargo test --test e2e -- --ignored
+}
+
 # The desktop panel (desktop/quickshell): Qt 6's qmllint on every QML file, and
 # portico.js against the golden files with Qt Quick Test, in Qt's own
 # JavaScript engine. Needs qt6-declarative and quickshell.
@@ -68,7 +84,7 @@ case "$1" in
     fmt) cargo fmt --check ;;
     clippy) cargo clippy --all-targets --all-features -- -D warnings ;;
     test) cargo test --all-targets --no-fail-fast ;;
-    e2e) cargo test --test e2e -- --ignored ;;
+    e2e) e2e ;;
     docs) cargo test --test docs ;;
     msrv) msrv ;;
     audit) ensure_tool audit && cargo audit ;;
