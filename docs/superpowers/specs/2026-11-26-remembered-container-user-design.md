@@ -1,6 +1,6 @@
 # Remembered Container User Design
 
-**Status:** Approved; in implementation
+**Status:** Approved; implemented
 
 ## Purpose
 

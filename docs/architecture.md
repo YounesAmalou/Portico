@@ -38,15 +38,15 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `domain::openssh` | `ssh -G` resolution (`config`), connection outcomes (`connect`), `known_hosts` and key fetch (`keys`), reading a child's output pipes (`pipes`) |
 | `domain::adopt` | Adoption and export plans: scanning (`scan`) and previews (`diff`) |
 | `domain::tunnel` | Saved port forwards, their store, and the runtime state of started ones (`runtime`, including the `Proc` methods specific to tunnels) |
-| `domain::settings` | The preferences file: reading, defaults, keeping comments on write |
+| `domain::settings` | The preferences file: reading, defaults, the remembered container users (`UserKey`, `remember_user`), keeping comments on write |
 | `domain::probe` | The connection test: its options and outcomes |
 | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | Identity data, jump-host suggestions, fuzzy matching, failure explanations, configuration errors |
 | `backend` | The `Backend` interface, `BackendId`, `AUTOMATIC` (every backend, in the order they are listed), `Target`, `Via`, `BackendIssue`, the dispatch functions, and `remote_command` and `quote` (the app's transport uses them) |
-| `backend::listing` | The container rows every backend produces (`Container`, `Listing`), grouping by Compose project, display names, and resolving a container reference |
+| `backend::listing` | The container rows every backend produces (`Container`, `Listing`), grouping by Compose project, display names, `remember_key` (the name a container is remembered by), and resolving a container reference |
 | `backend::docker` | The Docker adapter: `docker ps` parsing, and its access decision (`Access`, `decide`, private to this file) |
 | `backend::podman` | The Podman adapter: the listing script (the ssh user's own containers), `podman ps --format json` parsing, and `podman exec` |
 | `backend::proxmox` | The Proxmox VE adapter: the listing script (root or `sudo -n`), `pct list` parsing, and `pct exec` |
-| `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities`, and the settings (their file's location, reading and writing them) |
+| `app` | Operations over the domain and the backends, running a backend's commands locally or over `ssh`: `containers`, `tunnels`, `identities`, and the settings (their file's location, reading and writing them, and `App::remember_container_user`) |
 | `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`, `settings`) and the JSON documents (`json`) |
 | `picker` | The inline pickers the CLI opens when a host or container is missing; also used by the TUI |
 | `tui` | The event loop (`mod`, `events`), the terminal session (`terminal`, `hangup`), shared widgets (`text_input`, `dropdown`), the config watch (`watch`, which keeps only its file identity in `platform::fs`), one module per tab (`hosts`, `tunnels`, `containers`, with the hosts tab's form and its tests in `form`), and the workers that keep the interface responsive (`lister`, `tester`, `planner`, `identities`), `init`, `migrate` and the `settings` overlay |
