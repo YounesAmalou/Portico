@@ -224,27 +224,7 @@ fn a_remote_forward_listens_on_the_server_and_a_busy_one_fails() {
         &client,
         &["tunnel", "add", "back", "--on", "box", "-R", &spec],
     );
-    // TEMPORARY DIAGNOSTIC: how the log reads while the start waits.
-    let mut start = client
-        .command(&["tunnel", "start", "back"])
-        .spawn()
-        .unwrap();
-    let log = client.tunnel_runtime().join("back.log");
-    let mut seen = Vec::new();
-    let status = loop {
-        if let Some(status) = start.try_wait().unwrap() {
-            break status;
-        }
-        let read = match fs::read(&log) {
-            Ok(bytes) => format!("{:?}", String::from_utf8_lossy(&bytes)),
-            Err(error) => format!("error {error:?}"),
-        };
-        if seen.last() != Some(&read) {
-            seen.push(read);
-        }
-        thread::sleep(Duration::from_millis(200));
-    };
-    assert!(status.success(), "reads while starting: {seen:#?}");
+    run_ok(&client, &["tunnel", "start", "back"]);
     // The server is this machine, so its side of the forward is reachable here.
     assert_echoes(connect(remote), "from the server side");
 
