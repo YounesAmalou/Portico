@@ -8,10 +8,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The environment variable that names the home directory.
+pub const HOME_VARIABLE: &str = "USERPROFILE";
+
 /// The home directory from `USERPROFILE`, if it is set: where Windows' OpenSSH looks for
 /// `.ssh`. `HOME` is ignored, since Git Bash, MSYS and Cygwin set it to other places.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE").map(PathBuf::from)
+    std::env::var_os(HOME_VARIABLE).map(PathBuf::from)
 }
 
 /// The agent Windows' ssh uses when `SSH_AUTH_SOCK` is not set: the OpenSSH Authentication

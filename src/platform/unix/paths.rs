@@ -7,9 +7,12 @@ use std::path::PathBuf;
 
 use super::super::os::paths::SYSTEM_SSH_CONFIG;
 
+/// The environment variable that names the home directory.
+pub const HOME_VARIABLE: &str = "HOME";
+
 /// The home directory from `HOME`, if it is set.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os(HOME_VARIABLE).map(PathBuf::from)
 }
 
 /// The agent ssh uses when `SSH_AUTH_SOCK` is not set: none.

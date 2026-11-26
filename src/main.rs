@@ -22,7 +22,7 @@ fn main() -> ExitCode {
     let Some(home) = platform::paths::home_dir() else {
         return fail(
             &cli,
-            "HOME is not set",
+            &format!("{} is not set", platform::paths::HOME_VARIABLE),
             &mut io::stdout().lock(),
             &mut io::stderr(),
         );

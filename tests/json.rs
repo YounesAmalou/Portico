@@ -203,13 +203,24 @@ impl Fixture {
 
 /// Replaces what changes from run to run (the home, the busy port, PIDs and times), so the
 /// golden files are stable.
+/// On Windows, paths are also spelled with `/` and an exit status as on Unix, so that one
+/// golden file serves every system.
 fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
-    let mut text = text.replace(&home.display().to_string(), HOME);
+    let mut text = text.to_owned();
     if let Some(port) = busy_port {
         text = text.replace(&port.to_string(), BUSY_PORT);
     }
     let mut document: Value = serde_json::from_str(&text).unwrap();
-    fn walk(value: &mut Value) {
+    let home = home.display().to_string();
+    let walk_text = |text: &mut String| {
+        *text = text.replace(&home, HOME);
+        if cfg!(windows) {
+            *text = text
+                .replace('\\', "/")
+                .replace("exit code: ", "exit status: ");
+        }
+    };
+    fn walk(value: &mut Value, walk_text: &dyn Fn(&mut String)) {
         match value {
             Value::Object(map) => {
                 for (key, value) in map.iter_mut() {
@@ -217,15 +228,16 @@ fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
                         ("pid", Value::Number(_)) => *value = 41237.into(),
                         ("started", Value::Number(_)) => *value = 1781860921u64.into(),
                         ("finished", Value::Number(_)) => *value = 1781861043u64.into(),
-                        _ => walk(value),
+                        _ => walk(value, walk_text),
                     }
                 }
             }
-            Value::Array(values) => values.iter_mut().for_each(walk),
+            Value::Array(values) => values.iter_mut().for_each(|value| walk(value, walk_text)),
+            Value::String(text) => walk_text(text),
             _ => {}
         }
     }
-    walk(&mut document);
+    walk(&mut document, &walk_text);
     document
 }
 
@@ -662,9 +674,11 @@ fn json_is_refused_where_it_is_not_offered() {
 
 #[test]
 fn an_unset_home_is_an_error_document() {
+    // Windows' home is `USERPROFILE`.
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_portico"))
         .args(["hosts", "--json"])
-        .env_remove("HOME")
+        .env_remove(variable)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -673,19 +687,22 @@ fn an_unset_home_is_an_error_document() {
     assert_eq!(
         document,
         serde_json::json!({
-            "error": { "kind": "other", "message": "HOME is not set", "next": [] },
+            "error": { "kind": "other", "message": format!("{variable} is not set"), "next": [] },
             "schema": 1,
         })
     );
     // Without --json it stays text on stderr.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_portico"))
         .arg("hosts")
-        .env_remove("HOME")
+        .env_remove(variable)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"error: HOME is not set\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("error: {variable} is not set\n")
+    );
 }
 
 #[test]
