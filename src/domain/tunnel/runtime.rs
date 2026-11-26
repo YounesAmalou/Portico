@@ -684,6 +684,18 @@ mod tests {
             ..record.clone()
         };
         assert_eq!(proc.identify(&rebooted, &log, &uid), Identity::Stale);
+        // Without a readable BootId, Windows records a fixed token, so the exact start decides.
+        #[cfg(windows)]
+        {
+            let blind = Proc::without_boot_id();
+            let record = blind.rebuild_record(pid, start).unwrap();
+            assert_eq!(blind.identify(&record, &log, &uid), Identity::Alive);
+            let restarted = RunningRecord {
+                start: start + 1,
+                ..record.clone()
+            };
+            assert_eq!(blind.identify(&restarted, &log, &uid), Identity::Gone);
+        }
         assert_eq!(
             proc.identify(&record, &dir.path().join("other.log"), &uid),
             Identity::Gone

@@ -59,26 +59,49 @@ impl Stat {
     }
 }
 
+/// The key under `HKEY_LOCAL_MACHINE` whose `BootId` value counts this machine's boots.
+const BOOT_KEY: &str =
+    r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters";
+
+/// The boot token used when the registry's `BootId` cannot be read (some images lack it).
+/// A record's start is an absolute `FILETIME`, unique across boots, so the exact start alone
+/// tells its process from any other; the token only has to read the same at write and check.
+pub(super) const FALLBACK_BOOT_ID: &str = "windows";
+
 /// Reads the process table.
 #[derive(Clone, Debug)]
 pub struct Proc {
-    _private: (),
+    /// Where the `BootId` value is read from (`BOOT_KEY`; another key in tests).
+    boot_key: &'static str,
 }
 
 impl Proc {
     pub fn system() -> Self {
-        Self { _private: () }
+        Self { boot_key: BOOT_KEY }
+    }
+
+    /// A process table whose `BootId` cannot be read, as on an image without the value.
+    #[cfg(test)]
+    pub(crate) fn without_boot_id() -> Self {
+        Self {
+            boot_key: r"SOFTWARE\Portico\Tests\NoSuchKey",
+        }
     }
 
     /// The number Windows gives this boot, as text: the `BootId` the kernel's prefetcher keeps
-    /// in the registry, which counts boots. `None` when it cannot be read; a record's exact
-    /// creation time still tells its process from any other.
+    /// in the registry, which counts boots. When it cannot be read, `FALLBACK_BOOT_ID`, so a
+    /// record written then still matches and its exact creation time decides (a `None` here
+    /// would make every record stale, and `tunnel stop` would leave the tunnel running).
     pub fn boot_id(&self) -> Option<String> {
-        let key: Vec<u16> =
-            r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
-                .encode_utf16()
-                .chain([0])
-                .collect();
+        Some(
+            self.registry_boot_id()
+                .unwrap_or_else(|| FALLBACK_BOOT_ID.to_owned()),
+        )
+    }
+
+    /// The registry's `BootId`, or `None` when it cannot be read.
+    fn registry_boot_id(&self) -> Option<String> {
+        let key: Vec<u16> = self.boot_key.encode_utf16().chain([0]).collect();
         let value: Vec<u16> = "BootId".encode_utf16().chain([0]).collect();
         let mut id = 0u32;
         let mut size = size_of::<u32>() as u32;

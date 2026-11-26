@@ -372,6 +372,13 @@ mod tests {
         assert_eq!(proc.boot_id(), Some(boot));
     }
 
+    #[test]
+    fn an_unreadable_boot_id_falls_back_to_a_fixed_token() {
+        let proc = Proc::without_boot_id();
+        assert_eq!(proc.boot_id().as_deref(), Some(proc::FALLBACK_BOOT_ID));
+        assert_eq!(proc.boot_id(), proc.boot_id());
+    }
+
     /// A `cmd` running a long `ping`.
     fn cmd_with_ping() -> Child {
         quiet(Command::new("cmd").raw_arg("/c ping -n 30 127.0.0.1 >nul"))
