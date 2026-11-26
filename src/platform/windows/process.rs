@@ -306,16 +306,24 @@ mod tests {
     }
 
     /// Run by `a_detached_child_has_a_console_of_its_own` as the detached process: writes to
-    /// the file `PORTICO_CONSOLE_HELPER` names whether it has a console.
+    /// the file `PORTICO_CONSOLE_HELPER` names whether it is attached to a console.
     #[test]
     #[ignore = "a helper process of another test"]
     fn detached_console_helper() {
         let Some(path) = std::env::var_os("PORTICO_CONSOLE_HELPER") else {
             return;
         };
-        // SAFETY: `GetConsoleWindow` has no preconditions.
-        let window = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
-        let text = if window.is_null() { "none" } else { "console" };
+        // A console created with `CREATE_NO_WINDOW` has no window (`GetConsoleWindow` is null),
+        // so being attached to one is read from its process list, which fails without one.
+        let mut processes = [0u32; 8];
+        // SAFETY: the buffer holds the number of entries passed.
+        let attached = unsafe {
+            windows_sys::Win32::System::Console::GetConsoleProcessList(
+                processes.as_mut_ptr(),
+                processes.len() as u32,
+            )
+        };
+        let text = if attached == 0 { "none" } else { "console" };
         std::fs::write(path, text).unwrap();
     }
 
