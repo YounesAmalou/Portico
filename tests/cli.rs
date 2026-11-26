@@ -914,7 +914,60 @@ fn settings_lists_every_key_and_the_path() {
     ] {
         assert!(stdout.contains(expected), "{stdout}");
     }
+    assert!(!stdout.contains("Remembered"), "{stdout}");
     output.assert_success();
+}
+
+const REMEMBERED: &str = "[users.local.docker]\n\"shop/api\" = \"deploy\"\nweb = \"www-data\"\n\n[users.host.prod.podman]\n\"shop/api\" = \"app\"\n";
+
+fn write_settings(env: &TestEnv, text: &str) {
+    std::fs::create_dir_all(settings_file(env).parent().unwrap()).unwrap();
+    std::fs::write(settings_file(env), text).unwrap();
+}
+
+#[test]
+fn settings_lists_remembered_users() {
+    let env = TestEnv::new();
+    write_settings(&env, REMEMBERED);
+    env.run(["settings"]).assert_stdout_contains(
+        "Remembered container users:\n  this machine  docker  shop/api  deploy\n  this machine  docker  web       www-data\n  prod          podman  shop/api  app\n",
+    );
+}
+
+#[test]
+fn settings_forget_removes_an_entry() {
+    let env = TestEnv::new();
+    write_settings(&env, REMEMBERED);
+    let forget = [
+        "settings",
+        "forget",
+        "--on",
+        "prod",
+        "--backend",
+        "podman",
+        "shop/api",
+    ];
+    env.run(forget)
+        .assert_stdout_contains("forgot the user of shop/api (podman on prod)");
+    assert!(
+        !std::fs::read_to_string(settings_file(&env))
+            .unwrap()
+            .contains("app")
+    );
+    env.run(forget)
+        .assert_stdout_contains("nothing remembered for shop/api (podman on prod)");
+    env.run(["settings", "forget", "web"])
+        .assert_stdout_contains("forgot the user of web (docker on this machine)");
+}
+
+#[test]
+fn settings_forget_refuses_proxmox() {
+    let env = TestEnv::new();
+    env.run(["settings", "forget", "--backend", "proxmox", "101"])
+        .assert_exit_code_and_stderr_contains(
+            2,
+            "a Proxmox container's shell runs as root, so no user is remembered",
+        );
 }
 
 #[test]

@@ -217,10 +217,23 @@ fn document(command: JsonCommand, app: &App) -> Result<(Value, ExitCode), Failur
             for key in Key::ALL {
                 tabs.insert(key.leaf().to_owned(), json!(key.get(&settings)));
             }
+            let users: Vec<Value> = settings
+                .users
+                .iter()
+                .map(|(key, user)| {
+                    json!({
+                        "backend": key.backend.as_str(),
+                        "container": key.container,
+                        "target": target_json(&key.target),
+                        "user": user,
+                    })
+                })
+                .collect();
             success(json!({
                 "exists": app.settings_path().exists(),
                 "path": path(app.settings_path()),
                 "tabs": tabs,
+                "users": users,
             }))
         }
         JsonCommand::TunnelShow(name) => {
@@ -537,7 +550,15 @@ pub(super) fn inventory(inventory: &IdentityInventory) -> Value {
     json!({ "agents": agents, "files": files, "warnings": warnings })
 }
 
-pub(super) fn containers(list: &ContainerList) -> Value {
+/// A target as its documents spell it.
+fn target_json(target: &Target) -> Value {
+    match target {
+        Target::Local => json!({ "alias": null, "kind": "local" }),
+        Target::Host(alias) => json!({ "alias": alias, "kind": "host" }),
+    }
+}
+
+fn containers(list: &ContainerList) -> Value {
     let all = &list.listing.containers;
     // The human output's order: grouped by project, then the others.
     let containers: Vec<Value> = group(all)
@@ -560,10 +581,7 @@ pub(super) fn containers(list: &ContainerList) -> Value {
             })
         })
         .collect();
-    let target = match &list.target {
-        Target::Local => json!({ "alias": null, "kind": "local" }),
-        Target::Host(alias) => json!({ "alias": alias, "kind": "host" }),
-    };
+    let target = target_json(&list.target);
     let mut document = json!({
         "containers": containers,
         "note": optional_line(list.note.as_deref()),

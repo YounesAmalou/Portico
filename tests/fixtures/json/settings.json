@@ -7,5 +7,16 @@
     "podman": false,
     "proxmox": true,
     "tunnels": true
-  }
+  },
+  "users": [
+    {
+      "backend": "docker",
+      "container": "shop/api",
+      "target": {
+        "alias": null,
+        "kind": "local"
+      },
+      "user": "deploy"
+    }
+  ]
 }

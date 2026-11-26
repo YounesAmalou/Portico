@@ -574,11 +574,22 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
     "podman": false,
     "proxmox": true,
     "tunnels": true
-  }
+  },
+  "users": [
+    {
+      "backend": "docker",
+      "container": "shop/api",
+      "target": {
+        "alias": null,
+        "kind": "local"
+      },
+      "user": "deploy"
+    }
+  ]
 }
 ```
 
-`tabs` has one boolean per tab of the app and the panel: `tunnels`, `docker`, `podman` and `proxmox`; `false` means the tab is hidden. A file that cannot be read as settings gives an error of kind `settings` (exit status 1), and Portico never overwrites it:
+`tabs` has one boolean per tab of the app and the panel: `tunnels`, `docker`, `podman` and `proxmox`; `false` means the tab is hidden. `users` lists the container users Portico remembers (`portico settings forget` removes one), ordered with this machine first, then by host alias, backend and container: each has the `target` (`kind` `local` or `host`, and the host's `alias` or `null`), the `backend`, the `container` and the `user`; it is `[]` when none is remembered. A file that cannot be read as settings gives an error of kind `settings` (exit status 1), and Portico never overwrites it:
 
 <!-- golden: settings-invalid.json -->
 ```json

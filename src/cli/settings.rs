@@ -4,7 +4,8 @@ use std::{io::Write, process::ExitCode};
 
 use crate::{
     app::App,
-    domain::settings::{Key, parse_bool},
+    backend::{BackendId, Target},
+    domain::settings::{Key, UserKey, parse_bool},
     platform::paths::tilde,
 };
 
@@ -19,6 +20,28 @@ pub(super) enum SettingsCommand {
         #[arg(value_parser = value_argument)]
         value: String,
     },
+    /// Forget the user remembered for a container, so its shell asks again.
+    Forget {
+        /// The host the container runs on; this machine when left out.
+        #[arg(long, value_name = "ALIAS")]
+        on: Option<String>,
+        /// The container's backend.
+        #[arg(long, value_parser = backend_argument, default_value = "docker")]
+        backend: BackendId,
+        /// The container's name, as `portico shell` takes it.
+        container: String,
+    },
+}
+
+fn backend_argument(text: &str) -> Result<BackendId, String> {
+    match text {
+        "docker" => Ok(BackendId::Docker),
+        "podman" => Ok(BackendId::Podman),
+        "proxmox" => {
+            Err("a Proxmox container's shell runs as root, so no user is remembered".to_owned())
+        }
+        _ => Err("the backends are docker and podman".to_owned()),
+    }
 }
 
 fn key_argument(text: &str) -> Result<String, String> {
@@ -62,6 +85,37 @@ pub(super) fn run(
             } else {
                 " (not created yet)"
             };
+            if !settings.users.is_empty() {
+                let rows: Vec<[String; 4]> = settings
+                    .users
+                    .iter()
+                    .map(|(key, user)| {
+                        [
+                            key.target.describe(),
+                            key.backend.as_str().to_owned(),
+                            key.container.clone(),
+                            user.clone(),
+                        ]
+                    })
+                    .collect();
+                let width = |column: usize| rows.iter().map(|row| row[column].len()).max();
+                let (a, b, c) = (width(0), width(1), width(2));
+                writeln!(output, "\nRemembered container users:").map_err(io)?;
+                for row in &rows {
+                    writeln!(
+                        output,
+                        "  {:<a$}  {:<b$}  {:<c$}  {}",
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        a = a.unwrap_or(0),
+                        b = b.unwrap_or(0),
+                        c = c.unwrap_or(0),
+                    )
+                    .map_err(io)?;
+                }
+            }
             writeln!(
                 output,
                 "\nFile: {}{missing}",
@@ -77,6 +131,32 @@ pub(super) fn run(
                 .map_err(|error| error.to_string())?;
             let already = if changed { "" } else { "already " };
             writeln!(output, "{}: {already}{}", key.name(), state(value)).map_err(io)?;
+        }
+        Some(SettingsCommand::Forget {
+            on,
+            backend,
+            container,
+        }) => {
+            let target = on.map_or(Target::Local, Target::Host);
+            let key = UserKey {
+                target,
+                backend,
+                container,
+            };
+            let changed = app
+                .remember_container_user(&key, None)
+                .map_err(|error| error.to_string())?;
+            let place = format!(
+                "{} ({} on {})",
+                key.container,
+                backend.as_str(),
+                key.target.describe()
+            );
+            if changed {
+                writeln!(output, "forgot the user of {place}").map_err(io)?;
+            } else {
+                writeln!(output, "nothing remembered for {place}").map_err(io)?;
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
