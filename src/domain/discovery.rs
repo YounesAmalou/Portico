@@ -452,7 +452,9 @@ fn expand_environment(pattern: &str) -> Result<String, String> {
         }
         let value = env::var(name)
             .map_err(|_| format!("unresolved Include environment variable: {name}"))?;
-        if value.contains('\\') {
+        // OpenSSH reads a backslash in the expanded pattern as an escape on Unix, which
+        // Portico does not follow; on Windows it is the path separator.
+        if std::path::MAIN_SEPARATOR == '/' && value.contains('\\') {
             return Err(format!(
                 "unsupported syntax in Include environment variable: {name}"
             ));
