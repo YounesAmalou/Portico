@@ -207,10 +207,15 @@ mod tests {
         let start = proc.stat(child.id()).unwrap().start;
         let started = proc.started_at(start).unwrap();
         assert!(started.abs_diff(now()) < 60, "{started}");
-        let boot = proc.boot_id().unwrap();
-        assert_eq!(proc.boot_id(), Some(boot.clone()));
-        assert!(boot.parse::<u64>().unwrap() <= started, "{boot}");
         end(child);
+    }
+
+    #[test]
+    fn boot_id_is_read_and_stable() {
+        let proc = Proc::system();
+        let boot = proc.boot_id().expect("the registry's BootId");
+        assert!(boot.parse::<u32>().is_ok(), "{boot}");
+        assert_eq!(proc.boot_id(), Some(boot));
     }
 
     #[test]

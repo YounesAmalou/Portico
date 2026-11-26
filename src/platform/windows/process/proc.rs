@@ -10,13 +10,15 @@ use std::{
     },
     path::PathBuf,
     slice,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation},
     Win32::{
-        Foundation::{HANDLE, INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING},
+        Foundation::{
+            ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STATUS_BUFFER_OVERFLOW,
+            STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING,
+        },
         Security::{
             Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER,
             TokenUser,
@@ -26,7 +28,7 @@ use windows_sys::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
                 TH32CS_SNAPPROCESS,
             },
-            SystemInformation::GetTickCount64,
+            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
             Threading::{OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE},
         },
         UI::Shell::CommandLineToArgvW,
@@ -68,16 +70,31 @@ impl Proc {
         Self { _private: () }
     }
 
-    /// The boot time in Unix seconds, as text: now minus the time since boot, rounded to the
-    /// second, which stays the same for the whole boot.
+    /// The number Windows gives this boot, as text: the `BootId` the kernel's prefetcher keeps
+    /// in the registry, which counts boots. `None` when it cannot be read; a record's exact
+    /// creation time still tells its process from any other.
     pub fn boot_id(&self) -> Option<String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_millis();
-        // SAFETY: `GetTickCount64` has no preconditions.
-        let up = u128::from(unsafe { GetTickCount64() });
-        Some(((now.checked_sub(up)? + 500) / 1000).to_string())
+        let key: Vec<u16> =
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+        let value: Vec<u16> = "BootId".encode_utf16().chain([0]).collect();
+        let mut id = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        // SAFETY: NUL-terminated names, and a `u32` of the size passed for the value.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&raw mut id).cast(),
+                &mut size,
+            )
+        };
+        (status == ERROR_SUCCESS).then(|| id.to_string())
     }
 
     /// Unix seconds at which a process with `start` (a `FILETIME`) started.
@@ -216,33 +233,40 @@ unsafe fn wide_until_nul<'a>(text: *const u16) -> &'a [u16] {
 /// The command line of the process `process`, which the process may have changed since it
 /// started, as Unix's `/proc/<pid>/cmdline` may be.
 fn command_line(process: HANDLE) -> Option<Vec<u16>> {
+    // The first call reports the size the command line needs. The process may change its
+    // command line meanwhile, so a size that no longer fits is asked again, a few times.
     let mut length = 0;
-    // The first call fails, reporting the size the command line needs.
-    // SAFETY: a null buffer of length 0 and a valid pointer for the length.
-    unsafe {
-        NtQueryInformationProcess(
-            process,
-            ProcessCommandLineInformation,
-            std::ptr::null_mut(),
-            0,
-            &mut length,
-        )
-    };
-    // `u64`s align the buffer for the `UNICODE_STRING` it starts with.
-    let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
-    // SAFETY: a buffer of at least `length` bytes.
-    if length == 0
-        || unsafe {
+    let mut buffer: Vec<u64> = Vec::new();
+    let mut tries = 0;
+    loop {
+        // `u64`s align the buffer for the `UNICODE_STRING` it starts with.
+        buffer.resize((length as usize).div_ceil(8), 0);
+        // SAFETY: a buffer of `length` bytes or more (null and 0 on the first call), and a valid
+        // pointer for the length.
+        let status = unsafe {
             NtQueryInformationProcess(
                 process,
                 ProcessCommandLineInformation,
-                buffer.as_mut_ptr().cast(),
+                if length == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    buffer.as_mut_ptr().cast()
+                },
                 length,
                 &mut length,
             )
-        } < 0
-    {
-        return None;
+        };
+        if status >= 0 && !buffer.is_empty() {
+            break;
+        }
+        let too_small = matches!(
+            status,
+            STATUS_INFO_LENGTH_MISMATCH | STATUS_BUFFER_TOO_SMALL | STATUS_BUFFER_OVERFLOW
+        );
+        tries += 1;
+        if !too_small || length == 0 || tries > 3 {
+            return None;
+        }
     }
     // SAFETY: the call filled the aligned buffer with a `UNICODE_STRING` whose text follows it
     // in the same buffer.

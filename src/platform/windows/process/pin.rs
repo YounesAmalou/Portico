@@ -7,12 +7,14 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
 };
 
-use windows_sys::Win32::{
-    Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0},
-    System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+use windows_sys::{
+    Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
+    Win32::{
+        Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0},
+        System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        },
     },
 };
 
@@ -59,18 +61,52 @@ pub(super) fn creation_time(handle: &OwnedHandle) -> io::Result<u64> {
     Ok(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
 }
 
-/// Whether the process `handle` refers to has exited.
+/// Whether the process `handle` refers to has exited. The handle must have the right to wait
+/// on it (`PROCESS_SYNCHRONIZE`), as every handle opened here has; a wait that fails counts as
+/// not exited.
 pub(super) fn has_exited(handle: HANDLE) -> bool {
     // SAFETY: waiting with no timeout only reads the handle's state.
-    match unsafe { WaitForSingleObject(handle, 0) } {
-        WAIT_OBJECT_0 => true,
-        // A handle opened without the right to wait on it: its exit code says it instead.
-        _ => {
-            let mut code = 0;
-            // SAFETY: a valid `u32` for the call to fill.
-            unsafe { GetExitCodeProcess(handle, &mut code) != 0 && code != STILL_ACTIVE as u32 }
-        }
+    unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }
+}
+
+/// The ID of the process that created the process `handle` refers to, as it was then: it may
+/// name a process that has exited since, or a later one that got its ID.
+pub(super) fn parent_id(handle: &OwnedHandle) -> io::Result<u32> {
+    /// `PROCESS_BASIC_INFORMATION`, which `windows-sys` declares only with its kernel types.
+    #[repr(C)]
+    struct BasicInformation {
+        exit_status: i32,
+        peb: *mut std::ffi::c_void,
+        affinity: usize,
+        priority: i32,
+        id: usize,
+        parent: usize,
     }
+    let mut information = BasicInformation {
+        exit_status: 0,
+        peb: std::ptr::null_mut(),
+        affinity: 0,
+        priority: 0,
+        id: 0,
+        parent: 0,
+    };
+    let mut length = 0;
+    // SAFETY: a structure of the size passed, and a valid pointer for the length.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            raw(handle),
+            ProcessBasicInformation,
+            (&raw mut information).cast(),
+            size_of::<BasicInformation>() as u32,
+            &mut length,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "could not read a process's parent (NTSTATUS {status:#x})"
+        )));
+    }
+    u32::try_from(information.parent).map_err(|_| io::Error::other("invalid parent process ID"))
 }
 
 /// A process handle that can end the process and wait for its exit; it never reaches a later
@@ -89,9 +125,9 @@ impl Pin {
     }
 
     /// Pins `pid` with only what ending it takes, for when the full pin cannot be opened: it
-    /// still ends the process, but cannot wait for its exit.
+    /// still ends the process and sees its exit, but cannot read anything about it.
     pub(super) fn open_to_terminate(pid: u32) -> io::Result<Self> {
-        Self::open_with(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)
+        Self::open_with(pid, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE)
     }
 
     fn open_with(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> io::Result<Self> {
@@ -122,10 +158,6 @@ impl Pin {
     pub(crate) fn wait_exit(&self, wait: u32) -> bool {
         // SAFETY: waiting only reads the handle's state.
         unsafe { WaitForSingleObject(raw(&self.handle), wait) == WAIT_OBJECT_0 }
-    }
-
-    pub(super) fn creation_time(&self) -> io::Result<u64> {
-        creation_time(&self.handle)
     }
 }
 

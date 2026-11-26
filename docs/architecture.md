@@ -88,8 +88,9 @@ src/platform/
   macos/        Pin (kqueue NOTE_EXIT), children and stopped state (libproc), Proc (sysctl),
                 open(1) and its terminals, runtime_dir (~/.ssh/portico/run/tunnels)
   windows/      fs, net, paths, launcher and time for Windows; process: Pin (process handle),
-                Proc (Toolhelp, GetProcessTimes, the token's SID, the command line from ntdll),
-                tree walk by creation time, stop_process by TerminateProcess
+                Proc (Toolhelp, GetProcessTimes, the token's SID, the command line from ntdll,
+                the registry's BootId),
+                tree walk by creation time and parent, stop_process by TerminateProcess
 ```
 
 A system provides what `unix` calls (`Pin` with `open`, `signal` and `wait_exit`; `children`; `wait_until_stopped`; `Proc` with `stat`, `uid`, `cmdline`, `pids`, `boot_id` and `started_at`) and the per-system items of `paths` and `launcher`. A record's `start` is whatever the system's `Proc::stat` reports (clock ticks after boot on Linux, microseconds since the epoch on macOS, the creation `FILETIME` on Windows); records never move between systems.

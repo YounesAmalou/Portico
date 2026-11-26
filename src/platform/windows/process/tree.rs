@@ -1,14 +1,18 @@
 //! Ending a process with all of its descendants.
 
-use std::io;
+use std::{io, os::windows::io::OwnedHandle};
+
+use windows_sys::Win32::System::Threading::{
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 
 use super::{
-    pin::{Pin, is_gone, open_pin},
+    pin::{Pin, creation_time, is_gone, open_pin, open_process, parent_id},
     proc::process_table,
 };
 
-/// A process of the tree, pinned so its ID, and so the parent ID its children list, cannot
-/// name a later process while the walk runs.
+/// A process of the tree. Its handles keep its ID unassigned while the walk runs, so the
+/// parent ID its children report cannot come to name a later process.
 struct Member {
     pid: u32,
     pin: Pin,
@@ -20,12 +24,15 @@ struct Member {
 /// Windows cannot stop a process the way Unix's `SIGSTOP` does, so a process may start a child
 /// after the table was read; the table is read again after each round of ends until it shows
 /// no child that was not known, and a process that has ended cannot start another. A process
-/// counts as a child only if it was created after its parent: a parent ID may name an exited
-/// process whose ID a later process got. Failures never abandon the walk: each process that
-/// could be reached is still ended, and the first error is reported afterwards.
+/// listed with a known parent's ID counts as its child only once a handle holds it and, through
+/// that handle, it still names that parent and was created after it: between the reading of the
+/// table and the opening, the listed process may have exited and its ID gone to another, and a
+/// parent ID may name an exited process whose ID a later process got. Failures never abandon the
+/// walk: each process that could be reached is still ended, and the first error is reported
+/// afterwards.
 pub fn kill_process_tree(root: u32) -> io::Result<()> {
     let mut first_error = None;
-    let mut known = match member(root) {
+    let mut known = match member(root, None) {
         Ok(Some(root)) => vec![root],
         Ok(None) => return Ok(()),
         Err(error) => return Err(error),
@@ -75,9 +82,9 @@ fn add_descendants(
             if known.iter().any(|member| member.pid == pid) {
                 continue;
             }
-            match member(pid) {
-                Ok(Some(child)) if child.created >= parent_created => known.push(child),
-                Ok(_) => {}
+            match member(pid, Some((parent_pid, parent_created))) {
+                Ok(Some(child)) => known.push(child),
+                Ok(None) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
@@ -87,9 +94,25 @@ fn add_descendants(
     }
 }
 
-/// Pins `pid` with its creation time; `None` when it is gone. When the full pin cannot be
-/// opened, a handle that can only end the process does.
-fn member(pid: u32) -> io::Result<Option<Member>> {
+/// Holds `pid` and, when `parent` (its ID and creation time) is given, confirms through the
+/// handle that the process is that parent's child; then pins it to end it. `None` when it is
+/// gone or not the child. A process that cannot even be queried is not the parent's child as
+/// far as anything can show (another user's or a system process whose stale parent ID matches),
+/// so it is passed over without an error.
+fn member(pid: u32, parent: Option<(u32, u64)>) -> io::Result<Option<Member>> {
+    let query = match open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE) {
+        Ok(query) => query,
+        Err(error) if is_gone(&error) => return Ok(None),
+        Err(_) if parent.is_some() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let created = creation_time(&query)?;
+    if let Some((parent_pid, parent_created)) = parent
+        && !is_child(&query, created, parent_pid, parent_created)?
+    {
+        return Ok(None);
+    }
+    // `query` keeps the ID on this process while the pin is opened.
     let pin = match open_pin(pid) {
         Ok(pin) => pin,
         Err(error) if is_gone(&error) => return Ok(None),
@@ -99,6 +122,16 @@ fn member(pid: u32) -> io::Result<Option<Member>> {
             Err(error) => return Err(error),
         },
     };
-    let created = pin.creation_time()?;
     Ok(Some(Member { pid, pin, created }))
+}
+
+/// Whether the process `query` holds, created at `created`, was created by the process with
+/// `parent_pid` that was created at `parent_created`.
+fn is_child(
+    query: &OwnedHandle,
+    created: u64,
+    parent_pid: u32,
+    parent_created: u64,
+) -> io::Result<bool> {
+    Ok(created >= parent_created && parent_id(query)? == parent_pid)
 }
