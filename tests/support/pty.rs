@@ -26,6 +26,10 @@ use super::TestEnv;
 const ROWS: u16 = 24;
 const COLUMNS: u16 = 120;
 
+/// How long a step waits for Portico: generous, as each fake program it runs starts slowly on
+/// Windows (its launcher, then Git's `sh`); a step that is ready returns at once.
+const SLOW_WAIT: Duration = Duration::from_secs(15);
+
 /// A query for the cursor position, which a terminal answers with `ESC [ row ; column R`.
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 /// Whether the raw output carries the escape sequences the checks look for.
@@ -891,7 +895,7 @@ impl Terminal {
     /// its launcher and Git's `sh`); fails with the screen when it never holds. What Portico
     /// prints meanwhile is read only then, so the scenario reads it as before.
     fn wait_until(&mut self, mut done: impl FnMut() -> bool, failure: &dyn Fn() -> String) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + SLOW_WAIT;
         while !done() {
             if Instant::now() >= deadline {
                 let shown = Instant::now() + Duration::from_millis(200);
@@ -900,7 +904,13 @@ impl Terminal {
                 }
                 self.fail(&failure());
             }
-            thread::sleep(Duration::from_millis(10));
+            // ConPTY holds only a little of what Portico prints: unread, it stops Portico's
+            // drawing, and with it the loop that starts the work waited for.
+            if cfg!(windows) {
+                self.pump((Instant::now() + Duration::from_millis(10)).min(deadline));
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -967,7 +977,7 @@ impl Terminal {
 
     /// Waits until `text` is visible on the screen.
     fn read_screen(&mut self, text: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SLOW_WAIT;
         while !self.screen().contains(text) {
             self.pump(deadline);
         }
@@ -975,7 +985,7 @@ impl Terminal {
 
     /// Waits until `text` has left the screen.
     fn wait_gone(&mut self, text: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SLOW_WAIT;
         while self.screen().contains(text) {
             self.pump(deadline);
         }

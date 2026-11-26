@@ -535,6 +535,9 @@ fn podman_containers() {
     assert_eq!(document["containers"][0]["project"], "shop");
 }
 
+/// Unix-only: the listing names the user (`deploy`) through its shell script, which Windows,
+/// with no `sh`, does not run; there `podman ps` runs directly and names no one.
+#[cfg(unix)]
 #[test]
 fn podman_without_subordinate_ids_says_how_to_add_them() {
     let fixture = setup();
