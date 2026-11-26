@@ -50,8 +50,31 @@ tests() {
     cargo test --all-targets --no-run
     local log status=0 waited=0 limit=${TEST_LIMIT:-300}
     log=$(mktemp)
+    # TEMPORARY DIAGNOSTIC (Ruling G): who sends the tests' process group SIGHUP.
+    echo "DIAG step shell $$, terminal: $(tty 2>&1)"
+    ps -U "$(id -u)" -o pid,ppid,pgid,sess,tpgid,tt,stat,command
     set -m
-    cargo test --all-targets --no-fail-fast >"$log" 2>&1 </dev/null &
+    (
+        perl -MPOSIX=:signal_h -e '
+            my $action = POSIX::SigAction->new(sub {
+                my ($signal, $info) = @_;
+                printf STDERR "DIAG SIGHUP from pid %s (code %s, uid %s)\n",
+                    $info->{pid}, $info->{code}, $info->{uid};
+                my $columns = "pid,ppid,pgid,sess,tpgid,tt,stat,etime,command";
+                print STDERR `ps -o $columns -p $info->{pid}`;
+                print STDERR `ps -U $< -o $columns`;
+                exit 0;
+            }, POSIX::SigSet->new, SA_SIGINFO);
+            $action->safe(0);
+            sigaction(SIGHUP, $action) or die "sigaction: $!";
+            sleep 1 while 1;
+        ' &
+        sentinel=$!
+        cargo test --all-targets --no-fail-fast
+        code=$?
+        kill "$sentinel"
+        exit "$code"
+    ) >"$log" 2>&1 </dev/null &
     local tests=$!
     set +m
     tail -n +1 -f "$log" &
@@ -69,6 +92,10 @@ tests() {
     fi
     wait "$tests" || status=$?
     sleep 1
+    if [ "$status" -gt 128 ]; then
+        echo "DIAG the tests ended by signal $((status - 128)); processes:"
+        ps -U "$(id -u)" -o pid,ppid,pgid,sess,tpgid,tt,stat,etime,command
+    fi
     kill "$tail" 2>/dev/null || true
     rm -f -- "$log"
     return "$status"
