@@ -260,7 +260,16 @@ impl App {
         self.runtime.ensure().map_err(runtime_error(dir))?;
         let lock_path = self.runtime.lock();
         let lock = open_lock(&lock_path).map_err(runtime_error(lock_path.clone()))?;
-        acquire_lock(&lock, cancelled).map_err(runtime_error(lock_path))?;
+        acquire_lock(&lock, cancelled).map_err(|source| -> AppError {
+            // Cancelled while another start held the lock.
+            if source.kind() == io::ErrorKind::Interrupted
+                && cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+            {
+                OpenSshError::Cancelled.into()
+            } else {
+                runtime_error(lock_path)(source).into()
+            }
+        })?;
 
         if let TunnelStatus::Running { pid, .. } = self.run_state_locked(&tunnel.name) {
             return Ok(StartOutcome::AlreadyRunning { pid });

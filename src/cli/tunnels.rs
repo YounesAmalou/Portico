@@ -5,9 +5,10 @@ use std::{
     process::ExitCode,
 };
 
-use super::{CANCELLED, confirm, hosts::host_argument, json::JsonCommand};
+use super::{CANCELLED, Interrupts, Step, confirm, hosts::host_argument, json::JsonCommand};
 use crate::{
-    app::{App, StartOutcome, StopOutcome, TunnelChanges},
+    app::{App, AppError, StartOutcome, StopOutcome, TunnelChanges},
+    domain::openssh::OpenSshError,
     domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus},
     picker::{Picker, Row},
 };
@@ -239,6 +240,76 @@ fn pick_tunnel(
         .map(|index| reports[index].tunnel.name.clone()))
 }
 
+/// The interrupts a tunnel start watches. Where ssh backgrounds itself (Unix), the starting ssh
+/// is in Portico's process group and a Ctrl+C ends both, so no handler is installed and a signal
+/// acts as it always has. Where Portico starts ssh detached (Windows), a Ctrl+C or a closed
+/// console only raises the flag, and the start ends ssh's tree before Portico exits.
+pub(super) fn start_interrupts(handle_signals: bool) -> Result<Interrupts, String> {
+    Interrupts::install(handle_signals && !crate::platform::process::SSH_BACKGROUNDS)
+        .map_err(|error| format!("cannot handle signals: {error}"))
+}
+
+/// Starts `names` in turn; a signal stops the start under way, or any after it, and exits with
+/// `CANCELLED`.
+fn start<O: Write, E: Write>(
+    names: &[String],
+    app: &App,
+    interrupts: &Interrupts,
+    output: &mut O,
+    error: &mut E,
+) -> Result<ExitCode, String> {
+    let mut failed = false;
+    for name in names {
+        let (outcome, late) =
+            match interrupts.during(|cancelled| app.start_tunnel(name, Some(cancelled), false)) {
+                Step::Done(outcome) => (outcome, false),
+                Step::Late(outcome) => (outcome, true),
+            };
+        match outcome {
+            Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                writeln!(output, "{name}: cancelled").map_err(text)?;
+                return Ok(ExitCode::from(CANCELLED));
+            }
+            Ok(StartOutcome::Started { pid }) => {
+                let line = app
+                    .tunnel(name)
+                    .map_or(name.clone(), |report| report.tunnel.to_string());
+                writeln!(output, "Started {line}, pid {pid}.").map_err(text)?;
+            }
+            Ok(StartOutcome::AlreadyRunning { pid }) => {
+                writeln!(output, "{name} is already running (pid {pid}).").map_err(text)?;
+            }
+            Ok(StartOutcome::Failed {
+                reason,
+                explanation,
+            }) => {
+                failed = true;
+                match explanation {
+                    Some(explanation) => {
+                        for line in explanation.render(name, false) {
+                            writeln!(error, "{line}").map_err(text)?;
+                        }
+                    }
+                    None => writeln!(error, "{name}: failed \u{2014} {reason}").map_err(text)?,
+                }
+            }
+            Err(refusal) => {
+                failed = true;
+                writeln!(error, "error: {refusal}").map_err(text)?;
+            }
+        }
+        // A signal after this start finished leaves it standing but starts no other.
+        if late {
+            return Ok(ExitCode::from(CANCELLED));
+        }
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 pub(super) fn list<O: Write>(app: &App, output: &mut O) -> Result<ExitCode, String> {
     print_list(output, &app.tunnels().map_err(text)?)?;
     Ok(ExitCode::SUCCESS)
@@ -253,6 +324,7 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
     output: &mut O,
     error: &mut E,
     interactive: bool,
+    handle_signals: bool,
 ) -> Result<ExitCode, String> {
     match command {
         TunnelCommand::Show { name, .. } => {
@@ -387,45 +459,8 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             } else {
                 names
             };
-            let mut failed = false;
-            for name in names {
-                match app.start_tunnel(&name, None, false) {
-                    Ok(StartOutcome::Started { pid }) => {
-                        let line = app
-                            .tunnel(&name)
-                            .map_or(name.clone(), |report| report.tunnel.to_string());
-                        writeln!(output, "Started {line}, pid {pid}.").map_err(text)?;
-                    }
-                    Ok(StartOutcome::AlreadyRunning { pid }) => {
-                        writeln!(output, "{name} is already running (pid {pid}).").map_err(text)?;
-                    }
-                    Ok(StartOutcome::Failed {
-                        reason,
-                        explanation,
-                    }) => {
-                        failed = true;
-                        match explanation {
-                            Some(explanation) => {
-                                for line in explanation.render(&name, false) {
-                                    writeln!(error, "{line}").map_err(text)?;
-                                }
-                            }
-                            None => {
-                                writeln!(error, "{name}: failed \u{2014} {reason}").map_err(text)?
-                            }
-                        }
-                    }
-                    Err(refusal) => {
-                        failed = true;
-                        writeln!(error, "error: {refusal}").map_err(text)?;
-                    }
-                }
-            }
-            Ok(if failed {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            })
+            let interrupts = start_interrupts(handle_signals)?;
+            start(&names, app, &interrupts, output, error)
         }
         TunnelCommand::Stop { names, all, .. } => {
             let names = if all {
@@ -476,6 +511,77 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             } else {
                 ExitCode::SUCCESS
             })
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        domain::host::Host,
+        domain::managed::{ConfigPaths, ManagedStore},
+        domain::openssh::OpenSsh,
+        domain::tunnel::runtime::RuntimeDir,
+        test_executable::write_executable,
+    };
+
+    /// An app with tunnels `db` and `web` through a host whose ssh, once started, keeps
+    /// connecting.
+    pub(in crate::cli) fn two_tunnels() -> (TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("ssh");
+        write_executable(
+            &ssh,
+            "#!/bin/sh\nif [ \"$1\" = -G ]; then printf 'hostname x\\nport 22\\n'; exit 0; fi\nsleep 60\n",
+        );
+        fs::create_dir_all(dir.path().join("home/.ssh")).unwrap();
+        let app = App::new(
+            ManagedStore::new(ConfigPaths::from_home(dir.path().join("home"))),
+            OpenSsh::new(ssh, "terminal".into()),
+        )
+        .with_runtime_dir(RuntimeDir::at(dir.path().join("run")));
+        app.initialize(true).unwrap();
+        app.add(Host::new("prod", "x", None, None, None, None).unwrap())
+            .unwrap();
+        for name in ["db", "web"] {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let forward = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{port}")).unwrap();
+            app.add_tunnel(Tunnel::new(name, "prod", forward).unwrap())
+                .unwrap();
+        }
+        (dir, app)
+    }
+
+    #[test]
+    fn a_signal_during_a_start_cancels_it_and_starts_no_other() {
+        let (_dir, app) = two_tunnels();
+        let (mut output, mut error) = (Vec::new(), Vec::new());
+        let exit = start(
+            &["db".into(), "web".into()],
+            &app,
+            &Interrupts::signalled_during(),
+            &mut output,
+            &mut error,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(exit, ExitCode::from(CANCELLED), "{output}");
+        assert_eq!(output, "db: cancelled\n");
+        assert!(error.is_empty(), "{}", String::from_utf8_lossy(&error));
+        for name in ["db", "web"] {
+            assert!(
+                !app.tunnel(name).unwrap().status.is_running(),
+                "{name} is running"
+            );
         }
     }
 }

@@ -285,6 +285,9 @@ struct Interrupts {
     /// that window would; 0 never does.
     #[cfg(test)]
     signal_after: std::cell::Cell<usize>,
+    /// Raises the flag as the next step starts, as a signal while it runs would.
+    #[cfg(test)]
+    signal_within: std::cell::Cell<bool>,
 }
 
 /// A step's result, `Late` when a signal arrived after the step stopped checking for one.
@@ -300,6 +303,8 @@ impl Interrupts {
             default_action: Arc::new(AtomicBool::new(true)),
             #[cfg(test)]
             signal_after: std::cell::Cell::new(0),
+            #[cfg(test)]
+            signal_within: std::cell::Cell::new(false),
         };
         if handle_signals {
             for &signal in crate::platform::process::HANGUP_SIGNALS {
@@ -321,11 +326,23 @@ impl Interrupts {
         interrupts
     }
 
+    /// Interrupts without handlers whose flag is raised while the next step runs.
+    #[cfg(test)]
+    fn signalled_during() -> Self {
+        let interrupts = Self::install(false).expect("no handlers to install");
+        interrupts.signal_within.set(true);
+        interrupts
+    }
+
     /// Runs `step` with the cancel flag the signals set.
     fn during<T>(&self, step: impl FnOnce(&AtomicBool) -> T) -> Step<T> {
         // A signal acted on after an earlier step must not cancel this one.
         self.cancelled.store(false, Ordering::SeqCst);
         self.default_action.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        if self.signal_within.take() {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
         let result = step(&self.cancelled);
         #[cfg(test)]
         match self.signal_after.get() {
@@ -367,7 +384,7 @@ where
     E: Write,
 {
     if let Some(command) = cli.command.as_ref().and_then(json_command) {
-        return json::run(command, app, output);
+        return json::run(command, app, output, handle_signals);
     }
     match execute(
         cli,
@@ -692,9 +709,16 @@ fn execute<I: BufRead, O: Write, E: Write>(
             finish_connection(outcome, hold, input, error)
         }
         Some(Command::Tunnels { .. }) => tunnels::list(app, output),
-        Some(Command::Tunnel { command }) => {
-            tunnels::run(command, app, picker, input, output, error, interactive)
-        }
+        Some(Command::Tunnel { command }) => tunnels::run(
+            command,
+            app,
+            picker,
+            input,
+            output,
+            error,
+            interactive,
+            handle_signals,
+        ),
         Some(Command::Settings { command, .. }) => settings::run(command, app, output),
         // `main` runs these through `run_desktop`, with the desktop environment.
         Some(Command::Desktop { .. }) => {

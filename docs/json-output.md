@@ -839,7 +839,7 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
 | `error` | An error object when `outcome` is `failed`, otherwise `null` |
 | `tunnel` | The tunnel's report after the action, or `null` when no tunnel has that name |
 
-The exit status is 1 when any result failed. Once names are considered, every failure is a result, even an unreadable tunnels file: each name then fails with that message and `tunnel: null`, while `stop` still stops tunnels Portico has records of. The error document is only for a missing name and for failures before any name is considered. Starting a running tunnel or stopping a stopped one succeeds. `stop --all` stops every running tunnel, and reports none when nothing runs:
+The exit status is 1 when any result failed. Once names are considered, every failure is a result, even an unreadable tunnels file: each name then fails with that message and `tunnel: null`, while `stop` still stops tunnels Portico has records of. The error document is only for a missing name and for failures before any name is considered. Starting a running tunnel or stopping a stopped one succeeds. On Windows, a Ctrl+C (SIGINT) or SIGTERM during `tunnel start` cancels the start under way: that name, and every name not yet started, fails with the message `SSH operation cancelled`. `stop --all` stops every running tunnel, and reports none when nothing runs:
 
 <!-- golden: tunnel-stop-all.json -->
 ```json
