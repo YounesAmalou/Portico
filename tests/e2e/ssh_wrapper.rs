@@ -9,9 +9,9 @@
 //!
 //! Windows cannot replace a process the way `exec` does, so this program stays and waits for
 //! ssh, in a job that ends ssh with it: Portico stops a tunnel by terminating the process it
-//! started, which is this one. Portico also finds a tunnel by the `-E <log>` pair on its command
-//! line, which must name only that process: ssh gets the pair joined into one argument
-//! (`-E<log>`), which it reads the same way.
+//! started, which is this one. Portico also finds a tunnel by the `LocalCommand=portico-tunnel
+//! <log>` option on its command line, which must name only that process: ssh gets the command
+//! line without it.
 
 use std::{
     env,
@@ -41,7 +41,7 @@ fn main() {
             exit(127)
         });
         let flat = flat_config(Path::new(&home));
-        command.arg("-F").arg(&flat).args(join_log_option(args));
+        command.arg("-F").arg(&flat).args(drop_tunnel_marker(args));
         Some(flat)
     };
     let status = command.status().unwrap_or_else(|error| {
@@ -75,25 +75,30 @@ fn flat_config(home: &Path) -> PathBuf {
     flat
 }
 
-/// `args` with each `-E <log>` before `--` joined into `-E<log>`.
-fn join_log_option(args: Vec<OsString>) -> Vec<OsString> {
-    let mut joined = Vec::with_capacity(args.len());
+/// `args` without the `-o LocalCommand=portico-tunnel <log>` pair before `--`, by which
+/// Portico recognises the tunnel's process, which is this one: ssh needs no marker of its own.
+fn drop_tunnel_marker(args: Vec<OsString>) -> Vec<OsString> {
+    let mut kept = Vec::with_capacity(args.len());
     let mut rest = args.into_iter();
     while let Some(arg) = rest.next() {
         if arg == "--" {
-            joined.push(arg);
-            joined.extend(rest);
+            kept.push(arg);
+            kept.extend(rest);
             break;
         }
-        if arg == "-E" {
-            if let Some(log) = rest.next() {
-                let mut option = arg;
-                option.push(log);
-                joined.push(option);
+        if arg == "-o" {
+            if let Some(option) = rest.next() {
+                let marker = option
+                    .to_str()
+                    .is_some_and(|text| text.starts_with("LocalCommand=portico-tunnel "));
+                if !marker {
+                    kept.push(arg);
+                    kept.push(option);
+                }
                 continue;
             }
         }
-        joined.push(arg);
+        kept.push(arg);
     }
-    joined
+    kept
 }

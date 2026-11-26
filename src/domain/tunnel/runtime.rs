@@ -194,7 +194,7 @@ pub fn find_in(processes: &[Logged], log: &Path, since: Option<u64>) -> Option<(
 }
 
 impl Proc {
-    /// Whether `pid` is a live process of `uid` whose command line names `log` after `-E`, and,
+    /// Whether `pid` is a live process of `uid` whose command line names `log` as a tunnel's, and,
     /// when `start` is given, that started at that time.
     pub fn is_tunnel(&self, pid: u32, start: Option<u64>, log: &Path, uid: &Uid) -> bool {
         let Some(stat) = self.stat(pid) else {
@@ -206,7 +206,7 @@ impl Proc {
             && self.cmdline(pid).is_some_and(|args| names_log(&args, log))
     }
 
-    /// The newest live process of `uid` whose command line names `log` after `-E`, started no
+    /// The newest live process of `uid` whose command line names `log` as a tunnel's, started no
     /// earlier than `since` (clock ticks after boot) when given, with its start time.
     pub fn find_tunnel(&self, log: &Path, uid: &Uid, since: Option<u64>) -> Option<(u32, u64)> {
         find_in(&self.scan(uid), log, since)
@@ -245,11 +245,9 @@ impl Proc {
     }
 }
 
-/// Whether the arguments contain `-E` followed by `log`.
+/// Whether the arguments name `log` as a tunnel's ssh does (`process::tunnel_marker`).
 fn names_log(args: &[Vec<u8>], log: &Path) -> bool {
-    let log = log.as_os_str().as_encoded_bytes();
-    args.windows(2)
-        .any(|pair| pair[0] == b"-E" && pair[1] == log)
+    crate::platform::process::marked_log(args).as_deref() == Some(log)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -657,7 +655,7 @@ mod tests {
             let mut command = std::process::Command::new("cmd");
             command
                 .raw_arg(format!(
-                    "/c ping -n 30 127.0.0.1 >nul & rem ssh -E \"{}\" -L 5432:db:5432 -- prod-db",
+                    "/c ping -n 30 127.0.0.1 >nul & rem ssh -o PermitLocalCommand=no -o \"LocalCommand=portico-tunnel {}\" -L 5432:db:5432 -- prod-db",
                     log.display()
                 ))
                 .stdin(std::process::Stdio::null())

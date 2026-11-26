@@ -327,11 +327,17 @@ impl App {
             .open(path)
             .map_err(runtime_error(path.clone()))
         };
-        create(&log)?;
+        let log_file = create(&log)?;
         // stderr goes to a file, not a pipe: a ProxyCommand child (`ssh -W`, `nc`) inherits it and
-        // lives as long as the tunnel, so a pipe would never reach end of file.
+        // lives as long as the tunnel, so a pipe would never reach end of file. A foreground ssh
+        // logs there too, to the tunnel's log, which Portico opened so it can read it while ssh
+        // runs (Windows' ssh would keep its own `-E` file from being read).
         let stderr_path = self.runtime.stderr(&tunnel.name);
-        let stderr_file = create(&stderr_path)?;
+        let stderr_file = if SSH_BACKGROUNDS {
+            create(&stderr_path)?
+        } else {
+            log_file
+        };
         let mut command = Command::new(self.openssh.ssh_program());
         command
             .args(start_args(

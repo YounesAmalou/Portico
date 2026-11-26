@@ -55,6 +55,7 @@ if [ "$1" = -G ]; then
 fi
 printf '%s\n' "$*" >> '{ssh_calls}'
 if [ "$1" = -f ] || [ "$1" = -N ]; then
+  elog=/dev/stderr
   prev=
   for arg do
     [ "$prev" = -E ] && elog=$arg
@@ -255,8 +256,8 @@ fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
 }
 
 /// A tunnel's ssh command as Portico starts it on Unix: Windows' ssh cannot background itself,
-/// so there it runs without `-f` and logs at `LogLevel=VERBOSE`, by which the start sees it
-/// authenticate.
+/// so there it runs without `-f`, logs at `LogLevel=VERBOSE` (by which the start sees it
+/// authenticate) on standard error, and names its log in a `LocalCommand` instead of `-E`.
 fn unix_start(command: &mut Value) {
     let Value::Array(words) = command else {
         return;
@@ -266,6 +267,18 @@ fn unix_start(command: &mut Value) {
         .position(|pair| pair[0] == "-o" && pair[1] == "LogLevel=VERBOSE")
     {
         words.drain(at..at + 2);
+    }
+    // `-o PermitLocalCommand=no -o "LocalCommand=portico-tunnel <log>"` in place of `-E <log>`.
+    if let Some(at) = words
+        .iter()
+        .position(|word| word == "PermitLocalCommand=no")
+        && let Some(log) = words
+            .get(at + 2)
+            .and_then(Value::as_str)
+            .and_then(|command| command.strip_prefix("LocalCommand=portico-tunnel "))
+            .map(|log| log.replace("%%", "%"))
+    {
+        words.splice(at - 1..at + 3, ["-E".into(), log.into()]);
     }
     if words.first().is_some_and(|word| word == "ssh") && words.get(1) != Some(&"-f".into()) {
         words.insert(1, "-f".into());

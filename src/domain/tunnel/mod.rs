@@ -794,9 +794,10 @@ pub struct TunnelReport {
 }
 
 /// The `ssh` arguments that start `forward` through `host`, logging to `log`: in the background
-/// (`-f`) when `background`, otherwise in the foreground with the log level raised to the
-/// lowest that logs the authentication, by which the start sees the forward come up (see
-/// `runtime::ready`).
+/// (`-f`) when `background`, with `-E <log>`; otherwise in the foreground with the log level
+/// raised to the lowest that logs the authentication, by which the start sees the forward come
+/// up (see `runtime::ready`), logging on standard error, which the caller sends to `log`, and
+/// naming `log` in a `LocalCommand` that never runs (`process::tunnel_marker`).
 pub fn start_args(log: &Path, host: &str, forward: &Forward, background: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     if background {
@@ -817,8 +818,7 @@ pub fn start_args(log: &Path, host: &str, forward: &Forward, background: bool) -
         args.push("-o".into());
         args.push(option.into());
     }
-    args.push("-E".into());
-    args.push(log.into());
+    args.extend(crate::platform::process::tunnel_marker(log, background));
     args.push(forward.kind.flag().into());
     args.push(forward.spec().into());
     args.push("--".into());
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn start_args_without_background_drop_f_and_raise_log_level() {
+    fn start_args_without_background_drop_f_raise_log_level_and_mark_the_log() {
         let forward = local("127.0.0.1:5432:localhost:5432");
         let log = Path::new("/run/t/db.log");
         let args = start_args(log, "prod-db", &forward, false);
@@ -1218,8 +1218,10 @@ mod tests {
                 "RemoteCommand=none",
                 "-o",
                 "LogLevel=VERBOSE",
-                "-E",
-                "/run/t/db.log",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "LocalCommand=portico-tunnel /run/t/db.log",
                 "-L",
                 "127.0.0.1:5432:localhost:5432",
                 "--",

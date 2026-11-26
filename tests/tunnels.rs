@@ -12,6 +12,14 @@ const START: &str = if cfg!(windows) {
     "-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none"
 };
 
+/// What names the tunnel's log on its ssh command line: ssh's own log, or on Windows a
+/// `LocalCommand` that never runs.
+const LOG_MARKER: &str = if cfg!(windows) {
+    "-o PermitLocalCommand=no -o LocalCommand=portico-tunnel "
+} else {
+    "-E "
+};
+
 /// A fake `ssh`: `-G` answers like OpenSSH (refusing the alias `rejected`), and a tunnel start
 /// (`-f`, or `-N` where ssh cannot background itself) logs its arguments and leaves a
 /// background stand-in that carries them, as the real ssh's background process does (or, with
@@ -38,6 +46,8 @@ if [ "$1" = -G ]; then
 fi
 if [ "$1" = -f ] || [ "$1" = -N ]; then
   printf '%s\n' "$*" >> '{log}'
+  # The log: `-E <log>`, or on Windows standard error, which Portico sends to the log.
+  elog=/dev/stderr
   prev=
   for arg do
     [ "$prev" = -E ] && elog=$arg
@@ -153,7 +163,7 @@ fn tunnels_are_added_listed_shown_edited_and_removed() {
         "{show}"
     );
     assert!(show.contains("Status:  stopped"), "{show}");
-    assert!(show.contains(&format!("{START} -E ")), "{show}");
+    assert!(show.contains(&format!("{START} {LOG_MARKER}")), "{show}");
 
     env.run([
         "tunnel",
@@ -232,7 +242,7 @@ fn a_tunnel_starts_in_the_background_and_stops() {
     assert_eq!(
         call.trim(),
         format!(
-            "{START} -E {} -D {spec} -- prod",
+            "{START} {LOG_MARKER}{} -D {spec} -- prod",
             runtime.join("socks.log").display()
         )
     );
