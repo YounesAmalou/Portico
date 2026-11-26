@@ -150,6 +150,9 @@ fn expanded_include_alias_blocks_collision() {
         .assert_failure_stderr_contains("alias already exists");
 }
 
+/// Unix-only: there a backslash in an expanded Include escapes the next character; on Windows
+/// it is the path separator.
+#[cfg(unix)]
 #[test]
 fn escaped_expanded_include_makes_collision_discovery_incomplete() {
     let env = TestEnv::new();
@@ -382,7 +385,10 @@ fn test_reports_each_failure_as_an_explanation_and_exits_one() {
     install_fake_ssh(&env, &refused, &refused);
     env.run(["test", "dev"]).assert_exit_code_and_stdout_contains(
         1,
-        "dev: failed \u{2014} the server refused the login\n  user:    deploy@h:22\n  offered: /tmp/portico-fixture/wrong (file)\n  next:    check User and IdentityFile for dev, and that the public key is in the\n           server's authorized_keys\n",
+        &format!(
+            "dev: failed \u{2014} the server refused the login\n  user:    deploy@h:22\n  offered: {} (file)\n  next:    check User and IdentityFile for dev, and that the public key is in the\n           server's authorized_keys\n",
+            support::shown("/tmp/portico-fixture/wrong")
+        ),
     );
 }
 

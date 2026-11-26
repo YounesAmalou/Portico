@@ -54,7 +54,7 @@ if [ "$1" = -G ]; then
   exit 0
 fi
 printf '%s\n' "$*" >> '{ssh_calls}'
-if [ "$1" = -f ]; then
+if [ "$1" = -f ] || [ "$1" = -N ]; then
   prev=
   for arg do
     [ "$prev" = -E ] && elog=$arg
@@ -203,8 +203,8 @@ impl Fixture {
 
 /// Replaces what changes from run to run (the home, the busy port, PIDs and times), so the
 /// golden files are stable.
-/// On Windows, paths are also spelled with `/` and an exit status as on Unix, so that one
-/// golden file serves every system.
+/// On Windows, paths are also spelled with `/`, an exit status and a tunnel's ssh command as on
+/// Unix, so that one golden file serves every system.
 fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
     let mut text = text.to_owned();
     if let Some(port) = busy_port {
@@ -228,6 +228,10 @@ fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
                         ("pid", Value::Number(_)) => *value = 41237.into(),
                         ("started", Value::Number(_)) => *value = 1781860921u64.into(),
                         ("finished", Value::Number(_)) => *value = 1781861043u64.into(),
+                        ("command", Value::Array(_)) if cfg!(windows) => {
+                            unix_start(value);
+                            walk(value, walk_text);
+                        }
                         _ => walk(value, walk_text),
                     }
                 }
@@ -239,6 +243,24 @@ fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
     }
     walk(&mut document, &walk_text);
     document
+}
+
+/// A tunnel's ssh command as Portico starts it on Unix: Windows' ssh cannot background itself,
+/// so there it runs without `-f` and logs at `LogLevel=VERBOSE`, by which the start sees it
+/// authenticate.
+fn unix_start(command: &mut Value) {
+    let Value::Array(words) = command else {
+        return;
+    };
+    if let Some(at) = words
+        .windows(2)
+        .position(|pair| pair[0] == "-o" && pair[1] == "LogLevel=VERBOSE")
+    {
+        words.drain(at..at + 2);
+    }
+    if words.first().is_some_and(|word| word == "ssh") && words.get(1) != Some(&"-f".into()) {
+        words.insert(1, "-f".into());
+    }
 }
 
 fn golden_path(name: &str) -> PathBuf {

@@ -13,6 +13,12 @@ use std::{
 
 use tempfile::TempDir;
 
+#[cfg(windows)]
+#[allow(
+    unused_imports,
+    reason = "only some test binaries compile programs of their own"
+)]
+pub use executable::compile_program;
 use executable::write_executable;
 
 pub struct TestEnv {
@@ -211,9 +217,9 @@ impl TestEnv {
     }
 }
 
-/// `path`, written with `/`, as Portico shows it to people: joined with the system's separator.
+/// `path`, written with `/`, as Portico shows it to people: with the system's separator.
 pub fn shown(path: &str) -> String {
-    path.split('/').collect::<PathBuf>().display().to_string()
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
 }
 
 /// The file a fake program written at `path` runs from: `path` itself, or `<path>.exe` on

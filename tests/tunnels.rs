@@ -4,6 +4,14 @@ use std::{fs, net::TcpListener, path::PathBuf};
 
 use support::TestEnv;
 
+/// How Portico starts a tunnel's ssh: in the background, or on Windows, whose ssh cannot
+/// background itself, in the foreground with the log level that shows the authentication.
+const START: &str = if cfg!(windows) {
+    "-N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none -o LogLevel=VERBOSE"
+} else {
+    "-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none"
+};
+
 /// A fake `ssh`: `-G` answers like OpenSSH (refusing the alias `rejected`), and a tunnel start
 /// (`-f`, or `-N` where ssh cannot background itself) logs its arguments and leaves a
 /// background stand-in that carries them, as the real ssh's background process does (or, with
@@ -47,7 +55,7 @@ if [ "$1" = -f ] || [ "$1" = -N ]; then
   fi
   if [ "$1" = -N ]; then
     printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
-    sleep 60
+    {hold}
     exit 0
   fi
   # Like ssh -f, the background process leads its own session. macOS has no setsid command,
@@ -69,12 +77,25 @@ exit 0
             log = log.display(),
             fail = fail.display(),
             exit_after_auth = exit_after_auth.display(),
+            hold = hold_forward(),
         ),
     );
     env.run(["init", "-y"]).assert_success();
     env.run(["add", "prod", "-H", "prod.example"])
         .assert_success();
     (env, log)
+}
+
+/// What the fake `ssh -N` does once authenticated: stay up, holding the listen address of a
+/// local or dynamic forward, by which Windows' Portico sees the forward up.
+fn hold_forward() -> String {
+    #[cfg(windows)]
+    return format!(
+        "exec '{}' \"$@\"",
+        support::compile_program("tests/support/listen.rs").display()
+    );
+    #[cfg(unix)]
+    "sleep 60".into()
 }
 
 fn stdout(env: &TestEnv, args: &[&str]) -> String {
@@ -132,10 +153,7 @@ fn tunnels_are_added_listed_shown_edited_and_removed() {
         "{show}"
     );
     assert!(show.contains("Status:  stopped"), "{show}");
-    assert!(
-        show.contains("-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none -E "),
-        "{show}"
-    );
+    assert!(show.contains(&format!("{START} -E ")), "{show}");
 
     env.run([
         "tunnel",
@@ -212,7 +230,7 @@ fn a_tunnel_starts_in_the_background_and_stops() {
     assert_eq!(
         call.trim(),
         format!(
-            "-f -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o RemoteCommand=none -E {} -D {spec} -- prod",
+            "{START} -E {} -D {spec} -- prod",
             runtime.join("socks.log").display()
         )
     );
@@ -356,6 +374,10 @@ fn a_tunnel_whose_ssh_exits_while_waiting_is_failed() {
     );
 }
 
+/// Unix-only: Windows lets a socket bind loopback on a port that an ordinary listener on every
+/// address holds (the more specific one gets the connections), so the port is free for ssh
+/// there, and the probe rightly says so (see `platform::windows::net`).
+#[cfg(unix)]
 #[test]
 fn a_busy_local_port_is_not_mistaken_for_ready() {
     let (env, calls) = tunnel_env();
