@@ -19,6 +19,8 @@ use linux as os;
 #[cfg(target_os = "macos")]
 use macos as os;
 
+#[cfg(windows)]
+pub mod console;
 pub mod fs;
 pub mod launcher;
 pub mod net;

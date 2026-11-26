@@ -11,7 +11,7 @@ use std::{
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers,
     },
     execute,
@@ -108,7 +108,13 @@ fn interact(state: &mut impl State) -> Result<Option<Vec<usize>>, String> {
         },
     )
     .map_err(failed)?;
-    let outcome = run(&mut terminal, state, event::read);
+    // Windows' console keys go through the TUI's reader, which also reads the ones ConPTY
+    // reports in a form crossterm drops.
+    #[cfg(unix)]
+    let read = crossterm::event::read;
+    #[cfg(windows)]
+    let read = crate::tui::read_event;
+    let outcome = run(&mut terminal, state, read);
     drop(terminal);
     drop(raw);
     outcome

@@ -42,13 +42,89 @@ pub(super) enum Input {
 }
 
 /// Waits at most `timeout` for the terminal's next event.
+#[cfg(unix)]
 pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
-    #[cfg(windows)]
+    next_event_from(event::poll, event::read, timeout)
+}
+
+/// Waits at most `timeout` for the console's next event. A key press ConPTY reports by its
+/// control character alone, which crossterm would drop, is read here (see
+/// `platform::console`); everything else through crossterm.
+#[cfg(windows)]
+pub(super) fn next_event(timeout: Duration) -> io::Result<Input> {
+    use crate::platform::console;
     diag::peek();
-    let input = next_event_from(event::poll, event::read, timeout);
-    #[cfg(windows)]
+    let bare = console::wait_for_input(timeout).and_then(|queued| {
+        if queued {
+            console::take_bare_key().map(Some)
+        } else {
+            Ok(None)
+        }
+    });
+    let input = match bare {
+        Ok(None) => Ok(Input::Idle),
+        Ok(Some(Some(key))) => Ok(Input::Event(Event::Key(bare_key(
+            key.character,
+            key.alt,
+            key.shift,
+        )))),
+        // Queued input crossterm reads, one record at a time.
+        Ok(Some(None)) => next_event_from(event::poll, event::read, Duration::ZERO),
+        Err(error) if is_closed(&error) => Ok(Input::Closed),
+        Err(error) => Err(error),
+    };
     diag::log(&format!("{input:?}"));
     input
+}
+
+/// Waits for the console's next event, however long that takes; its end is `UnexpectedEof`.
+#[cfg(windows)]
+pub(crate) fn read_event() -> io::Result<Event> {
+    loop {
+        match next_event(Duration::from_secs(60))? {
+            Input::Event(event) => return Ok(event),
+            Input::Idle => {}
+            Input::Closed => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the console is gone",
+                ));
+            }
+        }
+    }
+}
+
+/// The key a control character (or DEL) stands for, read as crossterm reads it from a Unix
+/// terminal, with the modifiers held.
+#[cfg(any(windows, test))]
+fn bare_key(character: u8, alt: bool, shift: bool) -> event::KeyEvent {
+    use event::{KeyCode, KeyModifiers};
+    let (mut code, mut modifiers) = match character {
+        b'\r' => (KeyCode::Enter, KeyModifiers::NONE),
+        b'\t' => (KeyCode::Tab, KeyModifiers::NONE),
+        0x1b => (KeyCode::Esc, KeyModifiers::NONE),
+        0x7f => (KeyCode::Backspace, KeyModifiers::NONE),
+        0 => (KeyCode::Char(' '), KeyModifiers::CONTROL),
+        0x01..=0x1a => (
+            KeyCode::Char(char::from(character - 0x01 + b'a')),
+            KeyModifiers::CONTROL,
+        ),
+        0x1c..=0x1f => (
+            KeyCode::Char(char::from(character - 0x1c + b'4')),
+            KeyModifiers::CONTROL,
+        ),
+        _ => (KeyCode::Char(char::from(character)), KeyModifiers::NONE),
+    };
+    if alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if shift {
+        if code == KeyCode::Tab {
+            code = KeyCode::BackTab;
+        }
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    event::KeyEvent::new(code, modifiers)
 }
 
 // TEMPORARY DIAGNOSTIC (Ruling G): logs the console's raw input records and the events read.
@@ -408,6 +484,41 @@ mod tests {
 
     fn end_of_file() -> io::Error {
         io::Error::new(io::ErrorKind::UnexpectedEof, "the terminal is gone")
+    }
+
+    #[test]
+    fn bare_control_characters_are_the_keys_a_unix_terminal_sends() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let none = KeyModifiers::NONE;
+        let control = KeyModifiers::CONTROL;
+        for (character, expected) in [
+            (b'\r', key(KeyCode::Enter, none)),
+            (0x1b, key(KeyCode::Esc, none)),
+            (b'\t', key(KeyCode::Tab, none)),
+            (0x7f, key(KeyCode::Backspace, none)),
+            (0x03, key(KeyCode::Char('c'), control)),
+            (0x14, key(KeyCode::Char('t'), control)),
+            (0x00, key(KeyCode::Char(' '), control)),
+            (0x1c, key(KeyCode::Char('4'), control)),
+        ] {
+            assert_eq!(
+                bare_key(character, false, false),
+                expected,
+                "{character:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_key_keeps_alt_and_shift() {
+        assert_eq!(
+            bare_key(b'\r', true, false),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+        );
+        assert_eq!(
+            bare_key(b'\t', false, true),
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+        );
     }
 
     #[test]

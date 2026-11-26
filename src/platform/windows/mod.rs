@@ -1,5 +1,6 @@
 //! What only Windows has.
 
+pub mod console;
 pub mod fs;
 pub mod launcher;
 pub mod net;

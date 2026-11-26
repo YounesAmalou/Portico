@@ -61,6 +61,8 @@ use containers::{
 };
 use events::{Step, TerminalEvents};
 use form::{FORM_FIELDS, FormState, IDENTITY_FILE, PROXY_JUMP};
+#[cfg(windows)]
+pub(crate) use hangup::read_event;
 use hangup::{HangupWatch, wait_for_enter};
 use hosts::{DetailsCache, PendingTrust, PerHost, TestMark, details_for_selected, render_hosts};
 use identities::Indexer;
