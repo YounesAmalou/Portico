@@ -206,21 +206,27 @@ impl Fixture {
 /// On Windows, paths are also spelled with `/`, an exit status and a tunnel's ssh command as on
 /// Unix, so that one golden file serves every system.
 fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
-    let mut text = text.to_owned();
-    if let Some(port) = busy_port {
-        text = text.replace(&port.to_string(), BUSY_PORT);
-    }
-    let mut document: Value = serde_json::from_str(&text).unwrap();
+    let mut document: Value = serde_json::from_str(text).unwrap();
     let home = home.display().to_string();
+    // The home first: its temporary name may hold the port's digits.
     let walk_text = |text: &mut String| {
         *text = text.replace(&home, HOME);
+        if let Some(port) = busy_port {
+            *text = text.replace(&port.to_string(), BUSY_PORT);
+        }
         if cfg!(windows) {
             *text = text
                 .replace('\\', "/")
                 .replace("exit code: ", "exit status: ");
         }
     };
-    fn walk(value: &mut Value, walk_text: &dyn Fn(&mut String)) {
+    let busy_port = busy_port.map(u64::from);
+    let walk_number = |value: &mut Value| {
+        if value.as_u64().is_some() && value.as_u64() == busy_port {
+            *value = BUSY_PORT.parse::<u64>().unwrap().into();
+        }
+    };
+    fn walk(value: &mut Value, walk_text: &dyn Fn(&mut String), walk_number: &dyn Fn(&mut Value)) {
         match value {
             Value::Object(map) => {
                 for (key, value) in map.iter_mut() {
@@ -230,18 +236,21 @@ fn normalize(text: &str, home: &Path, busy_port: Option<u16>) -> Value {
                         ("finished", Value::Number(_)) => *value = 1781861043u64.into(),
                         ("command", Value::Array(_)) if cfg!(windows) => {
                             unix_start(value);
-                            walk(value, walk_text);
+                            walk(value, walk_text, walk_number);
                         }
-                        _ => walk(value, walk_text),
+                        _ => walk(value, walk_text, walk_number),
                     }
                 }
             }
-            Value::Array(values) => values.iter_mut().for_each(|value| walk(value, walk_text)),
+            Value::Array(values) => values
+                .iter_mut()
+                .for_each(|value| walk(value, walk_text, walk_number)),
             Value::String(text) => walk_text(text),
+            Value::Number(_) => walk_number(value),
             _ => {}
         }
     }
-    walk(&mut document, &walk_text);
+    walk(&mut document, &walk_text, &walk_number);
     document
 }
 
@@ -340,6 +349,9 @@ fn hosts_runs_no_ssh_and_asks_no_agent() {
     assert!(!ran.exists(), "{}", fs::read_to_string(&ran).unwrap());
 }
 
+/// Unix-only: the host's agent is the fixture's Unix socket (1Password's); Windows' agents
+/// listen on named pipes.
+#[cfg(unix)]
 #[test]
 fn show_of_a_managed_host() {
     let fixture = setup();
@@ -359,6 +371,9 @@ fn show_of_an_external_host_that_does_not_resolve() {
     assert_eq!(document["host"]["resolved"], Value::Null);
 }
 
+/// Unix-only: the fixture's agent is a Unix socket (1Password's); Windows' agents listen on
+/// named pipes.
+#[cfg(unix)]
 #[test]
 fn identities() {
     let fixture = setup();
@@ -384,6 +399,9 @@ fn containers_on_a_host_run_ssh_in_batch_mode() {
     assert!(ssh.contains("BatchMode=yes"), "{ssh}");
 }
 
+/// Unix-only: the offers are local Docker access through Unix groups, which Windows lacks
+/// (`UNIX_GROUPS` is false).
+#[cfg(unix)]
 #[test]
 fn docker_offers_are_reported_and_never_run() {
     let fixture = setup();
@@ -679,7 +697,7 @@ fn an_unreadable_config_is_an_error_document_on_stdout() {
             document["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains(".ssh/config"),
+                .contains(&support::shown(".ssh/config")),
             "{args:?}: {document}"
         );
         support::deny_read(&config);

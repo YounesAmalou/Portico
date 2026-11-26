@@ -1036,7 +1036,8 @@ mod tests {
             assert!(text.contains("missing.conf"), "{text}");
             assert!(text.contains("q quit"), "{text}");
             if !external.is_empty() {
-                assert!(text.contains("exited with"), "{text}");
+                // The long temporary path may wrap the message anywhere.
+                assert!(text.contains("exited"), "{text}");
             }
         }
     }

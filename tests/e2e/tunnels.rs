@@ -452,7 +452,10 @@ fn a_tunnel_through_a_jump_host_returns_and_stops_with_its_proxy() {
         }
         if Instant::now() >= deadline {
             let _ = start.kill();
-            panic!("`tunnel start` through a jump host did not return");
+            panic!(
+                "`tunnel start` through a jump host did not return\n{}",
+                client.tunnel_logs()
+            );
         }
         thread::sleep(Duration::from_millis(50));
     };

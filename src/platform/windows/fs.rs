@@ -432,6 +432,32 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_denied_to_the_user_is_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let user = std::env::var("USERNAME").unwrap();
+        let icacls = |args: &[&str]| {
+            let output = std::process::Command::new("icacls")
+                .arg(&locked)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "icacls {args:?}: {output:?}");
+        };
+        icacls(&["/deny", &format!("{user}:(W)")]);
+        let plain = writable(&locked);
+        let verbatim = writable(&fs::canonicalize(&locked).unwrap());
+        let resolved = writable(&canonicalize(&locked).unwrap());
+        icacls(&["/remove:d", &user]);
+        assert_eq!(
+            (plain.unwrap(), verbatim.unwrap(), resolved.unwrap()),
+            (false, false, false)
+        );
+        assert!(writable(&locked).unwrap());
+    }
+
+    #[test]
     fn a_link_written_with_slashes_resolves() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("dotfiles")).unwrap();

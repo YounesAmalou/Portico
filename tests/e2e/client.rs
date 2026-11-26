@@ -138,16 +138,35 @@ impl Client {
         self.command(args).output().unwrap()
     }
 
-    /// Runs Portico and fails the test unless it succeeds.
+    /// Runs Portico and fails the test unless it succeeds, with the tunnels' ssh logs.
     pub fn run_ok(&self, args: &[&str]) -> Output {
         let output = self.run(args);
         assert!(
             output.status.success(),
-            "portico {args:?}: {}\n{}",
+            "portico {args:?}: {}\n{}{}",
             output.status,
-            text(&output)
+            text(&output),
+            self.tunnel_logs()
         );
         output
+    }
+
+    /// Every tunnel's ssh log, for a failure message.
+    pub fn tunnel_logs(&self) -> String {
+        let Ok(entries) = fs::read_dir(self.tunnel_runtime()) else {
+            return String::new();
+        };
+        let mut logs = String::new();
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().is_some_and(|extension| extension == "log") {
+                logs.push_str(&format!(
+                    "--- {} ---\n{}\n",
+                    path.display(),
+                    fs::read_to_string(&path).unwrap_or_default()
+                ));
+            }
+        }
+        logs
     }
 
     pub fn init(&self) {

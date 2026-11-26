@@ -893,7 +893,10 @@ mod tests {
                 reason: AgentProblem::NoSuchSocket,
             }
             .describe(home),
-            "SSH agent, /run/a, unavailable: no such socket"
+            format!(
+                "SSH agent, {}, unavailable: no such socket",
+                crate::platform::paths::shown("/run/a")
+            )
         );
         assert_eq!(Agent::Disabled.describe(home), "none (IdentityAgent none)");
         assert_eq!(

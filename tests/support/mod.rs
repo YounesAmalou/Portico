@@ -217,6 +217,31 @@ impl TestEnv {
     }
 }
 
+/// OpenSSH's client program `name` as Portico runs it: the one on `PATH`, or on Windows the one
+/// Windows ships, since Git for Windows' own ssh, often first on `PATH`, reads a Windows path
+/// as a relative one.
+pub fn openssh(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        Path::new(&root)
+            .join(r"System32\OpenSSH")
+            .join(format!("{name}.exe"))
+    } else {
+        name.into()
+    }
+}
+
+/// `path` as an OpenSSH configuration file takes it: Windows' OpenSSH reads `/` in a Windows
+/// path, where a `\` may start an escape.
+pub fn config_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
+    }
+}
+
 /// `path`, written with `/`, as Portico shows it to people: with the system's separator.
 pub fn shown(path: &str) -> String {
     path.replace('/', std::path::MAIN_SEPARATOR_STR)

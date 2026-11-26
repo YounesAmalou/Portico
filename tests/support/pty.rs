@@ -150,7 +150,8 @@ fn run(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
             if RAW_SEQUENCES {
                 terminal.read_until(b"\x1b[?1049h", 0, Duration::from_secs(5));
             }
-            wait_for_file(&home.join("resolver-started"), "resolver did not start");
+            let started = home.join("resolver-started");
+            terminal.wait_until(|| started.exists(), "resolver did not start");
         }
         BlockedInitLock => {
             terminal.read_screen("y initialize");
@@ -462,13 +463,13 @@ fn act(terminal: &mut Terminal, home: &Path, scenario: Scenario) {
             // Opening the shell (the fake docker exits at once) remembers the user.
             terminal.write(b"\r");
             let settings_path = home.join(".config/portico/settings.toml");
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !fs::read_to_string(&settings_path)
-                .is_ok_and(|settings| settings.contains("\"shop/api\" = \"deploy\""))
-            {
-                assert!(Instant::now() < deadline, "the user was not remembered");
-                thread::sleep(Duration::from_millis(10));
-            }
+            terminal.wait_until(
+                || {
+                    fs::read_to_string(&settings_path)
+                        .is_ok_and(|settings| settings.contains("\"shop/api\" = \"deploy\""))
+                },
+                "the user was not remembered",
+            );
             let settings = fs::read_to_string(&settings_path).unwrap();
             assert!(settings.contains("[users.local.docker]"), "{settings}");
             terminal.read_screen("user: deploy");
@@ -854,6 +855,22 @@ impl Terminal {
 
     fn screen(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    /// Waits up to five seconds for `done`; fails with the screen when it never holds. What
+    /// Portico prints meanwhile is read only then, so the scenario reads it as before.
+    fn wait_until(&mut self, mut done: impl FnMut() -> bool, failure: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() >= deadline {
+                let shown = Instant::now() + Duration::from_millis(200);
+                while Instant::now() < shown {
+                    self.pump(shown);
+                }
+                self.fail(failure);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn find(&self, needle: &[u8], start: usize) -> Option<usize> {

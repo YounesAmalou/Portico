@@ -27,12 +27,12 @@ fn ordinary_openssh_resolves_a_portico_host() {
         &validation,
         entry.replace(
             "~/.ssh/portico/config",
-            env.managed_config().to_str().unwrap(),
+            &support::config_path(&env.managed_config()),
         ),
     )
     .unwrap();
 
-    let output = std::process::Command::new("ssh")
+    let output = std::process::Command::new(support::openssh("ssh"))
         .args(["-G", "-F"])
         .arg(validation)
         .arg("dev")
@@ -89,6 +89,12 @@ fn managed_strings_round_trip_through_openssh() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
+        // Windows reads `\` as a separator, which Portico writes as `/`.
+        let identity = if cfg!(windows) {
+            identity.replace('\\', "/")
+        } else {
+            identity.to_owned()
+        };
         assert!(
             stdout
                 .lines()
@@ -109,7 +115,7 @@ fn managed_strings_round_trip_through_openssh() {
             ManagedConfig::parse(&std::fs::read_to_string(env.managed_config()).unwrap()).unwrap();
         assert_eq!(
             managed.find("literal").unwrap().identity_file(),
-            Some(identity)
+            Some(identity.as_str())
         );
         env.run(["remove", "literal", "-f"]).assert_success();
     }

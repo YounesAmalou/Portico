@@ -1825,7 +1825,7 @@ mod tests {
         );
         assert_eq!(
             shell_status(&dev, Ok(Ok(ConnectionOutcome::LaunchFailed(failed)))),
-            "Could not open a terminal: exit status: 1"
+            format!("Could not open a terminal: {failed}")
         );
         assert_eq!(
             shell_status(&dev, Ok(Err(issue(None)))),
@@ -1840,7 +1840,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "{} exited with exit status: 1",
+                "{} exited with {failed}",
                 remote_command(&start_daemon_offer(&host("dev")).words)
             )
         );

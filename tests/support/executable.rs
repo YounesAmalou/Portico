@@ -35,12 +35,13 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
-/// The POSIX `sh` that runs the fakes: `/bin/sh`, or on Windows the one `sh_shim` uses (the
-/// `SH` variable, else Git for Windows' own).
+/// A POSIX `sh` that runs a script with the `PATH` it is given: `/bin/sh`, or on Windows Git
+/// for Windows' MSYS `sh` itself (its `bin\sh.exe`, which the fakes run through, puts Git's own
+/// tools first on `PATH`).
 #[allow(dead_code, reason = "only some tests run a script themselves")]
 pub fn posix_sh() -> std::path::PathBuf {
     if cfg!(windows) {
-        std::env::var_os("SH").map_or_else(|| r"C:\Program Files\Git\bin\sh.exe".into(), Into::into)
+        r"C:\Program Files\Git\usr\bin\sh.exe".into()
     } else {
         "/bin/sh".into()
     }
@@ -153,8 +154,10 @@ pub fn compile_program(source: &str) -> PathBuf {
     }
     fs::create_dir_all(&dir).unwrap();
     // Built under a name of its own, then renamed into place whole, as other test binaries
-    // may be building it at the same time.
-    let partial = dir.join(format!("{stem}-{}.exe", std::process::id()));
+    // and other tests of this one may be building it at the same time.
+    static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let build = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial = dir.join(format!("{stem}-{}-{build}.exe", std::process::id()));
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let output = Command::new(&rustc)
         .args(["--edition", "2021", "-C", "debuginfo=0", "-o"])

@@ -837,7 +837,9 @@ mod tests {
             &ssh,
             &format!(
                 "#!/bin/sh\nif [ \"$1\" = -G ]; then printf 'hostname x\\nport 22\\n'; exit 0; fi\n\
-                 sleep 60 &\necho $! > '{}'\nsleep 60\n",
+                 sleep 60 &\nchild=$!\n\
+                 [ -r /proc/$child/winpid ] && child=$(cat /proc/$child/winpid)\n\
+                 echo $child > '{}'\nsleep 60\n",
                 child_pid.display()
             ),
         );
