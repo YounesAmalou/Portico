@@ -43,22 +43,6 @@ in_own_session() {
     perl -MPOSIX -e 'POSIX::setsid() != -1 or die "setsid: $!\n"; exec @ARGV or die "exec: $!\n"' "$@"
 }
 
-# TEMPORARY DIAGNOSTIC (Ruling G): whether the unit tests still get SIGHUP in a session of their
-# own.
-diag_rounds() {
-    local filter round code out
-    out=$(mktemp)
-    for filter in domain:: domain:: ""; do
-        for round in 1 2 3 4 5; do
-            code=0
-            in_own_session cargo test --lib -q -- --test-threads=8 $filter >"$out" 2>&1 </dev/null || code=$?
-            echo "DIAG ${filter:-all} round $round: exit $code"
-            [ "$code" = 0 ] || tail -n 3 "$out"
-        done
-    done
-    rm -f -- "$out"
-}
-
 # The test suite. On macOS it runs in a session of its own, and so in a process group of its own.
 # The runner's processes share one process group, which the tests otherwise joined: macOS sent
 # that group SIGHUP, as it does an orphaned process group, while a test ending a process tree
@@ -73,7 +57,6 @@ tests() {
         return
     fi
     cargo test --all-targets --no-run
-    diag_rounds
     local log status=0 waited=0 limit=${TEST_LIMIT:-300}
     log=$(mktemp)
     in_own_session cargo test --all-targets --no-fail-fast >"$log" 2>&1 </dev/null &
