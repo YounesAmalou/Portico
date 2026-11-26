@@ -70,8 +70,12 @@ tests() {
             sleep 1 while 1;
         ' &
         sentinel=$!
-        cargo test --all-targets --no-fail-fast
-        code=$?
+        for round in 1 2 3 4 5; do
+            echo "DIAG round $round"
+            cargo test --all-targets --no-fail-fast
+            code=$?
+            [ "$code" = 0 ] || break
+        done
         kill "$sentinel"
         exit "$code"
     ) >"$log" 2>&1 </dev/null &
