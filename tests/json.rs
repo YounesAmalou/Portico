@@ -572,12 +572,17 @@ fn settings() {
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(document["exists"], false);
+    assert_eq!(document["users"], serde_json::json!([]));
     assert_eq!(
         document["tabs"],
         serde_json::json!({ "docker": true, "podman": true, "proxmox": true, "tunnels": true })
     );
     let set = fixture.run(&["settings", "set", "tabs.podman", "off"]);
     assert_eq!(set.status.code(), Some(0));
+    let path = fixture.env.home().join(".config/portico/settings.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("[users.local.docker]\n\"shop/api\" = \"deploy\"\n");
+    fs::write(&path, text).unwrap();
     fixture.golden(&["settings", "--json"], 0, "settings.json");
 }
 

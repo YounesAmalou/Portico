@@ -152,8 +152,8 @@ portico remove [<alias>] [-f]   Remove a managed host
 portico connect [<alias>] [-n]  Connect using OpenSSH
 portico test [<alias>] [--raw]  Check that logging in works, without a shell
 portico identities              List agents and identity files, and whether each is available
-portico settings [set <key> on|off]
-                                Show or change the preferences
+portico settings [set <key> on|off | forget [--on <alias>] [--backend docker|podman] <container>]
+                                Show or change the preferences, or forget a remembered container user
 portico containers [--on [<alias>]] [--backend docker|podman|proxmox]...
                                 List running containers, here or on a host
 portico shell [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [-u <user>] [-n]
@@ -278,7 +278,7 @@ portico shell 3f9a1c -n
 
 A container is referred to by its name, `project/service` (add `#n` for the n-th replica), a Compose `service` name (`service#n` for a replica, as the listing shows it), or an ID prefix of at least 4 hex characters, and is resolved against a fresh listing. A reference that matches nothing, or several containers, is an error naming the target and listing the candidates. Without `--backend`, `portico shell` looks in every installed backend; a name found in two of them is an error asking for `--backend`.
 
-Portico stores nothing for this: no container list, user or setting is ever written to disk. Listing on a host uses `ssh` with your configuration, once per backend; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
+The CLI stores nothing for this: `portico shell` writes no container list, user or setting, and does not read the remembered users described under [Settings](#settings) either (it uses the image's user unless `-u` names another). The TUI remembers a container's user, as described under [Container tabs](#container-tabs). Listing on a host uses `ssh` with your configuration, once per backend; the CLI lets ssh prompt, the TUI never does (`BatchMode`), so a host that needs a password or passphrase must be reachable through an agent or an open connection.
 
 **Podman.** Portico runs `podman` as the ssh user, so it lists that user's own (rootless) containers, or root's when you connect as root; an empty listing by another user says so. `-u` works as with Docker. A rootless user without subordinate IDs (`/etc/subuid`, `/etc/subgid`) is told how to add them; Portico changes nothing on the host.
 
@@ -352,7 +352,21 @@ proxmox = false
 
 `portico settings` prints each setting and whether the file exists, `portico settings set tabs.podman off` changes one (`on`, `off`, `true`, `false`, `yes` and `no` are accepted), and `portico settings --json` prints the same for scripts (see [Machine-readable output](#machine-readable-output)). The keys are `tabs.tunnels`, `tabs.docker`, `tabs.podman` and `tabs.proxmox`. A change keeps the file's comments, order and keys Portico does not know, and a symlinked file is written through, so the link stays. A file that cannot be read as settings is reported with its line and is never overwritten.
 
-The settings only choose what the TUI and the desktop panel show. The CLI is unaffected: `portico containers`, `portico shell` and the other commands work with every backend whatever the file says.
+**Remembered container users.** The `user:` line of a container tab belongs to the selected container: it shows the user remembered for it, or "image default". `u` edits the line for that container. Opening a shell (`Enter` or `n`) saves the user in the settings file, and opening one with a blank user forgets it. Proxmox shells run as root, so nothing is remembered for them. If the file cannot be written, the shell still opens and the status line says the user was not remembered.
+
+A container is remembered by the machine (this machine, or the host alias), the backend, and its Compose `project/service` (replicas share it) or, outside Compose, its name. That way the user survives a redeploy that gives the container a new ID. The users are kept in tables of the same file:
+
+```toml
+[users.local.docker]
+"shop/api" = "deploy"
+
+[users.host.web1.podman]
+"worker" = "app"
+```
+
+`portico settings` lists them under "Remembered container users:", and `portico settings forget [--on <alias>] [--backend docker|podman] <container>` removes one (`<container>` as listed, such as `shop/api`; without `--on` it means this machine, and `--backend` defaults to Docker). The alias is not checked against your hosts, so the entries of a host you removed can still be forgotten. `portico settings --json` includes them too.
+
+The settings only choose what the TUI and the desktop panel show, and which user the TUI opens container shells as. The CLI is unaffected: `portico containers`, `portico shell` and the other commands work with every backend whatever the file says.
 
 ### Adopt and export hosts
 
@@ -498,7 +512,7 @@ The Docker, Podman and Proxmox tabs each list the containers of one target with 
 | `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, as the hosts filter matches |
 | `Enter` | Open a shell in this terminal |
 | `n` | Open a shell in a new terminal |
-| `u` | Set the user for the next shell (empty means the image's user; not saved) |
+| `u` | Set the user for the selected container's shells (empty means the image's user); it is remembered when a shell opens |
 | `h` | Pick the target: type to narrow, `↑` / `↓` choose, `Enter` picks, `Esc` keeps the current one |
 | `L` | Show this machine's containers again |
 | `r` / `F5` | List again |

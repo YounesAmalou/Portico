@@ -118,7 +118,10 @@ impl SettingsOverlay {
     pub(super) fn finish_toggle(&mut self, key: Key, value: bool, result: Result<(), String>) {
         match result {
             Ok(()) => {
-                let mut settings = Settings { tabs: self.tabs };
+                let mut settings = Settings {
+                    tabs: self.tabs,
+                    ..Settings::default()
+                };
                 key.set(&mut settings, value);
                 self.tabs = settings.tabs;
                 self.error = None;
@@ -129,7 +132,10 @@ impl SettingsOverlay {
 
     /// The value `key` has now.
     pub(super) fn value(&self, key: Key) -> bool {
-        key.get(&Settings { tabs: self.tabs })
+        key.get(&Settings {
+            tabs: self.tabs,
+            ..Settings::default()
+        })
     }
 
     /// Records a desktop action's outcome and the status read after it.

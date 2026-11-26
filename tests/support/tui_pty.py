@@ -377,6 +377,29 @@ def check_terminal(scenario):
             os.write(master, b"/2")
             read_screen("Hosts /2")
             os.write(master, b"\r")
+        elif scenario == "remembered_user":
+            read_screen("1 Hosts")
+            os.write(master, b"3")
+            read_screen("api")
+            os.write(master, b"u")
+            os.write(master, b"\x1b[200~deploy\x1b[201~")
+            os.write(master, b"\r")
+            read_screen("user: deploy")
+            # Opening the shell (the fake docker exits at once) remembers the user.
+            os.write(master, b"\r")
+            settings_path = Path(home, ".config/portico/settings.toml")
+            deadline = time.monotonic() + 5
+            while not settings_path.exists() or '"shop/api" = "deploy"' not in settings_path.read_text():
+                assert time.monotonic() < deadline, "the user was not remembered"
+                time.sleep(0.01)
+            settings = settings_path.read_text()
+            assert "[users.local.docker]" in settings, settings
+            read_screen("user: deploy")
+        elif scenario == "remembered_user_restored":
+            read_screen("1 Hosts")
+            os.write(master, b"3")
+            read_screen("api")
+            read_screen("user: deploy")
         elif scenario == "settings":
             read_screen("4 Podman")
             os.write(master, b",")

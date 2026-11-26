@@ -1,6 +1,9 @@
 //! The containers tab: the target it lists, its keys, and how it reads.
 
-use std::{cell::Cell, collections::HashMap};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, HashMap},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -18,11 +21,11 @@ use crate::{
     app::ContainerError,
     backend::{
         AUTOMATIC, BackendId, Container, ContainerList, Offer, Target, Via, display_name, group,
-        remote_command,
+        remember_key, remote_command,
     },
     domain::fuzzy,
     domain::openssh::ConnectionOutcome,
-    domain::settings::Tabs,
+    domain::settings::{Tabs, UserKey},
     picker::{HIT, Outcome, Row, Single, State},
 };
 
@@ -54,6 +57,9 @@ pub(super) enum PanelAction {
         backend: BackendId,
         id: String,
         user: Option<String>,
+        /// The container whose user the shell remembers (forgets when `user` is `None`); `None`
+        /// for a listing whose shells always run as root.
+        remember: Option<UserKey>,
         via: Option<Via>,
         new_terminal: bool,
     },
@@ -86,9 +92,13 @@ pub(super) struct Panel {
     host: Option<String>,
     lists: HashMap<Target, PanelState>,
     selected: usize,
+    /// The user of each container for the session, by its target and [`remember_key`]: the
+    /// remembered ones, then the edits. A container without one uses its image's.
+    users: HashMap<(Target, String), String>,
+    /// The user line while it is being edited, which Enter keeps for that container.
     user: TextInput,
-    editing_user: bool,
-    previous_user: String,
+    /// The container whose user is being edited.
+    editing_user: Option<(Target, String)>,
     filter: TextInput,
     editing_filter: bool,
     /// The filter as it was when its edit began, which Esc restores.
@@ -110,6 +120,16 @@ impl Panel {
         Self {
             backend,
             ..Self::default()
+        }
+    }
+
+    /// Takes the users remembered for this panel's backend.
+    pub(super) fn remember(&mut self, users: &BTreeMap<UserKey, String>) {
+        for (key, user) in users {
+            if key.backend == self.backend {
+                self.users
+                    .insert((key.target.clone(), key.container.clone()), user.clone());
+            }
         }
     }
 
@@ -139,7 +159,7 @@ impl Panel {
 
     /// Whether the list has the keys, rather than the filter, the user or the target picker.
     pub(super) fn is_browsing(&self) -> bool {
-        !self.editing_filter && !self.editing_user && self.picker.is_none()
+        !self.editing_filter && self.editing_user.is_none() && self.picker.is_none()
     }
 
     pub(super) fn set_status(&mut self, status: Option<String>) {
@@ -218,13 +238,18 @@ impl Panel {
             }
             return PanelAction::None;
         }
-        if self.editing_user {
+        if let Some(container) = &self.editing_user {
             match key.code {
-                KeyCode::Enter => self.editing_user = false,
-                KeyCode::Esc => {
-                    self.editing_user = false;
-                    self.user = TextInput::new(&self.previous_user);
+                KeyCode::Enter => {
+                    let user = self.user.as_str().trim();
+                    if user.is_empty() {
+                        self.users.remove(container);
+                    } else {
+                        self.users.insert(container.clone(), user.to_owned());
+                    }
+                    self.editing_user = None;
                 }
+                KeyCode::Esc => self.editing_user = None,
                 _ => {
                     self.user.handle_key(key);
                 }
@@ -255,8 +280,10 @@ impl Panel {
                 PanelAction::None
             }
             KeyCode::Char('u') if !self.root_only() => {
-                self.previous_user = self.user.as_str().to_owned();
-                self.editing_user = true;
+                if let Some(container) = self.selected_key() {
+                    self.user = TextInput::new(self.chosen_user().as_deref().unwrap_or_default());
+                    self.editing_user = Some(container);
+                }
                 PanelAction::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -303,7 +330,7 @@ impl Panel {
             let mut filter = self.filter.clone();
             filter.paste(text);
             self.set_filter(filter);
-        } else if self.editing_user {
+        } else if self.editing_user.is_some() {
             self.user.paste(text);
         }
     }
@@ -414,7 +441,7 @@ impl Panel {
             let mut user = vec![Span::raw("user: ")];
             if self.root_only() {
                 user.push(Span::raw(ROOT_ONLY));
-            } else if self.editing_user {
+            } else if self.editing_user.is_some() {
                 user.extend(self.user.spans(true));
             } else if let Some(chosen) = self.chosen_user() {
                 user.push(Span::raw(chosen));
@@ -572,7 +599,7 @@ impl Panel {
             "type to search  ↑↓ choose  Enter pick  Esc cancel".into()
         } else if self.editing_filter {
             "type to filter  ←→ move  Enter apply  Esc cancel".into()
-        } else if self.editing_user {
+        } else if self.editing_user.is_some() {
             "Enter apply  Esc cancel".into()
         } else {
             let clear_filter = if self.filter.is_empty() {
@@ -580,7 +607,11 @@ impl Panel {
             } else {
                 "  Esc clear filter"
             };
-            let user = if self.root_only() { "" } else { "  u user" };
+            let user = if self.root_only() || self.selected_key().is_none() {
+                ""
+            } else {
+                "  u user"
+            };
             format!(
                 "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
             )
@@ -617,10 +648,16 @@ impl Panel {
             .is_some_and(|list| !list.backend.chooses_user())
     }
 
-    /// The user for the next shell, trimmed; blank means the image's own.
+    /// The selected container's target and [`remember_key`].
+    fn selected_key(&self) -> Option<(Target, String)> {
+        let list = self.listed()?;
+        let container = self.rows().get(self.selected).copied()?;
+        Some((list.target.clone(), remember_key(container)))
+    }
+
+    /// The selected container's user for its next shell; `None` means the image's own.
     fn chosen_user(&self) -> Option<String> {
-        let user = self.user.as_str().trim();
-        (!user.is_empty()).then(|| user.to_owned())
+        self.users.get(&self.selected_key()?).cloned()
     }
 
     fn shell(&self, new_terminal: bool) -> PanelAction {
@@ -629,12 +666,17 @@ impl Panel {
         else {
             return PanelAction::None;
         };
+        let root_only = self.root_only();
         PanelAction::Shell {
             target: list.target.clone(),
             backend: list.backend,
             id: container.id.clone(),
-            // Kept for when a Docker listing is shown again, but never sent with Proxmox.
-            user: self.chosen_user().filter(|_| !self.root_only()),
+            user: self.chosen_user().filter(|_| !root_only),
+            remember: (!root_only).then(|| UserKey {
+                target: list.target.clone(),
+                backend: list.backend,
+                container: remember_key(container),
+            }),
             via: list.via,
             new_terminal,
         }
@@ -834,6 +876,13 @@ impl ContainerTabs {
         self.tabs = tabs;
     }
 
+    /// Gives each panel the users remembered for its backend.
+    pub(super) fn remember(&mut self, users: &BTreeMap<UserKey, String>) {
+        for panel in &mut self.panels {
+            panel.remember(users);
+        }
+    }
+
     /// Shows `target` in every panel and returns the listings to start: each panel's that is
     /// neither kept nor running, and whose tab is turned on.
     pub(super) fn show(&mut self, target: &Target) -> Vec<(BackendId, Target)> {
@@ -946,6 +995,8 @@ mod tests {
         },
         domain::explain::{Explanation, Label},
     };
+
+    use std::collections::BTreeMap;
 
     use super::*;
 
@@ -1163,9 +1214,137 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enter_and_n_produce_shell_with_user() {
+    /// The key `dev`'s Docker entry for `container` is remembered under.
+    fn dev_key(container: &str) -> UserKey {
+        UserKey {
+            target: host("dev"),
+            backend: BackendId::Docker,
+            container: container.into(),
+        }
+    }
+
+    /// Types `text` into the user line of the selected container and applies it with Enter.
+    fn type_user(panel: &mut Panel, text: &str) -> PanelAction {
+        assert_eq!(press(panel, KeyCode::Char('u')), PanelAction::None);
+        for character in text.chars() {
+            assert_eq!(press(panel, KeyCode::Char(character)), PanelAction::None);
+        }
+        press(panel, KeyCode::Enter)
+    }
+
+    fn user_line(panel: &Panel) -> String {
+        texts(&panel.lines(true, 100, 200)).pop().unwrap()
+    }
+
+    /// A panel listing `dev` whose `shop/api` was remembered as `deploy`.
+    fn remembered_panel() -> Panel {
         let mut panel = listed_panel();
+        panel.remember(&BTreeMap::from([(dev_key("shop/api"), "deploy".into())]));
+        panel
+    }
+
+    #[test]
+    fn user_line_follows_selection() {
+        let mut tabs = ContainerTabs::default();
+        tabs.remember(&BTreeMap::from([
+            (dev_key("shop/api"), "deploy".into()),
+            (
+                UserKey {
+                    backend: BackendId::Podman,
+                    ..dev_key("shop/web")
+                },
+                "podman-only".into(),
+            ),
+        ]));
+        let panel = tabs.panel_mut(BackendId::Docker);
+        panel.show(host("dev"));
+        panel.finish(host("dev"), Ok(list(host("dev"), containers())));
+        assert_eq!(user_line(panel), "user: deploy");
+        press(panel, KeyCode::Down);
+        assert_eq!(user_line(panel), "user: image default", "Podman's own");
+        assert_eq!(type_user(panel, "root"), PanelAction::None);
+        assert_eq!(user_line(panel), "user: root");
+        press(panel, KeyCode::Up);
+        assert_eq!(user_line(panel), "user: deploy");
+        assert!(panel.details().unwrap().ends_with("user: deploy"));
+        press(panel, KeyCode::Down);
+        assert_eq!(user_line(panel), "user: root");
+        assert!(panel.details().unwrap().ends_with("user: root"));
+    }
+
+    #[test]
+    fn user_edit_does_not_write() {
+        let mut panel = remembered_panel();
+        assert_eq!(press(&mut panel, KeyCode::Char('u')), PanelAction::None);
+        assert_eq!(panel.footer(), "Enter apply  Esc cancel");
+        assert_eq!(
+            user_line(&panel).trim_end(),
+            "user: deploy",
+            "the edit starts from it, the cursor after it"
+        );
+        press(&mut panel, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::None,
+            "applies"
+        );
+        assert_eq!(user_line(&panel), "user: deployx");
+    }
+
+    #[test]
+    fn shell_carries_the_key_to_remember() {
+        let mut panel = remembered_panel();
+        assert_eq!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell {
+                target: host("dev"),
+                backend: BackendId::Docker,
+                id: "aaaa".into(),
+                user: Some("deploy".into()),
+                remember: Some(dev_key("shop/api")),
+                via: None,
+                new_terminal: false,
+            }
+        );
+        assert_eq!(
+            press(&mut panel, KeyCode::Char('n')),
+            PanelAction::Shell {
+                target: host("dev"),
+                backend: BackendId::Docker,
+                id: "aaaa".into(),
+                user: Some("deploy".into()),
+                remember: Some(dev_key("shop/api")),
+                via: None,
+                new_terminal: true,
+            }
+        );
+        // A container outside Compose is remembered by its name.
+        for _ in 0..3 {
+            press(&mut panel, KeyCode::Down);
+        }
+        assert!(matches!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell { user: None, remember: Some(key), .. } if key == dev_key("redis")
+        ));
+    }
+
+    #[test]
+    fn blank_or_spaced_user_is_trimmed() {
+        let mut panel = listed_panel();
+        type_user(&mut panel, "  root ");
+        assert!(matches!(
+            press(&mut panel, KeyCode::Enter),
+            PanelAction::Shell { user: Some(user), .. } if user == "root"
+        ));
+        press(&mut panel, KeyCode::Char('u'));
+        for _ in 0.."root".len() {
+            press(&mut panel, KeyCode::Backspace);
+        }
+        for _ in 0..3 {
+            press(&mut panel, KeyCode::Char(' '));
+        }
+        assert_eq!(press(&mut panel, KeyCode::Enter), PanelAction::None);
+        assert_eq!(user_line(&panel), "user: image default");
         assert_eq!(
             press(&mut panel, KeyCode::Enter),
             PanelAction::Shell {
@@ -1173,50 +1352,18 @@ mod tests {
                 backend: BackendId::Docker,
                 id: "aaaa".into(),
                 user: None,
+                remember: Some(dev_key("shop/api")),
                 via: None,
                 new_terminal: false,
-            }
-        );
-
-        assert_eq!(press(&mut panel, KeyCode::Char('u')), PanelAction::None);
-        assert_eq!(panel.footer(), "Enter apply  Esc cancel");
-        for character in "root".chars() {
-            assert_eq!(
-                press(&mut panel, KeyCode::Char(character)),
-                PanelAction::None
-            );
-        }
-        assert_eq!(
-            press(&mut panel, KeyCode::Enter),
-            PanelAction::None,
-            "applies"
-        );
-        assert_eq!(
-            texts(&panel.lines(true, 100, 200)).last().unwrap(),
-            "user: root"
-        );
-
-        press(&mut panel, KeyCode::Down);
-        assert_eq!(
-            press(&mut panel, KeyCode::Char('n')),
-            PanelAction::Shell {
-                target: host("dev"),
-                backend: BackendId::Docker,
-                id: "bbbb".into(),
-                user: Some("root".into()),
-                via: None,
-                new_terminal: true,
-            }
+            },
+            "a blank line forgets"
         );
     }
 
     #[test]
     fn esc_while_editing_user_restores() {
-        let mut panel = listed_panel();
-        assert_eq!(
-            texts(&panel.lines(true, 100, 200)).last().unwrap(),
-            "user: image default"
-        );
+        let mut panel = remembered_panel();
+        assert_eq!(user_line(&panel), "user: deploy");
         press(&mut panel, KeyCode::Char('u'));
         press(&mut panel, KeyCode::Char('x'));
         assert_eq!(
@@ -1225,17 +1372,14 @@ mod tests {
             "typed"
         );
         assert_eq!(press(&mut panel, KeyCode::Esc), PanelAction::None, "stays");
-        assert_eq!(
-            texts(&panel.lines(true, 100, 200)).last().unwrap(),
-            "user: image default"
-        );
+        assert_eq!(user_line(&panel), "user: deploy");
         assert_eq!(
             panel.footer(),
             "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
-            PanelAction::Shell { user: None, .. }
+            PanelAction::Shell { user: Some(user), .. } if user == "deploy"
         ));
         assert_eq!(
             press(&mut panel, KeyCode::Esc),
@@ -1247,6 +1391,16 @@ mod tests {
             PanelAction::List(host("dev"))
         );
         assert_eq!(press(&mut panel, KeyCode::Char('q')), PanelAction::Quit);
+    }
+
+    #[test]
+    fn a_user_belongs_to_its_target() {
+        let mut panel = remembered_panel();
+        panel.show(host("web"));
+        panel.finish(host("web"), Ok(list(host("web"), containers())));
+        assert_eq!(user_line(&panel), "user: image default");
+        panel.show(host("dev"));
+        assert_eq!(user_line(&panel), "user: deploy");
     }
 
     #[test]
@@ -1343,14 +1497,10 @@ mod tests {
     }
 
     /// A panel showing the Proxmox node `pve`, listed through sudo, after `deploy` was typed
-    /// as the user for an earlier Docker listing.
+    /// as the user of `api` in an earlier Docker listing.
     fn proxmox_panel() -> Panel {
         let mut panel = listed_panel();
-        press(&mut panel, KeyCode::Char('u'));
-        for character in "deploy".chars() {
-            press(&mut panel, KeyCode::Char(character));
-        }
-        press(&mut panel, KeyCode::Enter);
+        type_user(&mut panel, "deploy");
         let ct = |id: &str, name: &str| Container {
             id: id.into(),
             name: name.into(),
@@ -1403,17 +1553,32 @@ mod tests {
                 backend: BackendId::Proxmox,
                 id: "110".into(),
                 user: None,
+                remember: None,
                 via: Some(Via::Sudo),
                 new_terminal: false,
             }
         );
-        // The typed user is back with a Docker listing.
+        // The typed user is back with the Docker listing's `api`.
         panel.show(host("dev"));
         assert_eq!(
             texts(&panel.lines(true, 100, 200)).last().unwrap(),
             "user: deploy"
         );
         assert!(panel.footer().contains("u user"));
+    }
+
+    #[test]
+    fn proxmox_shell_remembers_nothing() {
+        let mut panel = proxmox_panel();
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('n')),
+            PanelAction::Shell {
+                user: None,
+                remember: None,
+                new_terminal: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1438,11 +1603,7 @@ mod tests {
         );
         press(&mut panel, KeyCode::Down);
         press(&mut panel, KeyCode::Down);
-        press(&mut panel, KeyCode::Char('u'));
-        for character in "root".chars() {
-            press(&mut panel, KeyCode::Char(character));
-        }
-        press(&mut panel, KeyCode::Enter);
+        type_user(&mut panel, "root");
         assert_eq!(
             panel.details().unwrap(),
             "name: redis\n\

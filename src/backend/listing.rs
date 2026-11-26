@@ -87,6 +87,15 @@ pub fn display_name(container: &Container, all: &[Container]) -> String {
     }
 }
 
+/// The key a container's remembered user is stored under: `project/service` for a Compose
+/// container, whatever its replica number, and its name for any other.
+pub fn remember_key(container: &Container) -> String {
+    match (&container.project, &container.service) {
+        (Some(project), Some(service)) => format!("{project}/{service}"),
+        _ => container.name.clone(),
+    }
+}
+
 /// Why a container reference did not pick exactly one container.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolveError {
@@ -365,5 +374,26 @@ mod tests {
         assert_eq!(resolved("nope", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("nope/web", &all), Err(ResolveError::NotFound));
         assert_eq!(resolved("web", &[]), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn remember_key_uses_project_service() {
+        let ct = container("shop-api-1", Some("shop"), Some("api"), 1);
+        assert_eq!(remember_key(&ct), "shop/api");
+    }
+
+    #[test]
+    fn remember_key_ignores_replica_number() {
+        let first = container("shop-api-1", Some("shop"), Some("api"), 1);
+        let second = container("shop-api-2", Some("shop"), Some("api"), 2);
+        assert_eq!(remember_key(&first), remember_key(&second));
+    }
+
+    #[test]
+    fn remember_key_falls_back_to_name() {
+        assert_eq!(remember_key(&container("web", None, None, 0)), "web");
+        let mut lone = container("odd", Some("shop"), None, 0);
+        lone.service = None;
+        assert_eq!(remember_key(&lone), "odd");
     }
 }

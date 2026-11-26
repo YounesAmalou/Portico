@@ -349,6 +349,51 @@ fn tui_tabs_switch_on_a_real_pty() {
 }
 
 #[test]
+fn tui_remembers_a_container_user() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "dev", "-H", "dev.example"])
+        .assert_success();
+    env.install_program(
+        "ssh",
+        "#!/bin/sh\nprintf 'hostname dev.example\\nport 22\\n'\n",
+    );
+    env.install_program(
+        "docker",
+        r#"#!/bin/sh
+if [ "$1" = ps ]; then
+  printf '%s\n' '{"id":"abc123","name":"shop-api-1","image":"api:1","command":"run","running_for":"1 hour ago","status":"Up 1 hour","ports":"","networks":"shop_default","mounts":"","project":"shop","service":"api","number":"1","working_dir":"/srv/shop"}'
+fi
+exit 0
+"#,
+    );
+
+    // A first run sets the user and opens a shell; a second run starts from the saved file.
+    for scenario in ["remembered_user", "remembered_user_restored"] {
+        let output = std::process::Command::new("python3")
+            .arg("-I")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/tui_pty.py"
+            ))
+            .arg(env!("CARGO_BIN_EXE_portico"))
+            .arg(env.home())
+            .arg(env.bin())
+            .arg(scenario)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "PTY harness failed ({scenario}):\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+}
+
+#[test]
 fn settings_overlay_hides_a_tab() {
     let env = TestEnv::new();
     env.run(["init", "-y"]).assert_success();

@@ -52,7 +52,7 @@ use crate::{
     domain::host::{Change, Host, HostChanges},
     domain::identity::IdentityInventory,
     domain::managed::TransactionError,
-    domain::settings::{Key, SettingsError, Tabs},
+    domain::settings::{Key, SettingsError, Tabs, UserKey},
     domain::suggest,
     platform::paths::tilde,
 };
@@ -158,7 +158,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
     state.home = app.home().to_owned();
     state.settings_path = app.settings_path().to_owned();
     match app.settings() {
-        Ok(settings) => state.apply_tabs(settings.tabs),
+        Ok(settings) => {
+            state.apply_tabs(settings.tabs);
+            state.containers.remember(&settings.users);
+            state.settings_valid = true;
+        }
         Err(error) => state.status = Some(settings_problem(&error, &state.home)),
     }
     sync_details(&mut state, &mut workers.resolver, false);
@@ -253,10 +257,17 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     backend,
                     id,
                     user,
+                    remember,
                     via,
                     new_terminal,
                 },
             ) => {
+                let unremembered = remember_after_shell(
+                    app,
+                    state.settings_valid,
+                    remember.as_ref(),
+                    user.as_deref(),
+                );
                 let shell = |cancelled| {
                     let user = user.as_deref();
                     app.container_shell(
@@ -275,10 +286,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 } else {
                     suspended(terminal, session, signals, || Ok(shell(Some(terminated))))?
                 };
-                state
-                    .containers
-                    .panel_mut(panel)
-                    .set_status(Some(shell_status(&target, result)));
+                let mut status = shell_status(&target, result);
+                if let Some(unremembered) = unremembered {
+                    status = format!("{status} · {unremembered}");
+                }
+                state.containers.panel_mut(panel).set_status(Some(status));
             }
             UiAction::Containers(backend, PanelAction::Fix { target, offer }) => {
                 let result = suspended(terminal, session, signals, || {
@@ -1104,6 +1116,9 @@ struct UiState {
     settings: Option<SettingsOverlay>,
     /// The settings file, shown in the overlay.
     settings_path: PathBuf,
+    /// Whether the settings file read at startup was valid: an invalid one is never written,
+    /// so a shell's user is not remembered.
+    settings_valid: bool,
 }
 
 type TestResults = PerHost<TestMark>;
@@ -1193,6 +1208,7 @@ impl UiState {
             tunnels: TunnelsScreen::default(),
             settings: None,
             settings_path: PathBuf::new(),
+            settings_valid: false,
         }
     }
 
@@ -1482,6 +1498,23 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
             &tilde(&state.settings_path, &state.home),
         );
     }
+}
+
+/// Remembers `user` for the container of a shell about to open (`None` forgets it), unless
+/// the shell remembers nothing or the settings file was invalid at startup. On failure, the
+/// message the status line adds after the shell's own.
+fn remember_after_shell(
+    app: &App,
+    settings_valid: bool,
+    key: Option<&UserKey>,
+    user: Option<&str>,
+) -> Option<String> {
+    let key = key.filter(|_| settings_valid)?;
+    let error = app.remember_container_user(key, user).err()?;
+    Some(format!(
+        "User not remembered: {}",
+        settings_problem(&error, app.home())
+    ))
 }
 
 /// The error's line, with the settings file's path shown from `home` as `~`.
@@ -2996,8 +3029,13 @@ mod tests {
         assert_eq!(state.tab, Tab::Tunnels);
         assert!(state.tunnels.footer().contains("Ctrl+Space suggest"));
         press(&mut state, KeyCode::Esc);
-        // The containers filter, user and target picker.
+        // The containers filter, user and target picker, with a container selected to edit
+        // the user of.
         char(&mut state, '3');
+        state
+            .containers
+            .panel_mut(BackendId::Docker)
+            .show(Target::Host("dev".into()));
         dev_listed(&mut state);
         for opener in ['/', 'u', 'h'] {
             char(&mut state, opener);
@@ -3505,5 +3543,79 @@ mod tests {
             Some(error.as_str())
         );
         assert!(rendered(&state).contains("portico desktop install failed"));
+    }
+
+    fn api_key() -> UserKey {
+        UserKey {
+            target: Target::Local,
+            backend: BackendId::Docker,
+            container: "shop/api".into(),
+        }
+    }
+
+    #[test]
+    fn remember_after_shell_writes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path()).with_settings_path(dir.path().join("settings.toml"));
+        assert_eq!(
+            remember_after_shell(&app, true, Some(&api_key()), Some("deploy")),
+            None
+        );
+        assert_eq!(app.settings().unwrap().user(&api_key()), Some("deploy"));
+        assert_eq!(
+            remember_after_shell(&app, true, Some(&api_key()), None),
+            None
+        );
+        assert_eq!(app.settings().unwrap().user(&api_key()), None, "forgotten");
+        assert_eq!(remember_after_shell(&app, true, None, Some("root")), None);
+        assert!(app.settings().unwrap().users.is_empty(), "Proxmox");
+    }
+
+    #[test]
+    fn invalid_file_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path()).with_settings_path(dir.path().join("settings.toml"));
+        std::fs::write(app.settings_path(), "[tabs\n").unwrap();
+        assert_eq!(
+            remember_after_shell(&app, false, Some(&api_key()), Some("deploy")),
+            None,
+            "the startup problem stands"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.settings_path()).unwrap(),
+            "[tabs\n"
+        );
+        // Not even a file that became valid since.
+        std::fs::write(app.settings_path(), "").unwrap();
+        assert_eq!(
+            remember_after_shell(&app, false, Some(&api_key()), Some("deploy")),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(app.settings_path()).unwrap(), "");
+    }
+
+    #[test]
+    fn failed_write_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path());
+        std::fs::create_dir_all(app.settings_path().parent().unwrap()).unwrap();
+        std::fs::write(app.settings_path(), "[tabs\n").unwrap();
+        let message = remember_after_shell(&app, true, Some(&api_key()), Some("deploy")).unwrap();
+        let error = app.settings().unwrap_err();
+        assert_eq!(
+            message,
+            format!(
+                "User not remembered: {}",
+                settings_problem(&error, app.home())
+            )
+        );
+        assert!(
+            message.contains("~/.config/portico/settings.toml"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.settings_path()).unwrap(),
+            "[tabs\n"
+        );
     }
 }
