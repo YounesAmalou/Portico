@@ -38,42 +38,29 @@ e2e() {
     cargo test --test e2e -- --ignored
 }
 
-# TEMPORARY DIAGNOSTIC (Ruling G): which unit tests the SIGHUP comes with.
-diag_rounds() {
-    local filter round code out
-    out=$(mktemp)
-    for filter in app::containers:: backend:: app::tests:: cli:: tui:: domain:: platform::; do
-        for round in 1 2 3 4 5 6; do
-            set -m
-            cargo test --lib -q -- --test-threads=8 "$filter" >"$out" 2>&1 </dev/null &
-            local job=$!
-            set +m
-            code=0
-            wait "$job" || code=$?
-            echo "DIAG $filter round $round: exit $code"
-            [ "$code" = 0 ] || tail -n 3 "$out"
-        done
-    done
-    rm -f -- "$out"
+# Runs a command as the leader of a new session (macOS has no setsid(1)).
+in_own_session() {
+    perl -MPOSIX -e 'POSIX::setsid() != -1 or die "setsid: $!\n"; exec @ARGV or die "exec: $!\n"' "$@"
 }
 
-# The test suite. On macOS the tests write to a file the step prints as it grows, not to the
-# step's own output, and get TEST_LIMIT seconds (300 by default) once built: a test that hangs,
-# or a process that never exits while holding the output, then ends the step with the tests
-# still running and a process listing, instead of a job that times out with no log at all.
+# The test suite. On macOS it runs in a session of its own, and so in a process group of its own.
+# The runner's processes share one process group, which the tests otherwise joined: macOS sent
+# that group SIGHUP, as it does an orphaned process group, while a test ending a process tree
+# held some of its processes stopped, and the runner ended with the tests (the job then timed
+# out without a log). The processes launchd adopts from the tests are in another session than
+# theirs, so their exits no longer count against the tests' group. The tests write to a file the
+# step prints as it grows, and get TEST_LIMIT seconds (300 by default) once built: a hang ends
+# the step with the tests' output and a process listing.
 tests() {
     if [ "$(uname -s)" != Darwin ]; then
         cargo test --all-targets --no-fail-fast
         return
     fi
     cargo test --all-targets --no-run
-    diag_rounds
     local log status=0 waited=0 limit=${TEST_LIMIT:-300}
     log=$(mktemp)
-    set -m
-    cargo test --all-targets --no-fail-fast >"$log" 2>&1 </dev/null &
+    in_own_session cargo test --all-targets --no-fail-fast >"$log" 2>&1 </dev/null &
     local tests=$!
-    set +m
     tail -n +1 -f "$log" &
     local tail=$!
     while kill -0 "$tests" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
