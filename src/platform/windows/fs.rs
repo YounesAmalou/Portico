@@ -21,7 +21,8 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_WRITE_PROTECT, HANDLE},
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ADD_FILE, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_TEMPORARY,
+        FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
         GetFileInformationByHandle, GetFileInformationByHandleEx, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -197,21 +198,24 @@ pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
 }
 
 /// Whether the current user may write to `path`: a file is opened for writing (without
-/// truncating it), a directory for adding a file, which the access control list and the
-/// read-only attribute both answer. An error that is not a refusal (the path is missing, say)
-/// is returned.
+/// truncating it), which the access control list and the read-only attribute both answer; in
+/// a directory a file is created, and deleted again as it is closed. Opening the directory
+/// itself would not do: an administrator may open it whatever its access rules say. An error
+/// that is not a refusal (the path is missing, say) is returned.
 pub fn writable(path: &Path) -> io::Result<bool> {
-    let mut options = OpenOptions::new();
-    if fs::metadata(path)?.is_dir() {
-        // A directory can only be opened with backup semantics; its read-only attribute
-        // does not stop files being added to it.
-        options
-            .access_mode(FILE_ADD_FILE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let opened = if fs::metadata(path)?.is_dir() {
+        static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let probe = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .attributes(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path.join(format!(".portico-writable-{}-{probe}", std::process::id())))
     } else {
-        options.write(true);
-    }
-    match options.open(path) {
+        OpenOptions::new().write(true).open(path)
+    };
+    match opened {
         Ok(_) => Ok(true),
         Err(error) if is_read_only_error(&error) => Ok(false),
         Err(error) => Err(error),
