@@ -9,6 +9,7 @@ pub mod keybinding;
 pub mod launcher;
 pub mod panel;
 pub mod status;
+pub mod tray;
 
 use std::{
     ffi::OsString,
