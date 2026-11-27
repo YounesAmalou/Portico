@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn nothing_installed() {
         let (_dir, env) = omarchy();
-        let s = status(&env);
+        let s = linux_status(&env);
         assert!(!s.installed);
         assert_eq!(s.lines[0].label, "Panel");
         assert_eq!(s.lines[0].text, "not installed");
@@ -318,7 +318,7 @@ mod tests {
         fs::write(&icon, launcher::icon_file()).unwrap();
         add_binding(&env);
         std::os::unix::fs::symlink(env.panel_dir(), Target::Omarchy.link(&env)).unwrap();
-        let s = status(&env);
+        let s = linux_status(&env);
         assert!(s.installed);
         assert!(
             s.lines[0].text.starts_with("installed in "),
@@ -350,7 +350,7 @@ mod tests {
     fn only_a_binding_counts_as_installed() {
         let (_dir, env) = omarchy();
         add_binding(&env);
-        let s = status(&env);
+        let s = linux_status(&env);
         assert!(s.installed);
         assert_eq!(s.lines[0].text, "not installed");
     }

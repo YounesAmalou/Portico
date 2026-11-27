@@ -86,6 +86,18 @@ pub fn run(
         let host = tray::SystemHost::new(env);
         return super::tray::run(command, env, system, &host, input, output, interactive);
     }
+    run_linux(command, env, input, output, interactive)
+}
+
+/// The Linux flow: the Quickshell panel, the launcher entry and the keybinding. Separate from
+/// `run` so its tests run on every Unix, whatever `run` dispatches to there.
+fn run_linux(
+    command: DesktopCommand,
+    env: &DesktopEnv,
+    input: &mut dyn BufRead,
+    output: Out,
+    interactive: bool,
+) -> Result<ExitCode, String> {
     match command {
         DesktopCommand::Install {
             omarchy,
@@ -1007,7 +1019,7 @@ mod tests {
 
     fn install(env: &DesktopEnv, answers: &str) -> (Result<ExitCode, String>, String) {
         let mut output = Vec::new();
-        let result = run(
+        let result = run_linux(
             DesktopCommand::Install {
                 omarchy: false,
                 quickshell: false,
