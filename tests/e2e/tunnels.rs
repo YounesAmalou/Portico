@@ -378,9 +378,11 @@ fn the_tui_adds_starts_and_stops_a_tunnel() {
     terminal.type_text("db");
     terminal.key(Key::Tab);
     terminal.type_text("bo");
-    // Tab completes the alias, and then moves on.
+    // Tab completes the alias, and then moves on: past Container (left empty, so Backend is
+    // not offered) and Kind.
     terminal.key(Key::Tab);
     for field in [
+        "",
         "",
         "127.0.0.1",
         &port.to_string(),
