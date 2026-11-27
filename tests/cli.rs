@@ -1031,3 +1031,143 @@ fn settings_reports_an_invalid_file() {
     env.run(["settings"])
         .assert_exit_code_and_stderr_contains(1, "line 1");
 }
+
+/// A port nobody uses: bound, read, released.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// An initialised home with the host `prod`, whose ssh starts tunnels as
+/// `support::install_tunnel_ssh` does and answers the listening-ports command with 80 and 443.
+fn forward_env() -> TestEnv {
+    let env = TestEnv::new();
+    support::install_tunnel_ssh(&env);
+    std::fs::write(
+        env.home().parent().unwrap().join("remote-calls"),
+        "printf 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:*\\nLISTEN 0 511 [::]:443 [::]:*\\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*\\n'\n",
+    )
+    .unwrap();
+    env.run(["init", "-y"]).assert_success();
+    env.run(["add", "prod", "-H", "prod.example"])
+        .assert_success();
+    env
+}
+
+/// Stops every tunnel when dropped, so no stand-in outlives a failed test.
+struct StopAll<'a>(&'a TestEnv);
+
+impl Drop for StopAll<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.run(["tunnel", "stop", "--all"]);
+    }
+}
+
+fn stdout_of(result: support::RunResult) -> String {
+    let output = result.0;
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn forward_requires_a_port_when_not_interactive() {
+    let env = forward_env();
+    env.run(["forward", "--on", "prod"])
+        .assert_exit_code_and_stderr(2, "error: --port is required; suggested: 80, 443\n");
+    assert!(env.run(["tunnels"]).0.stdout.starts_with(b"No tunnels."));
+}
+
+#[test]
+fn forward_refuses_a_local_port_of_zero() {
+    let env = forward_env();
+    let output = env.run(["forward", "--on", "prod", "--port", "5432", "--local", "0"]);
+    output.assert_exit_code_and_stderr(
+        1,
+        "error: local port 0 is not a port; give one from 1 through 65535\n",
+    );
+    assert!(env.run(["tunnels"]).0.stdout.starts_with(b"No tunnels."));
+}
+
+#[test]
+fn forward_prints_the_address_and_how_to_keep_it() {
+    let env = forward_env();
+    let _stop = StopAll(&env);
+    let local = free_port();
+    let output = stdout_of(env.run([
+        "forward",
+        "--on",
+        "prod",
+        "--port",
+        "5432",
+        "--local",
+        &local.to_string(),
+    ]));
+    assert_eq!(
+        output,
+        format!(
+            "Forwarding 127.0.0.1:{local} \u{2192} prod:5432 (temporary forward _prod-5432).\n\
+             Stop it with `portico tunnel stop _prod-5432`, keep it with `portico tunnel save _prod-5432`.\n"
+        )
+    );
+    let list = stdout_of(env.run(["tunnels"]));
+    assert!(list.contains("_prod-5432 (temporary)  prod  "), "{list}");
+    assert!(list.contains("running  pid "), "{list}");
+    env.run(["tunnel", "stop", "_prod-5432"])
+        .assert_stdout_contains("Stopped _prod-5432.");
+    assert!(stdout_of(env.run(["tunnels"])).starts_with("No tunnels."));
+}
+
+#[test]
+fn forward_to_a_local_container_prints_where_it_is_reachable() {
+    let env = TestEnv::new();
+    env.run(["init", "-y"]).assert_success();
+    env.install_program(
+        "docker",
+        r#"#!/bin/sh
+if [ "$1" = inspect ]; then
+  echo '{"bridge":{"IPAddress":"172.18.0.4"}}|{"80/tcp":{}}|default'
+  exit 0
+fi
+cat <<'EOF'
+{"id":"aaaa1111","name":"web","image":"nginx","command":"","running_for":"","status":"Up 2 hours","ports":"0.0.0.0:8080->80/tcp","networks":"bridge","mounts":"","project":"","service":"","number":"","working_dir":""}
+EOF
+"#,
+    );
+    let output = stdout_of(env.run(["forward", "web"]));
+    assert_eq!(output, "Port 80 of web is reachable at 127.0.0.1:8080.\n");
+    // Nothing was started.
+    assert!(stdout_of(env.run(["tunnels"])).starts_with("No tunnels."));
+}
+
+#[test]
+fn tunnel_save_keeps_a_temporary_forward() {
+    let env = forward_env();
+    let _stop = StopAll(&env);
+    let local = free_port().to_string();
+    stdout_of(env.run([
+        "forward", "--on", "prod", "--port", "5432", "--local", &local,
+    ]));
+    let output = stdout_of(env.run(["tunnel", "save", "_prod-5432", "--name", "pg"]));
+    assert_eq!(
+        output,
+        "Saved pg.\nRestarted it as pg; connections through it were interrupted.\n"
+    );
+    let list = stdout_of(env.run(["tunnels"]));
+    assert!(list.contains("pg  prod  "), "{list}");
+    assert!(!list.contains("_prod-5432"), "{list}");
+    assert!(list.contains("running  pid "), "{list}");
+    let file = std::fs::read_to_string(env.home().join(".ssh/portico/tunnels")).unwrap();
+    assert!(file.contains("pg"), "{file}");
+    // Only a temporary forward is saved.
+    env.run(["tunnel", "save", "pg"])
+        .assert_failure_stderr_contains("pg is not a temporary forward");
+}

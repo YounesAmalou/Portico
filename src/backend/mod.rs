@@ -12,7 +12,7 @@ use podman::Podman;
 use proxmox::Proxmox;
 
 pub use listing::{
-    Container, Group, Listing, ResolveError, display_name, group, remember_key, resolve,
+    Container, Group, Listing, Published, ResolveError, display_name, group, remember_key, resolve,
 };
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
@@ -104,6 +104,30 @@ pub struct ContainerList {
     pub via: Option<Via>,
     /// Said once when `via` is set: other shells still lack the group.
     pub note: Option<String>,
+}
+
+/// One port a container listens on, as a forward can reach it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortOffer {
+    /// The port inside the container.
+    pub port: u16,
+    /// The port of the host it is published on, when it is.
+    pub published: Option<u16>,
+    /// The one host address it is published on, when that is neither a wildcard nor loopback:
+    /// reached there rather than at `localhost`.
+    pub published_address: Option<String>,
+    /// Listens on loopback only inside the container: nothing but the container reaches it.
+    pub loopback_only: bool,
+}
+
+/// Where a container can be reached from its host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reach {
+    /// The container's own address on the host, when it has one a host can use.
+    pub address: Option<String>,
+    /// The container shares the host's network: its ports are the host's.
+    pub host_network: bool,
+    pub ports: Vec<PortOffer>,
 }
 
 /// A container backend. Docker is the default: the backend of a held shell named without one.
@@ -254,6 +278,18 @@ pub trait Backend {
     /// when the listing needed it.
     fn shell_words(&self, id: &str, user: Option<&str>, via: Option<Via>) -> Vec<String>;
 
+    /// Where `container` can be reached from `target`: its address and the ports it offers,
+    /// asked with the commands `run` runs, through `via` as `shell_words` applies it. A run that
+    /// fails stops it as `ListFailure::Run`; a tool that ran and refused is a
+    /// `ListFailure::Issue`.
+    fn reach<E>(
+        &self,
+        target: &Target,
+        container: &Container,
+        via: Option<Via>,
+        run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    ) -> Result<Reach, ListFailure<E>>;
+
     /// `problem` explained without asking the target anything more.
     fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue;
 }
@@ -282,6 +318,21 @@ pub fn shell_words(
         BackendId::Docker => Docker.shell_words(id, user, via),
         BackendId::Podman => Podman.shell_words(id, user, via),
         BackendId::Proxmox => Proxmox.shell_words(id, user, via),
+    }
+}
+
+/// Where a container of `backend` can be reached; see [`Backend::reach`].
+pub fn reach<E>(
+    backend: BackendId,
+    target: &Target,
+    container: &Container,
+    via: Option<Via>,
+    run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+) -> Result<Reach, ListFailure<E>> {
+    match backend {
+        BackendId::Docker => Docker.reach(target, container, via, run),
+        BackendId::Podman => Podman.reach(target, container, via, run),
+        BackendId::Proxmox => Proxmox.reach(target, container, via, run),
     }
 }
 

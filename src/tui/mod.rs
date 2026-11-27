@@ -24,6 +24,7 @@ mod containers;
 mod dropdown;
 mod events;
 mod form;
+mod forward;
 mod hangup;
 mod hosts;
 mod identities;
@@ -39,7 +40,10 @@ mod tunnels;
 mod watch;
 
 use crate::{
-    app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestTarget},
+    app::{
+        App, AppError, ForwardTarget, HostDetails, HostInventory, HostSummary, Ownership,
+        TestTarget,
+    },
     backend::{AUTOMATIC, BackendId, Target},
     desktop::{
         DesktopEnv,
@@ -61,6 +65,7 @@ use containers::{
 };
 use events::{Step, TerminalEvents};
 use form::{FORM_FIELDS, FormState, IDENTITY_FILE, PROXY_JUMP};
+use forward::{ForwardDialog, Suggester};
 pub(crate) use hangup::read_event;
 use hangup::{HangupWatch, wait_for_enter};
 use hosts::{DetailsCache, PendingTrust, PerHost, TestMark, details_for_selected, render_hosts};
@@ -74,7 +79,7 @@ use terminal::{PanicHook, Signals, TerminalGuard, TerminalSession, suspended};
 use tester::{Job, Origin, Tester};
 pub(crate) use text_input::TextInput;
 use thiserror::Error;
-use tunnels::{Starter, TunnelAction, TunnelsScreen};
+use tunnels::{Finished, Starter, TunnelAction, TunnelsScreen};
 use watch::ConfigWatch;
 
 /// Longest quiet period after a selection change before the host is resolved.
@@ -191,6 +196,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             continue;
         }
         if let Event::Paste(text) = event {
+            if state.forward.is_some() {
+                state.paste_forward(&text);
+                redraw = true;
+                continue;
+            }
             if state.handle_paste(&text) == UiAction::FormEdited {
                 workers
                     .tester
@@ -221,6 +231,22 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             UiAction::Quit => return Ok(()),
             UiAction::Tunnels(action) => {
                 run_tunnel_action(app, &mut state, &mut workers.starter, action)
+            }
+            UiAction::OpenForward(target) => workers.suggester.request(target),
+            UiAction::CloseForward => workers.suggester.cancel(),
+            UiAction::Copy(text) => {
+                let status = match terminal::copy_osc52(&text) {
+                    Ok(()) => format!("copied {text}"),
+                    Err(error) => format!("could not copy {text}: {error}"),
+                };
+                show_clipboard_status(&mut state, status);
+            }
+            UiAction::OpenUrl(url) => {
+                let status = match crate::platform::launcher::open_url(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(error) => format!("could not open {url}: {error}"),
+                };
+                show_clipboard_status(&mut state, status);
             }
             UiAction::Connect {
                 alias,
@@ -481,8 +507,17 @@ fn on_tick(
     if state.in_form() {
         workers.indexer.request();
     }
-    if let Some((name, result)) = workers.starter.poll() {
-        state.tunnels.finish_start(&name, result);
+    if let Some(loaded) = workers.suggester.try_finished()
+        && let Some(dialog) = &mut state.forward
+    {
+        dialog.finish_loading(loaded);
+        redraw = true;
+    }
+    let finished = workers.starter.poll();
+    if !finished.is_empty() {
+        for finished in finished {
+            finish_job(state, finished);
+        }
         state.tunnels.reload(app);
         redraw = true;
     }
@@ -513,14 +548,59 @@ fn on_tick(
     redraw
 }
 
+/// Shows the result of a job of the tunnels tab's start worker; the caller reloads afterwards.
+fn finish_job(state: &mut UiState, finished: Finished) {
+    match finished {
+        Finished::Tunnel(name, result) => state.tunnels.finish_start(&name, result),
+        Finished::Forward(result) => state.finish_forward(result),
+        Finished::Save(result) => state.tunnels.finish_save(result),
+    }
+}
+
+/// The status line after stopping tunnel `name`: stopping a temporary forward removes it.
+fn stop_status(name: &str, result: Result<crate::app::StopOutcome, AppError>) -> String {
+    use crate::app::StopOutcome;
+    let temporary = crate::domain::tunnel::is_temporary(name);
+    let name = crate::domain::tunnel::printable(name);
+    match result {
+        Ok(StopOutcome::Stopped) if temporary => format!("Stopped and removed {name}"),
+        Ok(StopOutcome::Stopped) => format!("Stopped {name}"),
+        Ok(StopOutcome::NotRunning) if temporary => format!("Removed {name}"),
+        Ok(StopOutcome::NotRunning) => format!("{name} was not running"),
+        Err(error) => crate::domain::tunnel::printable(&error.to_string()),
+    }
+}
+
+/// Shows a copy's or an open's outcome where it was asked for: the forward dialog when it is
+/// open, otherwise the Tunnels tab.
+fn show_clipboard_status(state: &mut UiState, status: String) {
+    match &mut state.forward {
+        Some(dialog) => dialog.set_status(status),
+        None => state.tunnels.set_status(status),
+    }
+}
+
 /// Carries out what the Tunnels tab asked for.
 fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, action: TunnelAction) {
     let screen = &mut state.tunnels;
     match action {
-        TunnelAction::None | TunnelAction::Quit => return,
+        // Copy and Open become the interface's own actions before they get here.
+        TunnelAction::None | TunnelAction::Quit | TunnelAction::Copy(_) | TunnelAction::Open(_) => {
+            return;
+        }
         TunnelAction::Refresh => screen.set_status("Refreshed"),
         TunnelAction::Start(name) => {
             starter.start(name);
+            screen.set_starting(starter.running().map(str::to_owned));
+            return;
+        }
+        TunnelAction::Forward {
+            target,
+            reach,
+            remote,
+            local,
+        } => {
+            starter.forward(target, reach, remote, local);
             screen.set_starting(starter.running().map(str::to_owned));
             return;
         }
@@ -528,11 +608,13 @@ fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, acti
             starter.cancel();
             screen.set_starting(None);
         }
-        TunnelAction::Stop(name) => screen.set_status(match app.stop_tunnel(&name) {
-            Ok(crate::app::StopOutcome::Stopped) => format!("Stopped {name}"),
-            Ok(crate::app::StopOutcome::NotRunning) => format!("{name} was not running"),
-            Err(error) => error.to_string(),
-        }),
+        TunnelAction::Stop(name) => screen.set_status(stop_status(&name, app.stop_tunnel(&name))),
+        // The save restarts a running forward, which runs on the worker like any start.
+        TunnelAction::Save { temporary, name } => {
+            starter.save(temporary, name);
+            screen.set_starting(starter.running().map(str::to_owned));
+            return;
+        }
         TunnelAction::Add(tunnel) => {
             let done = format!("Saved {}", tunnel.name);
             screen.finish_change(app.add_tunnel(tunnel), done);
@@ -797,6 +879,7 @@ struct Workers {
     planner: Planner,
     indexer: Indexer,
     starter: Starter,
+    suggester: Suggester,
 }
 
 impl Workers {
@@ -811,6 +894,7 @@ impl Workers {
             planner: Planner::spawn(scope, app),
             indexer: Indexer::spawn(scope, app),
             starter: Starter::spawn(scope, app),
+            suggester: Suggester::spawn(scope, app),
         }
     }
 
@@ -830,6 +914,7 @@ impl Workers {
             || self.planner.is_running()
             || self.indexer.is_running()
             || self.starter.running().is_some()
+            || self.suggester.is_running()
     }
 }
 
@@ -1078,6 +1163,8 @@ struct UiState {
     /// Whether the settings file read at startup was valid: an invalid one is never written,
     /// so a shell's user is not remembered.
     settings_valid: bool,
+    /// The forward dialog, over the hosts or a container tab while it is open.
+    forward: Option<ForwardDialog>,
 }
 
 type TestResults = PerHost<TestMark>;
@@ -1126,6 +1213,14 @@ enum UiAction {
     Setting(Key),
     /// Runs a desktop integration action of the open overlay.
     Desktop(DesktopRun),
+    /// Asks for the suggestions of the forward dialog just opened for the target.
+    OpenForward(ForwardTarget),
+    /// The forward dialog closed: its suggestions are no longer wanted.
+    CloseForward,
+    /// Puts the text on the terminal's clipboard.
+    Copy(String),
+    /// Opens the URL in the browser.
+    OpenUrl(String),
 }
 
 impl UiState {
@@ -1168,6 +1263,7 @@ impl UiState {
             settings: None,
             settings_path: PathBuf::new(),
             settings_valid: false,
+            forward: None,
         }
     }
 
@@ -1266,6 +1362,9 @@ impl UiState {
         if self.mode == Mode::Settings {
             return self.handle_settings_key(key);
         }
+        if self.forward.is_some() {
+            return self.handle_forward_key(key);
+        }
         if let Some(action) = self.handle_tab_key(key) {
             return action;
         }
@@ -1273,6 +1372,8 @@ impl UiState {
             Tab::Hosts => self.handle_hosts_key(key),
             Tab::Tunnels => match self.tunnels.handle_key(key) {
                 TunnelAction::Quit => UiAction::Quit,
+                TunnelAction::Copy(text) => UiAction::Copy(text),
+                TunnelAction::Open(url) => UiAction::OpenUrl(url),
                 action => UiAction::Tunnels(action),
             },
             Tab::Containers(backend) => {
@@ -1299,6 +1400,17 @@ impl UiState {
                         self.containers.panel_mut(backend).choose_target(hosts);
                         UiAction::None
                     }
+                    PanelAction::Forward {
+                        target,
+                        backend,
+                        container,
+                        via,
+                    } => self.open_forward(ForwardTarget::Container {
+                        target,
+                        backend,
+                        container,
+                        via,
+                    }),
                     action => self.containers.after_key(backend, &before, action),
                 }
             }
@@ -1450,6 +1562,9 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         }
         Tab::Containers(backend) => render_containers(frame, body, state, backend),
     }
+    if let Some(dialog) = &state.forward {
+        dialog.render(frame, body, &state.home);
+    }
     if let Some(overlay) = &state.settings {
         overlay.render(
             frame,
@@ -1586,7 +1701,7 @@ fn footer_text(state: &UiState) -> String {
             let containers = state.containers_hint();
             let tab_keys = state.tab_keys_hint();
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  {containers}{tab_keys}, settings  q quit"
+                "{output}t test  Enter connect  {new_terminal}  f forward  {containers}{tab_keys}, settings  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""
@@ -2668,6 +2783,8 @@ mod tests {
                 .unwrap(),
             status: TunnelStatus::Running { pid: 7, started: 0 },
             warnings: Vec::new(),
+            temporary: false,
+            reaches: "dev".into(),
         }]);
         state
     }
@@ -3344,6 +3461,128 @@ mod tests {
             "{}",
             buffer_text(&buffer)
         );
+    }
+
+    #[test]
+    fn stopping_a_temporary_forward_says_it_was_removed() {
+        use crate::app::StopOutcome;
+        assert_eq!(
+            stop_status("_prod-80", Ok(StopOutcome::Stopped)),
+            "Stopped and removed _prod-80"
+        );
+        assert_eq!(
+            stop_status("_prod-80", Ok(StopOutcome::NotRunning)),
+            "Removed _prod-80"
+        );
+        assert_eq!(stop_status("db", Ok(StopOutcome::Stopped)), "Stopped db");
+        assert_eq!(
+            stop_status(
+                "db",
+                Err(AppError::Tunnel(crate::app::TunnelRefusal::Unknown(
+                    "d\u{1b}[31mb".into()
+                )))
+            ),
+            stop_status(
+                "db",
+                Err(AppError::Tunnel(crate::app::TunnelRefusal::Unknown(
+                    "db".into()
+                )))
+            ),
+            "the error is printable"
+        );
+    }
+
+    #[test]
+    fn a_save_runs_on_the_start_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path());
+        let mut state = test_state(vec![summary("prod", Ownership::Managed)]);
+        std::thread::scope(|scope| {
+            let mut starter = Starter::spawn(scope, &app);
+            run_tunnel_action(
+                &app,
+                &mut state,
+                &mut starter,
+                TunnelAction::Save {
+                    temporary: "_prod-80".into(),
+                    name: "prod-80".into(),
+                },
+            );
+            assert_eq!(starter.running(), Some("_prod-80"), "not run inline");
+            assert_eq!(
+                state.tunnels.status_line().as_deref(),
+                Some("Starting _prod-80\u{2026} (Esc to cancel)")
+            );
+            let finished = loop {
+                let finished = starter.poll();
+                if !finished.is_empty() {
+                    break finished;
+                }
+                std::thread::yield_now();
+            };
+            assert!(
+                matches!(finished.as_slice(), [tunnels::Finished::Save(Err(_))]),
+                "{finished:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_finished_save_shows_its_status() {
+        use crate::domain::tunnel::{Forward, Kind, Tunnel};
+        let mut state = test_state(vec![summary("prod", Ownership::Managed)]);
+        finish_job(
+            &mut state,
+            tunnels::Finished::Save(Ok(crate::app::SaveOutcome {
+                tunnel: Tunnel::new(
+                    "prod-80",
+                    "prod",
+                    Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                )
+                .unwrap(),
+                restarted: Some(crate::app::StartOutcome::Started { pid: 9 }),
+                note: None,
+                cancelled: false,
+            })),
+        );
+        assert_eq!(
+            state.tunnels.status_line().as_deref(),
+            Some("saved prod-80; restarted it (connections through it were interrupted)")
+        );
+    }
+
+    #[test]
+    fn the_tunnels_tab_copies_and_opens_a_local_address() {
+        use crate::domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
+        let mut state = test_state(vec![summary("prod", Ownership::Managed)]);
+        state.tunnels = tunnels::tests::screen_with(vec![TunnelReport {
+            tunnel: Tunnel {
+                name: "_prod-80".into(),
+                host: "prod".into(),
+                forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+            },
+            status: TunnelStatus::Running { pid: 7, started: 0 },
+            warnings: Vec::new(),
+            temporary: true,
+            reaches: "prod".into(),
+        }]);
+        char(&mut state, '2');
+        assert_eq!(
+            char(&mut state, 'y'),
+            UiAction::Copy("127.0.0.1:8080".into())
+        );
+        assert_eq!(
+            char(&mut state, 'b'),
+            UiAction::OpenUrl("http://127.0.0.1:8080".into())
+        );
+        show_clipboard_status(&mut state, "copied 127.0.0.1:8080".into());
+        assert_eq!(
+            state.tunnels.status_line().as_deref(),
+            Some("copied 127.0.0.1:8080")
+        );
+        let text = render_text_at(&state, 120);
+        assert!(text.contains("w save"), "{text}");
+        assert!(text.contains("temporary"), "{text}");
     }
 
     #[test]

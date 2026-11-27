@@ -419,3 +419,90 @@ fn shim_passes_arguments_and_exit_code() {
     );
     assert_eq!(output.status.code(), Some(7));
 }
+
+/// A fake `ssh`: `-G` answers like OpenSSH (refusing the alias `rejected`), and a tunnel start
+/// (`-f`, or `-N` where ssh cannot background itself) logs its arguments and leaves a
+/// background stand-in that carries them, as the real ssh's background process does (or, with
+/// `-N`, stays in the foreground authenticated), unless `fail-start` exists, when it fails as
+/// ssh would on a busy remote port, or `exit-after-auth`, when it does so half a second after
+/// authenticating. Any other call runs `remote-calls`' script when it exists, so a test can
+/// answer a remote command. Returns the log of the tunnel starts.
+pub fn install_tunnel_ssh(env: &TestEnv) -> PathBuf {
+    let log = env.home().parent().unwrap().join("ssh-calls");
+    let fail = env.home().parent().unwrap().join("fail-start");
+    let exit_after_auth = env.home().parent().unwrap().join("exit-after-auth");
+    env.install_program(
+        "ssh",
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = -G ]; then
+  for alias do :; done
+  if [ "$alias" = rejected ] && [ "$2" = -o ]; then
+    echo "Bad local forwarding specification '1:x'" >&2
+    exit 255
+  fi
+  printf 'hostname resolved.example\nuser resolved\nport 22\n'
+  exit 0
+fi
+if [ "$1" = -f ] || [ "$1" = -N ]; then
+  printf '%s\n' "$*" >> '{log}'
+  # The log: `-E <log>`, or on Windows standard error, which Portico sends to the log.
+  elog=/dev/stderr
+  prev=
+  for arg do
+    [ "$prev" = -E ] && elog=$arg
+    prev=$arg
+  done
+  if [ -f '{fail}' ]; then
+    printf '\033[31mError: remote port forwarding failed for listen port 8080\033[0m\a\n' >> "$elog"
+    exit 255
+  fi
+  if [ -f '{exit_after_auth}' ]; then
+    printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
+    sleep 0.5
+    printf 'Error: remote port forwarding failed for listen port 8080\n' >> "$elog"
+    exit 255
+  fi
+  if [ "$1" = -N ]; then
+    printf 'Authenticated to prod.example ([192.0.2.1]:22) using "publickey".\n' >> "$elog"
+    {hold}
+    exit 0
+  fi
+  # Like ssh -f, the background process leads its own session. macOS has no setsid command,
+  # so Perl forks it there, and returns only once it leads its session and carries the
+  # arguments (the exec closes the pipe), as the setsid command has done by the time Portico
+  # looks.
+  if command -v setsid >/dev/null; then
+    setsid sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1 &
+  else
+    perl -MPOSIX -e 'pipe(my $r, my $w) or die; defined(my $pid = fork) or die;
+      if ($pid) {{ close $w; sysread($r, my $b, 1); exit 0 }}
+      close $r; POSIX::setsid(); exec @ARGV or die' \
+      sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1
+  fi
+  exit 0
+fi
+if [ -f '{remote}' ]; then . '{remote}'; fi
+exit 0
+"#,
+            log = log.display(),
+            fail = fail.display(),
+            exit_after_auth = exit_after_auth.display(),
+            remote = env.home().parent().unwrap().join("remote-calls").display(),
+            hold = hold_forward(),
+        ),
+    );
+    log
+}
+
+/// What the fake `ssh -N` does once authenticated: stay up, holding the listen address of a
+/// local or dynamic forward, by which Windows' Portico sees the forward up.
+fn hold_forward() -> String {
+    #[cfg(windows)]
+    return format!(
+        "exec '{}' \"$@\"",
+        compile_program("tests/support/listen.rs").display()
+    );
+    #[cfg(unix)]
+    "sleep 60".into()
+}

@@ -5,6 +5,7 @@
 //! collisions between saved tunnels, the status types every interface renders, and the ssh
 //! arguments of a start. Processes and files live in `runtime` and `store`.
 
+pub mod ports;
 pub mod runtime;
 pub mod store;
 
@@ -325,7 +326,9 @@ impl Forward {
         }
     }
 
-    fn destination_text(&self) -> Option<String> {
+    /// Where a local or remote forward connects to, as `host:port` (an IPv6 address in
+    /// brackets); `None` for a dynamic forward.
+    pub fn destination_text(&self) -> Option<String> {
         self.destination
             .as_ref()
             .map(|destination| format!("{}:{}", bracketed(&destination.host), destination.port))
@@ -406,6 +409,44 @@ impl Tunnel {
         validate_host(&tunnel.host)?;
         Ok(tunnel)
     }
+}
+
+/// The name of a temporary forward to `label` (a short host or container name) on remote `port`:
+/// `_<label>-<port>`, each character of the label outside `[A-Za-z0-9._-]` becoming `-`. The
+/// leading `_` makes it fail `validate_name`, so it never clashes with a saved tunnel.
+pub fn temporary_name(label: &str, port: u16) -> String {
+    let slug: String = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("_{slug}-{port}")
+}
+
+/// Whether `name` is a temporary forward's (it starts with `_`).
+pub fn is_temporary(name: &str) -> bool {
+    name.starts_with('_')
+}
+
+/// `base`, else `base-2`, `base-3`, ... the first that `taken` does not claim.
+pub fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_owned();
+    }
+    (2u32..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken(candidate))
+        .expect("an unbounded range always yields a free name")
+}
+
+/// The name a temporary forward is saved under: without its leading `_`.
+pub fn saved_name_for(temporary: &str) -> String {
+    temporary.strip_prefix('_').unwrap_or(temporary).to_owned()
 }
 
 pub fn validate_name(name: &str) -> Result<(), TunnelError> {
@@ -785,12 +826,17 @@ impl fmt::Display for TunnelWarning {
     }
 }
 
-/// A saved tunnel with its status, as every interface shows it.
+/// A saved tunnel or a temporary forward with its status, as every interface shows it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TunnelReport {
     pub tunnel: Tunnel,
     pub status: TunnelStatus,
     pub warnings: Vec<TunnelWarning>,
+    /// Whether this is a temporary forward, which lives only in the runtime directory.
+    pub temporary: bool,
+    /// What the tunnel reaches, for display: a saved tunnel's host alias, a temporary
+    /// forward's label (`web on prod`), or its destination when its record has none.
+    pub reaches: String,
 }
 
 /// The `ssh` arguments that start `forward` through `host`, logging to `log`: in the background
@@ -1253,5 +1299,24 @@ mod tests {
             listeners_in_effective_config(gateway),
             [("0.0.0.0".to_owned(), 5432), ("::".to_owned(), 5432)]
         );
+    }
+
+    #[test]
+    fn temporary_names_are_slugged_and_cannot_clash_with_saved_ones() {
+        assert_eq!(temporary_name("prod", 5432), "_prod-5432");
+        assert_eq!(temporary_name("shop_api.1", 80), "_shop_api.1-80");
+        assert_eq!(temporary_name("wéb", 80), "_w-b-80");
+        assert_eq!(temporary_name("a/b", 80), "_a-b-80");
+        assert!(validate_name(&temporary_name("prod", 5432)).is_err());
+        assert!(is_temporary("_x-1"));
+        assert!(!is_temporary("x"));
+        assert_eq!(unique_name("_w-80", |name| name == "_w-80"), "_w-80-2");
+        assert_eq!(unique_name("_w-80", |_| false), "_w-80");
+        assert_eq!(
+            unique_name("_w-80", |name| name == "_w-80" || name == "_w-80-2"),
+            "_w-80-3"
+        );
+        assert_eq!(saved_name_for("_w-80"), "w-80");
+        assert_eq!(saved_name_for("w-80"), "w-80");
     }
 }

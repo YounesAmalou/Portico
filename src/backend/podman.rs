@@ -8,7 +8,7 @@ use crate::platform::process::UNIX_TOOLS;
 
 use super::{
     Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, Problem,
-    RunFailure, RunResult, SHELL_SCRIPT, Target, Via,
+    Reach, RunFailure, RunResult, SHELL_SCRIPT, Target, Via,
 };
 
 /// Names the user whose containers these are, then lists them. Without `podman`, `exec`
@@ -232,6 +232,25 @@ impl Backend for Podman {
     /// `podman exec` into container `id`, as `user` when given. Podman needs no `via`.
     fn shell_words(&self, id: &str, user: Option<&str>, _via: Option<Via>) -> Vec<String> {
         exec_words(id, user)
+    }
+
+    /// `podman inspect` of the container, as docker's but reading the exposed ports from
+    /// `.NetworkSettings.Ports`, which Podman before 5.3 has. Podman needs no `via`.
+    fn reach<E>(
+        &self,
+        target: &Target,
+        container: &Container,
+        _via: Option<Via>,
+        run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    ) -> Result<Reach, ListFailure<E>> {
+        super::docker::reach_with(
+            "podman",
+            super::docker::PODMAN_INSPECT_FORMAT,
+            container,
+            None::<fn(&[String]) -> Vec<String>>,
+            run,
+            |stderr| issue(target, Problem::Other, None, stderr),
+        )
     }
 
     fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue {
@@ -622,5 +641,83 @@ mod tests {
                 SHELL_SCRIPT
             ]
         );
+    }
+
+    #[test]
+    fn reach_works_on_podman_before_5_3() {
+        // Podman before 5.3 has no `.Config.ExposedPorts`: a template naming it fails.
+        let container = Container {
+            id: "abc".into(),
+            name: "web".into(),
+            image: String::new(),
+            command: String::new(),
+            running_for: String::new(),
+            status: String::new(),
+            ports: "0.0.0.0:8080->80/tcp".into(),
+            networks: String::new(),
+            mounts: String::new(),
+            project: None,
+            service: None,
+            number: None,
+            working_dir: None,
+        };
+        let reach = Podman
+            .reach::<()>(&host(), &container, None, &mut |words| {
+                let format = &words[3];
+                if format.contains(".Config.ExposedPorts") {
+                    return Ok(output(
+                        125,
+                        "",
+                        "Error: template: inspect:1:52: executing \"inspect\" at <.Config.ExposedPorts>: can't evaluate field ExposedPorts in type *define.InspectContainerConfig",
+                    ));
+                }
+                assert!(format.contains(".NetworkSettings.Ports"));
+                Ok(output(
+                    0,
+                    r#"{"podman":{"IPAddress":"10.88.0.5"}}|{"80/tcp":[{"HostIp":"","HostPort":"8080"}],"443/tcp":null}|bridge"#,
+                    "",
+                ))
+            })
+            .unwrap();
+        assert_eq!(reach.address.as_deref(), Some("10.88.0.5"));
+        let ports: Vec<_> = reach.ports.iter().map(|o| (o.port, o.published)).collect();
+        assert_eq!(ports, [(80, Some(8080)), (443, None)]);
+    }
+
+    #[test]
+    fn a_rootless_container_with_no_address_has_none() {
+        let mut calls = Vec::new();
+        let container = Container {
+            id: "abc".into(),
+            name: "web".into(),
+            image: String::new(),
+            command: String::new(),
+            running_for: String::new(),
+            status: String::new(),
+            ports: "0.0.0.0:8080->80/tcp".into(),
+            networks: String::new(),
+            mounts: String::new(),
+            project: None,
+            service: None,
+            number: None,
+            working_dir: None,
+        };
+        let reach = Podman
+            .reach::<()>(&host(), &container, Some(Via::Sg), &mut |words| {
+                calls.push(words.to_vec());
+                Ok(output(
+                    0,
+                    r#"{"podman":{"IPAddress":""}}|{"80/tcp":{}}|pasta"#,
+                    "",
+                ))
+            })
+            .unwrap();
+        assert_eq!(calls[0][..2], ["podman", "inspect"].map(String::from));
+        assert_eq!(reach.address, None);
+        assert_eq!(reach.ports.len(), 1);
+        let failed = Podman.reach::<()>(&host(), &container, None, &mut |_| {
+            Ok(output(1, "", "boom"))
+        });
+        assert!(matches!(failed, Err(ListFailure::Issue(_))));
     }
 }

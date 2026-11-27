@@ -24,7 +24,7 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    super::common::launcher::{LAUNCH_GRACE, Launch, run},
+    super::common::launcher::{LAUNCH_GRACE, Launch, open_url_with, run},
     process::keep_standard_handles,
 };
 
@@ -40,6 +40,13 @@ pub enum Choice {
     Console,
     /// A new Windows Terminal window, through `wt.exe`.
     WindowsTerminal,
+}
+
+/// Opens `url` in the default browser with `start`, through `cmd /c` (it is a shell built-in),
+/// without waiting for it. The empty argument is the window title `start` would otherwise take
+/// from a quoted URL.
+pub fn open_url(url: &str) -> io::Result<()> {
+    open_url_with("cmd", &["/c", "start", ""], url)
 }
 
 /// `portico_terminal` when it names an executable or `cmd` (a new console window); otherwise

@@ -13,11 +13,13 @@
       },
       "host": "prod",
       "name": "busy",
+      "reaches": "prod",
       "status": {
         "address": "127.0.0.1:5433",
         "by": null,
         "state": "port-in-use"
       },
+      "temporary": false,
       "warnings": []
     },
     {
@@ -32,9 +34,11 @@
       },
       "host": "prod",
       "name": "db",
+      "reaches": "prod",
       "status": {
         "state": "stopped"
       },
+      "temporary": false,
       "warnings": [
         {
           "kind": "collides-with",
@@ -55,11 +59,13 @@
       },
       "host": "prod",
       "name": "preview",
+      "reaches": "prod",
       "status": {
         "finished": 1781861043,
         "reason": "Error: remote port forwarding failed for listen port 8080",
         "state": "failed"
       },
+      "temporary": false,
       "warnings": []
     },
     {
@@ -74,9 +80,11 @@
       },
       "host": "prod",
       "name": "socks",
+      "reaches": "prod",
       "status": {
         "state": "stopped"
       },
+      "temporary": false,
       "warnings": [
         {
           "kind": "collides-with",
@@ -84,6 +92,27 @@
           "tunnel": "db"
         }
       ]
+    },
+    {
+      "forward": {
+        "bind_address": "127.0.0.1",
+        "bind_port": 8080,
+        "description": "127.0.0.1:8080 → 172.18.0.4:80",
+        "kind": "local",
+        "spec": "127.0.0.1:8080:172.18.0.4:80",
+        "target_host": "172.18.0.4",
+        "target_port": 80
+      },
+      "host": "prod",
+      "name": "_web-80",
+      "reaches": "web on prod",
+      "status": {
+        "finished": 1781861043,
+        "reason": "Connection to prod closed by remote host.",
+        "state": "failed"
+      },
+      "temporary": true,
+      "warnings": []
     }
   ]
 }

@@ -37,11 +37,13 @@
     },
     "host": "prod",
     "name": "preview",
+    "reaches": "prod",
     "status": {
       "finished": 1781861043,
       "reason": "Error: remote port forwarding failed for listen port 8080",
       "state": "failed"
     },
+    "temporary": false,
     "warnings": []
   }
 }

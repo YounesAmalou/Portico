@@ -26,11 +26,16 @@ use super::{
     dropdown::{SUGGESTION_ROWS, Suggestions, suggestion_lines},
 };
 use crate::{
-    app::{App, AppError, Ownership, StartOutcome, TunnelChanges, TunnelRefusal},
+    app::{
+        App, AppError, ForwardTarget, Ownership, SaveOutcome, StartOutcome, TunnelChanges,
+        TunnelRefusal,
+    },
+    backend::Reach,
     domain::fuzzy,
     domain::suggest::{self, Candidate},
     domain::tunnel::{
         Forward, Kind, Tunnel, TunnelError, TunnelField, TunnelReport, TunnelStatus, collisions,
+        printable, saved_name_for,
     },
     picker::HIT,
 };
@@ -178,10 +183,16 @@ enum Screen {
     Filter,
     Form,
     ConfirmRemove,
+    /// The name prompt of `w`, which saves a temporary forward.
+    SaveName,
 }
 
 /// What the screen asks the event loop to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one is made per key and handled at once; boxing the forward's target buys nothing"
+)]
 pub(super) enum TunnelAction {
     None,
     Quit,
@@ -195,6 +206,23 @@ pub(super) enum TunnelAction {
         changes: TunnelChanges,
     },
     Remove(String),
+    /// Saves temporary forward `temporary` as tunnel `name`.
+    Save {
+        temporary: String,
+        name: String,
+    },
+    /// Puts a tunnel's local address on the clipboard.
+    Copy(String),
+    /// Opens a URL in the browser.
+    Open(String),
+    /// Starts a temporary forward from the forward dialog of the hosts or a container tab.
+    Forward {
+        target: ForwardTarget,
+        /// Where the container is reached, as its suggestions found it.
+        reach: Option<Reach>,
+        remote: u16,
+        local: Option<u16>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -220,7 +248,32 @@ pub(super) struct TunnelsScreen {
     refreshed: Option<Instant>,
     /// The tunnel to select once the list is next rebuilt, after it was saved.
     pending_select: Option<String>,
+    /// The name typed in the save prompt.
+    save_name: TextInput,
+    /// Why the name typed in the save prompt was refused.
+    save_error: Option<String>,
 }
+
+/// A local forward's address on this machine, as it is copied and opened: none for a remote or
+/// dynamic forward. Without a bind address ssh listens on loopback, reached as `localhost`.
+fn local_address(report: &TunnelReport) -> Option<String> {
+    let forward = &report.tunnel.forward;
+    if forward.kind != Kind::Local || lost_forward(report) {
+        return None;
+    }
+    Some(match forward.bind_address.as_deref() {
+        None | Some("" | "*") => format!("localhost:{}", forward.bind_port),
+        Some(_) => forward.listen(),
+    })
+}
+
+/// Whether `report` is a temporary forward whose record was rebuilt without its host and forward.
+fn lost_forward(report: &TunnelReport) -> bool {
+    report.temporary && report.tunnel.host.is_empty()
+}
+
+/// Said when `s` or `w` meets a temporary forward whose record lost its forward.
+const LOST: &str = "its record lost the forward; x removes it";
 
 /// How many log lines the details show unless unfolded.
 const LOG_LINES: usize = 3;
@@ -228,7 +281,9 @@ const LOG_LINES: usize = 3;
 impl TunnelsScreen {
     /// Re-reads the tunnels, their statuses and the host aliases, keeping the selection.
     pub(super) fn reload(&mut self, app: &App) {
-        let selected = self.selected_name().map(str::to_owned);
+        // A tunnel waiting to be selected wins over the selection it replaces.
+        let selected =
+            (self.pending_select.take()).or_else(|| self.selected_name().map(str::to_owned));
         match app.tunnels() {
             Ok(reports) => {
                 self.extras = reports
@@ -338,6 +393,40 @@ impl TunnelsScreen {
         }
     }
 
+    /// Applies a save of a temporary forward: success selects the saved tunnel and says whether it
+    /// was restarted; a refusal stays in the prompt for another name.
+    pub(super) fn finish_save(&mut self, result: Result<SaveOutcome, AppError>) {
+        match result {
+            Ok(outcome) => {
+                let name = outcome.tunnel.name;
+                let mut status = format!("saved {}", printable(&name));
+                match outcome.restarted {
+                    Some(StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. }) => {
+                        status.push_str("; restarted it (connections through it were interrupted)");
+                    }
+                    Some(StartOutcome::Failed { reason, .. }) => {
+                        status.push_str(&format!("; restarting it failed: {}", printable(&reason)));
+                    }
+                    None if outcome.cancelled => status.push_str("; restart cancelled"),
+                    None => {}
+                }
+                if let Some(note) = outcome.note {
+                    status.push_str(&format!("; {}", printable(&note)));
+                }
+                self.screen = Screen::Browse;
+                self.save_error = None;
+                self.status = Some(status);
+                self.select_new(&name);
+            }
+            // Asks for another name, unless something else took the screen meanwhile.
+            Err(error) if matches!(self.screen, Screen::Browse | Screen::SaveName) => {
+                self.screen = Screen::SaveName;
+                self.save_error = Some(printable(&error.to_string()));
+            }
+            Err(error) => self.status = Some(printable(&error.to_string())),
+        }
+    }
+
     fn refilter(&mut self) {
         let filter = self.filter.as_str();
         self.visible = self
@@ -348,7 +437,12 @@ impl TunnelsScreen {
                 let forward = report.tunnel.forward.describe();
                 fuzzy::match_fields(
                     filter,
-                    &[&report.tunnel.name, &report.tunnel.host, &forward],
+                    &[
+                        &report.tunnel.name,
+                        &report.tunnel.host,
+                        &report.reaches,
+                        &forward,
+                    ],
                 )
                 .is_some()
             })
@@ -363,6 +457,12 @@ impl TunnelsScreen {
         if let Some(name) = self.pending_select.take() {
             self.select(&name);
         }
+    }
+
+    /// Selects tunnel `name`, now if it is listed and otherwise once the list is next rebuilt.
+    pub(super) fn select_new(&mut self, name: &str) {
+        self.select(name);
+        self.pending_select = Some(name.to_owned());
     }
 
     fn select(&mut self, name: &str) {
@@ -380,7 +480,7 @@ impl TunnelsScreen {
         self.selected.map(|index| &self.reports[index])
     }
 
-    fn selected_name(&self) -> Option<&str> {
+    pub(super) fn selected_name(&self) -> Option<&str> {
         self.selected().map(|report| report.tunnel.name.as_str())
     }
 
@@ -432,8 +532,14 @@ impl TunnelsScreen {
             Screen::ConfirmRemove => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
                     self.screen = Screen::Browse;
-                    self.selected_name()
-                        .map_or(TunnelAction::None, |name| TunnelAction::Remove(name.into()))
+                    match self.selected() {
+                        // Stopping a temporary forward removes it.
+                        Some(report) if report.temporary => {
+                            TunnelAction::Stop(report.tunnel.name.clone())
+                        }
+                        Some(report) => TunnelAction::Remove(report.tunnel.name.clone()),
+                        None => TunnelAction::None,
+                    }
                 }
                 KeyCode::Esc | KeyCode::Char('n') => {
                     self.screen = Screen::Browse;
@@ -441,6 +547,48 @@ impl TunnelsScreen {
                 }
                 _ => TunnelAction::None,
             },
+            Screen::SaveName => match key.code {
+                // The prompt closes while the save runs, so Esc cancels its restart; a refusal
+                // opens it again.
+                KeyCode::Enter => match self.selected() {
+                    Some(report) => {
+                        let action = TunnelAction::Save {
+                            temporary: report.tunnel.name.clone(),
+                            name: self.save_name.as_str().to_owned(),
+                        };
+                        self.screen = Screen::Browse;
+                        action
+                    }
+                    None => {
+                        self.screen = Screen::Browse;
+                        TunnelAction::None
+                    }
+                },
+                KeyCode::Esc => {
+                    self.screen = Screen::Browse;
+                    self.save_error = None;
+                    TunnelAction::None
+                }
+                _ => {
+                    self.save_name.handle_key(key);
+                    TunnelAction::None
+                }
+            },
+        }
+    }
+
+    /// The question of the confirmation prompt.
+    fn confirmation(&self) -> String {
+        match self.selected() {
+            Some(report) if report.temporary => {
+                format!("Stop and remove {}? (y/n)", printable(&report.tunnel.name))
+            }
+            report => format!(
+                "Remove {}?",
+                report.map_or("the selected tunnel".into(), |report| printable(
+                    &report.tunnel.name
+                ))
+            ),
         }
     }
 
@@ -450,6 +598,7 @@ impl TunnelsScreen {
                 self.filter.paste(text);
                 self.refilter();
             }
+            Screen::SaveName => self.save_name.paste(text),
             Screen::Form if self.form.active != KIND => {
                 let field = FIELDS[self.form.active].0;
                 let text: String = text.chars().filter(|c| field.permits(*c)).collect();
@@ -467,6 +616,8 @@ impl TunnelsScreen {
         let running = self
             .selected()
             .is_some_and(|report| report.status.is_running());
+        let temporary = self.selected().is_some_and(|report| report.temporary);
+        let lost = self.selected().is_some_and(lost_forward);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -485,10 +636,36 @@ impl TunnelsScreen {
                 self.form = TunnelForm::default();
                 self.screen = Screen::Form;
             }
+            // A temporary forward is not edited, and a saved tunnel is already saved.
+            KeyCode::Char('e') if temporary => {}
+            KeyCode::Char('w') if !temporary => {}
+            KeyCode::Char('w') if lost => {
+                self.status = Some(format!("cannot save it: {LOST}"));
+            }
+            KeyCode::Char('w') => {
+                let name = self.selected_name().map(saved_name_for).unwrap_or_default();
+                self.save_name = TextInput::new(&name);
+                self.save_error = None;
+                self.screen = Screen::SaveName;
+            }
+            KeyCode::Char('y') | KeyCode::Char('b') => {
+                let copy = key.code == KeyCode::Char('y');
+                return match self.selected().and_then(local_address) {
+                    Some(address) if copy => TunnelAction::Copy(address),
+                    Some(address) => TunnelAction::Open(format!("http://{address}")),
+                    None => {
+                        let what = if copy { "copy" } else { "open" };
+                        self.status = Some(format!("no local address to {what}"));
+                        TunnelAction::None
+                    }
+                };
+            }
+            // Removing a temporary forward stops it.
+            KeyCode::Char('x') if temporary => self.screen = Screen::ConfirmRemove,
             KeyCode::Char('e') | KeyCode::Char('x') if running => {
                 self.status = Some(format!(
                     "{} is running; stop it first (s)",
-                    self.selected_name().unwrap_or_default()
+                    printable(self.selected_name().unwrap_or_default())
                 ));
             }
             KeyCode::Char('e') => {
@@ -506,8 +683,17 @@ impl TunnelsScreen {
                 let Some(name) = self.selected_name().map(str::to_owned) else {
                     return TunnelAction::None;
                 };
+                // Stopping a temporary forward removes it: ask, as x does.
+                if running && temporary {
+                    self.screen = Screen::ConfirmRemove;
+                    return TunnelAction::None;
+                }
                 if running {
                     return TunnelAction::Stop(name);
+                }
+                if lost {
+                    self.status = Some(format!("cannot start it again: {LOST}"));
+                    return TunnelAction::None;
                 }
                 if let Some(starting) = &self.starting {
                     self.status = Some(format!("{starting} is still starting (Esc to cancel)"));
@@ -644,8 +830,17 @@ impl TunnelsScreen {
                 } else {
                     "o log  "
                 };
+                let edit = match self.selected() {
+                    Some(report) if report.temporary => "w save  ",
+                    _ => "e edit  ",
+                };
+                let address = if self.selected().and_then(local_address).is_some() {
+                    "y copy  b open  "
+                } else {
+                    ""
+                };
                 format!(
-                    "↑↓ move  / filter  {toggle}a add  e edit  x remove  r refresh  {log}Tab/1-5 tabs  , settings  q quit"
+                    "↑↓ move  / filter  {toggle}a add  {edit}x remove  {address}r refresh  {log}Tab/1-5 tabs  , settings  q quit"
                 )
             }
             Screen::Filter => "type to filter  ←→ move  Enter apply  Esc cancel".into(),
@@ -660,7 +855,11 @@ impl TunnelsScreen {
                 };
                 format!("↑↓ field{special}  Enter save  Esc cancel")
             }
+            Screen::ConfirmRemove if self.selected().is_some_and(|report| report.temporary) => {
+                "y stop and remove  n cancel".into()
+            }
             Screen::ConfirmRemove => "Enter remove  Esc cancel".into(),
+            Screen::SaveName => "type a name  Enter save  Esc cancel".into(),
         }
     }
 
@@ -723,12 +922,14 @@ impl TunnelsScreen {
                 ),
             ),
             Screen::ConfirmRemove => (
-                "Remove tunnel",
-                vec![Line::raw(format!(
-                    "Remove {}?",
-                    self.selected_name().unwrap_or("the selected tunnel")
-                ))],
+                if self.selected().is_some_and(|report| report.temporary) {
+                    "Stop forward"
+                } else {
+                    "Remove tunnel"
+                },
+                vec![Line::raw(self.confirmation())],
             ),
+            Screen::SaveName => ("Save forward", self.save_lines()),
             _ => ("Details", self.detail_lines()),
         };
         frame.render_widget(
@@ -749,37 +950,45 @@ impl TunnelsScreen {
         if self.reports.is_empty() {
             return vec![ListItem::new(Line::raw("No tunnels. Press a to add one."))];
         }
-        let rows: Vec<[String; 3]> = self
-            .visible
-            .iter()
-            .map(|&index| {
-                let tunnel = &self.reports[index].tunnel;
-                [
-                    tunnel.name.clone(),
-                    tunnel.host.clone(),
-                    tunnel.forward.describe(),
-                ]
-            })
-            .collect();
+        self.row_lines().into_iter().map(ListItem::new).collect()
+    }
+
+    /// The table's rows, one line per visible tunnel.
+    fn row_lines(&self) -> Vec<Line<'static>> {
+        let rows = self.rows();
+        let marker_width = |marker: Option<&str>| marker.map_or(0, |marker| marker.len() + 1);
         let width = |column: usize| {
             rows.iter()
-                .map(|row| row[column].chars().count())
+                .map(|(marker, row)| {
+                    let extra = if column == 0 {
+                        marker_width(*marker)
+                    } else {
+                        0
+                    };
+                    row[column].chars().count() + extra
+                })
                 .max()
                 .unwrap_or(0)
         };
         let widths = [width(0), width(1), width(2)];
+        let dim = Style::default().add_modifier(Modifier::DIM);
         self.visible
             .iter()
             .zip(rows)
-            .map(|(&index, row)| {
+            .map(|(&index, (marker, row))| {
                 let report = &self.reports[index];
                 let positions = fuzzy::match_fields(self.filter.as_str(), &[&row[0]])
                     .and_then(|found| found.positions.into_iter().next())
                     .unwrap_or_default();
                 let mut spans = fuzzy::highlight(&row[0], &positions, Style::default(), HIT);
+                let name_width = row[0].chars().count() + marker_width(marker);
+                if let Some(marker) = marker {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(marker, dim));
+                }
                 spans.push(Span::raw(format!(
                     "{}  {:w1$}  {:w2$}  ",
-                    " ".repeat(widths[0] - row[0].chars().count()),
+                    " ".repeat(widths[0] - name_width),
                     row[1],
                     row[2],
                     w1 = widths[1],
@@ -794,9 +1003,59 @@ impl TunnelsScreen {
                 } else {
                     status_span(&report.status)
                 });
-                ListItem::new(Line::from(spans))
+                Line::from(spans)
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    fn row_texts(&self) -> Vec<String> {
+        self.row_lines().iter().map(Line::to_string).collect()
+    }
+
+    /// The visible rows' columns: the name's marker, then the name, what it reaches and the local
+    /// address (a remote or dynamic forward's description), all printable.
+    fn rows(&self) -> Vec<(Option<&'static str>, [String; 3])> {
+        self.visible
+            .iter()
+            .map(|&index| {
+                let report = &self.reports[index];
+                let local = if lost_forward(report) {
+                    "unknown".to_owned()
+                } else {
+                    local_address(report).unwrap_or_else(|| report.tunnel.forward.describe())
+                };
+                (
+                    report.temporary.then_some("temporary"),
+                    [
+                        printable(&report.tunnel.name),
+                        printable(&report.reaches),
+                        printable(&local),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    /// The save prompt: the name, then why it was refused.
+    fn save_lines(&self) -> Vec<Line<'static>> {
+        let mut name = vec![Span::raw("> Name: ")];
+        name.extend(self.save_name.spans(true));
+        let mut lines = vec![
+            Line::raw(format!(
+                "Save {} as a tunnel.",
+                printable(self.selected_name().unwrap_or_default())
+            )),
+            Line::raw(""),
+            Line::from(name),
+        ];
+        if let Some(error) = &self.save_error {
+            lines.push(Line::styled(
+                format!("    {error}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        lines
     }
 
     fn detail_lines(&self) -> Vec<Line<'static>> {
@@ -809,10 +1068,12 @@ impl TunnelsScreen {
         let detail = report.status.detail();
         let mut status = vec![Span::raw("Status:  "), status_span(&report.status)];
         if !detail.is_empty() {
-            status.push(Span::raw(format!(" \u{2014} {detail}")));
+            status.push(Span::raw(format!(" \u{2014} {}", printable(&detail))));
         }
+        let temporary = if report.temporary { " (temporary)" } else { "" };
         let mut lines = vec![
-            Line::raw(format!("Name:    {}", tunnel.name)),
+            Line::raw(format!("Name:    {}{temporary}", printable(&tunnel.name))),
+            Line::raw(format!("Reaches: {}", printable(&report.reaches))),
             Line::raw(format!("Host:    {}", tunnel.host)),
             Line::raw(format!(
                 "Forward: {} {} {}",
@@ -947,16 +1208,47 @@ fn status_span(status: &TunnelStatus) -> Span<'static> {
     Span::styled(status.name(), style)
 }
 
+/// What the starter starts: a tunnel by its name, or a temporary forward.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one is sent per start; boxing the forward's target buys nothing"
+)]
+enum Job {
+    Tunnel(String),
+    /// Saves temporary forward `temporary` as tunnel `name`, restarting it when it runs.
+    Save {
+        temporary: String,
+        name: String,
+    },
+    Forward {
+        target: ForwardTarget,
+        reach: Option<Reach>,
+        remote: u16,
+        local: Option<u16>,
+    },
+}
+
 struct Request {
     generation: u64,
-    name: String,
+    job: Job,
     cancelled: Arc<AtomicBool>,
 }
 
 struct Delivered {
     generation: u64,
-    name: String,
-    result: Result<StartOutcome, String>,
+    finished: Finished,
+}
+
+/// A start's result.
+#[derive(Debug)]
+pub(super) enum Finished {
+    /// Tunnel `.0`'s start.
+    Tunnel(String, Result<StartOutcome, String>),
+    /// A temporary forward's start, with the forward it started under its name.
+    Forward(Result<(Tunnel, StartOutcome), String>),
+    /// A temporary forward's save. It is delivered even when cancelled: the cancel only stops
+    /// the restart, and the tunnel is saved.
+    Save(Result<SaveOutcome, AppError>),
 }
 
 /// Starts one tunnel at a time on a worker thread, with the scheme of the connection tester:
@@ -977,19 +1269,37 @@ impl Starter {
         let (sender, results) = mpsc::channel();
         scope.spawn(move || {
             while let Ok(request) = receiver.recv() {
-                if request.cancelled.load(Ordering::Relaxed) {
+                let save = matches!(request.job, Job::Save { .. });
+                if request.cancelled.load(Ordering::Relaxed) && !save {
                     continue;
                 }
-                let result = app
-                    .start_tunnel(&request.name, Some(&request.cancelled), true)
-                    .map_err(|error| error.to_string());
-                if request.cancelled.load(Ordering::Relaxed) {
+                let cancelled = Some(request.cancelled.as_ref());
+                let finished = match request.job {
+                    Job::Tunnel(name) => {
+                        let result = app
+                            .start_tunnel(&name, cancelled, true)
+                            .map_err(|error| error.to_string());
+                        Finished::Tunnel(name, result)
+                    }
+                    Job::Save { temporary, name } => {
+                        Finished::Save(app.save_tunnel(&temporary, &name, cancelled))
+                    }
+                    Job::Forward {
+                        target,
+                        reach,
+                        remote,
+                        local,
+                    } => Finished::Forward(
+                        app.quick_forward(&target, reach.as_ref(), remote, local, cancelled, true)
+                            .map_err(|error| error.to_string()),
+                    ),
+                };
+                if request.cancelled.load(Ordering::Relaxed) && !save {
                     continue;
                 }
                 let delivered = Delivered {
                     generation: request.generation,
-                    name: request.name,
-                    result,
+                    finished,
                 };
                 if sender.send(delivered).is_err() {
                     return;
@@ -1004,17 +1314,50 @@ impl Starter {
         }
     }
 
+    /// Starts tunnel `name`, cancelling the start still running.
     pub(super) fn start(&mut self, name: String) {
+        self.send(name.clone(), Job::Tunnel(name));
+    }
+
+    /// Saves temporary forward `temporary` as tunnel `name`, shown as the temporary forward
+    /// starting while its restart runs; cancels the start still running.
+    pub(super) fn save(&mut self, temporary: String, name: String) {
+        self.send(temporary.clone(), Job::Save { temporary, name });
+    }
+
+    /// Starts a temporary forward to port `remote` of `target`, cancelling the start still
+    /// running.
+    pub(super) fn forward(
+        &mut self,
+        target: ForwardTarget,
+        reach: Option<Reach>,
+        remote: u16,
+        local: Option<u16>,
+    ) {
+        let shown = format!("a forward to {}:{remote}", target.label());
+        self.send(
+            shown,
+            Job::Forward {
+                target,
+                reach,
+                remote,
+                local,
+            },
+        );
+    }
+
+    /// Sends `job`, shown as `shown` while it runs.
+    fn send(&mut self, shown: String, job: Job) {
         self.cancel();
         self.generation += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         let request = Request {
             generation: self.generation,
-            name: name.clone(),
+            job,
             cancelled: Arc::clone(&cancelled),
         };
         if self.requests.send(request).is_ok() {
-            self.running = Some((name, cancelled));
+            self.running = Some((shown, cancelled));
         }
     }
 
@@ -1028,15 +1371,19 @@ impl Starter {
         self.running.as_ref().map(|(name, _)| name.as_str())
     }
 
-    pub(super) fn poll(&mut self) -> Option<(String, Result<StartOutcome, String>)> {
-        let mut current = None;
-        while let Ok(delivered) = self.results.try_recv() {
-            if self.running.is_some() && delivered.generation == self.generation {
+    /// The results delivered since the last poll: the current job's, and any save's, which
+    /// is wanted even once cancelled or replaced.
+    pub(super) fn poll(&mut self) -> Vec<Finished> {
+        let mut delivered = Vec::new();
+        while let Ok(result) = self.results.try_recv() {
+            if self.running.is_some() && result.generation == self.generation {
                 self.running = None;
-                current = Some((delivered.name, delivered.result));
+                delivered.push(result.finished);
+            } else if matches!(result.finished, Finished::Save(_)) {
+                delivered.push(result.finished);
             }
         }
-        current
+        delivered
     }
 }
 
@@ -1065,6 +1412,8 @@ pub(super) mod tests {
             .unwrap(),
             status,
             warnings: Vec::new(),
+            temporary: false,
+            reaches: "prod".into(),
         }
     }
 
@@ -1409,6 +1758,327 @@ pub(super) mod tests {
         );
         screen.handle_key(key(KeyCode::Esc));
         assert_eq!(screen.screen, Screen::Browse);
+    }
+
+    fn temporary(name: &str, status: TunnelStatus) -> TunnelReport {
+        TunnelReport {
+            tunnel: Tunnel {
+                name: name.into(),
+                host: "prod".into(),
+                forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+            },
+            status,
+            warnings: Vec::new(),
+            temporary: true,
+            reaches: "prod".into(),
+        }
+    }
+
+    /// A temporary record rebuilt without its host and forward, as the app reports it.
+    fn lost(name: &str) -> TunnelReport {
+        TunnelReport {
+            tunnel: Tunnel {
+                name: name.into(),
+                host: String::new(),
+                forward: Forward {
+                    kind: Kind::Dynamic,
+                    bind_address: None,
+                    bind_port: 0,
+                    destination: None,
+                },
+            },
+            status: TunnelStatus::Failed {
+                reason: "exited".into(),
+                finished: None,
+            },
+            warnings: Vec::new(),
+            temporary: true,
+            reaches: "unknown".into(),
+        }
+    }
+
+    fn failed() -> TunnelStatus {
+        TunnelStatus::Failed {
+            reason: "connection lost".into(),
+            finished: None,
+        }
+    }
+
+    #[test]
+    fn rows_show_the_name_what_it_reaches_the_local_address_and_the_status() {
+        let mut saved = report("db", TunnelStatus::Stopped);
+        saved.reaches = "prod-db".into();
+        let screen = screen_with(vec![
+            saved,
+            temporary("_prod-80", TunnelStatus::Running { pid: 7, started: 0 }),
+            lost("_web-80"),
+        ]);
+        let rows = screen.row_texts();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let words = |row: &str| {
+            row.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            words(&rows[0]),
+            ["db", "prod-db", "localhost:5432", "stopped"]
+        );
+        assert_eq!(
+            words(&rows[1]),
+            ["_prod-80", "temporary", "prod", "127.0.0.1:8080", "running"]
+        );
+        assert_eq!(
+            words(&rows[2]),
+            ["_web-80", "temporary", "unknown", "unknown", "failed"]
+        );
+    }
+
+    #[test]
+    fn row_text_is_made_printable() {
+        let mut forward = temporary("_prod-80", TunnelStatus::Stopped);
+        forward.reaches = "web\u{1b}[31m on prod".into();
+        let screen = screen_with(vec![forward]);
+        assert!(
+            screen.row_texts()[0].contains("web on prod"),
+            "{:?}",
+            screen.row_texts()
+        );
+    }
+
+    #[test]
+    fn w_asks_for_a_name_and_saves_a_temporary_forward() {
+        let mut screen = screen_with(vec![
+            report("db", TunnelStatus::Stopped),
+            temporary("_prod-80", TunnelStatus::Running { pid: 7, started: 0 }),
+        ]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('w'))),
+            TunnelAction::None
+        );
+        assert!(screen.is_browsing(), "w does nothing on a saved tunnel");
+        assert_eq!(screen.status, None);
+        screen.handle_key(key(KeyCode::Down));
+        assert!(screen.footer().contains("w save"), "{}", screen.footer());
+        screen.handle_key(key(KeyCode::Char('w')));
+        assert_eq!(screen.screen, Screen::SaveName);
+        assert_eq!(screen.save_name.as_str(), "prod-80");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            TunnelAction::Save {
+                temporary: "_prod-80".into(),
+                name: "prod-80".into()
+            }
+        );
+        assert!(
+            screen.is_browsing(),
+            "the prompt closes while the save runs, so Esc cancels its restart"
+        );
+        screen.finish_save(Err(AppError::Tunnel(TunnelRefusal::Exists(
+            "prod-80".into(),
+        ))));
+        assert_eq!(screen.screen, Screen::SaveName, "a refusal asks again");
+        assert!(screen.save_error.is_some());
+        type_text(&mut screen, "x");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            TunnelAction::Save {
+                temporary: "_prod-80".into(),
+                name: "prod-80x".into()
+            }
+        );
+        screen.handle_key(key(KeyCode::Esc));
+        assert!(screen.is_browsing(), "Esc cancels");
+    }
+
+    #[test]
+    fn a_save_shows_the_restart_and_the_note_and_selects_the_saved_tunnel() {
+        let mut screen = screen_with(vec![temporary(
+            "_prod-80",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        screen.handle_key(key(KeyCode::Char('w')));
+        let saved = Tunnel::new(
+            "prod-80",
+            "prod",
+            Forward::parse(Kind::Local, "127.0.0.1:8080:172.18.0.4:80").unwrap(),
+        )
+        .unwrap();
+        screen.finish_save(Ok(SaveOutcome {
+            tunnel: saved.clone(),
+            restarted: Some(StartOutcome::Started { pid: 9 }),
+            note: Some("saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated".into()),
+            cancelled: false,
+        }));
+        assert!(screen.is_browsing());
+        assert_eq!(
+            screen.status_line().as_deref(),
+            Some(
+                "saved prod-80; restarted it (connections through it were interrupted); saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated"
+            )
+        );
+        assert_eq!(screen.pending_select.as_deref(), Some("prod-80"));
+
+        screen.handle_key(key(KeyCode::Char('w')));
+        screen.finish_save(Ok(SaveOutcome {
+            tunnel: saved,
+            restarted: Some(StartOutcome::Failed {
+                reason: "port in use".into(),
+                explanation: None,
+            }),
+            note: None,
+            cancelled: false,
+        }));
+        assert_eq!(
+            screen.status_line().as_deref(),
+            Some("saved prod-80; restarting it failed: port in use")
+        );
+    }
+
+    #[test]
+    fn a_cancelled_restart_says_the_tunnel_is_saved() {
+        let mut screen = screen_with(vec![temporary(
+            "_prod-80",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        screen.handle_key(key(KeyCode::Char('w')));
+        screen.handle_key(key(KeyCode::Enter));
+        screen.finish_save(Ok(SaveOutcome {
+            tunnel: temporary("prod-80", TunnelStatus::Stopped).tunnel,
+            restarted: None,
+            note: None,
+            cancelled: true,
+        }));
+        assert_eq!(
+            screen.status_line().as_deref(),
+            Some("saved prod-80; restart cancelled")
+        );
+    }
+
+    #[test]
+    fn a_running_tunnel_name_is_printable_in_the_stop_first_message() {
+        let mut screen = screen_with(vec![report(
+            "db",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        screen.reports[0].tunnel.name = "d\u{1b}[31mb".into();
+        screen.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(
+            screen.status.as_deref(),
+            Some("db is running; stop it first (s)")
+        );
+    }
+
+    #[test]
+    fn e_does_not_edit_a_temporary_forward() {
+        let mut screen = screen_with(vec![temporary("_prod-80", failed())]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('e'))),
+            TunnelAction::None
+        );
+        assert!(screen.is_browsing());
+        assert_eq!(screen.status, None);
+        assert!(!screen.footer().contains("e edit"), "{}", screen.footer());
+    }
+
+    #[test]
+    fn x_stops_and_removes_a_temporary_forward_after_asking() {
+        let mut screen = screen_with(vec![temporary(
+            "_prod-80",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        screen.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(screen.screen, Screen::ConfirmRemove);
+        assert_eq!(screen.confirmation(), "Stop and remove _prod-80? (y/n)");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('n'))),
+            TunnelAction::None
+        );
+        screen.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('y'))),
+            TunnelAction::Stop("_prod-80".into())
+        );
+    }
+
+    #[test]
+    fn s_on_a_running_temporary_forward_asks_before_stopping_it() {
+        let mut screen = screen_with(vec![temporary(
+            "_prod-80",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('s'))),
+            TunnelAction::None
+        );
+        assert_eq!(screen.screen, Screen::ConfirmRemove);
+        assert_eq!(screen.confirmation(), "Stop and remove _prod-80? (y/n)");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('n'))),
+            TunnelAction::None
+        );
+        screen.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('y'))),
+            TunnelAction::Stop("_prod-80".into())
+        );
+    }
+
+    #[test]
+    fn y_copies_and_b_opens_the_local_address() {
+        let mut screen = screen_with(vec![
+            temporary("_prod-80", TunnelStatus::Running { pid: 7, started: 0 }),
+            report("db", TunnelStatus::Stopped),
+            lost("_web-80"),
+        ]);
+        assert!(
+            screen.footer().contains("y copy  b open"),
+            "{}",
+            screen.footer()
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('y'))),
+            TunnelAction::Copy("127.0.0.1:8080".into())
+        );
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('b'))),
+            TunnelAction::Open("http://127.0.0.1:8080".into())
+        );
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('y'))),
+            TunnelAction::Copy("localhost:5432".into()),
+            "a saved local forward has a local address too"
+        );
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('y'))),
+            TunnelAction::None
+        );
+        assert_eq!(screen.status.as_deref(), Some("no local address to copy"));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('b'))),
+            TunnelAction::None
+        );
+        assert_eq!(screen.status.as_deref(), Some("no local address to open"));
+    }
+
+    #[test]
+    fn s_starts_a_failed_temporary_forward_unless_its_record_lost_the_forward() {
+        let mut screen = screen_with(vec![temporary("_prod-80", failed()), lost("_web-80")]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('s'))),
+            TunnelAction::Start("_prod-80".into())
+        );
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('s'))),
+            TunnelAction::None
+        );
+        assert_eq!(
+            screen.status.as_deref(),
+            Some("cannot start it again: its record lost the forward; x removes it")
+        );
     }
 
     #[test]

@@ -1,16 +1,19 @@
-use std::io::{BufRead, Write};
+use std::{
+    io::{BufRead, Write},
+    process::ExitCode,
+};
 
 use crate::{
     app::{App, ContainerError},
     backend::{
-        BackendId, BackendIssue, ContainerList, Problem, ResolveError, Target, Via, display_name,
-        group, remote_command, resolve,
+        AUTOMATIC, BackendId, BackendIssue, Container, ContainerList, Problem, ResolveError,
+        Target, Via, display_name, group, remote_command, resolve,
     },
     picker::{Picker, Row},
 };
 
 use super::{
-    confirm,
+    CANCELLED, confirm,
     hosts::{host_argument, print_connection_failure},
 };
 
@@ -262,6 +265,76 @@ pub(super) fn resolve_in(
             Err(format!("{}; choose one with --backend", error(candidates)))
         }
     }
+}
+
+/// The container `reference` names on `target`, or the one chosen in the picker without it,
+/// with what its listing said of it. The containers are listed with `backend`, or every
+/// installed backend without it, as `portico shell` lists them; `usage` is the command line the
+/// error shows when there is no terminal for the picker. `Ok(Err(exit))` ends the command:
+/// nothing runs on `target`, or the pick was cancelled.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choose_container<I: BufRead, O: Write, E: Write>(
+    app: &App,
+    target: &Target,
+    reference: Option<String>,
+    backend: Option<BackendId>,
+    usage: &str,
+    picker: &mut dyn Picker,
+    input: &mut I,
+    output: &mut O,
+    error: &mut E,
+    interactive: bool,
+) -> Result<Result<(Chosen, Container), ExitCode>, String> {
+    let lists = match backend {
+        Some(backend) => vec![list_with_offers(
+            app,
+            target,
+            &[backend],
+            input,
+            output,
+            error,
+            interactive,
+        )?],
+        None => list_every(app, target, &AUTOMATIC, input, output, error, interactive)?.lists,
+    };
+    if lists.iter().all(|list| list.listing.containers.is_empty()) {
+        writeln!(error, "No running containers on {target}.").map_err(|error| error.to_string())?;
+        return Ok(Err(ExitCode::FAILURE));
+    }
+    let chosen = match reference {
+        Some(reference) => resolve_in(target, &reference, &lists)?,
+        None if interactive && picker.available() => {
+            let (mut chosen, rows): (Vec<Chosen>, Vec<Row>) =
+                every_container_row(&lists).into_iter().unzip();
+            match picker.pick_one("container", rows)? {
+                Some(index) => chosen.swap_remove(index),
+                None => return Ok(Err(ExitCode::from(CANCELLED))),
+            }
+        }
+        None => {
+            return Err(format!(
+                "choose a container: {usage} (no terminal for the picker)"
+            ));
+        }
+    };
+    let container = listed(&lists, &chosen).ok_or_else(|| {
+        ContainerError::NoMatch {
+            target: target.clone(),
+            reference: chosen.id.clone(),
+        }
+        .to_string()
+    })?;
+    Ok(Ok((chosen, container)))
+}
+
+/// The container `chosen` names, as its listing has it.
+pub(super) fn listed(lists: &[ContainerList], chosen: &Chosen) -> Option<Container> {
+    lists
+        .iter()
+        .filter(|list| list.backend == chosen.backend)
+        .flat_map(|list| &list.listing.containers)
+        .find(|container| container.id == chosen.id)
+        .cloned()
 }
 
 /// The picker's rows for the containers of every listing, each with its container. With

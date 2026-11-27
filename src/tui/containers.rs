@@ -67,6 +67,13 @@ pub(super) enum PanelAction {
         target: Target,
         offer: Offer,
     },
+    /// Opens the forward dialog for a port of the selected container.
+    Forward {
+        target: Target,
+        backend: BackendId,
+        container: Container,
+        via: Option<Via>,
+    },
 }
 
 /// The open target picker and the target of each of its rows.
@@ -299,6 +306,7 @@ impl Panel {
             }
             KeyCode::Enter => self.shell(false),
             KeyCode::Char('n') => self.shell(true),
+            KeyCode::Char('f') => self.forward(),
             KeyCode::Char(character) => match state {
                 PanelState::Failed(failure) => match &failure.offer {
                     Some(offer) if offer.key == character => PanelAction::Fix {
@@ -612,8 +620,13 @@ impl Panel {
             } else {
                 "  u user"
             };
+            let forward = if self.selected_key().is_none() {
+                ""
+            } else {
+                "  f forward"
+            };
             format!(
-                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
+                "↑↓ choose  / filter{clear_filter}  Enter shell  n new terminal{user}{forward}  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
             )
         }
     }
@@ -660,6 +673,21 @@ impl Panel {
         self.users.get(&self.selected_key()?).cloned()
     }
 
+    /// The forward dialog's action for the selected container, if any.
+    fn forward(&self) -> PanelAction {
+        let (Some(list), Some(container)) =
+            (self.listed(), self.rows().get(self.selected).copied())
+        else {
+            return PanelAction::None;
+        };
+        PanelAction::Forward {
+            target: list.target.clone(),
+            backend: list.backend,
+            container: container.clone(),
+            via: list.via,
+        }
+    }
+
     fn shell(&self, new_terminal: bool) -> PanelAction {
         let (Some(list), Some(container)) =
             (self.listed(), self.rows().get(self.selected).copied())
@@ -688,7 +716,7 @@ const ROOT_ONLY: &str = "root (Proxmox)";
 
 /// `text` wrapped at spaces to `width` columns, breaking a word longer than that. Continuation
 /// lines keep the text's indentation unless it would take more than half the width.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     if display_width(text) <= width {
         return vec![text.to_owned()];
@@ -1375,7 +1403,7 @@ mod tests {
         assert_eq!(user_line(&panel), "user: deploy");
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
+            "↑↓ choose  / filter  Enter shell  n new terminal  u user  f forward  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
@@ -1565,6 +1593,29 @@ mod tests {
             "user: deploy"
         );
         assert!(panel.footer().contains("u user"));
+    }
+
+    #[test]
+    fn f_forwards_a_port_of_the_selected_container() {
+        let mut panel = listed_panel();
+        let PanelAction::Forward {
+            target,
+            backend,
+            container,
+            via,
+        } = press(&mut panel, KeyCode::Char('f'))
+        else {
+            panic!("f forwards");
+        };
+        assert_eq!(target, host("dev"));
+        assert_eq!(backend, crate::backend::BackendId::Docker);
+        assert_eq!(container.id, "aaaa");
+        assert_eq!(via, None);
+        assert!(panel.footer().contains("f forward"), "{}", panel.footer());
+        assert_eq!(
+            press(&mut Panel::default(), KeyCode::Char('f')),
+            PanelAction::None
+        );
     }
 
     #[test]
@@ -2020,7 +2071,7 @@ mod tests {
         assert_eq!(panel.title().to_string(), "Docker /db");
         assert_eq!(
             panel.footer(),
-            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
+            "↑↓ choose  / filter  Esc clear filter  Enter shell  n new terminal  u user  f forward  h target  L this machine  r refresh  Tab/1-5 tabs  , settings  q quit"
         );
 
         press(&mut panel, KeyCode::Char('/'));

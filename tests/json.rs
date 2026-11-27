@@ -73,11 +73,11 @@ EOF
     )
 }
 
-/// `docker ps` lines: a Compose service and a container outside any project, whose command
-/// carries a secret.
+/// `docker ps` lines: a Compose service publishing port 80 on 8080, and a container outside any
+/// project, whose command carries a secret.
 fn listing() -> String {
     [
-                r#"{"id":"4f1c2a9b7d3e","name":"shop-web-1","image":"nginx:1.27","command":"nginx -g daemon","running_for":"3 hours ago","status":"Up 3 hours","ports":"80/tcp","networks":"shop_default","mounts":"/srv/shop","project":"shop","service":"web","number":"1","working_dir":"/srv/shop"}"#
+                r#"{"id":"4f1c2a9b7d3e","name":"shop-web-1","image":"nginx:1.27","command":"nginx -g daemon","running_for":"3 hours ago","status":"Up 3 hours","ports":"0.0.0.0:8080->80/tcp","networks":"shop_default","mounts":"/srv/shop","project":"shop","service":"web","number":"1","working_dir":"/srv/shop"}"#
         .to_owned(),
         format!(
             r#"{{"id":"9a8b7c6d5e4f","name":"cache","image":"redis:7","command":"redis-server --requirepass={SECRET}","running_for":"5 minutes ago","status":"Up 5 minutes","ports":"","networks":"bridge","mounts":"","project":"","service":"","number":"","working_dir":""}}"#
@@ -85,6 +85,9 @@ fn listing() -> String {
     ]
     .join("\n")
 }
+
+/// `docker inspect` of `shop-web-1`: on `shop_default` at 172.18.0.4, exposing 80.
+const INSPECT: &str = r#"{"shop_default":{"IPAddress":"172.18.0.4"}}|{"80/tcp":{}}|default"#;
 
 fn setup() -> Fixture {
     let env = TestEnv::new();
@@ -122,6 +125,12 @@ fn setup() -> Fixture {
     fs::write(
         runtime.join("preview.run"),
         "state failed\nreason Error: remote port forwarding failed for listen port 8080\nexit 255\nfinished 1781861043\n",
+    )
+    .unwrap();
+    // A temporary forward to `shop-web-1`'s address, whose ssh exited.
+    fs::write(
+        runtime.join("_web-80.run"),
+        "state failed\nreason Connection to prod closed by remote host.\nexit 255\nfinished 1781861043\nhost prod\nforward -L 127.0.0.1:8080:172.18.0.4:80\nreaches web on prod\n",
     )
     .unwrap();
     fs::write(
@@ -175,7 +184,10 @@ fn setup() -> Fixture {
     );
     env.install_program(
         "docker",
-        &format!("#!/bin/sh\ncat <<'EOF'\n{}\nEOF\n", listing()),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = inspect ]; then\n  echo '{INSPECT}'\n  exit 0\nfi\ncat <<'EOF'\n{}\nEOF\n",
+            listing()
+        ),
     );
     Fixture {
         env,
@@ -564,7 +576,117 @@ fn tunnels() {
         .iter()
         .map(|tunnel| tunnel["status"]["state"].as_str().unwrap())
         .collect();
-    assert_eq!(states, ["port-in-use", "stopped", "failed", "stopped"]);
+    assert_eq!(
+        states,
+        ["port-in-use", "stopped", "failed", "stopped", "failed"]
+    );
+    let temporary: Vec<(&str, bool)> = document["tunnels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tunnel| {
+            (
+                tunnel["reaches"].as_str().unwrap(),
+                tunnel["temporary"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        temporary,
+        [
+            ("prod", false),
+            ("prod", false),
+            ("prod", false),
+            ("prod", false),
+            ("web on prod", true)
+        ]
+    );
+}
+
+/// A port nobody uses: bound, read, released.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn forward_to_a_host_prints_the_started_forward() {
+    let fixture = setup();
+    support::install_tunnel_ssh(&fixture.env);
+    let local = free_port();
+    let output = fixture.run(&[
+        "forward",
+        "--on",
+        "prod",
+        "--port",
+        "5432",
+        "--local",
+        &local.to_string(),
+        "--json",
+    ]);
+    let stopped = fixture.run(&["tunnel", "stop", "--all"]);
+    assert!(stopped.status.success());
+    // The local port is shown as the busy port, whatever port the test really bound.
+    let document = check_golden(&output, 0, "forward.json", fixture.env.home(), Some(local));
+    assert_eq!(document["tunnel"]["name"], "_prod-5432");
+    assert_eq!(document["tunnel"]["temporary"], true);
+    assert_eq!(document["tunnel"]["status"]["state"], "running");
+}
+
+#[test]
+fn forward_on_this_machine_prints_where_the_ports_are_reachable() {
+    let fixture = setup();
+    let document = fixture.golden(&["forward", "web", "--json"], 0, "forward-here.json");
+    assert_eq!(document["reachable"][0]["address"], "127.0.0.1:8080");
+}
+
+#[test]
+fn forward_without_a_port_is_a_usage_error_with_the_suggestions() {
+    let fixture = setup();
+    let output = fixture.run(&["forward", "--on", "prod", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["error"]["kind"], "usage");
+    assert_eq!(
+        document["error"]["message"],
+        "--port is required; no port was suggested"
+    );
+}
+
+#[test]
+fn forward_refuses_a_local_port_of_zero() {
+    let fixture = setup();
+    let output = fixture.run(&[
+        "forward", "--on", "prod", "--port", "80", "--local", "0", "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document["error"]["message"],
+        "local port 0 is not a port; give one from 1 through 65535"
+    );
+}
+
+#[test]
+fn tunnel_save_keeps_a_temporary_forward() {
+    let fixture = setup();
+    let document = fixture.golden(
+        &["tunnel", "save", "_web-80", "--json"],
+        0,
+        "tunnel-save.json",
+    );
+    assert_eq!(document["tunnel"]["name"], "web-80");
+    assert_eq!(document["tunnel"]["temporary"], false);
+    let output = fixture.run(&["tunnel", "save", "db", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document["error"]["message"],
+        "db is not a temporary forward"
+    );
 }
 
 #[test]

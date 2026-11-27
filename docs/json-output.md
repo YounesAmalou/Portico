@@ -11,10 +11,12 @@ Portico's read commands, its settings, and starting and stopping tunnels, print 
 | `portico identities --json` | [Every agent and identity file](#identities) |
 | `portico containers [--on <alias>] [--backend docker\|podman\|proxmox]... --json` | [The running containers of this machine or a host](#containers) |
 | `portico settings --json` | [Portico's settings](#settings) |
-| `portico tunnels --json` | [The saved tunnels and their status](#tunnels) |
+| `portico tunnels --json` | [The saved tunnels and temporary forwards, and their status](#tunnels) |
 | `portico tunnel show <name> --json` | [One tunnel, its command line and its log](#tunnel-show) |
 | `portico tunnel start <name>... --json` | [What each start did](#start-and-stop) |
 | `portico tunnel stop <name>... --json`, `portico tunnel stop --all --json` | [What each stop did](#start-and-stop) |
+| `portico tunnel save <name> [--name <new>] --json` | [The saved tunnel](#tunnel-save) |
+| `portico forward [<container>] --on <alias> --port <remote> [--local <port>] [--backend docker\|podman\|proxmox] --json`, `portico forward <container> [--port <remote>] --json` | [The started forward, or where a container of this machine is reachable](#forward) |
 
 Other commands do not accept `--json`. To connect, a consumer runs `portico connect <alias> --new-terminal`, and to open a container's shell `portico shell <id> --on <alias> --new-terminal` (without `--on` for this machine); both report through their exit status only.
 
@@ -52,7 +54,7 @@ A command that fails prints an error document and exits with status 1:
 
 | `kind` | When |
 |---|---|
-| `usage` | A required name is missing |
+| `usage` | A required name is missing, or `portico forward` has no `--port` |
 | `unknown-host` | The alias is not in the inventory |
 | `unknown-tunnel` | No tunnel has that name |
 | `ssh` | ssh could not reach or authenticate to the host, or did not establish a tunnel |
@@ -607,7 +609,7 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
 
 ## Tunnels
 
-`portico tunnels --json` lists the saved tunnels and their status. It runs no `ssh`.
+`portico tunnels --json` lists the saved tunnels, in name order, then the temporary forwards started with `portico forward` (or `f` in the TUI), newest first, and their status. It runs no `ssh`.
 
 <!-- golden: tunnels.json -->
 ```json
@@ -626,11 +628,13 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
       },
       "host": "prod",
       "name": "busy",
+      "reaches": "prod",
       "status": {
         "address": "127.0.0.1:5433",
         "by": null,
         "state": "port-in-use"
       },
+      "temporary": false,
       "warnings": []
     },
     {
@@ -645,9 +649,11 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
       },
       "host": "prod",
       "name": "db",
+      "reaches": "prod",
       "status": {
         "state": "stopped"
       },
+      "temporary": false,
       "warnings": [
         {
           "kind": "collides-with",
@@ -668,11 +674,13 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
       },
       "host": "prod",
       "name": "preview",
+      "reaches": "prod",
       "status": {
         "finished": 1781861043,
         "reason": "Error: remote port forwarding failed for listen port 8080",
         "state": "failed"
       },
+      "temporary": false,
       "warnings": []
     },
     {
@@ -687,9 +695,11 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
       },
       "host": "prod",
       "name": "socks",
+      "reaches": "prod",
       "status": {
         "state": "stopped"
       },
+      "temporary": false,
       "warnings": [
         {
           "kind": "collides-with",
@@ -697,6 +707,27 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
           "tunnel": "db"
         }
       ]
+    },
+    {
+      "forward": {
+        "bind_address": "127.0.0.1",
+        "bind_port": 8080,
+        "description": "127.0.0.1:8080 → 172.18.0.4:80",
+        "kind": "local",
+        "spec": "127.0.0.1:8080:172.18.0.4:80",
+        "target_host": "172.18.0.4",
+        "target_port": 80
+      },
+      "host": "prod",
+      "name": "_web-80",
+      "reaches": "web on prod",
+      "status": {
+        "finished": 1781861043,
+        "reason": "Connection to prod closed by remote host.",
+        "state": "failed"
+      },
+      "temporary": true,
+      "warnings": []
     }
   ]
 }
@@ -705,6 +736,8 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
 | Field | Meaning |
 |---|---|
 | `name`, `host` | The tunnel's name and the alias it goes through |
+| `temporary` | `true` for a temporary forward, which lives only until it is stopped (its name starts with `_`); `false` for a saved tunnel |
+| `reaches` | What the tunnel reaches, for showing it: a saved tunnel's host alias; a temporary forward's host (`prod`), container (`web on prod`) or CT (`CT 101 on pve`), or its destination (`172.18.0.4:80`) when Portico rebuilt its record without one |
 | `forward.kind` | `local`, `remote` or `dynamic` |
 | `forward.bind_address` | The listen address, or `null` for ssh's default (loopback) |
 | `forward.bind_port` | The listen port |
@@ -712,7 +745,7 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
 | `forward.spec` | The forward in ssh's syntax (the argument of `-L`, `-R` or `-D`) |
 | `forward.description` | The forward as Portico shows it |
 | `status` | Below |
-| `warnings[]` | `kind` `unknown-host` (with `host`: the alias is no longer known) or `collides-with` (with `tunnel`: another saved tunnel uses the same port), and `message` |
+| `warnings[]` | `kind` `unknown-host` (with `host`: the alias is no longer known) or `collides-with` (with `tunnel`: another tunnel uses the same port), and `message` |
 
 | `status.state` | Further keys |
 |---|---|
@@ -766,11 +799,13 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
     },
     "host": "prod",
     "name": "preview",
+    "reaches": "prod",
     "status": {
       "finished": 1781861043,
       "reason": "Error: remote port forwarding failed for listen port 8080",
       "state": "failed"
     },
+    "temporary": false,
     "warnings": []
   }
 }
@@ -807,11 +842,13 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
         },
         "host": "prod",
         "name": "preview",
+        "reaches": "prod",
         "status": {
           "finished": 1781861043,
           "reason": "the server refused the remote forward on port 8080",
           "state": "failed"
         },
+        "temporary": false,
         "warnings": []
       }
     },
@@ -850,6 +887,99 @@ The exit status is 1 when any result failed. Once names are considered, every fa
 ```
 
 **Run `start` and `stop` asynchronously.** `start` returns when ssh has established the tunnel or given up, which can take as long as the host's `ConnectTimeout`; `stop` can wait a few seconds for ssh to exit. The document arrives when they finish.
+
+## Tunnel save
+
+`portico tunnel save <name> --json` keeps temporary forward `<name>` as a saved tunnel, named `--name` or by default the temporary name without its leading `_`. A running forward is stopped and the saved tunnel started at once, so connections through it are interrupted for about a second; a failed one is saved without starting. The document gives the saved tunnel's report (the same object as in the list) and a `note`, or `null`:
+
+<!-- golden: tunnel-save.json -->
+```json
+{
+  "note": "saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated",
+  "schema": 1,
+  "tunnel": {
+    "forward": {
+      "bind_address": "127.0.0.1",
+      "bind_port": 8080,
+      "description": "127.0.0.1:8080 → 172.18.0.4:80",
+      "kind": "local",
+      "spec": "127.0.0.1:8080:172.18.0.4:80",
+      "target_host": "172.18.0.4",
+      "target_port": 80
+    },
+    "host": "prod",
+    "name": "web-80",
+    "reaches": "prod",
+    "status": {
+      "state": "stopped"
+    },
+    "temporary": false,
+    "warnings": []
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `tunnel` | The saved tunnel's report, after its restart |
+| `note` | One line to show once: the tunnel reaches a container's current address, which a recreated container does not keep |
+
+The exit status is 1 when the restart failed: the tunnel is saved either way, and its `status` says why it is not running. A name that is not a temporary forward, or a new name already in use, is an error document.
+
+## Forward
+
+`portico forward --on <alias> --port <remote> --json` starts a temporary forward from `127.0.0.1` to port `<remote>` of the host, and with a container name (as `portico shell` takes it), to that port of the container on the host. `--local` chooses the local port; by default it is the remote port when Portico can listen on it, otherwise the next free port above (above the remote port plus 8000 for a port that needs privileges). The document gives the started forward's report:
+
+<!-- golden: forward.json -->
+```json
+{
+  "schema": 1,
+  "tunnel": {
+    "forward": {
+      "bind_address": "127.0.0.1",
+      "bind_port": 5433,
+      "description": "127.0.0.1:5433 → localhost:5432",
+      "kind": "local",
+      "spec": "127.0.0.1:5433:localhost:5432",
+      "target_host": "localhost",
+      "target_port": 5432
+    },
+    "host": "prod",
+    "name": "_prod-5432",
+    "reaches": "prod",
+    "status": {
+      "pid": 41237,
+      "started": 1781860921,
+      "state": "running"
+    },
+    "temporary": true,
+    "warnings": []
+  }
+}
+```
+
+Without `--on`, the container is on this machine, which needs no forward: the document lists where each of its ports, or only `--port`, is already reachable (a published port at `127.0.0.1`, and on Linux another port at the container's address):
+
+<!-- golden: forward-here.json -->
+```json
+{
+  "reachable": [
+    {
+      "address": "127.0.0.1:8080",
+      "port": 80
+    }
+  ],
+  "schema": 1
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `tunnel` | The started forward's report: `temporary` is `true`, `status.state` `running` |
+| `reachable[].port` | The container's port |
+| `reachable[].address` | Where this machine reaches it, as `address:port` |
+
+Without `--port` a forward through a host is a `usage` error whose `message` lists the ports the host or container suggests (`--port is required; suggested: 80, 443`), with `next` saying why there are none when they could not be read. A start that fails is an error document of kind `ssh`, and nothing is left behind.
 
 ## What is never printed
 

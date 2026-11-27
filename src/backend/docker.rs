@@ -7,7 +7,8 @@ use crate::platform::process::UNIX_GROUPS;
 
 use super::{
     Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, Offer,
-    Problem, RunFailure, RunResult, Target, Via, remote_command,
+    PortOffer, Problem, Reach, RunFailure, RunResult, Target, Via, listing::published_ports,
+    remote_command,
 };
 
 /// The `docker ps --format` template: one flat JSON object of strings per
@@ -348,8 +349,121 @@ impl Backend for Docker {
         }
     }
 
+    /// `docker inspect` of the container: its networks, exposed ports and network mode.
+    fn reach<E>(
+        &self,
+        target: &Target,
+        container: &Container,
+        via: Option<Via>,
+        run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    ) -> Result<Reach, ListFailure<E>> {
+        reach_with(
+            "docker",
+            INSPECT_FORMAT,
+            container,
+            via.map(|tool| move |words: &[String]| in_group(tool, words)),
+            run,
+            |stderr| plain_issue(target, Problem::Other, stderr),
+        )
+    }
+
     fn plain_issue(&self, target: &Target, problem: Problem, stderr: String) -> BackendIssue {
         plain_issue(target, problem, stderr)
+    }
+}
+
+/// What `docker inspect` prints: the networks, the exposed ports and the network mode, as JSON
+/// separated by `|`.
+pub(super) const INSPECT_FORMAT: &str =
+    "{{json .NetworkSettings.Networks}}|{{json .Config.ExposedPorts}}|{{.HostConfig.NetworkMode}}";
+
+/// What `podman inspect` prints, in the shape of [`INSPECT_FORMAT`]. Podman has
+/// `.Config.ExposedPorts` only from 5.3; `.NetworkSettings.Ports`, keyed by the same
+/// `80/tcp`, holds the exposed ports too (unpublished ones with no host port) on every version.
+pub(super) const PODMAN_INSPECT_FORMAT: &str = "{{json .NetworkSettings.Networks}}|{{json .NetworkSettings.Ports}}|{{.HostConfig.NetworkMode}}";
+
+/// Runs `<program> inspect --format <format>` on `container` (wrapped by `wrap` when the
+/// listing needed a tool) and reads where it can be reached. A run that fails stops it; a
+/// non-zero exit is the `issue` built from its stderr.
+pub(super) fn reach_with<E>(
+    program: &str,
+    format: &str,
+    container: &Container,
+    wrap: Option<impl Fn(&[String]) -> Vec<String>>,
+    run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    issue: impl FnOnce(String) -> BackendIssue,
+) -> Result<Reach, ListFailure<E>> {
+    let words: Vec<String> = [program, "inspect", "--format", format, &container.id]
+        .map(String::from)
+        .to_vec();
+    let words = match wrap {
+        Some(wrap) => wrap(&words),
+        None => words,
+    };
+    let output = run(&words).map_err(stopped)?;
+    if !output.status.success() {
+        return Err(failed(issue(lossy(&output.stderr))));
+    }
+    Ok(parse_inspect(&lossy(&output.stdout), &container.ports))
+}
+
+/// Reads the output of [`INSPECT_FORMAT`] or [`PODMAN_INSPECT_FORMAT`]: the address of the
+/// first network, by name, that has one (a value that is not an IP address is none); and the
+/// ports the row publishes, then the exposed ones it does not, each ascending. Only the keys
+/// of the exposed ports count, so either format's object reads the same.
+pub(super) fn parse_inspect(stdout: &str, row_ports: &str) -> Reach {
+    // The mode and the exposed ports hold no `|`; a network name might.
+    let mut parts = stdout.trim().rsplitn(3, '|');
+    let mode = parts.next().unwrap_or("").trim();
+    let exposed = parts.next().unwrap_or("");
+    let networks = parts.next().unwrap_or("");
+    let address = serde_json::from_str::<serde_json::Value>(networks)
+        .ok()
+        .and_then(|value| {
+            let mut named: Vec<(&String, &serde_json::Value)> = value.as_object()?.iter().collect();
+            named.sort_by_key(|(name, _)| *name);
+            named.into_iter().find_map(|(_, network)| {
+                let ip: std::net::IpAddr = network.get("IPAddress")?.as_str()?.parse().ok()?;
+                Some(ip.to_string())
+            })
+        });
+    let mut published = published_ports(row_ports);
+    published.sort_by_key(|offer| (offer.container, offer.host));
+    published.dedup_by_key(|offer| offer.container);
+    let mut ports: Vec<PortOffer> = published
+        .iter()
+        .map(|offer| PortOffer {
+            port: offer.container,
+            published: Some(offer.host),
+            published_address: offer.address.clone(),
+            loopback_only: false,
+        })
+        .collect();
+    let mut open: Vec<u16> = serde_json::from_str::<serde_json::Value>(exposed)
+        .ok()
+        .and_then(|value| {
+            Some(
+                value
+                    .as_object()?
+                    .keys()
+                    .filter_map(|key| key.strip_suffix("/tcp")?.parse().ok())
+                    .filter(|port| !published.iter().any(|offer| offer.container == *port))
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    open.sort_unstable();
+    open.dedup();
+    ports.extend(open.into_iter().map(|port| PortOffer {
+        port,
+        published: None,
+        published_address: None,
+        loopback_only: false,
+    }));
+    Reach {
+        address,
+        host_network: mode == "host",
+        ports,
     }
 }
 
@@ -943,5 +1057,138 @@ mod tests {
                 .prompt
                 .starts_with("Start the Docker service on this machine? This runs: ")
         );
+    }
+
+    fn row(ports: &str) -> Container {
+        Container {
+            id: "abc".into(),
+            name: "web".into(),
+            image: String::new(),
+            command: String::new(),
+            running_for: String::new(),
+            status: String::new(),
+            ports: ports.into(),
+            networks: String::new(),
+            mounts: String::new(),
+            project: None,
+            service: None,
+            number: None,
+            working_dir: None,
+        }
+    }
+
+    fn reach_of(
+        via: Option<Via>,
+        out: Output,
+        ports: &str,
+    ) -> (Vec<Vec<String>>, Result<Reach, ListFailure<()>>) {
+        let mut calls = Vec::new();
+        let mut out = Some(out);
+        let result = Docker.reach(&Target::Local, &row(ports), via, &mut |words| {
+            calls.push(words.to_vec());
+            Ok(out.take().unwrap())
+        });
+        (calls, result)
+    }
+
+    fn inspected(networks: &str, exposed: &str, mode: &str) -> Output {
+        Output {
+            status: crate::platform::process::exit_status(0),
+            stdout: format!("{networks}|{exposed}|{mode}\n").into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reach_takes_the_first_named_network_with_an_address() {
+        let out = inspected(
+            r#"{"zeta":{"IPAddress":"10.0.0.9"},"alpha":{"IPAddress":"172.18.0.4"}}"#,
+            r#"{"80/tcp":{},"443/tcp":{}}"#,
+            "default",
+        );
+        let (calls, reach) = reach_of(None, out, "0.0.0.0:8080->80/tcp");
+        assert_eq!(
+            calls,
+            [["docker", "inspect", "--format", INSPECT_FORMAT, "abc"].map(String::from)]
+        );
+        let reach = reach.unwrap();
+        assert_eq!(reach.address.as_deref(), Some("172.18.0.4"));
+        assert!(!reach.host_network);
+        assert_eq!(
+            reach.ports,
+            [
+                PortOffer {
+                    port: 80,
+                    published: Some(8080),
+                    published_address: None,
+                    loopback_only: false
+                },
+                PortOffer {
+                    port: 443,
+                    published: None,
+                    published_address: None,
+                    loopback_only: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reach_keeps_the_one_address_a_port_is_published_on() {
+        let out = inspected("{}", r#"{"80/tcp":{}}"#, "default");
+        let reach = reach_of(None, out, "192.168.1.10:8080->80/tcp").1.unwrap();
+        assert_eq!(reach.ports[0].published, Some(8080));
+        assert_eq!(
+            reach.ports[0].published_address.as_deref(),
+            Some("192.168.1.10")
+        );
+    }
+
+    #[test]
+    fn reach_ignores_a_network_address_that_is_not_one() {
+        let out = inspected(
+            r#"{"alpha":{"IPAddress":"-oProxyCommand=x"},"beta":{"IPAddress":"10.0.0.2"}}"#,
+            "{}",
+            "default",
+        );
+        let reach = reach_of(None, out, "").1.unwrap();
+        assert_eq!(reach.address.as_deref(), Some("10.0.0.2"));
+        let out = inspected(r#"{"alpha":{"IPAddress":"a b"}}"#, "{}", "default");
+        assert_eq!(reach_of(None, out, "").1.unwrap().address, None);
+    }
+
+    #[test]
+    fn reach_reads_host_networking_and_missing_addresses() {
+        let out = inspected(r#"{"host":{"IPAddress":""}}"#, "null", "host");
+        let reach = reach_of(None, out, "").1.unwrap();
+        assert!(reach.host_network);
+        assert_eq!(reach.address, None);
+        assert!(reach.ports.is_empty());
+    }
+
+    #[test]
+    fn reach_runs_through_the_group_the_listing_needed() {
+        let out = inspected("{}", "{}", "default");
+        let (calls, _) = reach_of(Some(Via::Sg), out, "");
+        assert_eq!(calls[0][..3], ["sg", "docker", "-c"].map(String::from));
+    }
+
+    #[test]
+    fn a_failed_inspect_is_an_issue_and_a_cancelled_one_stops() {
+        let out = Output {
+            status: crate::platform::process::exit_status(1),
+            stdout: Vec::new(),
+            stderr: b"Error: no such object".to_vec(),
+        };
+        let (_, result) = reach_of(None, out, "");
+        let Err(ListFailure::Issue(issue)) = result else {
+            panic!("expected an issue");
+        };
+        assert_eq!(issue.problem, Problem::Other);
+        assert!(issue.headline.contains("no such object"));
+        let result = Docker.reach(&Target::Local, &row(""), None, &mut |_| {
+            Err(RunFailure::Cancelled(()))
+        });
+        assert!(matches!(result, Err(ListFailure::Run(()))));
     }
 }

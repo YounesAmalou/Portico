@@ -8,8 +8,9 @@ use std::{
 use super::{CANCELLED, Interrupts, Step, confirm, hosts::host_argument, json::JsonCommand};
 use crate::{
     app::{App, AppError, StartOutcome, StopOutcome, TunnelChanges},
+    domain::explain::Explanation,
     domain::openssh::OpenSshError,
-    domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus},
+    domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus, saved_name_for},
     picker::{Picker, Row},
 };
 
@@ -54,6 +55,17 @@ pub(super) enum TunnelCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Keep a temporary forward as a saved tunnel; a running one restarts under its new name.
+    Save {
+        /// The temporary forward, as `portico tunnels` lists it (`_web-80`).
+        name: String,
+        /// The saved tunnel's name; by default the temporary name without its leading `_`.
+        #[arg(long = "name", value_name = "NEW")]
+        new_name: Option<String>,
+        /// Print one JSON document instead of text (see docs/json-output.md).
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop running tunnels.
     Stop {
         names: Vec<String>,
@@ -70,6 +82,14 @@ pub(super) fn json_command(command: &TunnelCommand) -> Option<JsonCommand> {
     Some(match command {
         TunnelCommand::Show { name, json: true } => JsonCommand::TunnelShow(name.clone()),
         TunnelCommand::Start { names, json: true } => JsonCommand::TunnelStart(names.clone()),
+        TunnelCommand::Save {
+            name,
+            new_name,
+            json: true,
+        } => JsonCommand::TunnelSave {
+            name: name.clone(),
+            new_name: new_name.clone(),
+        },
         TunnelCommand::Stop {
             names,
             all,
@@ -128,8 +148,12 @@ fn print_list<O: Write>(output: &mut O, reports: &[TunnelReport]) -> Result<(), 
         .iter()
         .map(|report| {
             [
-                report.tunnel.name.clone(),
-                report.tunnel.host.clone(),
+                if report.temporary {
+                    format!("{} (temporary)", report.tunnel.name)
+                } else {
+                    report.tunnel.name.clone()
+                },
+                crate::domain::tunnel::printable(&report.reaches),
                 report.tunnel.forward.describe(),
                 report.status.name().into(),
                 report.status.detail(),
@@ -284,14 +308,7 @@ fn start<O: Write, E: Write>(
                 explanation,
             }) => {
                 failed = true;
-                match explanation {
-                    Some(explanation) => {
-                        for line in explanation.render(name, false) {
-                            writeln!(error, "{line}").map_err(text)?;
-                        }
-                    }
-                    None => writeln!(error, "{name}: failed \u{2014} {reason}").map_err(text)?,
-                }
+                print_failed_start(error, name, &reason, explanation)?;
             }
             Err(refusal) => {
                 failed = true;
@@ -308,6 +325,30 @@ fn start<O: Write, E: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// A failed start of tunnel `name`: its explanation, or the reason in one line.
+pub(super) fn print_failed_start<E: Write>(
+    error: &mut E,
+    name: &str,
+    reason: &str,
+    explanation: Option<Explanation>,
+) -> Result<(), String> {
+    match explanation {
+        Some(explanation) => {
+            for line in explanation.render(name, false) {
+                writeln!(error, "{line}").map_err(text)?;
+            }
+            Ok(())
+        }
+        None => writeln!(error, "{name}: failed \u{2014} {reason}").map_err(text),
+    }
+}
+
+/// The name temporary forward `name` is saved under: `new_name`, or by default its name without
+/// the leading `_`.
+pub(super) fn save_name(name: &str, new_name: Option<String>) -> String {
+    new_name.unwrap_or_else(|| saved_name_for(name))
 }
 
 pub(super) fn list<O: Write>(app: &App, output: &mut O) -> Result<ExitCode, String> {
@@ -462,6 +503,34 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             let interrupts = start_interrupts(handle_signals)?;
             start(&names, app, &interrupts, output, error)
         }
+        TunnelCommand::Save { name, new_name, .. } => {
+            let saved = save_name(&name, new_name);
+            let outcome = app.save_tunnel(&name, &saved, None).map_err(text)?;
+            let name = &outcome.tunnel.name;
+            writeln!(output, "Saved {name}.").map_err(text)?;
+            let mut exit = ExitCode::SUCCESS;
+            match outcome.restarted {
+                None => {}
+                Some(StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. }) => {
+                    writeln!(
+                        output,
+                        "Restarted it as {name}; connections through it were interrupted."
+                    )
+                    .map_err(text)?;
+                }
+                Some(StartOutcome::Failed {
+                    reason,
+                    explanation,
+                }) => {
+                    exit = ExitCode::FAILURE;
+                    print_failed_start(error, name, &reason, explanation)?;
+                }
+            }
+            if let Some(note) = outcome.note {
+                writeln!(output, "Note: {note}.").map_err(text)?;
+            }
+            Ok(exit)
+        }
         TunnelCommand::Stop { names, all, .. } => {
             let names = if all {
                 let running = app.running_tunnels().map_err(text)?;
@@ -559,6 +628,18 @@ pub(super) mod tests {
                 .unwrap();
         }
         (dir, app)
+    }
+
+    #[test]
+    fn the_list_prints_what_a_tunnel_reaches_without_escapes() {
+        let (_dir, app) = two_tunnels();
+        let mut reports = app.tunnels().unwrap();
+        reports[0].reaches = "web on \u{1b}]0;owned\u{7}prod".into();
+        let mut output = Vec::new();
+        print_list(&mut output, &reports).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+        assert!(output.contains("web on prod"), "{output:?}");
     }
 
     #[test]

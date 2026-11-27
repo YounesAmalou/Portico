@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "tunnel": {
+    "forward": {
+      "bind_address": "127.0.0.1",
+      "bind_port": 5433,
+      "description": "127.0.0.1:5433 → localhost:5432",
+      "kind": "local",
+      "spec": "127.0.0.1:5433:localhost:5432",
+      "target_host": "localhost",
+      "target_port": 5432
+    },
+    "host": "prod",
+    "name": "_prod-5432",
+    "reaches": "prod",
+    "status": {
+      "pid": 41237,
+      "started": 1781860921,
+      "state": "running"
+    },
+    "temporary": true,
+    "warnings": []
+  }
+}
