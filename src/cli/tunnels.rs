@@ -505,7 +505,7 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
         }
         TunnelCommand::Save { name, new_name, .. } => {
             let saved = save_name(&name, new_name);
-            let outcome = app.save_tunnel(&name, &saved).map_err(text)?;
+            let outcome = app.save_tunnel(&name, &saved, None).map_err(text)?;
             let name = &outcome.tunnel.name;
             writeln!(output, "Saved {name}.").map_err(text)?;
             let mut exit = ExitCode::SUCCESS;

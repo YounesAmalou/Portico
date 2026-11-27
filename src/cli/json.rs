@@ -309,7 +309,7 @@ fn document(
             ))
         }
         JsonCommand::TunnelSave { name, new_name } => {
-            let outcome = app.save_tunnel(&name, &save_name(&name, new_name))?;
+            let outcome = app.save_tunnel(&name, &save_name(&name, new_name), None)?;
             let tunnel = app.tunnel(&outcome.tunnel.name)?;
             // Saved either way; a restart that failed shows in the status and fails the run.
             let restart_failed = matches!(outcome.restarted, Some(StartOutcome::Failed { .. }));

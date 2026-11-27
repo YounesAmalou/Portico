@@ -60,6 +60,8 @@ pub struct SaveOutcome {
     pub restarted: Option<StartOutcome>,
     /// Said once: the saved tunnel reaches a container's address, which can change.
     pub note: Option<String>,
+    /// Whether the restart was cancelled: the tunnel is saved but not started.
+    pub cancelled: bool,
 }
 
 impl ForwardTarget {
@@ -251,8 +253,14 @@ impl App {
     /// Saves temporary forward `temporary` as tunnel `name`, as the tunnel form would. A
     /// running forward is stopped and the saved tunnel started at once (ssh finds a tunnel by
     /// its log path, which cannot change while it runs); a failed one is saved without
-    /// starting. The note says when the tunnel reaches a container's address.
-    pub fn save_tunnel(&self, temporary: &str, name: &str) -> Result<SaveOutcome, AppError> {
+    /// starting. The note says when the tunnel reaches a container's address. Setting
+    /// `cancelled` cancels the restart, never the save.
+    pub fn save_tunnel(
+        &self,
+        temporary: &str,
+        name: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<SaveOutcome, AppError> {
         if !is_temporary(temporary) {
             return Err(TunnelRefusal::NotTemporary(temporary.into()).into());
         }
@@ -264,15 +272,22 @@ impl App {
         let tunnel = Tunnel::new(name, report.tunnel.host.clone(), report.tunnel.forward)?;
         self.add_tunnel(tunnel.clone())?;
         // The tunnel is saved from here on: a stop or start refused is its failed start, not an
-        // error, so the save is never half applied. Nothing can cancel this start.
+        // error, so the save is never half applied. A cancelled start leaves it saved.
+        let mut restart_cancelled = false;
         let restarted = if report.status.is_running() {
             let started = self
                 .stop_tunnel(&report.tunnel.name)
-                .and_then(|_| self.start_tunnel(&tunnel.name, None, false));
-            Some(started.unwrap_or_else(|error| StartOutcome::Failed {
-                reason: first_line(&error.to_string()),
-                explanation: None,
-            }))
+                .and_then(|_| self.start_tunnel(&tunnel.name, cancelled, false));
+            match started {
+                Err(AppError::OpenSsh(OpenSshError::Cancelled)) => {
+                    restart_cancelled = true;
+                    None
+                }
+                started => Some(started.unwrap_or_else(|error| StartOutcome::Failed {
+                    reason: first_line(&error.to_string()),
+                    explanation: None,
+                })),
+            }
         } else {
             self.forget_run(&report.tunnel.name);
             None
@@ -292,6 +307,7 @@ impl App {
             tunnel,
             restarted,
             note,
+            cancelled: restart_cancelled,
         })
     }
 
@@ -1010,7 +1026,7 @@ exit 0
 
         let saved = fixture
             .app
-            .save_tunnel(&temporary.name, "prod-5432")
+            .save_tunnel(&temporary.name, "prod-5432", None)
             .unwrap();
 
         assert_eq!(saved.tunnel.name, "prod-5432");
@@ -1052,7 +1068,7 @@ exit 0
 
         let saved = fixture
             .app
-            .save_tunnel(&temporary.name, "prod-5432")
+            .save_tunnel(&temporary.name, "prod-5432", None)
             .unwrap();
 
         match &saved.restarted {
@@ -1085,7 +1101,10 @@ exit 0
             .quick_forward(&docker_web(), None, 443, Some(free_port()), None, false)
             .unwrap();
 
-        let saved = fixture.app.save_tunnel(&temporary.name, "web-443").unwrap();
+        let saved = fixture
+            .app
+            .save_tunnel(&temporary.name, "web-443", None)
+            .unwrap();
 
         assert_eq!(
             saved.note.as_deref(),
@@ -1095,12 +1114,49 @@ exit 0
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cancelled_restart_leaves_the_forward_saved() {
+        let fixture = fixture();
+        let (temporary, _) = fixture
+            .app
+            .quick_forward(
+                &ForwardTarget::Host("prod".into()),
+                None,
+                5432,
+                Some(free_port()),
+                None,
+                false,
+            )
+            .unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let saved = fixture
+            .app
+            .save_tunnel(&temporary.name, "prod-5432", Some(&cancelled))
+            .unwrap();
+
+        assert!(saved.cancelled);
+        assert_eq!(saved.restarted, None);
+        let reports = fixture.app.tunnels().unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.tunnel.name == "prod-5432" && !report.temporary),
+            "{reports:?}"
+        );
+        assert!(!fixture.app.runtime.record(&temporary.name).exists());
+    }
+
     #[test]
     fn a_failed_forward_is_saved_without_starting() {
         let fixture = fixture();
         fixture.failed("_prod-5432", "-L 127.0.0.1:15432:localhost:5432");
 
-        let saved = fixture.app.save_tunnel("_prod-5432", "prod-5432").unwrap();
+        let saved = fixture
+            .app
+            .save_tunnel("_prod-5432", "prod-5432", None)
+            .unwrap();
 
         assert_eq!(saved.restarted, None);
         assert_eq!(
@@ -1117,7 +1173,7 @@ exit 0
     fn only_a_temporary_forward_is_saved() {
         let fixture = fixture();
 
-        let refused = fixture.app.save_tunnel("socks", "other");
+        let refused = fixture.app.save_tunnel("socks", "other", None);
 
         assert!(
             matches!(

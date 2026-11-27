@@ -515,10 +515,10 @@ fn on_tick(
         dialog.finish_loading(loaded);
         redraw = true;
     }
-    if let Some(finished) = workers.starter.poll() {
-        match finished {
-            Finished::Tunnel(name, result) => state.tunnels.finish_start(&name, result),
-            Finished::Forward(result) => state.finish_forward(result),
+    let finished = workers.starter.poll();
+    if !finished.is_empty() {
+        for finished in finished {
+            finish_job(state, finished);
         }
         state.tunnels.reload(app);
         redraw = true;
@@ -548,6 +548,29 @@ fn on_tick(
         redraw = true;
     }
     redraw
+}
+
+/// Shows the result of a job of the tunnels tab's start worker; the caller reloads afterwards.
+fn finish_job(state: &mut UiState, finished: Finished) {
+    match finished {
+        Finished::Tunnel(name, result) => state.tunnels.finish_start(&name, result),
+        Finished::Forward(result) => state.finish_forward(result),
+        Finished::Save(result) => state.tunnels.finish_save(result),
+    }
+}
+
+/// The status line after stopping tunnel `name`: stopping a temporary forward removes it.
+fn stop_status(name: &str, result: Result<crate::app::StopOutcome, AppError>) -> String {
+    use crate::app::StopOutcome;
+    let temporary = crate::domain::tunnel::is_temporary(name);
+    let name = crate::domain::tunnel::printable(name);
+    match result {
+        Ok(StopOutcome::Stopped) if temporary => format!("Stopped and removed {name}"),
+        Ok(StopOutcome::Stopped) => format!("Stopped {name}"),
+        Ok(StopOutcome::NotRunning) if temporary => format!("Removed {name}"),
+        Ok(StopOutcome::NotRunning) => format!("{name} was not running"),
+        Err(error) => crate::domain::tunnel::printable(&error.to_string()),
+    }
 }
 
 /// Shows a copy's or an open's outcome where it was asked for: the forward dialog when it is
@@ -587,24 +610,12 @@ fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, acti
             starter.cancel();
             screen.set_starting(None);
         }
-        TunnelAction::Stop(name) => {
-            // Stopping a temporary forward removes it.
-            let temporary = crate::domain::tunnel::is_temporary(&name);
-            let shown = crate::domain::tunnel::printable(&name);
-            screen.set_status(match app.stop_tunnel(&name) {
-                Ok(crate::app::StopOutcome::Stopped) if temporary => {
-                    format!("Stopped and removed {shown}")
-                }
-                Ok(crate::app::StopOutcome::Stopped) => format!("Stopped {shown}"),
-                Ok(crate::app::StopOutcome::NotRunning) if temporary => {
-                    format!("Removed {shown}")
-                }
-                Ok(crate::app::StopOutcome::NotRunning) => format!("{shown} was not running"),
-                Err(error) => error.to_string(),
-            });
-        }
+        TunnelAction::Stop(name) => screen.set_status(stop_status(&name, app.stop_tunnel(&name))),
+        // The save restarts a running forward, which runs on the worker like any start.
         TunnelAction::Save { temporary, name } => {
-            screen.finish_save(app.save_tunnel(&temporary, &name));
+            starter.save(temporary, name);
+            screen.set_starting(starter.running().map(str::to_owned));
+            return;
         }
         TunnelAction::Add(tunnel) => {
             let done = format!("Saved {}", tunnel.name);
@@ -3451,6 +3462,94 @@ mod tests {
             squashed(&panel).contains(&squashed(&command)),
             "{}",
             buffer_text(&buffer)
+        );
+    }
+
+    #[test]
+    fn stopping_a_temporary_forward_says_it_was_removed() {
+        use crate::app::StopOutcome;
+        assert_eq!(
+            stop_status("_prod-80", Ok(StopOutcome::Stopped)),
+            "Stopped and removed _prod-80"
+        );
+        assert_eq!(
+            stop_status("_prod-80", Ok(StopOutcome::NotRunning)),
+            "Removed _prod-80"
+        );
+        assert_eq!(stop_status("db", Ok(StopOutcome::Stopped)), "Stopped db");
+        assert_eq!(
+            stop_status(
+                "db",
+                Err(AppError::Tunnel(crate::app::TunnelRefusal::Unknown(
+                    "d\u{1b}[31mb".into()
+                )))
+            ),
+            stop_status(
+                "db",
+                Err(AppError::Tunnel(crate::app::TunnelRefusal::Unknown(
+                    "db".into()
+                )))
+            ),
+            "the error is printable"
+        );
+    }
+
+    #[test]
+    fn a_save_runs_on_the_start_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = settings_app(dir.path());
+        let mut state = test_state(vec![summary("prod", Ownership::Managed)]);
+        std::thread::scope(|scope| {
+            let mut starter = Starter::spawn(scope, &app);
+            run_tunnel_action(
+                &app,
+                &mut state,
+                &mut starter,
+                TunnelAction::Save {
+                    temporary: "_prod-80".into(),
+                    name: "prod-80".into(),
+                },
+            );
+            assert_eq!(starter.running(), Some("_prod-80"), "not run inline");
+            assert_eq!(
+                state.tunnels.status_line().as_deref(),
+                Some("Starting _prod-80\u{2026} (Esc to cancel)")
+            );
+            let finished = loop {
+                let finished = starter.poll();
+                if !finished.is_empty() {
+                    break finished;
+                }
+                std::thread::yield_now();
+            };
+            assert!(
+                matches!(finished.as_slice(), [tunnels::Finished::Save(Err(_))]),
+                "{finished:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_finished_save_shows_its_status() {
+        use crate::domain::tunnel::{Forward, Kind, Tunnel};
+        let mut state = test_state(vec![summary("prod", Ownership::Managed)]);
+        finish_job(
+            &mut state,
+            tunnels::Finished::Save(Ok(crate::app::SaveOutcome {
+                tunnel: Tunnel::new(
+                    "prod-80",
+                    "prod",
+                    Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                )
+                .unwrap(),
+                restarted: Some(crate::app::StartOutcome::Started { pid: 9 }),
+                note: None,
+                cancelled: false,
+            })),
+        );
+        assert_eq!(
+            state.tunnels.status_line().as_deref(),
+            Some("saved prod-80; restarted it (connections through it were interrupted)")
         );
     }
 

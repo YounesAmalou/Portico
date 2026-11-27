@@ -407,6 +407,7 @@ impl TunnelsScreen {
                     Some(StartOutcome::Failed { reason, .. }) => {
                         status.push_str(&format!("; restarting it failed: {}", printable(&reason)));
                     }
+                    None if outcome.cancelled => status.push_str("; restart cancelled"),
                     None => {}
                 }
                 if let Some(note) = outcome.note {
@@ -417,10 +418,12 @@ impl TunnelsScreen {
                 self.status = Some(status);
                 self.select_new(&name);
             }
-            Err(error) => {
+            // Asks for another name, unless something else took the screen meanwhile.
+            Err(error) if matches!(self.screen, Screen::Browse | Screen::SaveName) => {
                 self.screen = Screen::SaveName;
                 self.save_error = Some(printable(&error.to_string()));
             }
+            Err(error) => self.status = Some(printable(&error.to_string())),
         }
     }
 
@@ -545,11 +548,17 @@ impl TunnelsScreen {
                 _ => TunnelAction::None,
             },
             Screen::SaveName => match key.code {
+                // The prompt closes while the save runs, so Esc cancels its restart; a refusal
+                // opens it again.
                 KeyCode::Enter => match self.selected() {
-                    Some(report) => TunnelAction::Save {
-                        temporary: report.tunnel.name.clone(),
-                        name: self.save_name.as_str().to_owned(),
-                    },
+                    Some(report) => {
+                        let action = TunnelAction::Save {
+                            temporary: report.tunnel.name.clone(),
+                            name: self.save_name.as_str().to_owned(),
+                        };
+                        self.screen = Screen::Browse;
+                        action
+                    }
                     None => {
                         self.screen = Screen::Browse;
                         TunnelAction::None
@@ -656,7 +665,7 @@ impl TunnelsScreen {
             KeyCode::Char('e') | KeyCode::Char('x') if running => {
                 self.status = Some(format!(
                     "{} is running; stop it first (s)",
-                    self.selected_name().unwrap_or_default()
+                    printable(self.selected_name().unwrap_or_default())
                 ));
             }
             KeyCode::Char('e') => {
@@ -1201,6 +1210,11 @@ fn status_span(status: &TunnelStatus) -> Span<'static> {
 )]
 enum Job {
     Tunnel(String),
+    /// Saves temporary forward `temporary` as tunnel `name`, restarting it when it runs.
+    Save {
+        temporary: String,
+        name: String,
+    },
     Forward {
         target: ForwardTarget,
         reach: Option<Reach>,
@@ -1227,6 +1241,9 @@ pub(super) enum Finished {
     Tunnel(String, Result<StartOutcome, String>),
     /// A temporary forward's start, with the forward it started under its name.
     Forward(Result<(Tunnel, StartOutcome), String>),
+    /// A temporary forward's save. It is delivered even when cancelled: the cancel only stops
+    /// the restart, and the tunnel is saved.
+    Save(Result<SaveOutcome, AppError>),
 }
 
 /// Starts one tunnel at a time on a worker thread, with the scheme of the connection tester:
@@ -1247,7 +1264,8 @@ impl Starter {
         let (sender, results) = mpsc::channel();
         scope.spawn(move || {
             while let Ok(request) = receiver.recv() {
-                if request.cancelled.load(Ordering::Relaxed) {
+                let save = matches!(request.job, Job::Save { .. });
+                if request.cancelled.load(Ordering::Relaxed) && !save {
                     continue;
                 }
                 let cancelled = Some(request.cancelled.as_ref());
@@ -1257,6 +1275,9 @@ impl Starter {
                             .start_tunnel(&name, cancelled, true)
                             .map_err(|error| error.to_string());
                         Finished::Tunnel(name, result)
+                    }
+                    Job::Save { temporary, name } => {
+                        Finished::Save(app.save_tunnel(&temporary, &name, cancelled))
                     }
                     Job::Forward {
                         target,
@@ -1268,7 +1289,7 @@ impl Starter {
                             .map_err(|error| error.to_string()),
                     ),
                 };
-                if request.cancelled.load(Ordering::Relaxed) {
+                if request.cancelled.load(Ordering::Relaxed) && !save {
                     continue;
                 }
                 let delivered = Delivered {
@@ -1291,6 +1312,12 @@ impl Starter {
     /// Starts tunnel `name`, cancelling the start still running.
     pub(super) fn start(&mut self, name: String) {
         self.send(name.clone(), Job::Tunnel(name));
+    }
+
+    /// Saves temporary forward `temporary` as tunnel `name`, shown as the temporary forward
+    /// starting while its restart runs; cancels the start still running.
+    pub(super) fn save(&mut self, temporary: String, name: String) {
+        self.send(temporary.clone(), Job::Save { temporary, name });
     }
 
     /// Starts a temporary forward to port `remote` of `target`, cancelling the start still
@@ -1339,15 +1366,19 @@ impl Starter {
         self.running.as_ref().map(|(name, _)| name.as_str())
     }
 
-    pub(super) fn poll(&mut self) -> Option<Finished> {
-        let mut current = None;
-        while let Ok(delivered) = self.results.try_recv() {
-            if self.running.is_some() && delivered.generation == self.generation {
+    /// The results delivered since the last poll: the current job's, and any save's, which
+    /// is wanted even once cancelled or replaced.
+    pub(super) fn poll(&mut self) -> Vec<Finished> {
+        let mut delivered = Vec::new();
+        while let Ok(result) = self.results.try_recv() {
+            if self.running.is_some() && result.generation == self.generation {
                 self.running = None;
-                current = Some(delivered.finished);
+                delivered.push(result.finished);
+            } else if matches!(result.finished, Finished::Save(_)) {
+                delivered.push(result.finished);
             }
         }
-        current
+        delivered
     }
 }
 
@@ -1834,6 +1865,10 @@ pub(super) mod tests {
                 name: "prod-80".into()
             }
         );
+        assert!(
+            screen.is_browsing(),
+            "the prompt closes while the save runs, so Esc cancels its restart"
+        );
         screen.finish_save(Err(AppError::Tunnel(TunnelRefusal::Exists(
             "prod-80".into(),
         ))));
@@ -1868,6 +1903,7 @@ pub(super) mod tests {
             tunnel: saved.clone(),
             restarted: Some(StartOutcome::Started { pid: 9 }),
             note: Some("saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated".into()),
+            cancelled: false,
         }));
         assert!(screen.is_browsing());
         assert_eq!(
@@ -1886,10 +1922,45 @@ pub(super) mod tests {
                 explanation: None,
             }),
             note: None,
+            cancelled: false,
         }));
         assert_eq!(
             screen.status_line().as_deref(),
             Some("saved prod-80; restarting it failed: port in use")
+        );
+    }
+
+    #[test]
+    fn a_cancelled_restart_says_the_tunnel_is_saved() {
+        let mut screen = screen_with(vec![temporary(
+            "_prod-80",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        screen.handle_key(key(KeyCode::Char('w')));
+        screen.handle_key(key(KeyCode::Enter));
+        screen.finish_save(Ok(SaveOutcome {
+            tunnel: temporary("prod-80", TunnelStatus::Stopped).tunnel,
+            restarted: None,
+            note: None,
+            cancelled: true,
+        }));
+        assert_eq!(
+            screen.status_line().as_deref(),
+            Some("saved prod-80; restart cancelled")
+        );
+    }
+
+    #[test]
+    fn a_running_tunnel_name_is_printable_in_the_stop_first_message() {
+        let mut screen = screen_with(vec![report(
+            "db",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        screen.reports[0].tunnel.name = "d\u{1b}[31mb".into();
+        screen.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(
+            screen.status.as_deref(),
+            Some("db is running; stop it first (s)")
         );
     }
 
