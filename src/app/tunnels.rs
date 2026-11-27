@@ -156,6 +156,25 @@ fn recorded_tunnel(name: &str, host: &str, forward: &str) -> Option<Tunnel> {
     })
 }
 
+/// The record of a failed start of `tunnel`: a temporary forward's keeps its host, forward and
+/// `reaches`, so it stays listed and can start again.
+fn failed_record(
+    tunnel: &Tunnel,
+    reaches: Option<&str>,
+    reason: &str,
+    exit: Option<i32>,
+) -> Record {
+    let temporary = is_temporary(&tunnel.name);
+    Record::Failed {
+        reason: reason.to_owned(),
+        exit,
+        finished: now(),
+        host: temporary.then(|| tunnel.host.clone()),
+        forward: temporary.then(|| forward_text(&tunnel.forward)),
+        reaches: reaches.filter(|_| temporary).map(str::to_owned),
+    }
+}
+
 /// A forward as a record's `forward` line writes it.
 fn forward_text(forward: &Forward) -> String {
     format!("{} {}", forward.kind.flag(), forward.spec())
@@ -516,8 +535,32 @@ impl App {
 
     /// Runs the tunnel's ssh, waits for it to background itself (or, where ssh cannot, for its
     /// forward to come up while it runs detached), and records the result. A temporary
-    /// forward's failed record keeps its host, forward and `reaches`, so it can start again.
+    /// forward's failed record keeps its host, forward and `reaches`, so it can start again,
+    /// and one is written however the start ends without success, a cancel included: its
+    /// record is the only place its forward lives.
     fn launch(
+        &self,
+        tunnel: &Tunnel,
+        reaches: Option<&str>,
+        cancelled: Option<&AtomicBool>,
+        in_tui: bool,
+    ) -> Result<StartOutcome, AppError> {
+        let outcome = self.run_start(tunnel, reaches, cancelled, in_tui);
+        if let Err(error) = &outcome
+            && is_temporary(&tunnel.name)
+        {
+            let reason = match error {
+                AppError::OpenSsh(OpenSshError::Cancelled) => "cancelled".to_owned(),
+                error => error.to_string(),
+            };
+            let _ = failed_record(tunnel, reaches, &reason, None)
+                .write(&self.runtime.record(&tunnel.name));
+        }
+        outcome
+    }
+
+    /// `launch` without the failed record of a temporary forward whose start ended in an error.
+    fn run_start(
         &self,
         tunnel: &Tunnel,
         reaches: Option<&str>,
@@ -528,15 +571,7 @@ impl App {
             self.runtime.record(&tunnel.name),
             self.runtime.log(&tunnel.name),
         );
-        let temporary = is_temporary(&tunnel.name);
-        let failed = |reason: &str, exit: Option<i32>| Record::Failed {
-            reason: reason.to_owned(),
-            exit,
-            finished: now(),
-            host: temporary.then(|| tunnel.host.clone()),
-            forward: temporary.then(|| forward_text(&tunnel.forward)),
-            reaches: reaches.filter(|_| temporary).map(str::to_owned),
-        };
+        let failed = |reason: &str, exit: Option<i32>| failed_record(tunnel, reaches, reason, exit);
         Record::remove(&record_path).map_err(runtime_error(record_path.clone()))?;
         let create = |path: &PathBuf| {
             private(
@@ -1209,7 +1244,8 @@ mod tests {
     /// An app with the host `prod` whose `ssh` fakes tunnel starts: `-G` answers like OpenSSH,
     /// and a start leaves a background stand-in that carries its arguments, as ssh's background
     /// process does, unless `<dir>/fail-start` exists, when it fails as ssh does on a refused
-    /// forward.
+    /// forward, or `<dir>/hang-start`, when it keeps connecting (and says so in
+    /// `<dir>/connecting`).
     #[cfg(target_os = "linux")]
     fn tunnel_app(dir: &Path) -> App {
         use crate::{domain::host::Host, test_executable::write_executable};
@@ -1230,10 +1266,16 @@ if [ -f '{fail}' ]; then
   echo 'Error: remote port forwarding failed for listen port 8080' >> "$elog"
   exit 255
 fi
+if [ -f '{hang}' ]; then
+  : > '{connecting}'
+  exec sleep 60
+fi
 setsid sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1 &
 exit 0
 "#,
-                fail = dir.join("fail-start").display()
+                fail = dir.join("fail-start").display(),
+                hang = dir.join("hang-start").display(),
+                connecting = dir.join("connecting").display(),
             ),
         );
         fs::create_dir_all(dir.join("home/.ssh")).unwrap();
@@ -1536,5 +1578,90 @@ exit 0
         assert_eq!(names, ["_new-81", "_old-80"]);
         // A record without `reaches` shows the destination.
         assert_eq!(reports[0].reaches, "172.18.0.4:80");
+    }
+
+    /// A listed temporary forward whose ssh failed, as `start_temporary` leaves it.
+    #[cfg(target_os = "linux")]
+    fn failed_temporary(app: &App) -> String {
+        let tunnel = temporary(free_port());
+        app.runtime.ensure().unwrap();
+        failed_record(&tunnel, Some("prod"), "exited", Some(255))
+            .write(&app.runtime.record(&tunnel.name))
+            .unwrap();
+        tunnel.name
+    }
+
+    /// The forward is still listed, failed, with its host, forward and `reaches`.
+    #[cfg(target_os = "linux")]
+    fn assert_kept(app: &App, name: &str) {
+        let Some(Record::Failed {
+            host,
+            forward,
+            reaches,
+            ..
+        }) = Record::read(&app.runtime.record(name))
+        else {
+            panic!("no failed record for {name}");
+        };
+        assert_eq!(host.as_deref(), Some("prod"));
+        assert!(forward.is_some());
+        assert_eq!(reaches.as_deref(), Some("prod"));
+        let reports = app.tunnels().unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.tunnel.name == name && report.status.name() == "failed"),
+            "{reports:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cancelled_restart_keeps_the_temporary_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        let name = failed_temporary(&app);
+        let cancelled = AtomicBool::new(true);
+        let result = app.start_tunnel(&name, Some(&cancelled), false);
+        assert!(
+            matches!(result, Err(AppError::OpenSsh(OpenSshError::Cancelled))),
+            "{result:?}"
+        );
+        assert_kept(&app, &name);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_restart_cancelled_while_connecting_keeps_the_temporary_forward() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        let name = failed_temporary(&app);
+        fs::write(dir.path().join("hang-start"), "").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let (cancelled, connecting) = (Arc::clone(&cancelled), dir.path().join("connecting"));
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !connecting.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        };
+        let result = app.start_tunnel(&name, Some(&cancelled), false);
+        canceller.join().unwrap();
+        assert!(
+            matches!(result, Err(AppError::OpenSsh(OpenSshError::Cancelled))),
+            "{result:?}"
+        );
+        assert_kept(&app, &name);
+        let Some(Record::Failed { reason, .. }) = Record::read(&app.runtime.record(&name)) else {
+            unreachable!()
+        };
+        assert_eq!(reason, "cancelled");
     }
 }
