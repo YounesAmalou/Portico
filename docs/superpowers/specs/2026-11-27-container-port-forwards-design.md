@@ -94,7 +94,7 @@ A quick forward to a container (from the previous slice) records its container t
 
 ### JSON
 
-Tunnel objects gain `container`: `{"backend": "docker", "reference": "shop/api", "port": 80}`, or `null`. For a container tunnel the forward's `target_host` is `null` (not stored) and `target_port` is the port inside the container. `reaches` for a saved container tunnel is `<reference> on <host>`. The changes are additive; `docs/json-output.md` and the goldens are updated.
+Tunnel objects gain `container`: `{"backend": "docker", "reference": "shop/api", "port": 80}`, or `null`. For a container tunnel the forward's `target_host` is the reference (still a string, so no consumer breaks; decided by the maintainer), `target_port` is the port inside the container, and `description` reads `127.0.0.1:8080 → shop/api:80`. `reaches` for a saved container tunnel is `<reference> on <host>`. The changes are additive; `docs/json-output.md` and the goldens are updated.
 
 ### Documentation
 
