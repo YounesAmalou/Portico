@@ -239,18 +239,14 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                     Ok(()) => format!("copied {text}"),
                     Err(error) => format!("could not copy {text}: {error}"),
                 };
-                if let Some(dialog) = &mut state.forward {
-                    dialog.set_status(status);
-                }
+                show_clipboard_status(&mut state, status);
             }
             UiAction::OpenUrl(url) => {
                 let status = match crate::platform::launcher::open_url(&url) {
                     Ok(()) => format!("opened {url}"),
                     Err(error) => format!("could not open {url}: {error}"),
                 };
-                if let Some(dialog) = &mut state.forward {
-                    dialog.set_status(status);
-                }
+                show_clipboard_status(&mut state, status);
             }
             UiAction::Connect {
                 alias,
@@ -554,11 +550,23 @@ fn on_tick(
     redraw
 }
 
+/// Shows a copy's or an open's outcome where it was asked for: the forward dialog when it is
+/// open, otherwise the Tunnels tab.
+fn show_clipboard_status(state: &mut UiState, status: String) {
+    match &mut state.forward {
+        Some(dialog) => dialog.set_status(status),
+        None => state.tunnels.set_status(status),
+    }
+}
+
 /// Carries out what the Tunnels tab asked for.
 fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, action: TunnelAction) {
     let screen = &mut state.tunnels;
     match action {
-        TunnelAction::None | TunnelAction::Quit => return,
+        // Copy and Open become the interface's own actions before they get here.
+        TunnelAction::None | TunnelAction::Quit | TunnelAction::Copy(_) | TunnelAction::Open(_) => {
+            return;
+        }
         TunnelAction::Refresh => screen.set_status("Refreshed"),
         TunnelAction::Start(name) => {
             starter.start(name);
@@ -579,11 +587,25 @@ fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, acti
             starter.cancel();
             screen.set_starting(None);
         }
-        TunnelAction::Stop(name) => screen.set_status(match app.stop_tunnel(&name) {
-            Ok(crate::app::StopOutcome::Stopped) => format!("Stopped {name}"),
-            Ok(crate::app::StopOutcome::NotRunning) => format!("{name} was not running"),
-            Err(error) => error.to_string(),
-        }),
+        TunnelAction::Stop(name) => {
+            // Stopping a temporary forward removes it.
+            let temporary = crate::domain::tunnel::is_temporary(&name);
+            let shown = crate::domain::tunnel::printable(&name);
+            screen.set_status(match app.stop_tunnel(&name) {
+                Ok(crate::app::StopOutcome::Stopped) if temporary => {
+                    format!("Stopped and removed {shown}")
+                }
+                Ok(crate::app::StopOutcome::Stopped) => format!("Stopped {shown}"),
+                Ok(crate::app::StopOutcome::NotRunning) if temporary => {
+                    format!("Removed {shown}")
+                }
+                Ok(crate::app::StopOutcome::NotRunning) => format!("{shown} was not running"),
+                Err(error) => error.to_string(),
+            });
+        }
+        TunnelAction::Save { temporary, name } => {
+            screen.finish_save(app.save_tunnel(&temporary, &name));
+        }
         TunnelAction::Add(tunnel) => {
             let done = format!("Saved {}", tunnel.name);
             screen.finish_change(app.add_tunnel(tunnel), done);
@@ -1341,6 +1363,8 @@ impl UiState {
             Tab::Hosts => self.handle_hosts_key(key),
             Tab::Tunnels => match self.tunnels.handle_key(key) {
                 TunnelAction::Quit => UiAction::Quit,
+                TunnelAction::Copy(text) => UiAction::Copy(text),
+                TunnelAction::Open(url) => UiAction::OpenUrl(url),
                 action => UiAction::Tunnels(action),
             },
             Tab::Containers(backend) => {
@@ -3428,6 +3452,40 @@ mod tests {
             "{}",
             buffer_text(&buffer)
         );
+    }
+
+    #[test]
+    fn the_tunnels_tab_copies_and_opens_a_local_address() {
+        use crate::domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus};
+        let mut state = test_state(vec![summary("prod", Ownership::Managed)]);
+        state.tunnels = tunnels::tests::screen_with(vec![TunnelReport {
+            tunnel: Tunnel {
+                name: "_prod-80".into(),
+                host: "prod".into(),
+                forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+            },
+            status: TunnelStatus::Running { pid: 7, started: 0 },
+            warnings: Vec::new(),
+            temporary: true,
+            reaches: "prod".into(),
+        }]);
+        char(&mut state, '2');
+        assert_eq!(
+            char(&mut state, 'y'),
+            UiAction::Copy("127.0.0.1:8080".into())
+        );
+        assert_eq!(
+            char(&mut state, 'b'),
+            UiAction::OpenUrl("http://127.0.0.1:8080".into())
+        );
+        show_clipboard_status(&mut state, "copied 127.0.0.1:8080".into());
+        assert_eq!(
+            state.tunnels.status_line().as_deref(),
+            Some("copied 127.0.0.1:8080")
+        );
+        let text = render_text_at(&state, 120);
+        assert!(text.contains("w save"), "{text}");
+        assert!(text.contains("temporary"), "{text}");
     }
 
     #[test]
