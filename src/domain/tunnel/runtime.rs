@@ -138,13 +138,13 @@ impl Record {
     pub fn render(&self) -> String {
         match self {
             Record::Running(record) => format!(
-                "state running\npid {}\nstart {}\nboot {}\nstarted {}\nhost {}\nforward {}\n{}",
+                "state running\npid {}\nstart {}\nboot {}\nstarted {}\n{}{}{}",
                 record.pid,
                 record.start,
                 record.boot,
                 record.started,
-                record.host,
-                record.forward,
+                line("host", Some(&record.host)),
+                line("forward", Some(&record.forward)),
                 line("reaches", record.reaches.as_deref())
             ),
             Record::Failed {
@@ -793,6 +793,20 @@ mod tests {
         Record::remove(&path).unwrap();
         Record::remove(&path).unwrap();
         assert_eq!(Record::read(&path), None);
+    }
+
+    #[test]
+    fn a_running_record_keeps_one_printable_value_per_line() {
+        let mut running = record(41, 500);
+        running.host = "prod\nstate failed".into();
+        running.forward = "-L 127.0.0.1:80:\u{1b}[31mweb:80".into();
+        let text = Record::Running(running).render();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert_eq!(text.matches("state ").count(), 1, "{text:?}");
+        let Some(Record::Running(parsed)) = Record::parse(&text) else {
+            panic!("{text:?}");
+        };
+        assert_eq!(parsed.host, "prod");
     }
 
     /// macOS has no runtime directory: its `runtime_dir` is tested in `platform::macos`.

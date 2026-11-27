@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::super::{
-    common::launcher::{Launch, run, spawn_detached},
+    common::launcher::{Launch, open_url_with, run},
     unix::fs::write_unique,
 };
 
@@ -19,7 +19,7 @@ pub const DEFAULT_LAUNCHER: &str = "open";
 
 /// Opens `url` in the default browser with `open(1)`, without waiting for it.
 pub fn open_url(url: &str) -> io::Result<()> {
-    spawn_detached("open", &[url])
+    open_url_with("open", &[], url)
 }
 
 /// A terminal application Portico knows how to hand a command to.

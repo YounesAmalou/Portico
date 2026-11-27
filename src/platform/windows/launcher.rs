@@ -24,7 +24,7 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    super::common::launcher::{LAUNCH_GRACE, Launch, run, spawn_detached},
+    super::common::launcher::{LAUNCH_GRACE, Launch, open_url_with, run},
     process::keep_standard_handles,
 };
 
@@ -46,7 +46,7 @@ pub enum Choice {
 /// without waiting for it. The empty argument is the window title `start` would otherwise take
 /// from a quoted URL.
 pub fn open_url(url: &str) -> io::Result<()> {
-    spawn_detached("cmd", &["/c", "start", "", url])
+    open_url_with("cmd", &["/c", "start", ""], url)
 }
 
 /// `portico_terminal` when it names an executable or `cmd` (a new console window); otherwise

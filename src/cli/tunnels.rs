@@ -153,7 +153,7 @@ fn print_list<O: Write>(output: &mut O, reports: &[TunnelReport]) -> Result<(), 
                 } else {
                     report.tunnel.name.clone()
                 },
-                report.reaches.clone(),
+                crate::domain::tunnel::printable(&report.reaches),
                 report.tunnel.forward.describe(),
                 report.status.name().into(),
                 report.status.detail(),
@@ -628,6 +628,18 @@ pub(super) mod tests {
                 .unwrap();
         }
         (dir, app)
+    }
+
+    #[test]
+    fn the_list_prints_what_a_tunnel_reaches_without_escapes() {
+        let (_dir, app) = two_tunnels();
+        let mut reports = app.tunnels().unwrap();
+        reports[0].reaches = "web on \u{1b}]0;owned\u{7}prod".into();
+        let mut output = Vec::new();
+        print_list(&mut output, &reports).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+        assert!(output.contains("web on prod"), "{output:?}");
     }
 
     #[test]
