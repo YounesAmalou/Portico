@@ -105,6 +105,9 @@ pub struct RunningRecord {
     pub host: String,
     /// The flag and spec, as `-L 127.0.0.1:5432:localhost:5432`.
     pub forward: String,
+    /// What a temporary forward reaches, for display: `web on prod`. Absent from saved tunnels'
+    /// records and from rebuilt ones.
+    pub reaches: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,25 +118,52 @@ pub enum Record {
         exit: Option<i32>,
         /// Unix seconds.
         finished: u64,
+        /// The host and forward of a temporary forward, which has no saved tunnel to read them from.
+        host: Option<String>,
+        forward: Option<String>,
+        reaches: Option<String>,
     },
+}
+
+/// `key value` as one record line, or nothing when `value` is absent. The value is cut to its
+/// first line and made printable, so the record stays one value per line.
+fn line(key: &str, value: Option<&str>) -> String {
+    value.map_or(String::new(), |value| {
+        let value = super::printable(value.lines().next().unwrap_or_default());
+        format!("{key} {value}\n")
+    })
 }
 
 impl Record {
     pub fn render(&self) -> String {
         match self {
             Record::Running(record) => format!(
-                "state running\npid {}\nstart {}\nboot {}\nstarted {}\nhost {}\nforward {}\n",
-                record.pid, record.start, record.boot, record.started, record.host, record.forward
+                "state running\npid {}\nstart {}\nboot {}\nstarted {}\nhost {}\nforward {}\n{}",
+                record.pid,
+                record.start,
+                record.boot,
+                record.started,
+                record.host,
+                record.forward,
+                line("reaches", record.reaches.as_deref())
             ),
             Record::Failed {
                 reason,
                 exit,
                 finished,
+                host,
+                forward,
+                reaches,
             } => {
                 let exit = exit.map_or(String::new(), |code| format!("exit {code}\n"));
                 // The reason is one line, so the record stays one value per line.
                 let reason = super::printable(reason.lines().next().unwrap_or_default());
-                format!("state failed\nreason {reason}\n{exit}finished {finished}\n")
+                format!(
+                    "state failed\nreason {reason}\n{exit}finished {finished}\n{}{}{}",
+                    line("host", host.as_deref()),
+                    line("forward", forward.as_deref()),
+                    line("reaches", reaches.as_deref())
+                )
             }
         }
     }
@@ -153,11 +183,15 @@ impl Record {
                 started: value("started")?.parse().ok()?,
                 host: value("host")?,
                 forward: value("forward")?,
+                reaches: value("reaches"),
             })),
             "failed" => Some(Record::Failed {
                 reason: value("reason")?,
                 exit: value("exit").and_then(|code| code.parse().ok()),
                 finished: value("finished")?.parse().ok()?,
+                host: value("host"),
+                forward: value("forward"),
+                reaches: value("reaches"),
             }),
             _ => None,
         }
@@ -229,6 +263,7 @@ impl Proc {
             started: self.started_at(start).unwrap_or_else(now),
             host,
             forward,
+            reaches: None,
         })
     }
 
@@ -274,6 +309,19 @@ pub enum Bind {
     InUse,
     /// A privileged port, or an address the user may not bind.
     Denied,
+}
+
+/// The local port a temporary forward to remote `remote` listens on: the remote port when
+/// `127.0.0.1` binds it, else the next free one above it. When binding the remote port is
+/// denied (a privileged port), the search starts at `remote + 8000`. `None` when no port up to
+/// 65535 is free.
+pub fn default_local_port(remote: u16, probe: impl Fn(u16) -> Bind) -> Option<u16> {
+    let start = match probe(remote) {
+        Bind::Free => return Some(remote),
+        Bind::InUse => remote.checked_add(1)?,
+        Bind::Denied => remote.checked_add(8000)?,
+    };
+    (start..=u16::MAX).find(|port| probe(*port) == Bind::Free)
 }
 
 /// Binds `address:port` and closes it at once, as ssh would bind it. A name is resolved and
@@ -465,6 +513,7 @@ mod tests {
             started: 2000,
             host: "prod-db".into(),
             forward: "-L 5432:db:5432".into(),
+            reaches: None,
         }
     }
 
@@ -715,6 +764,9 @@ mod tests {
             reason: "Address already in use: 127.0.0.1:5432\nsecond line".into(),
             exit: Some(255),
             finished: 1781861043,
+            host: None,
+            forward: None,
+            reaches: None,
         };
         assert_eq!(
             Record::parse(&failed.render()),
@@ -722,6 +774,9 @@ mod tests {
                 reason: "Address already in use: 127.0.0.1:5432".into(),
                 exit: Some(255),
                 finished: 1781861043,
+                host: None,
+                forward: None,
+                reaches: None,
             })
         );
         assert_eq!(Record::parse("state running\npid x\n"), None);
@@ -892,5 +947,66 @@ mod tests {
             Some("bind [127.0.0.1]:5432: Address already in use")
         );
         assert_eq!(log_tail(&log, 5).len(), 2);
+    }
+
+    #[test]
+    fn default_local_port_follows_the_remote_port_when_free() {
+        assert_eq!(default_local_port(5432, |_| Bind::Free), Some(5432));
+        assert_eq!(
+            default_local_port(5432, |port| if port == 5432 {
+                Bind::InUse
+            } else {
+                Bind::Free
+            }),
+            Some(5433)
+        );
+        assert_eq!(
+            default_local_port(80, |port| match port {
+                80 => Bind::Denied,
+                8080 => Bind::Free,
+                _ => Bind::InUse,
+            }),
+            Some(8080)
+        );
+        assert_eq!(default_local_port(65535, |_| Bind::InUse), None);
+    }
+
+    #[test]
+    fn record_keeps_what_a_temporary_forward_reaches() {
+        let running = Record::Running(RunningRecord {
+            reaches: Some("web on prod".into()),
+            ..record(41, 500)
+        });
+        assert!(running.render().contains("reaches web on prod\n"));
+        assert_eq!(Record::parse(&running.render()), Some(running));
+        let old =
+            "state running\npid 41\nstart 500\nboot b\nstarted 2000\nhost h\nforward -D 1080\n";
+        let Some(Record::Running(old)) = Record::parse(old) else {
+            panic!("an older record must parse");
+        };
+        assert_eq!(old.reaches, None);
+
+        let failed = Record::Failed {
+            reason: "no route".into(),
+            exit: Some(255),
+            finished: 7,
+            host: Some("prod".into()),
+            forward: Some("-L 127.0.0.1:80:localhost:80".into()),
+            reaches: Some("web on prod".into()),
+        };
+        assert_eq!(Record::parse(&failed.render()), Some(failed));
+        let saved = Record::Failed {
+            reason: "no route".into(),
+            exit: None,
+            finished: 7,
+            host: None,
+            forward: None,
+            reaches: None,
+        };
+        let text = saved.render();
+        assert!(
+            !text.contains("host ") && !text.contains("forward ") && !text.contains("reaches ")
+        );
+        assert_eq!(Record::parse(&text), Some(saved));
     }
 }

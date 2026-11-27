@@ -414,6 +414,9 @@ impl App {
                     reason: reason.clone(),
                     exit: None,
                     finished: now(),
+                    host: None,
+                    forward: None,
+                    reaches: None,
                 }
                 .write(&record_path)
                 .map_err(runtime_error(record_path))?;
@@ -453,6 +456,9 @@ impl App {
             reason: reason.clone(),
             exit: status.code(),
             finished: now(),
+            host: None,
+            forward: None,
+            reaches: None,
         }
         .write(&record_path)
         .map_err(runtime_error(record_path))?;
@@ -477,6 +483,7 @@ impl App {
             started: now(),
             host: tunnel.host.clone(),
             forward: format!("{} {}", tunnel.forward.kind.flag(), tunnel.forward.spec()),
+            reaches: None,
         })
         .write(record_path)
         .map_err(runtime_error(record_path.to_path_buf()))?;
@@ -926,6 +933,7 @@ mod tests {
             started: 0,
             host: "prod".into(),
             forward: "-D 1080".into(),
+            reaches: None,
         })
         .write(&record)
         .unwrap();
