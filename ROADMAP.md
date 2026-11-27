@@ -16,14 +16,6 @@ These bind every item below. A design that needs to break one must say so and be
 
 Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/specs/2026-09-13-portico-host-management-design.md`) and adds what was decided since. Slices are grouped by the release they are planned for, and listed in rough order, because later slices build on earlier ones. Open design questions are settled when a slice starts, in its own design review.
 
-### v6: share a port from anywhere
-
-Saved port forwards work, but setting one up means knowing the target's address and filling in a separate form first. v6 turns it around: start from the host, container or Proxmox CT you are looking at, bring one of its ports to this machine, and save it only if you want to keep it. It builds on the backend interface (`docs/architecture.md`), so it covers every backend at once.
-
-2. **Forwards to containers and CTs.** A forward whose target is a container or a Proxmox CT, named the way the pickers name it (Compose project and service, container name, or CT ID), not by its IP. Portico looks up the current address through the backend each time the forward starts, so it survives a container being recreated (for example by a Coolify redeploy), and the far port can be any port inside the container, including one the host itself already uses.
-   - Decided: an app that listens only on `127.0.0.1` inside its container cannot be reached from the host, and Portico does not force it. The documentation says so, and the forward reports that nothing answers instead of failing silently. This is revisited only if a clean way is found that installs nothing in the container and needs no extra privileges.
-   - Open design question, settled when the slice starts: containers on networks the host cannot route to.
-
 ### Unscheduled
 
 3. **More OpenSSH directives (optional, undecided).** Managed hosts support only host, user, port, identity file and ProxyJump today. Supporting more directives is wanted but must not overload the tool. Whether this ships as a curated set added one directive at a time, as a free-form "custom directive" field validated by OpenSSH, or both, is an open design question; the answer decides the slice's size. It stays optional: the default form does not grow.
