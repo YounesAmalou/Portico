@@ -106,7 +106,7 @@ The README's tunnels section documents container tunnels, the replica rule and t
 - App, with fake ssh and backend scripts: a saved container tunnel starts against the current address; after the fake container "moves" (new address), the next start follows it; a stopped container, an unroutable one and a CT without an address are refused with their reasons; the "nothing answers" warning from a log line; a quick container forward restarts with a new address and saves by name.
 - CLI and JSON: `tunnel add --container`, `edit`, `show`, the goldens.
 - TUI: the form's Container field and backend chooser, and the tunnels tab's target text.
-- End to end: the throwaway sshd has no containers, so the e2e suite gains a fake `docker` on the server side's `PATH` that lists one container whose address is `127.0.0.1` and whose port is the test's listener; a container tunnel reaches it, and after the fake's port changes, a restart follows.
+- End to end: the throwaway sshd has no containers, so the e2e suite gains a fake `docker` on the server side's `PATH` that lists one container whose address is `127.0.0.1` and whose port is the test's listener; a container tunnel reaches it; after the fake's address changes (to `127.0.0.2`, on Linux), a restart follows; and once the fake lists no container, a start is refused. The test runs where the server side runs commands through a POSIX shell (not on Windows, whose server uses `cmd.exe`).
 
 ## Calls made after the design review
 
