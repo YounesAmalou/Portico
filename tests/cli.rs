@@ -1032,17 +1032,6 @@ fn settings_reports_an_invalid_file() {
         .assert_exit_code_and_stderr_contains(1, "line 1");
 }
 
-/// The desktop integration is Omarchy's: other systems refuse it and keep it out of the help.
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn the_desktop_integration_is_refused_outside_linux() {
-    let env = TestEnv::new();
-    env.run(["desktop", "status"])
-        .assert_exit_code_and_stderr_contains(1, "needs Linux with Omarchy");
-    let help = env.run(["--help"]);
-    assert!(!String::from_utf8_lossy(&help.0.stdout).contains("desktop"));
-}
-
 /// A port nobody uses: bound, read, released.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

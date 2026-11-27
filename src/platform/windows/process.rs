@@ -205,6 +205,33 @@ pub fn stop_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool>
     Ok(true)
 }
 
+/// Ends `pid` alone, leaving the processes it started running, if `verify` still recognises
+/// it once a pin holds it. Returns whether it was ended. For a program whose children must
+/// outlive it, such as the tray app's own update, which the app starts and which stops it.
+pub fn stop_single_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool> {
+    let pin = match open_pin(pid) {
+        Ok(pin) => pin,
+        Err(error) if is_gone(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !verify() {
+        return Ok(false);
+    }
+    match pin.terminate() {
+        Ok(()) => {}
+        Err(error) if is_gone(&error) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    pin.wait_exit(TERM_GRACE_MS);
+    Ok(true)
+}
+
+/// Keeps a console program `command` starts from opening a window, which it would when this
+/// process has no console (the tray app's update runs without one).
+pub fn hide_console(command: &mut Command) -> &mut Command {
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -244,6 +271,28 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    #[test]
+    fn stop_single_process_leaves_the_children_running() {
+        let mut parent = long_lived("portico-single-stop");
+        let pid = parent.id();
+        // `cmd` starts `ping`; wait until it has.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let child = loop {
+            let table = process_table().unwrap();
+            if let Some((child, _)) = table.iter().find(|(_, parent)| *parent == pid) {
+                break *child;
+            }
+            assert!(Instant::now() < deadline, "cmd started no child");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!stop_single_process(pid, || false).unwrap());
+        assert!(stop_single_process(pid, || true).unwrap());
+        let ping = Pin::open(child).expect("the child outlived its parent");
+        assert!(!ping.wait_exit(0), "the child was ended with its parent");
+        ping.terminate().unwrap();
+        let _ = parent.wait();
     }
 
     /// Run by `a_detached_child_does_not_hold_the_output_of_its_parent` as a separate process

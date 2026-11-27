@@ -16,3 +16,12 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
+
+  # The tray app (desktop/tray) is its own Cargo project with its own lock file.
+  - package-ecosystem: cargo
+    directory: /desktop/tray
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]

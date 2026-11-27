@@ -394,10 +394,8 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
                 }
             }
             UiAction::CancelPlan => workers.planner.cancel(),
-            // The desktop integration is Omarchy's, so other systems leave it out of the overlay.
-            UiAction::OpenSettings => {
-                state.open_settings(cfg!(target_os = "linux").then(|| status(desktop)));
-            }
+            // The panel on Linux, the tray app on macOS and Windows.
+            UiAction::OpenSettings => state.open_settings(Some(status(desktop))),
             UiAction::Setting(key) => toggle_setting(app, &mut state, key),
             UiAction::Desktop(run) => {
                 let result = match std::env::current_exe() {

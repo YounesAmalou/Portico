@@ -16,14 +16,6 @@ These bind every item below. A design that needs to break one must say so and be
 
 Each slice keeps the requirements recorded in the v1 design (`docs/superpowers/specs/2026-09-13-portico-host-management-design.md`) and adds what was decided since. Slices are grouped by the release they are planned for, and listed in rough order, because later slices build on earlier ones. Open design questions are settled when a slice starts, in its own design review.
 
-### v5: the desktop interfaces
-
-Builds on the platform layer (`docs/architecture.md`): each system is a new implementation of it, not a fork of the Linux code, as macOS and Windows already are. Each system's design review decides its build, process control and terminal launcher.
-
-1. **macOS and Windows desktop interfaces.** The counterpart of the Quickshell panel on each system: a menu bar app on macOS and a system tray app on Windows that list hosts, open shells (in hosts and their containers) in a new terminal, and start and stop saved port forwards. Like the Quickshell panel, each is a separate consumer of Portico's CLI and JSON output, not code inside Portico. Each is installed, updated and removed from the desktop integration setting in the TUI's settings on its system.
-   - Footprint is a requirement, not a preference: each app stays as light as the TUI in memory, CPU when idle and download size.
-   - Open design questions, settled when the slice starts: the toolkit, chosen by measuring the candidates available then against the footprint requirement (native toolkits such as SwiftUI and WinUI, cross-platform shells such as Tauri, and others), and how each is kept in step with the binary, as `portico desktop install` does on Linux.
-
 ### v6: share a port from anywhere
 
 Saved port forwards work, but setting one up means knowing the target's address and filling in a separate form first. v6 turns it around: start from the host, container or Proxmox CT you are looking at, bring one of its ports to this machine, and save it only if you want to keep it. It builds on the backend interface (`docs/architecture.md`), so it covers every backend at once.

@@ -66,7 +66,7 @@ pub(super) struct SettingsOverlay {
     cursor: usize,
     /// The tabs as written, applied when the overlay closes.
     pub(super) tabs: Tabs,
-    /// The desktop integration's status, or `None` where it is not offered (outside Linux).
+    /// The desktop integration's status, or `None` where it is not offered.
     pub(super) desktop: Option<Status>,
     /// The last toggle's or action's failure, as one line.
     pub(super) error: Option<String>,

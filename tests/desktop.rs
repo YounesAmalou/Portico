@@ -305,6 +305,28 @@ fn refuses_to_ask_without_a_terminal() {
     );
 }
 
+/// The tray app's flags are macOS's and Windows'.
+#[test]
+fn tray_flags_are_refused_on_linux() {
+    let desktop = Desktop::omarchy();
+    for flags in [
+        &["--no-login"][..],
+        &["--from", "/tmp/archive.tar.gz"],
+        &["--tray-only"],
+    ] {
+        let mut args = vec!["desktop", "install", "--yes"];
+        args.extend_from_slice(flags);
+        let output = desktop.run(&args, "");
+        assert!(!output.status.success());
+        assert!(
+            text(&output).contains(&format!("{} is only on macOS and Windows", flags[0])),
+            "{}",
+            text(&output)
+        );
+    }
+    assert!(!desktop.panel().exists(), "nothing changed");
+}
+
 #[test]
 fn refuses_a_taken_combination_with_yes_before_any_change() {
     let desktop = Desktop::omarchy();

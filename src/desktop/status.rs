@@ -2,6 +2,7 @@
 
 use super::{
     DesktopEnv, Link, Target, installed_bindings, launcher, link_state, omarchy_enabled, panel,
+    tray::{self, System, SystemHost, TrayHost},
 };
 
 /// One row of the status. `label` is `"Panel"`, `"Launcher"` or `"Keybinding"` on a
@@ -34,7 +35,96 @@ pub struct Status {
     pub installed: bool,
 }
 
+/// What is installed: the tray app on macOS and Windows, the panel and the rest on Linux.
 pub fn status(env: &DesktopEnv) -> Status {
+    match System::current() {
+        Some(system) => tray_status(env, system, &SystemHost::new(env)),
+        None => linux_status(env),
+    }
+}
+
+/// The tray app's status: the app, its login entry and whether it runs.
+pub fn tray_status(env: &DesktopEnv, system: System, host: &dyn TrayHost) -> Status {
+    tray_status_with(env, system, host, env!("CARGO_PKG_VERSION"))
+}
+
+/// `tray_status` against a `portico` of `version`.
+pub fn tray_status_with(
+    env: &DesktopEnv,
+    system: System,
+    host: &dyn TrayHost,
+    version: &str,
+) -> Status {
+    let paths = tray::paths(system, &env.home, env.local_app_data.as_deref());
+    let placed = paths.placed(system);
+    let present = std::fs::symlink_metadata(placed).is_ok();
+    let app = if !present {
+        "not installed".to_string()
+    } else {
+        match host.app_version(placed) {
+            Some(installed) if installed == version => format!(
+                "installed in {}, {installed} (matches this portico)",
+                env.show(placed)
+            ),
+            Some(installed) => format!(
+                "installed in {}, {installed}; this portico is {version}: out of date, run portico desktop install",
+                env.show(placed)
+            ),
+            None => format!("installed in {}, version unknown", env.show(placed)),
+        }
+    };
+    let entry = host.login_entry();
+    let login = match &entry {
+        None => "not set up".to_string(),
+        Some(text) => {
+            let name = system.login_name();
+            match tray::entry_portico(system, text) {
+                Some(portico) if !portico.exists() => format!(
+                    "set up ({name}), but points at {}, which no longer exists",
+                    env.show(&portico)
+                ),
+                Some(portico) => format!("set up ({name}), runs {}", env.show(&portico)),
+                None => format!("set up ({name}), in a form Portico does not write"),
+            }
+        }
+    };
+    let running = host.running();
+    let running = if running.is_empty() {
+        "no".to_string()
+    } else {
+        let pids = running
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if running.len() == 1 {
+            "process"
+        } else {
+            "processes"
+        };
+        format!("yes ({noun} {pids})")
+    };
+    Status {
+        lines: vec![
+            Line {
+                label: system.app_name(),
+                text: app,
+            },
+            Line {
+                label: "At login",
+                text: login,
+            },
+            Line {
+                label: "Running",
+                text: running,
+            },
+        ],
+        installed: present || entry.is_some(),
+    }
+}
+
+/// The panel, the launcher entry and the keybinding.
+fn linux_status(env: &DesktopEnv) -> Status {
     let mut lines = Vec::new();
     let mut installed = false;
     let dir = env.panel_dir();
@@ -206,7 +296,7 @@ mod tests {
     #[test]
     fn nothing_installed() {
         let (_dir, env) = omarchy();
-        let s = status(&env);
+        let s = linux_status(&env);
         assert!(!s.installed);
         assert_eq!(s.lines[0].label, "Panel");
         assert_eq!(s.lines[0].text, "not installed");
@@ -228,7 +318,7 @@ mod tests {
         fs::write(&icon, launcher::icon_file()).unwrap();
         add_binding(&env);
         std::os::unix::fs::symlink(env.panel_dir(), Target::Omarchy.link(&env)).unwrap();
-        let s = status(&env);
+        let s = linux_status(&env);
         assert!(s.installed);
         assert!(
             s.lines[0].text.starts_with("installed in "),
@@ -260,7 +350,7 @@ mod tests {
     fn only_a_binding_counts_as_installed() {
         let (_dir, env) = omarchy();
         add_binding(&env);
-        let s = status(&env);
+        let s = linux_status(&env);
         assert!(s.installed);
         assert_eq!(s.lines[0].text, "not installed");
     }
