@@ -1,6 +1,6 @@
 # macOS and Windows Desktop Interfaces Design
 
-**Status:** Approved
+**Status:** Approved; implemented
 
 ## Purpose
 
@@ -8,7 +8,7 @@ On Linux, the Quickshell panel (`desktop/quickshell/`) lists the hosts, opens sh
 
 This slice adds the counterpart on each system: a **menu bar app on macOS** and a **system tray app on Windows**, one Rust program (`portico-tray`) built for both. Like the Quickshell panel, it is a separate consumer of Portico's CLI and JSON output (`docs/json-output.md`), not code inside Portico. On each system it is installed, updated and removed by `portico desktop install | uninstall`, and so from the desktop integration rows of the TUI's settings overlay.
 
-It implements v5 item 1 of `ROADMAP.md`, "macOS and Windows desktop interfaces".
+It implements what `ROADMAP.md` listed as "macOS and Windows desktop interfaces"; that item left the roadmap when the slice shipped.
 
 ## Goals
 
@@ -125,13 +125,13 @@ Portico
 - **Not found:** when the `portico` path does not run, the menu shows only "Portico was not found at <path>", a hint to run `portico desktop install` again, Refresh and Quit.
 - All text is set as plain menu titles; free text in the documents is already one line with no control characters (`docs/json-output.md`, "Free text is one line"), and the app truncates titles to a readable length (builder's call, about 60 characters).
 
-**When it runs portico.** At start, and on Refresh: `portico --version`, `settings --json`, `hosts --json` and `tunnels --json`, in that order, on a worker thread. Also when the menu is opened: on macOS and Windows `tray-icon` reports the click that opens the menu, and the app starts a refresh of `tunnels --json` then (hosts and settings only on Refresh), so a tunnel started from a terminal shows up the next time the menu is looked at. Nothing runs on a timer. Every run is an argument list with no shell; on Windows every child gets `CREATE_NO_WINDOW` so no console flashes. Results are sent to the event loop, which rebuilds the affected part of the menu. Rows of the menu that is open are updated in place where `muda` allows; otherwise the update shows the next time it opens (builder's call, per system).
+**When it runs portico.** At start, and on Refresh: `portico --version`, `settings --json`, `hosts --json` and `tunnels --json`, in that order, on a worker thread. Also when the menu is opened: on macOS and Windows `tray-icon` reports the click that opens the menu, and the app starts a refresh of `tunnels --json` then (hosts and settings only on Refresh), so a tunnel started from a terminal shows up the next time the menu is looked at. Nothing runs on a timer. Every run is an argument list with no shell; on Windows every child gets `CREATE_NO_WINDOW` so no console flashes. Results are sent to the event loop, which rebuilds the affected part of the menu. A menu is never replaced while it is open: new data shows the next time the menu opens.
 
 **Version check and self-update.** The app compares its own version with `portico --version`. When they differ, a banner item "Portico is X.Y.Z, this app is A.B.C: Update" hands the update off and quits:
 
-1. The app starts `portico desktop install --yes --tray-only` **detached** from itself: in a new session (`setsid`) on macOS, with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, with its output appended to `tray-update.log` in Portico's runtime directory. The LaunchAgent sets `AbandonProcessGroup` so launchd does not kill the installer when the app exits.
+1. The app starts `portico desktop install --yes --tray-only` **detached** from itself: in a new session (`setsid`) on macOS, with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, with its output appended to `tray-update.log` in the app's support directory (macOS `~/Library/Application Support/Portico/`, Windows `%LOCALAPPDATA%\Portico\`), beside the app's single-instance lock. The LaunchAgent sets `AbandonProcessGroup` so launchd does not kill the installer when the app exits.
 2. The app quits at once.
-3. The installer waits up to 5 seconds for the app to exit, stops it through `platform::process` if it has not, replaces it, and starts the new copy (`launchctl kickstart gui/<uid>/<label>` when the login entry exists, otherwise directly, detached). It never runs `launchctl bootout` during an update.
+3. The installer waits up to 5 seconds for the app to exit, stops it through `platform::process` if it has not (on Windows only the app's own process, never its tree, because the installer is its child), replaces it, and starts the new copy (`launchctl kickstart gui/<uid>/<label>` when the login entry exists, otherwise directly, detached). It never runs `launchctl bootout` during an update.
 4. If any step fails, the installer starts whichever app is in place (the old one when the replacement never happened), and the last line of `tray-update.log` says why. At start, an app finds a log whose last line is a failure newer than itself and shows it as a disabled "Update failed: <message>" item until the next successful update, which removes the log.
 
 `--tray-only` updates only the app; it neither creates nor removes the login entry.
@@ -168,16 +168,16 @@ The LaunchAgent label and the registry value name are Portico's own markers: uni
 https://github.com/YounesAmalou/Portico/releases/download/v<version>/portico-tray-v<version>-<target>.<tar.gz|zip>
 ```
 
-where `<target>` is the target `portico` was built for (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`). Install runs `curl --fail --location --proto =https --tlsv1.2 --silent --show-error -o <tmp> <url>` into a private temporary directory, then checks the file's SHA-256 (computed in Portico, a small dependency-free implementation or the `sha2` crate, builder's call against `cargo deny`):
+where `<target>` is the target `portico` was built for (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`). Install runs `curl --fail --location --proto =https --tlsv1.2 --silent --show-error -o <tmp> <url>` into a private scratch directory under the app's support directory, announced with "Downloading <asset>…", before any question is asked, so the preview can show the download's size and digest check; nothing outside the scratch directory changes until the questions are answered. It then checks the file's SHA-256 (computed in Portico, a small dependency-free implementation or the `sha2` crate, builder's call against `cargo deny`):
 
 - **Release builds** of `portico` carry the expected digest for their own target, set at build time (`PORTICO_TRAY_SHA256`, read with `option_env!`). A mismatch stops the install and deletes the download.
 - **Builds without it** (`cargo install`, a checkout) download `SHA256SUMS` of the same release the same way and use its line for the archive; the preview says "checked against the release's SHA256SUMS". A version with no release (a 404) stops with a message naming `--from`.
 
-It then unpacks with `tar` (`tar -xzf` on macOS; on Windows, Windows' own `tar.exe`, bsdtar, reads the zip), into the temporary directory, checks the unpacked layout is the expected one (a single `Portico Tray.app` or `portico-tray.exe`, no path leaving the directory), stops a running copy, and moves the result into place (replacing the previous version). On macOS, a downloaded file carries no quarantine attribute when `curl` writes it, so Gatekeeper does not block the ad-hoc-signed app; install clears `com.apple.quarantine` anyway when `--from` points at a file that has one.
+It then unpacks with `tar` (`/usr/bin/tar -xzf` on macOS; on Windows `%SystemRoot%\System32\tar.exe`, bsdtar, which reads the zip; never a `tar` found on `PATH`), into the scratch directory, checks the unpacked layout is the expected one (a single `Portico Tray.app` or `portico-tray.exe`, no path leaving the directory), stops a running copy, and moves the result into place (replacing the previous version). On macOS, a downloaded file carries no quarantine attribute when `curl` writes it, so Gatekeeper does not block the ad-hoc-signed app; install clears `com.apple.quarantine` anyway when `--from` points at a file that has one.
 
 `curl` or `tar` missing, a network error and a non-2xx status are each reported with the command that failed and its last stderr line.
 
-**Preview and questions**, in the style of the Linux flow:
+**Preview and questions**, in the style of the Linux flow (every question is asked `[y/N]`, like every other Portico confirmation; the block below shows the default answer as `[Y/n]` only as a sketch of the layout):
 
 ```
 Menu bar app       not installed → Portico Tray 0.8.0
@@ -225,7 +225,7 @@ On macOS and Windows the overlay's "Desktop integration" section appears, with t
 
 The requirement is "as light as the TUI". Measured and enforced as follows:
 
-- **Download size:** CI fails `macos (tray)` and `windows (tray)` when the packaged app is larger than the `portico` archive of the same target (about 4 MB today). Expected: 1-2 MB.
+- **Download size:** CI fails `macos (tray)` and `windows (tray)` when the packaged app is larger than a fixed 4 MiB cap (about the size of the `portico` archive today). Expected: 1-2 MB.
 - **Idle CPU:** by construction, nothing runs on a timer; the event loop blocks in the system's run loop. The design forbids timers, so a review catches one.
 - **Memory:** measured by hand on each system when the slice is verified (Activity Monitor's "Memory", Task Manager's "Memory (private working set)") and recorded in this design's "Verification" section; the target is at most the TUI's resident memory with an open host list on the same machine. CI cannot measure a GUI app's memory meaningfully on a headless runner.
 
@@ -250,10 +250,15 @@ The requirement is "as light as the TUI". Measured and enforced as follows:
 
 - The `tray-icon`, `muda` and Windows resource crate versions, checked against `cargo deny`'s licence and advisory policy.
 - How the event loop is driven on each system (`tao` or `winit` versus the bare system loop that `tray-icon`'s examples use); the lighter one that works wins.
-- Whether menu items update in place while the menu is open.
-- The SHA-256 implementation in `portico`.
+- - The SHA-256 implementation in `portico`.
 - Title truncation length.
 
 ## Verification
 
-To be filled when the slice is verified on real machines: memory of the app idle and with a menu open, the app's download size, and the TUI's memory for comparison, on macOS (Apple silicon) and Windows (x64).
+Done on Linux and in CI: the pure parts of the app and of the install flow are unit-tested, the app's Windows menu and event loop are linted with `cargo clippy --target x86_64-pc-windows-gnu`, and the macOS and Windows jobs build, package and size-check the archives.
+
+Still to be done, on a Mac (Apple silicon) and a Windows machine (x64), because the maintainer's machine is Linux and CI cannot do them:
+
+- The memory measurement: the app idle and with a menu open, and the TUI's for comparison, with the app's download size, recorded here.
+- A real run of the app on each system, covering what only a real desktop shows: on macOS, that the run loop's mode during menu tracking delivers the refresh started when the menu opens, and `launchctl bootstrap` and `kickstart` of the LaunchAgent; on Windows, that the popup menu's mode is detected so no menu is replaced while open, and the `Portico Tray` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- The self-update hand-off on both systems: the banner starts the detached installer, the app quits, the installer replaces it and starts the new copy, and a failure leaves the old app running with the reason in `tray-update.log`.

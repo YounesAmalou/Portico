@@ -2,7 +2,7 @@
 
 Portico is a fast, keyboard-first interface for managing OpenSSH hosts on Linux, macOS and Windows. It provides both a terminal UI and a direct CLI while leaving OpenSSH in control of connections and effective configuration.
 
-Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker and Podman containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) connects to hosts and starts and stops tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
+Portico manages hosts, adopts existing ones from your own SSH configuration, tests connections on demand, shows which identities each host uses and whether they are available, opens shells in Docker and Podman containers and Proxmox VE's LXC containers, and starts and stops saved tunnels. It prints JSON for scripts, and a Quickshell desktop panel (also an Omarchy plugin) on Linux, a menu bar app on macOS and a tray app on Windows connect to hosts and start and stop tunnels from the desktop. Further work is on the [roadmap](ROADMAP.md).
 
 ## What Portico does
 
@@ -16,12 +16,12 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Lists the running Docker and Podman containers on this machine or a host, grouped by Compose project, and a Proxmox VE node's LXC containers, and opens a shell in one.
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Prints one versioned JSON document per command for scripts and desktop panels.
-- Comes with a desktop panel for Quickshell and Omarchy (Linux) to open hosts and container shells in a new terminal and to start and stop tunnels.
+- Comes with a desktop panel for Quickshell and Omarchy (Linux), a menu bar app (macOS) and a tray app (Windows) to open hosts and container shells in a new terminal and to start and stop tunnels.
 - Provides a TUI with Hosts and Tunnels tabs and a tab per container backend (Docker, Podman, Proxmox) when run without a subcommand.
 - Supports normal terminal paste into filters and host fields.
 - Preserves existing SSH configuration and treats externally configured hosts as read-only until you adopt them.
 
-Portico owns only `~/.ssh/portico/config` and, for saved tunnels, `~/.ssh/portico/tunnels`, which OpenSSH never reads. `portico desktop install` adds, only with your confirmation, the desktop panel's directory `~/.local/share/portico/panel` (which any `portico` command keeps in step with the binary), links to it in your desktop shell's configuration, a launcher entry and icon under `~/.local/share` marked as Portico's, and one keybinding line between marker comments; `portico desktop uninstall` removes exactly those. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
+Portico owns only `~/.ssh/portico/config` and, for saved tunnels, `~/.ssh/portico/tunnels`, which OpenSSH never reads. On Linux, `portico desktop install` adds, only with your confirmation, the desktop panel's directory `~/.local/share/portico/panel` (which any `portico` command keeps in step with the binary), links to it in your desktop shell's configuration, a launcher entry and icon under `~/.local/share` marked as Portico's, and one keybinding line between marker comments; `portico desktop uninstall` removes exactly those. On macOS and Windows it downloads the tray app and sets it up to start at login, as [Desktop integration](#desktop-integration) describes. Besides `init`'s one-line `Include`, `adopt` and `export` are the only operations that change your own SSH configuration files, and each shows a preview and asks for confirmation first (unless `--yes`). Trusting a host key in the connection test appends it to your `known_hosts` file. Initialization adds an `Include ~/.ssh/portico/config` line to `~/.ssh/config` when needed and previews the change before applying it. Managed updates are validated with OpenSSH before activation and keep the previous valid fragment at `~/.ssh/portico/config.bak`. Each update probes only the added or changed aliases, so its cost does not grow with the number of managed hosts. Host values are validated up front: hostnames and users are single values, identity files may contain inner spaces but not blank or padded values, and ProxyJump values contain no whitespace (OpenSSH validates their destinations).
 
 Private keys remain where they already live. Portico stores identity-file references but never reads, copies, or takes ownership of private-key contents. To show identities it only checks that key files exist, reads public key files with `ssh-keygen -l`, and asks agents for their public key list with `ssh-add -l`; it never generates keys, loads them into an agent, or asks an agent to sign.
 
@@ -31,7 +31,7 @@ Private keys remain where they already live. Portico stores identity-file refere
 - OpenSSH client tools (`ssh`); on Windows, the OpenSSH Client optional feature, which current Windows installs include
 - `xdg-terminal-exec` for the new-terminal option only, on Linux
 - Only for container shells, on this machine or on the host: `docker`, `podman`, or `pct` on a Proxmox VE node, run as root or through passwordless `sudo`
-- Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#desktop-panel) (Linux only)
+- Quickshell 0.3 or newer and `setsid` (util-linux), only for the [desktop panel](#linux) (Linux only)
 - Rust 1.88 or newer, only when building from source
 - Python 3 and `stty`, only to run the complete pseudo-terminal integration test on Linux and macOS
 
@@ -67,7 +67,7 @@ On Windows:
 - A new terminal window opens in Windows Terminal (`wt`), or in a new console window when it is not installed. `PORTICO_TERMINAL` overrides this: `cmd` for a console window, or the path of a launcher program that takes the command as its arguments.
 - Tunnels work with the Windows OpenSSH client, and `portico tunnel stop` ends the tunnel's `ssh` process and the processes it started.
 - Portico keeps its files under your user profile: `%USERPROFILE%\.ssh\portico\` for the managed hosts and tunnels, and `%APPDATA%\portico\settings.toml` for settings. Agent keys are listed from the OpenSSH Authentication Agent service.
-- The [desktop panel](#desktop-panel) is Linux only.
+- The Quickshell panel is Linux only; Windows has the [tray app](#macos-and-windows).
 
 ### Release packages and binaries
 
@@ -357,7 +357,7 @@ In JSON mode Portico never opens a picker or asks a question (a missing name is 
 
 ### Settings
 
-Press `,` in the TUI to open the settings. The overlay lists a checkbox for each tab that can be hidden (Tunnels, Docker, Podman and Proxmox; Hosts is always shown) and, on Linux, the desktop integration. `↑` / `↓` or `j` / `k` move, `Space` or `Enter` toggles a tab or runs an action, and `Esc` or `,` closes it. A hidden tab disappears from the tab bar, and neither the TUI nor the desktop panel runs its tool (`docker`, `podman` or `pct`) while it is hidden. On Linux, the desktop integration shows what `portico desktop status` reports and offers **Install or update** and, once something is installed, **Uninstall**; each runs the same preview and confirmations as `portico desktop install` and `uninstall`. The desktop panel reads the same settings and hides the same tabs.
+Press `,` in the TUI to open the settings. The overlay lists a checkbox for each tab that can be hidden (Tunnels, Docker, Podman and Proxmox; Hosts is always shown) and the desktop integration. `↑` / `↓` or `j` / `k` move, `Space` or `Enter` toggles a tab or runs an action, and `Esc` or `,` closes it. A hidden tab disappears from the tab bar, and neither the TUI nor the desktop panel runs its tool (`docker`, `podman` or `pct`) while it is hidden. The desktop integration shows what `portico desktop status` reports and offers **Install or update** and, once something is installed, **Uninstall**; each runs the same preview and confirmations as `portico desktop install` and `uninstall`. The desktop panel reads the same settings and hides the same tabs.
 
 The settings live in `~/.config/portico/settings.toml` (under `$XDG_CONFIG_HOME` when set). The file is optional: without it, every tab is shown. It is plain TOML, and you can edit it by hand:
 
@@ -384,7 +384,7 @@ A container is remembered by the machine (this machine, or the host alias), the 
 
 `portico settings` lists them under "Remembered container users:", and `portico settings forget [--on <alias>] [--backend docker|podman] <container>` removes one (`<container>` as listed, such as `shop/api`; without `--on` it means this machine, and `--backend` defaults to Docker). The alias is not checked against your hosts, so the entries of a host you removed can still be forgotten. `portico settings --json` includes them too.
 
-The settings only choose what the TUI and the desktop panel show, and which user the TUI opens container shells as. The CLI is unaffected: `portico containers`, `portico shell` and the other commands work with every backend whatever the file says.
+The settings only choose what the TUI, the desktop panel and the tray app show, and which user the TUI opens container shells as. The CLI is unaffected: `portico containers`, `portico shell` and the other commands work with every backend whatever the file says.
 
 ### Adopt and export hosts
 
@@ -402,11 +402,13 @@ Portico shows an exact preview of both files first and, unless you pass `--yes`,
 
 Use `portico <command> --help` for the authoritative options for a command.
 
-## Desktop panel
+## Desktop integration
+
+Portico has no desktop program of its own: on each system a small separate program reads Portico's `--json` output and runs `portico`. Linux has a Quickshell panel, macOS a menu bar app and Windows a tray app. `portico desktop install`, `uninstall` and `status` manage whichever your system has, and so does the TUI's settings overlay (`,`).
+
+### Linux
 
 ![The desktop panel, with saved tunnels and an expanded host](desktop/quickshell/preview.png)
-
-The desktop panel and `portico desktop` need Linux; on macOS and Windows the command is hidden and refused.
 
 `desktop/quickshell/` is a small Quickshell panel: the saved tunnels with their status and a Start or Stop button, and the hosts to connect to in a new terminal, each expandable to its running containers to open a shell in. It runs `portico` with `--json` when it opens and lists the tunnels again every 5 seconds while it stays open; nothing runs while it is closed. Containers are listed only when you expand a host (`→`), and the panel never runs `portico show`. It manages nothing: hosts and tunnels are added, edited and removed in the CLI and the TUI. Typing filters tunnels by name or host, hosts by alias, and the containers already listed by name, image or ID (a host whose listed containers match stays visible, showing only those), `↑` / `↓` move, `Enter` connects, opens the shell or starts or stops the tunnel, `←` collapses, `F5` lists again and `Esc` closes.
 
@@ -448,6 +450,27 @@ omarchy plugin enable portico
 For a keybinding, bind `omarchy-shell shell toggle portico`. `omarchy plugin add` does not apply, because the plugin is a directory of this repository rather than a repository of its own. To remove it, `omarchy plugin disable portico` and delete the link. `portico desktop install` replaces such a link with its own copy, after saying so.
 
 Connecting runs `portico connect --new-terminal`, so the terminal is the one `xdg-terminal-exec` opens, and a failure is explained there or under the row. Start and stop run in the background (a start can take as long as the host's `ConnectTimeout`) under `setsid`, so a reload of the panel never interrupts one.
+
+### macOS and Windows
+
+`desktop/tray/` is one small Rust program, `portico-tray`: a menu bar app on macOS and a notification area (system tray) app on Windows. Its menu lists, as the Linux panel does:
+
+- the saved tunnels with their state (a checkmark when running); clicking one starts or stops it, and the menu shows an error under it when that fails;
+- the hosts, each with **Open shell** (in a new terminal) and **Show containers**, which lists the containers of every tab that is turned on in the settings and opens a shell in one;
+- **This machine**, with **Show containers** for the local engines.
+
+It also has **Refresh** and **Quit**, and a banner when its version differs from `portico --version`, whose **Update** button updates the app (see below). It manages nothing: hosts and tunnels are added, edited and removed in the CLI and the TUI. It runs `portico` when it starts, on **Refresh** and, for the tunnels only, when the menu is opened; nothing runs on a timer, and a menu is never replaced while it is open, so new data shows the next time you open it. Containers are listed only when you click **Show containers**.
+
+**Install it with `portico desktop install`.** Unlike the Linux panel, the app is not built into the `portico` binary: the command downloads the app of its own version from the GitHub release with `curl` (`portico-tray-v<version>-<target>.tar.gz` on macOS, `.zip` on Windows), announced with "Downloading ...", before it asks anything. The download must match the SHA-256 digest built into the release's `portico`; a `portico` built from source (`cargo install`) has no such digest, so it checks the file against the release's `SHA256SUMS` instead, and the preview says which. A version with no release stops with a message. It then shows its whole plan (the download's size, where the app goes and what will start at login) and asks about each of two parts, answering `y` or `N` as `portico` does everywhere else:
+
+- **The app.** On macOS, `~/Applications/Portico Tray.app`; on Windows, `%LOCALAPPDATA%\Programs\Portico\portico-tray.exe`. The archive is unpacked with the system's own `tar` (`/usr/bin/tar` on macOS, `%SystemRoot%\System32\tar.exe` on Windows), never one found on `PATH`, and an installed copy is stopped and replaced.
+- **Starting at login,** and now. On macOS, a LaunchAgent `~/Library/LaunchAgents/io.github.younesamalou.portico.tray.plist`; on Windows, the value `Portico Tray` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Both record the path of your `portico` (the one on your `PATH`, so a package manager's link survives its upgrades), which a program started at login cannot find through `PATH` itself. `--no-login` leaves this out.
+
+`--yes` accepts every proposal without asking. `--from <archive>` installs from a local archive in the release layout instead of downloading it, without checking its digest, for a `portico` that has no release such as a checkout (`scripts/build-tray.sh <version> <target> <directory>` makes one). `portico desktop status` shows whether the app is installed, its version (and "out of date" when it differs from `portico`), what the login entry points at and whether it is running, and `portico desktop uninstall` stops the app and removes the app and the login entry, after a preview and a question; nothing else is touched. The Linux-only options (`--omarchy`, `--quickshell`, `--bind`, `--no-bind`, `--no-panel` and `--no-launcher`) are refused there, as `--no-login` and `--from` are refused on Linux.
+
+**Updating.** When the app and `portico` differ in version, the app shows a banner. **Update** runs `portico desktop install --yes --tray-only` detached from the app and quits; the installer waits for it to exit, replaces it and starts the new copy, and writes to `tray-update.log` in the app's support directory (`~/Library/Application Support/Portico/` on macOS, `%LOCALAPPDATA%\Portico\` on Windows). If the update fails, the old app is started again and shows the reason in its menu. Running `portico desktop install` again also updates it. A development build of the app shows no banner.
+
+The app is not notarized (macOS) or code-signed (Windows). Because `curl` downloads it, macOS does not quarantine it and Gatekeeper does not stop it (an app you install from a local archive that a browser downloaded has its quarantine attribute cleared too), and it is signed ad hoc. Windows SmartScreen may warn about `portico-tray.exe` when it first runs. If you do not trust a download, build it yourself: `desktop/tray/README.md` describes the app, and `scripts/build-tray.sh` builds the archive.
 
 ## TUI keys
 

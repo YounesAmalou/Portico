@@ -651,12 +651,12 @@ fn the_desktop_panel_manifest_names_files_that_exist() {
 }
 
 #[test]
-fn readme_documents_the_desktop_panel() {
+fn readme_documents_the_desktop_integration() {
     let readme = read("README.md");
     let section = readme
-        .split("## Desktop panel")
+        .split("## Desktop integration")
         .nth(1)
-        .expect("README has a Desktop panel section");
+        .expect("README has a Desktop integration section");
     for needle in [
         "desktop/quickshell",
         "qs -p",
@@ -668,10 +668,16 @@ fn readme_documents_the_desktop_panel() {
         "portico desktop install",
         "portico desktop uninstall",
         "portico desktop status",
+        "portico-tray",
+        "--from",
+        "--no-login",
+        "tray-update.log",
+        "Gatekeeper",
+        "SmartScreen",
     ] {
         assert!(
             section.contains(needle),
-            "README's Desktop panel section lacks {needle}"
+            "README's Desktop integration section lacks {needle}"
         );
     }
 }
