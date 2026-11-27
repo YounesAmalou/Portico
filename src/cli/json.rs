@@ -114,6 +114,10 @@ impl Failure {
 
 impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
+        let error = match error {
+            AppError::Container(error) => return (*error).into(),
+            error => error,
+        };
         let kind = match &error {
             AppError::UnknownHost(_) | AppError::Tunnel(TunnelRefusal::UnknownHost { .. }) => {
                 "unknown-host"

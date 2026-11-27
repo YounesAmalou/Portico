@@ -337,19 +337,12 @@ impl App {
     ) -> Result<Tunnel, AppError> {
         let host = &tunnel.host;
         let on = Target::Host(self.connectable_alias(host)?);
-        let failed = |error: ContainerError| -> AppError {
-            match error {
-                ContainerError::App(error) => error,
-                error => TunnelRefusal::ReachFailed {
-                    label: format!("{} on {host}", target.reference),
-                    reason: container_reason(&error),
-                }
-                .into(),
-            }
-        };
         let list = self
             .containers(&on, &[target.backend], true, cancelled)
-            .map_err(failed)?;
+            .map_err(|error| match error {
+                ContainerError::App(error) => error,
+                error => AppError::Container(Box::new(error)),
+            })?;
         let container = resolve_lowest(&target.reference, &list.listing.containers).map_err(
             |error| match error {
                 ResolveError::NotFound => TunnelRefusal::NotRunning {
@@ -366,7 +359,14 @@ impl App {
         )?;
         let reach = self
             .container_reach(&on, target.backend, container, list.via, cancelled)
-            .map_err(failed)?;
+            .map_err(|error| match error {
+                ContainerError::App(error) => error,
+                error => TunnelRefusal::ReachFailed {
+                    label: format!("{} on {host}", target.reference),
+                    reason: container_reason(&error),
+                }
+                .into(),
+            })?;
         let destination = destination(&reach, target.port).ok_or_else(|| match target.backend {
             BackendId::Proxmox => TunnelRefusal::NoCtAddress {
                 id: container.id.clone(),
@@ -1403,6 +1403,7 @@ exit 0
             "{refused:?}"
         );
     }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_saved_container_tunnel_starts_at_the_current_address_and_follows_it() {
@@ -1536,6 +1537,57 @@ exit 0
         }
         assert_eq!(fixture.read("starts"), "");
         assert!(!fixture.app.runtime.record("api").exists());
+    }
+
+    #[test]
+    fn a_listing_that_fails_is_its_own_explained_failure() {
+        let fixture = fixture();
+        fixture.behave(
+            "case \"$last\" in\n  *'ps --no-trunc'*) echo 'Error: something odd happened' >&2; exit 1 ;;\nesac\n",
+        );
+        add_container_tunnel(&fixture.app, "web", free_port());
+
+        let refused = fixture.app.start_tunnel("api", None, false);
+
+        match refused {
+            Err(AppError::Container(error)) => {
+                assert!(matches!(*error, ContainerError::Backend(_)), "{error:?}");
+            }
+            other => panic!("expected the listing's failure, got {other:?}"),
+        }
+        assert!(!fixture.read("remote").contains("inspect"));
+        assert_eq!(fixture.read("starts"), "");
+        assert!(!fixture.app.runtime.record("api").exists());
+    }
+
+    #[test]
+    fn a_ct_tunnel_without_an_address_says_so() {
+        let fixture = fixture();
+        fixture.behave(
+            "case \"$last\" in\n  *'pct exec'*) printf -- '---\\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\\n' ;;\n  *'pct list'*) printf 'via=none\\nVMID       Status     Lock         Name\\n101        running                 db\\n' ;;\nesac\n",
+        );
+        let listen = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{}", free_port())).unwrap();
+        let target = ContainerTarget {
+            backend: BackendId::Proxmox,
+            reference: "101".into(),
+            port: 80,
+        };
+        fixture
+            .app
+            .add_tunnel(Tunnel::to_container("db", "prod", listen, target).unwrap())
+            .unwrap();
+
+        let refused = fixture.app.start_tunnel("db", None, false);
+
+        match refused {
+            Err(AppError::Tunnel(refusal @ TunnelRefusal::NoCtAddress { .. })) => assert_eq!(
+                refusal.to_string(),
+                "could not read the address of CT 101 on prod"
+            ),
+            other => panic!("expected NoCtAddress, got {other:?}"),
+        }
+        assert!(fixture.read("remote").contains("pct exec"));
+        assert_eq!(fixture.read("starts"), "");
     }
 
     #[cfg(target_os = "linux")]

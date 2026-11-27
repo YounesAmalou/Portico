@@ -5,7 +5,7 @@ use std::{
     cell::OnceCell,
     fs::{File, OpenOptions},
     io::{self, Read},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -234,15 +234,85 @@ fn container_text(tunnel: &Tunnel) -> Option<String> {
         .map(ContainerTarget::record_text)
 }
 
-/// The address a test connection to a local listener on `address` goes to: a wildcard
-/// address is reached at the loopback of its family.
-fn local_socket(address: &str, port: u16) -> Option<SocketAddr> {
-    let ip = match address.parse::<IpAddr>().ok()? {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
+/// The addresses a test connection to local listeners on `addresses`, port `port`, goes to: a
+/// wildcard address is reached at the loopback of its family, and a host name at what it
+/// resolves to.
+fn local_sockets(addresses: &[String], port: u16) -> Vec<SocketAddr> {
+    let mut sockets = Vec::new();
+    for address in addresses {
+        let resolved: Vec<SocketAddr> = match address.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => (address.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+                .unwrap_or_default(),
+        };
+        for socket in resolved {
+            let ip = match socket.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ip => ip,
+            };
+            let socket = SocketAddr::new(ip, port);
+            if !sockets.contains(&socket) {
+                sockets.push(socket);
+            }
+        }
+    }
+    sockets
+}
+
+/// Whether a container forward's far side refuses a connection: connects to the first of
+/// `addresses` that accepts (each tried in turn, again until [`ANSWER_WAIT`] has passed, as a
+/// listener may come up on one address before another), then waits, within the same bound,
+/// for `log` to say ssh's channel was refused. A byte from the far side means something
+/// answers; a connection ssh closed without that line in the log a short while later means
+/// nothing is known. The connection is closed on return.
+fn refused_after_connect(addresses: &[SocketAddr], log: &Path) -> bool {
+    let started = Instant::now();
+    let left = || ANSWER_WAIT.saturating_sub(started.elapsed());
+    let mut stream = None;
+    'connect: while !addresses.is_empty() {
+        for address in addresses {
+            let wait = left().min(CONNECT_WAIT);
+            if wait.is_zero() {
+                break 'connect;
+            }
+            if let Ok(connected) = TcpStream::connect_timeout(address, wait) {
+                stream = Some(connected);
+                break 'connect;
+            }
+        }
+        thread::sleep(POLL.min(left()));
+    }
+    let Some(mut stream) = stream else {
+        return nothing_answers(log);
     };
-    Some(SocketAddr::new(ip, port))
+    let _ = stream.set_nonblocking(true);
+    let mut closed_at = None;
+    loop {
+        if nothing_answers(log) {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= ANSWER_WAIT {
+            return false;
+        }
+        let mut byte = [0; 1];
+        match stream.read(&mut byte) {
+            // The far side answered: something listens.
+            Ok(1..) => return false,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            // ssh closed the connection: its log line follows shortly, if it says anything.
+            _ => {
+                let closed = *closed_at.get_or_insert(elapsed);
+                if elapsed - closed >= CLOSED_GRACE {
+                    return false;
+                }
+            }
+        }
+        thread::sleep(POLL);
+    }
 }
 
 /// The record of a failed start of `tunnel`: a temporary forward's keeps its host, forward and
@@ -574,46 +644,8 @@ impl App {
         else {
             return outcome;
         };
-        let log = self.runtime.log(&tunnel.name);
-        let Some(address) = tunnel
-            .forward
-            .listen_addresses()
-            .first()
-            .and_then(|address| local_socket(address, tunnel.forward.bind_port))
-        else {
-            return outcome;
-        };
-        let refused = match TcpStream::connect_timeout(&address, ANSWER_WAIT) {
-            Ok(mut stream) => {
-                let started = Instant::now();
-                let _ = stream.set_nonblocking(true);
-                let mut closed_at = None;
-                loop {
-                    if nothing_answers(&log) {
-                        break true;
-                    }
-                    let elapsed = started.elapsed();
-                    if elapsed >= ANSWER_WAIT {
-                        break false;
-                    }
-                    let mut byte = [0; 1];
-                    match stream.read(&mut byte) {
-                        // The far side answered: something listens.
-                        Ok(1..) => break false,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        // ssh closed the connection: its log line follows shortly.
-                        _ => {
-                            let closed = *closed_at.get_or_insert(elapsed);
-                            if elapsed - closed >= Duration::from_millis(200) {
-                                break false;
-                            }
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
-            Err(_) => nothing_answers(&log),
-        };
+        let addresses = local_sockets(&tunnel.forward.listen_addresses(), tunnel.forward.bind_port);
+        let refused = refused_after_connect(&addresses, &self.runtime.log(&tunnel.name));
         if !refused {
             return outcome;
         }
@@ -1265,6 +1297,15 @@ impl App {
 /// How long a container tunnel's start waits for ssh to report the test connection refused.
 const ANSWER_WAIT: Duration = Duration::from_millis(800);
 
+/// How long one connection attempt to a local listener may take.
+const CONNECT_WAIT: Duration = Duration::from_millis(200);
+
+/// How long after ssh closes the test connection its log may still gain the refused line.
+const CLOSED_GRACE: Duration = Duration::from_millis(200);
+
+/// How often the test connection and the log are looked at.
+const POLL: Duration = Duration::from_millis(20);
+
 /// `tunnel` as `ssh -G` checks it when it is saved: a container tunnel's destination, the
 /// reference, stands in as `localhost:<port inside>`, which validates the host and the listen
 /// side.
@@ -1888,5 +1929,167 @@ exit 0
             unreachable!()
         };
         assert_eq!(reason, "cancelled");
+    }
+
+    /// What `refused_after_connect` says, and how long it took, while a listener the test owns
+    /// accepts the connection and `serve` handles it; `serve` gets the log path. The accepted
+    /// connection stays open until the probe returns unless `serve` shuts it down.
+    fn probe(
+        serve: impl FnOnce(&mut std::net::TcpStream, &Path) + Send + 'static,
+    ) -> (bool, Duration) {
+        probe_through(false, serve)
+    }
+
+    /// `probe`, with an address that refuses tried first when `refusing_first`: the
+    /// listener's port at `127.0.0.2`, which nothing else can bind while the test holds
+    /// `127.0.0.1` on it (a released port could be taken by another test meanwhile).
+    fn probe_through(
+        refusing_first: bool,
+        serve: impl FnOnce(&mut std::net::TcpStream, &Path) + Send + 'static,
+    ) -> (bool, Duration) {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("api.log");
+        fs::write(&log, "Authenticated to x.\n").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, finished) = mpsc::channel::<()>();
+        let server = {
+            let log = log.clone();
+            thread::spawn(move || {
+                // Never waits past a probe that did not connect.
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "the probe never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                serve(&mut stream, &log);
+                let _ = finished.recv();
+            })
+        };
+        let mut addresses = vec![address];
+        if refusing_first {
+            addresses.insert(0, SocketAddr::new([127, 0, 0, 2].into(), address.port()));
+        }
+        let started = Instant::now();
+        let refused = refused_after_connect(&addresses, &log);
+        let elapsed = started.elapsed();
+        drop(done);
+        server.join().unwrap();
+        (refused, elapsed)
+    }
+
+    #[test]
+    fn a_refused_channel_logged_after_the_connection_is_nothing_answering() {
+        let (refused, elapsed) = probe(|stream, log| {
+            thread::sleep(Duration::from_millis(100));
+            let mut text = fs::read_to_string(log).unwrap();
+            text.push_str("channel 2: open failed: connect failed: Connection refused\n");
+            fs::write(log, text).unwrap();
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(refused);
+        assert!(
+            elapsed < ANSWER_WAIT + Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_byte_from_the_far_side_is_an_answer_at_once() {
+        use std::io::Write;
+
+        let (refused, elapsed) = probe(|stream, _| {
+            stream.write_all(b"S").unwrap();
+        });
+        assert!(!refused);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_address_that_refuses_is_passed_over_for_the_next() {
+        use std::io::Write;
+
+        let (refused, elapsed) = probe_through(true, |stream, _| {
+            stream.write_all(b"S").unwrap();
+        });
+        assert!(!refused);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_silent_far_side_is_given_the_whole_wait_and_no_more() {
+        let (refused, elapsed) = probe(|_, _| {});
+        assert!(!refused);
+        assert!(elapsed >= ANSWER_WAIT, "{elapsed:?}");
+        assert!(
+            elapsed < ANSWER_WAIT + Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_closed_without_a_logged_refusal_says_nothing() {
+        let (refused, elapsed) = probe(|stream, _| {
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(!refused);
+        assert!(elapsed < ANSWER_WAIT, "{elapsed:?}");
+    }
+
+    #[test]
+    fn nothing_to_connect_to_reads_the_log_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("api.log");
+        let started = Instant::now();
+        assert!(!refused_after_connect(&[], &log));
+        fs::write(
+            &log,
+            "channel 2: open failed: connect failed: Connection refused\n",
+        )
+        .unwrap();
+        assert!(refused_after_connect(&[], &log));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn listen_addresses_become_the_sockets_a_test_connection_reaches() {
+        let sockets = local_sockets(
+            &[
+                "0.0.0.0".into(),
+                "::".into(),
+                "127.0.0.1".into(),
+                "localhost".into(),
+            ],
+            8080,
+        );
+        assert_eq!(sockets[0], "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(sockets[1], "[::1]:8080".parse().unwrap());
+        // The duplicate is dropped; `localhost` resolves to the loopback.
+        assert_eq!(
+            sockets.iter().filter(|s| s.port() == 8080).count(),
+            sockets.len()
+        );
+        assert_eq!(
+            sockets
+                .iter()
+                .filter(|s| **s == "127.0.0.1:8080".parse().unwrap())
+                .count(),
+            1
+        );
+        assert!(
+            sockets.iter().all(|socket| socket.ip().is_loopback()),
+            "{sockets:?}"
+        );
     }
 }

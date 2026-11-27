@@ -748,7 +748,8 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
         | AppError::KnownHosts { .. }
         | AppError::TunnelStore(_)
         | AppError::InvalidTunnel(_)
-        | AppError::Tunnel(_) => false,
+        | AppError::Tunnel(_)
+        | AppError::Container(_) => false,
     }
 }
 

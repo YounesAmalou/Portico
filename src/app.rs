@@ -193,6 +193,10 @@ pub enum AppError {
     InvalidTunnel(#[from] TunnelError),
     #[error(transparent)]
     Tunnel(#[from] TunnelRefusal),
+    /// Listing a container tunnel's containers failed, explained as the listing explains it.
+    /// Boxed: a container error holds an `AppError` itself.
+    #[error(transparent)]
+    Container(Box<ContainerError>),
 }
 
 impl App {
