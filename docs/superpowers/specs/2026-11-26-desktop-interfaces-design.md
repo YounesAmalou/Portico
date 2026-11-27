@@ -250,12 +250,12 @@ The requirement is "as light as the TUI". Measured and enforced as follows:
 
 - The `tray-icon`, `muda` and Windows resource crate versions, checked against `cargo deny`'s licence and advisory policy.
 - How the event loop is driven on each system (`tao` or `winit` versus the bare system loop that `tray-icon`'s examples use); the lighter one that works wins.
-- - The SHA-256 implementation in `portico`.
+- The SHA-256 implementation in `portico`.
 - Title truncation length.
 
 ## Verification
 
-Done on Linux and in CI: the pure parts of the app and of the install flow are unit-tested, the app's Windows menu and event loop are linted with `cargo clippy --target x86_64-pc-windows-gnu`, and the macOS and Windows jobs build, package and size-check the archives.
+Done on Linux and in CI: the pure parts of the app and of the install flow are unit-tested, and the macOS and Windows jobs build, package and size-check the archives. During development the app's Windows menu and event loop were also checked by hand with `cargo clippy --target x86_64-pc-windows-gnu` on Linux; no script runs that.
 
 Still to be done, on a Mac (Apple silicon) and a Windows machine (x64), because the maintainer's machine is Linux and CI cannot do them:
 
