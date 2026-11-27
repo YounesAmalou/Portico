@@ -12,7 +12,7 @@ use podman::Podman;
 use proxmox::Proxmox;
 
 pub use listing::{
-    Container, Group, Listing, ResolveError, display_name, group, remember_key, resolve,
+    Container, Group, Listing, Published, ResolveError, display_name, group, remember_key, resolve,
 };
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
@@ -113,6 +113,9 @@ pub struct PortOffer {
     pub port: u16,
     /// The port of the host it is published on, when it is.
     pub published: Option<u16>,
+    /// The one host address it is published on, when that is neither a wildcard nor loopback:
+    /// reached there rather than at `localhost`.
+    pub published_address: Option<String>,
     /// Listens on loopback only inside the container: nothing but the container reaches it.
     pub loopback_only: bool,
 }

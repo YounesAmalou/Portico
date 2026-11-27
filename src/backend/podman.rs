@@ -234,7 +234,8 @@ impl Backend for Podman {
         exec_words(id, user)
     }
 
-    /// `podman inspect` of the container, as docker's. Podman needs no `via`.
+    /// `podman inspect` of the container, as docker's but reading the exposed ports from
+    /// `.NetworkSettings.Ports`, which Podman before 5.3 has. Podman needs no `via`.
     fn reach<E>(
         &self,
         target: &Target,
@@ -244,6 +245,7 @@ impl Backend for Podman {
     ) -> Result<Reach, ListFailure<E>> {
         super::docker::reach_with(
             "podman",
+            super::docker::PODMAN_INSPECT_FORMAT,
             container,
             None::<fn(&[String]) -> Vec<String>>,
             run,
@@ -639,6 +641,47 @@ mod tests {
                 SHELL_SCRIPT
             ]
         );
+    }
+
+    #[test]
+    fn reach_works_on_podman_before_5_3() {
+        // Podman before 5.3 has no `.Config.ExposedPorts`: a template naming it fails.
+        let container = Container {
+            id: "abc".into(),
+            name: "web".into(),
+            image: String::new(),
+            command: String::new(),
+            running_for: String::new(),
+            status: String::new(),
+            ports: "0.0.0.0:8080->80/tcp".into(),
+            networks: String::new(),
+            mounts: String::new(),
+            project: None,
+            service: None,
+            number: None,
+            working_dir: None,
+        };
+        let reach = Podman
+            .reach::<()>(&host(), &container, None, &mut |words| {
+                let format = &words[3];
+                if format.contains(".Config.ExposedPorts") {
+                    return Ok(output(
+                        125,
+                        "",
+                        "Error: template: inspect:1:52: executing \"inspect\" at <.Config.ExposedPorts>: can't evaluate field ExposedPorts in type *define.InspectContainerConfig",
+                    ));
+                }
+                assert!(format.contains(".NetworkSettings.Ports"));
+                Ok(output(
+                    0,
+                    r#"{"podman":{"IPAddress":"10.88.0.5"}}|{"80/tcp":[{"HostIp":"","HostPort":"8080"}],"443/tcp":null}|bridge"#,
+                    "",
+                ))
+            })
+            .unwrap();
+        assert_eq!(reach.address.as_deref(), Some("10.88.0.5"));
+        let ports: Vec<_> = reach.ports.iter().map(|o| (o.port, o.published)).collect();
+        assert_eq!(ports, [(80, Some(8080)), (443, None)]);
     }
 
     #[test]

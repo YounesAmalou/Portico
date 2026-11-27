@@ -5,7 +5,7 @@ use super::{
     Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, PortOffer,
     Problem, Reach, RunFailure, RunResult, SHELL_SCRIPT, Target, Via,
 };
-use crate::domain::tunnel::ports::{parse_ss, suggested_ports};
+use crate::domain::tunnel::ports::{parse_listeners, suggested_ports};
 
 /// Lists the CTs as root: directly when the user is root, otherwise through `sudo -n`, which
 /// never prompts. `pct` lives in `/usr/sbin`, which Debian leaves out of a non-root `PATH`.
@@ -36,9 +36,10 @@ pub fn exec_words(vmid: &str, via: Option<Via>) -> Vec<String> {
     words.into_iter().map(String::from).collect()
 }
 
-/// Run inside a CT: its global IPv4 addresses, a `---` line, then the tcp ports it listens on.
-pub const REACH_SCRIPT: &str =
-    "ip -4 -o addr show scope global; echo ---; ss -Hltn 2>/dev/null || true";
+/// Run inside a CT: its global IPv4 addresses, a `---` line, then the tcp ports it listens on,
+/// from `ss` or, in a busybox CT, `netstat`.
+pub const REACH_SCRIPT: &str = "ip -4 -o addr show scope global; echo ---; \
+ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null || true";
 
 /// The words that run [`REACH_SCRIPT`] in CT `vmid`, through `via` as [`exec_words`] has it.
 pub fn reach_words(vmid: &str, via: Option<Via>) -> Vec<String> {
@@ -50,8 +51,8 @@ pub fn reach_words(vmid: &str, via: Option<Via>) -> Vec<String> {
     words.into_iter().map(String::from).collect()
 }
 
-/// Reads the output of [`REACH_SCRIPT`]: the first address, without its prefix length, and the
-/// suggested ports.
+/// Reads the output of [`REACH_SCRIPT`]: the first IP address, without its prefix length (a
+/// word that is not one is no address), and the suggested ports.
 pub fn parse_reach(stdout: &str) -> Reach {
     let mut addresses = String::new();
     let mut listeners = String::new();
@@ -73,16 +74,18 @@ pub fn parse_reach(stdout: &str) -> Reach {
         let mut words = line.split_whitespace();
         words.find(|word| *word == "inet")?;
         let cidr = words.next()?;
-        Some(cidr.split('/').next().unwrap_or(cidr).to_string())
+        let ip: std::net::IpAddr = cidr.split('/').next().unwrap_or(cidr).parse().ok()?;
+        Some(ip.to_string())
     });
     Reach {
         address,
         host_network: false,
-        ports: suggested_ports(&parse_ss(&listeners))
+        ports: suggested_ports(&parse_listeners(&listeners))
             .into_iter()
             .map(|(port, loopback_only)| PortOffer {
                 port,
                 published: None,
+                published_address: None,
                 loopback_only,
             })
             .collect(),
@@ -691,6 +694,33 @@ VMID       Status     Lock         Name                \n\
             })
         });
         assert!(matches!(failed, Err(ListFailure::Issue(_))));
+    }
+
+    #[test]
+    fn reach_reads_netstat_in_a_busybox_ct() {
+        assert!(REACH_SCRIPT.contains("|| netstat -ltn"));
+        let reach = parse_reach(
+            "2: eth0    inet 10.0.0.7/24 scope global eth0\n---\n\
+Active Internet connections (only servers)\n\
+Proto Recv-Q Send-Q Local Address           Foreign Address         State\n\
+tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN\n\
+tcp        0      0 127.0.0.1:6379          0.0.0.0:*               LISTEN\n",
+        );
+        assert_eq!(reach.address.as_deref(), Some("10.0.0.7"));
+        let ports: Vec<_> = reach
+            .ports
+            .iter()
+            .map(|o| (o.port, o.loopback_only))
+            .collect();
+        assert_eq!(ports, [(80, false), (6379, true)]);
+    }
+
+    #[test]
+    fn reach_ignores_an_address_that_is_not_one() {
+        let reach = parse_reach("2: eth0    inet ;rm-rf/24 scope global eth0\n---\n");
+        assert_eq!(reach.address, None);
+        let reach = parse_reach("2: eth0    inet -oProxyCommand=x scope global eth0\n---\n");
+        assert_eq!(reach.address, None);
     }
 
     #[test]

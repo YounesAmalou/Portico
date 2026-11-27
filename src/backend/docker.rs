@@ -359,6 +359,7 @@ impl Backend for Docker {
     ) -> Result<Reach, ListFailure<E>> {
         reach_with(
             "docker",
+            INSPECT_FORMAT,
             container,
             via.map(|tool| move |words: &[String]| in_group(tool, words)),
             run,
@@ -371,30 +372,30 @@ impl Backend for Docker {
     }
 }
 
-/// What `inspect` prints: the networks, the exposed ports and the network mode, as JSON
+/// What `docker inspect` prints: the networks, the exposed ports and the network mode, as JSON
 /// separated by `|`.
 pub(super) const INSPECT_FORMAT: &str =
     "{{json .NetworkSettings.Networks}}|{{json .Config.ExposedPorts}}|{{.HostConfig.NetworkMode}}";
 
-/// Runs `<program> inspect` on `container` (wrapped by `wrap` when the listing needed a tool)
-/// and reads where it can be reached. A run that fails stops it; a non-zero exit is the
-/// `issue` built from its stderr.
+/// What `podman inspect` prints, in the shape of [`INSPECT_FORMAT`]. Podman has
+/// `.Config.ExposedPorts` only from 5.3; `.NetworkSettings.Ports`, keyed by the same
+/// `80/tcp`, holds the exposed ports too (unpublished ones with no host port) on every version.
+pub(super) const PODMAN_INSPECT_FORMAT: &str = "{{json .NetworkSettings.Networks}}|{{json .NetworkSettings.Ports}}|{{.HostConfig.NetworkMode}}";
+
+/// Runs `<program> inspect --format <format>` on `container` (wrapped by `wrap` when the
+/// listing needed a tool) and reads where it can be reached. A run that fails stops it; a
+/// non-zero exit is the `issue` built from its stderr.
 pub(super) fn reach_with<E>(
     program: &str,
+    format: &str,
     container: &Container,
     wrap: Option<impl Fn(&[String]) -> Vec<String>>,
     run: &mut dyn FnMut(&[String]) -> RunResult<E>,
     issue: impl FnOnce(String) -> BackendIssue,
 ) -> Result<Reach, ListFailure<E>> {
-    let words: Vec<String> = [
-        program,
-        "inspect",
-        "--format",
-        INSPECT_FORMAT,
-        &container.id,
-    ]
-    .map(String::from)
-    .to_vec();
+    let words: Vec<String> = [program, "inspect", "--format", format, &container.id]
+        .map(String::from)
+        .to_vec();
     let words = match wrap {
         Some(wrap) => wrap(&words),
         None => words,
@@ -406,8 +407,10 @@ pub(super) fn reach_with<E>(
     Ok(parse_inspect(&lossy(&output.stdout), &container.ports))
 }
 
-/// Reads the output of [`INSPECT_FORMAT`]: the address of the first network, by name, that has
-/// one; and the ports the row publishes, then the exposed ones it does not, each ascending.
+/// Reads the output of [`INSPECT_FORMAT`] or [`PODMAN_INSPECT_FORMAT`]: the address of the
+/// first network, by name, that has one (a value that is not an IP address is none); and the
+/// ports the row publishes, then the exposed ones it does not, each ascending. Only the keys
+/// of the exposed ports count, so either format's object reads the same.
 pub(super) fn parse_inspect(stdout: &str, row_ports: &str) -> Reach {
     // The mode and the exposed ports hold no `|`; a network name might.
     let mut parts = stdout.trim().rsplitn(3, '|');
@@ -420,18 +423,19 @@ pub(super) fn parse_inspect(stdout: &str, row_ports: &str) -> Reach {
             let mut named: Vec<(&String, &serde_json::Value)> = value.as_object()?.iter().collect();
             named.sort_by_key(|(name, _)| *name);
             named.into_iter().find_map(|(_, network)| {
-                let ip = network.get("IPAddress")?.as_str()?;
-                (!ip.is_empty()).then(|| ip.to_string())
+                let ip: std::net::IpAddr = network.get("IPAddress")?.as_str()?.parse().ok()?;
+                Some(ip.to_string())
             })
         });
     let mut published = published_ports(row_ports);
-    published.sort_by_key(|&(host, port)| (port, host));
-    published.dedup_by_key(|&mut (_, port)| port);
+    published.sort_by_key(|offer| (offer.container, offer.host));
+    published.dedup_by_key(|offer| offer.container);
     let mut ports: Vec<PortOffer> = published
         .iter()
-        .map(|&(host, port)| PortOffer {
-            port,
-            published: Some(host),
+        .map(|offer| PortOffer {
+            port: offer.container,
+            published: Some(offer.host),
+            published_address: offer.address.clone(),
             loopback_only: false,
         })
         .collect();
@@ -443,15 +447,17 @@ pub(super) fn parse_inspect(stdout: &str, row_ports: &str) -> Reach {
                     .as_object()?
                     .keys()
                     .filter_map(|key| key.strip_suffix("/tcp")?.parse().ok())
-                    .filter(|port| !published.iter().any(|&(_, p)| p == *port))
+                    .filter(|port| !published.iter().any(|offer| offer.container == *port))
                     .collect(),
             )
         })
         .unwrap_or_default();
     open.sort_unstable();
+    open.dedup();
     ports.extend(open.into_iter().map(|port| PortOffer {
         port,
         published: None,
+        published_address: None,
         loopback_only: false,
     }));
     Reach {
@@ -1114,15 +1120,41 @@ mod tests {
                 PortOffer {
                     port: 80,
                     published: Some(8080),
+                    published_address: None,
                     loopback_only: false
                 },
                 PortOffer {
                     port: 443,
                     published: None,
+                    published_address: None,
                     loopback_only: false
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reach_keeps_the_one_address_a_port_is_published_on() {
+        let out = inspected("{}", r#"{"80/tcp":{}}"#, "default");
+        let reach = reach_of(None, out, "192.168.1.10:8080->80/tcp").1.unwrap();
+        assert_eq!(reach.ports[0].published, Some(8080));
+        assert_eq!(
+            reach.ports[0].published_address.as_deref(),
+            Some("192.168.1.10")
+        );
+    }
+
+    #[test]
+    fn reach_ignores_a_network_address_that_is_not_one() {
+        let out = inspected(
+            r#"{"alpha":{"IPAddress":"-oProxyCommand=x"},"beta":{"IPAddress":"10.0.0.2"}}"#,
+            "{}",
+            "default",
+        );
+        let reach = reach_of(None, out, "").1.unwrap();
+        assert_eq!(reach.address.as_deref(), Some("10.0.0.2"));
+        let out = inspected(r#"{"alpha":{"IPAddress":"a b"}}"#, "{}", "default");
+        assert_eq!(reach_of(None, out, "").1.unwrap().address, None);
     }
 
     #[test]

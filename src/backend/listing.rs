@@ -69,10 +69,22 @@ pub fn group(containers: &[Container]) -> Vec<Group<'_>> {
     groups
 }
 
-/// The tcp ports published on the host in a ports column, as `(host, container)` pairs without
-/// repeats: `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 5432/tcp` gives `[(8080, 80)]`.
-pub fn published_ports(ports: &str) -> Vec<(u16, u16)> {
-    let mut found = Vec::new();
+/// A tcp port published on the host, as a ports column shows it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Published {
+    /// The one host address it is published on, when that is neither a wildcard nor loopback.
+    pub address: Option<String>,
+    /// The port of the host.
+    pub host: u16,
+    /// The port inside the container.
+    pub container: u16,
+}
+
+/// The tcp ports published on the host in a ports column, without repeats:
+/// `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 5432/tcp` gives one, 8080 to 80 on any address.
+/// A mapping on a wildcard or loopback address wins over one on a specific address.
+pub fn published_ports(ports: &str) -> Vec<Published> {
+    let mut found: Vec<Published> = Vec::new();
     for entry in ports.split(',') {
         let Some((host, container)) = entry.trim().split_once("->") else {
             continue;
@@ -80,14 +92,43 @@ pub fn published_ports(ports: &str) -> Vec<(u16, u16)> {
         let Some(container) = container.strip_suffix("/tcp") else {
             continue;
         };
-        let host = host.rsplit(':').next().unwrap_or(host);
-        if let (Ok(host), Ok(container)) = (host.parse(), container.parse())
-            && !found.contains(&(host, container))
+        let (address, port) = match host.rsplit_once(':') {
+            Some((address, port)) => (address, port),
+            None => ("", host),
+        };
+        let (Ok(host), Ok(container)) = (port.parse(), container.parse()) else {
+            continue;
+        };
+        let address = specific_address(address);
+        match found
+            .iter_mut()
+            .find(|seen| seen.host == host && seen.container == container)
         {
-            found.push((host, container));
+            Some(seen) => {
+                if address.is_none() {
+                    seen.address = None;
+                }
+            }
+            None => found.push(Published {
+                address,
+                host,
+                container,
+            }),
         }
     }
     found
+}
+
+/// The address of a ports column entry when it names one host address that is neither a
+/// wildcard (`0.0.0.0`, `::`, none) nor loopback; anything that is not an IP address is none.
+fn specific_address(address: &str) -> Option<String> {
+    let address = address.trim();
+    let bare = address
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(address);
+    let ip: std::net::IpAddr = bare.parse().ok()?;
+    (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
 }
 
 /// A Compose container shows its service, numbered when the service has
@@ -206,9 +247,44 @@ mod tests {
             published_ports(
                 "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 5432/tcp, 53/udp, 0.0.0.0:53->53/udp"
             ),
-            [(8080, 80)]
+            [Published {
+                address: None,
+                host: 8080,
+                container: 80
+            }]
         );
         assert!(published_ports("").is_empty());
+    }
+
+    #[test]
+    fn a_port_published_on_one_address_keeps_it() {
+        assert_eq!(
+            published_ports("192.168.1.10:8080->80/tcp, [fd00::5]:8443->443/tcp"),
+            [
+                Published {
+                    address: Some("192.168.1.10".into()),
+                    host: 8080,
+                    container: 80
+                },
+                Published {
+                    address: Some("fd00::5".into()),
+                    host: 8443,
+                    container: 443
+                },
+            ]
+        );
+        for wildcard in [
+            "0.0.0.0:8080->80/tcp",
+            "[::]:8080->80/tcp",
+            "127.0.0.1:8080->80/tcp",
+            "[::1]:8080->80/tcp",
+            "8080->80/tcp",
+            "192.168.1.10:8080->80/tcp, 0.0.0.0:8080->80/tcp",
+        ] {
+            let found = published_ports(wildcard);
+            assert_eq!(found.len(), 1, "{wildcard}");
+            assert_eq!(found[0].address, None, "{wildcard}");
+        }
     }
 
     fn container(

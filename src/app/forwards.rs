@@ -397,15 +397,14 @@ impl App {
 }
 
 /// Where port `remote` of a container is reached from its host: through the host port it is
-/// published on, at `localhost` on the host's network, else at the container's address.
+/// published on (at the one address it is published on, else `localhost`), at `localhost` on
+/// the host's network, else at the container's address.
 fn destination(reach: &Reach, remote: u16) -> Option<Destination> {
-    let published = reach
-        .ports
-        .iter()
-        .find(|offer| offer.port == remote)
-        .and_then(|offer| offer.published);
+    let offer = reach.ports.iter().find(|offer| offer.port == remote);
+    let published = offer.and_then(|offer| Some((offer.published?, &offer.published_address)));
     let (host, port) = match published {
-        Some(published) => ("localhost".to_owned(), published),
+        Some((published, Some(address))) => (address.clone(), published),
+        Some((published, None)) => ("localhost".to_owned(), published),
         None if reach.host_network => ("localhost".to_owned(), remote),
         None => (reach.address.clone()?, remote),
     };
@@ -420,22 +419,25 @@ fn reachable_here(reach: &Reach, linux: bool) -> Vec<(u16, String)> {
         .ports
         .iter()
         .filter_map(|offer| {
-            let address = match offer.published {
-                Some(published) => format!("127.0.0.1:{published}"),
-                None if !linux || offer.loopback_only => return None,
-                None if reach.host_network => format!("127.0.0.1:{}", offer.port),
-                None => {
-                    let address = reach.address.as_ref()?;
-                    if address.contains(':') {
-                        format!("[{address}]:{}", offer.port)
-                    } else {
-                        format!("{address}:{}", offer.port)
-                    }
-                }
+            let address = match (offer.published, &offer.published_address) {
+                (Some(published), Some(address)) => socket(address, published),
+                (Some(published), None) => format!("127.0.0.1:{published}"),
+                (None, _) if !linux || offer.loopback_only => return None,
+                (None, _) if reach.host_network => format!("127.0.0.1:{}", offer.port),
+                (None, _) => socket(reach.address.as_ref()?, offer.port),
             };
             Some((offer.port, address))
         })
         .collect()
+}
+
+/// `address:port`, with an IPv6 address in brackets.
+fn socket(address: &str, port: u16) -> String {
+    if address.contains(':') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
+    }
 }
 
 /// A container error in one line, for a suggestion's `unavailable` or a refusal.
@@ -772,6 +774,7 @@ exit 0
             ports: vec![PortOffer {
                 port: 443,
                 published: None,
+                published_address: None,
                 loopback_only: false,
             }],
         };
@@ -949,11 +952,13 @@ exit 0
                 PortOffer {
                     port: 80,
                     published: Some(8080),
+                    published_address: None,
                     loopback_only: false,
                 },
                 PortOffer {
                     port: 443,
                     published: None,
+                    published_address: None,
                     loopback_only: false,
                 },
             ],
@@ -971,6 +976,60 @@ exit 0
     }
 
     #[test]
+    fn a_port_published_on_one_address_is_reached_there() {
+        let offer = |published_address: Option<&str>| Reach {
+            address: Some("172.18.0.4".into()),
+            host_network: false,
+            ports: vec![PortOffer {
+                port: 80,
+                published: Some(8080),
+                published_address: published_address.map(String::from),
+                loopback_only: false,
+            }],
+        };
+        let at = |reach: &Reach| destination(reach, 80).map(|d| (d.host, d.port));
+
+        assert_eq!(
+            at(&offer(Some("192.168.1.10"))),
+            Some(("192.168.1.10".into(), 8080))
+        );
+        assert_eq!(at(&offer(None)), Some(("localhost".into(), 8080)));
+        assert_eq!(
+            reachable_here(&offer(Some("192.168.1.10")), true),
+            vec![(80, "192.168.1.10:8080".to_string())]
+        );
+        assert_eq!(
+            reachable_here(&offer(Some("fd00::5")), false),
+            vec![(80, "[fd00::5]:8080".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_ports_column_decides_where_a_published_port_is_reached() {
+        let fixture = fixture();
+        fixture.behave(&format!("echo '{INSPECT}'\n"));
+        for (ports, expected) in [
+            ("192.168.1.10:8080->80/tcp", "192.168.1.10"),
+            ("[::]:8080->80/tcp", "localhost"),
+            ("0.0.0.0:8080->80/tcp", "localhost"),
+        ] {
+            let target = ForwardTarget::Container {
+                target: Target::Host("prod".into()),
+                backend: BackendId::Docker,
+                container: container("web", ports),
+                via: None,
+            };
+            let reach = fixture
+                .app
+                .forward_suggestions(&target, None)
+                .reach
+                .expect("the container's reach");
+            let found = destination(&reach, 80).map(|d| (d.host, d.port));
+            assert_eq!(found, Some((expected.to_string(), 8080)), "{ports}");
+        }
+    }
+
+    #[test]
     fn elsewhere_only_published_ports_are_reachable_here() {
         let reach = Reach {
             address: Some("172.18.0.4".into()),
@@ -979,16 +1038,19 @@ exit 0
                 PortOffer {
                     port: 80,
                     published: Some(8080),
+                    published_address: None,
                     loopback_only: false,
                 },
                 PortOffer {
                     port: 443,
                     published: None,
+                    published_address: None,
                     loopback_only: false,
                 },
                 PortOffer {
                     port: 6379,
                     published: None,
+                    published_address: None,
                     loopback_only: true,
                 },
             ],
