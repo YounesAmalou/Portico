@@ -2,9 +2,10 @@
 //! opened with `pct exec`, as root or through `sudo -n`.
 
 use super::{
-    Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, Problem,
-    RunFailure, RunResult, SHELL_SCRIPT, Target, Via,
+    Backend, BackendId, BackendIssue, Container, ContainerList, ListFailure, Listing, PortOffer,
+    Problem, Reach, RunFailure, RunResult, SHELL_SCRIPT, Target, Via,
 };
+use crate::domain::tunnel::ports::{parse_ss, suggested_ports};
 
 /// Lists the CTs as root: directly when the user is root, otherwise through `sudo -n`, which
 /// never prompts. `pct` lives in `/usr/sbin`, which Debian leaves out of a non-root `PATH`.
@@ -33,6 +34,44 @@ pub fn exec_words(vmid: &str, via: Option<Via>) -> Vec<String> {
     }
     words.extend(["pct", "exec", vmid, "--", "sh", "-c", SHELL_SCRIPT]);
     words.into_iter().map(String::from).collect()
+}
+
+/// Run inside a CT: its global IPv4 addresses, a `---` line, then the tcp ports it listens on.
+pub const REACH_SCRIPT: &str =
+    "ip -4 -o addr show scope global; echo ---; ss -Hltn 2>/dev/null || true";
+
+/// The words that run [`REACH_SCRIPT`] in CT `vmid`, through `via` as [`exec_words`] has it.
+pub fn reach_words(vmid: &str, via: Option<Via>) -> Vec<String> {
+    let mut words = Vec::new();
+    if via == Some(Via::Sudo) {
+        words.extend(["sudo", "-n"]);
+    }
+    words.extend(["pct", "exec", vmid, "--", "sh", "-c", REACH_SCRIPT]);
+    words.into_iter().map(String::from).collect()
+}
+
+/// Reads the output of [`REACH_SCRIPT`]: the first address, without its prefix length, and the
+/// suggested ports.
+pub fn parse_reach(stdout: &str) -> Reach {
+    let (addresses, listeners) = stdout.split_once("\n---").unwrap_or((stdout, ""));
+    let address = addresses.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        words.find(|word| *word == "inet")?;
+        let cidr = words.next()?;
+        Some(cidr.split('/').next().unwrap_or(cidr).to_string())
+    });
+    Reach {
+        address,
+        host_network: false,
+        ports: suggested_ports(&parse_ss(listeners))
+            .into_iter()
+            .map(|(port, loopback_only)| PortOffer {
+                port,
+                published: None,
+                loopback_only,
+            })
+            .collect(),
+    }
 }
 
 /// What the listing script printed besides the table.
@@ -209,6 +248,29 @@ impl Backend for Proxmox {
             markers.user.as_deref(),
             stderr,
         ))))
+    }
+
+    /// Runs [`REACH_SCRIPT`] in the CT through `pct exec`, as the listing reached `pct`.
+    fn reach<E>(
+        &self,
+        target: &Target,
+        container: &Container,
+        via: Option<Via>,
+        run: &mut dyn FnMut(&[String]) -> RunResult<E>,
+    ) -> Result<Reach, ListFailure<E>> {
+        let output = run(&reach_words(&container.id, via)).map_err(|failure| match failure {
+            RunFailure::Cancelled(error) | RunFailure::Failed(error) => ListFailure::Run(error),
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(ListFailure::Issue(Box::new(issue(
+                target,
+                Problem::Other,
+                None,
+                stderr,
+            ))));
+        }
+        Ok(parse_reach(&String::from_utf8_lossy(&output.stdout)))
     }
 
     /// `pct exec` into CT `id` as root; `user` does not apply (the app refuses it first).
@@ -562,5 +624,57 @@ VMID       Status     Lock         Name                \n\
         };
         assert_eq!(run("0"), "via=none\npct list\n");
         assert_eq!(run("1000"), "user=deploy\nvia=sudo\nsudo -n pct list\n");
+    }
+
+    #[test]
+    fn reach_reads_the_address_and_listeners_of_a_ct() {
+        let stdout = "2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0\n---\nLISTEN 0 4096 127.0.0.1:5432 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\n";
+        let mut calls = Vec::new();
+        let container = Container {
+            id: "101".into(),
+            name: "db".into(),
+            image: String::new(),
+            command: String::new(),
+            running_for: String::new(),
+            status: "running".into(),
+            ports: String::new(),
+            networks: String::new(),
+            mounts: String::new(),
+            project: None,
+            service: None,
+            number: None,
+            working_dir: None,
+        };
+        let reach = Proxmox
+            .reach::<()>(&Target::Local, &container, Some(Via::Sudo), &mut |words| {
+                calls.push(words.to_vec());
+                Ok(Output {
+                    status: exit_status(0),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                })
+            })
+            .unwrap();
+        assert_eq!(calls, [reach_words("101", Some(Via::Sudo))]);
+        assert_eq!(
+            calls[0][..4],
+            ["sudo", "-n", "pct", "exec"].map(String::from)
+        );
+        assert_eq!(reach.address.as_deref(), Some("192.168.1.50"));
+        let ports: Vec<_> = reach
+            .ports
+            .iter()
+            .map(|o| (o.port, o.loopback_only))
+            .collect();
+        assert_eq!(ports, [(80, false), (5432, true)]);
+        assert!(reach.ports.iter().all(|o| o.published.is_none()));
+        let failed = Proxmox.reach::<()>(&Target::Local, &container, None, &mut |_| {
+            Ok(Output {
+                status: exit_status(255),
+                stdout: Vec::new(),
+                stderr: b"no".to_vec(),
+            })
+        });
+        assert!(matches!(failed, Err(ListFailure::Issue(_))));
     }
 }

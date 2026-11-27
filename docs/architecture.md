@@ -57,7 +57,7 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 
 ## The backend interface
 
-`src/backend/mod.rs` defines the `Backend` trait: list the running containers of a target, give the command that opens a shell in one, and explain a problem. The app owns the transport: it runs commands on this machine or through `ssh` and hands each adapter a `run` callback. An adapter says which commands to run and what their output means.
+`src/backend/mod.rs` defines the `Backend` trait: list the running containers of a target, give the command that opens a shell in one, say where one can be reached (`reach`: its address and the ports it offers), and explain a problem. The app owns the transport: it runs commands on this machine or through `ssh` and hands each adapter a `run` callback. An adapter says which commands to run and what their output means.
 
 Adapters are compiled in and chosen at run time through the `BackendId` enum. Nothing is loaded from outside the binary.
 
@@ -65,7 +65,7 @@ Adapters are compiled in and chosen at run time through the `BackendId` enum. No
 
 1. Add the adapter in `src/backend/<name>.rs`, implementing `Backend`. It produces the shared `backend::Listing` of `backend::Container` rows (`src/backend/listing.rs`), which grouping, naming and lookup already work on.
 2. Add one `BackendId` variant.
-3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str`, `program`, `title`, `chooses_user` and `ungrouped_heading`, and the dispatch functions `list`, `shell_words` and `plain_issue`.
+3. Add one arm for it in each match in `src/backend/mod.rs`: `BackendId::as_str`, `program`, `title`, `chooses_user` and `ungrouped_heading`, and the dispatch functions `list`, `shell_words`, `reach` and `plain_issue`.
 4. Make the interfaces reach it: add the new id where it belongs in `backend::AUTOMATIC` (Docker, Podman, Proxmox). Every backend is listed in that order: the TUI has one tab per backend (`Tab::ALL` in `src/tui/mod.rs`, which a test keeps in step with `AUTOMATIC`), each with its own panel and listing worker, and the CLI's human listing and `portico shell` walk `AUTOMATIC` themselves. `App::containers` without a backend returns the first one installed, which only the JSON output uses. With `--backend`, the CLI maps its `BackendArg` value to the id (`src/cli/mod.rs`): add a value there. The list records its backend (`ContainerList::backend`), and the shell, the CLI's human and JSON output and the TUI read it from there; the JSON adds a `backend` key for every backend but Docker, whose documents predate it.
 
 ### Add a platform

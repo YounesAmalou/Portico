@@ -69,6 +69,27 @@ pub fn group(containers: &[Container]) -> Vec<Group<'_>> {
     groups
 }
 
+/// The tcp ports published on the host in a ports column, as `(host, container)` pairs without
+/// repeats: `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 5432/tcp` gives `[(8080, 80)]`.
+pub fn published_ports(ports: &str) -> Vec<(u16, u16)> {
+    let mut found = Vec::new();
+    for entry in ports.split(',') {
+        let Some((host, container)) = entry.trim().split_once("->") else {
+            continue;
+        };
+        let Some(container) = container.strip_suffix("/tcp") else {
+            continue;
+        };
+        let host = host.rsplit(':').next().unwrap_or(host);
+        if let (Ok(host), Ok(container)) = (host.parse(), container.parse())
+            && !found.contains(&(host, container))
+        {
+            found.push((host, container));
+        }
+    }
+    found
+}
+
 /// A Compose container shows its service, numbered when the service has
 /// replicas; any other container shows its name.
 pub fn display_name(container: &Container, all: &[Container]) -> String {
@@ -177,6 +198,17 @@ fn pick(mut found: Vec<&Container>) -> Result<&Container, ResolveError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn published_ports_are_the_tcp_mappings_without_repeats() {
+        assert_eq!(
+            super::published_ports(
+                "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 5432/tcp, 53/udp, 0.0.0.0:53->53/udp"
+            ),
+            [(8080, 80)]
+        );
+        assert!(super::published_ports("").is_empty());
+    }
+
     use super::*;
 
     fn container(
