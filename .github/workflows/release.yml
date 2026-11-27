@@ -132,9 +132,11 @@ jobs:
           path: dist/*
 
   # The macOS artifacts, built on Apple silicon for both architectures (Intel is
-  # cross-compiled): the binary's tarball and a CycloneDX SBOM, attested in the same job.
-  # The arm64 binary is run before it is packaged. The linker signs both ad hoc; they are
-  # not notarized, which Homebrew does not need.
+  # cross-compiled): the tray app's tarball (scripts/build-tray.sh), then the binary's tarball
+  # and a CycloneDX SBOM, attested in the same job. The binary bakes in the SHA-256 of the
+  # tray app's tarball (PORTICO_TRAY_SHA256), which `portico desktop install` checks. The arm64
+  # binary and app are run before they are released. The linker signs the binary ad hoc, and
+  # build-tray.sh the app; they are not notarized, which Homebrew does not need.
   build-macos:
     needs: [verify, checks]
     runs-on: macos-latest
@@ -155,16 +157,24 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
+          tray=$(scripts/build-tray.sh "$VERSION" "$TARGET" dist)
+          PORTICO_TRAY_SHA256=$(shasum -a 256 "$tray" | cut -d ' ' -f 1)
+          export PORTICO_TRAY_SHA256
           binary=$(scripts/build-release.sh "$VERSION" "$TARGET" dist)
           if [ "$TARGET" = aarch64-apple-darwin ]; then
             "$binary" --version | grep -qx "portico $VERSION"
+            tar -xzf "$tray" -C "$RUNNER_TEMP"
+            codesign --verify --deep --strict "$RUNNER_TEMP/Portico Tray.app"
+            "$RUNNER_TEMP/Portico Tray.app/Contents/MacOS/portico-tray" --version |
+              grep -qx "portico-tray $VERSION"
           fi
+          # The SBOM describes the binary, not the tray app.
           {
             echo "binary=$binary"
             echo "sbom=dist/portico-v$VERSION-$TARGET.cdx.json"
             echo "carriers<<EOF"
             echo "$binary"
-            find dist -type f ! -name '*.cdx.json'
+            find dist -type f ! -name '*.cdx.json' ! -name 'portico-tray-*'
             echo EOF
           } >> "$GITHUB_OUTPUT"
       - name: Attest build provenance
@@ -184,9 +194,11 @@ jobs:
           path: dist/*
 
   # The Windows artifacts, built on a Windows x64 runner for both architectures (arm64 is
-  # cross-compiled by the runner's Visual Studio): a zip of portico.exe and a CycloneDX SBOM,
-  # attested in the same job. The x64 binary is run before it is packaged. They are not
-  # code-signed.
+  # cross-compiled by the runner's Visual Studio): a zip of the tray app's portico-tray.exe
+  # (scripts/build-tray.sh), then a zip of portico.exe and a CycloneDX SBOM, attested in the
+  # same job. portico.exe bakes in the SHA-256 of the tray app's zip (PORTICO_TRAY_SHA256),
+  # which `portico desktop install` checks. The x64 binary is run before it is packaged. They
+  # are not code-signed.
   build-windows:
     needs: [verify, checks]
     runs-on: windows-latest
@@ -210,17 +222,21 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
+          tray=$(scripts/build-tray.sh "$VERSION" "$TARGET" dist)
+          PORTICO_TRAY_SHA256=$(sha256sum "$tray" | cut -d ' ' -f 1)
+          export PORTICO_TRAY_SHA256
           # The attest action reads Windows paths, not Git for Windows' /d/... ones.
           binary=$(cygpath -m "$(scripts/build-release.sh "$VERSION" "$TARGET" dist)")
           if [ "$TARGET" = x86_64-pc-windows-msvc ]; then
             "$binary" --version | grep -qx "portico $VERSION"
           fi
+          # The SBOM describes the binary, not the tray app.
           {
             echo "binary=$binary"
             echo "sbom=dist/portico-v$VERSION-$TARGET.cdx.json"
             echo "carriers<<EOF"
             echo "$binary"
-            find dist -type f ! -name '*.cdx.json'
+            find dist -type f ! -name '*.cdx.json' ! -name 'portico-tray-*'
             echo EOF
           } >> "$GITHUB_OUTPUT"
       - name: Attest build provenance

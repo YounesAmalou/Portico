@@ -1,6 +1,7 @@
 # Build output
 /target/
 /dist/
+/desktop/tray/target/
 *.crate
 
 # Local tooling and agent workspaces

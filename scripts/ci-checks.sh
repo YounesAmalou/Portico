@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test|e2e|docs|msrv|audit|deny|package|desktop>" >&2
+    echo "usage: $0 <fmt|clippy|test|e2e|docs|msrv|audit|deny|package|desktop|tray>" >&2
     exit 2
 }
 
@@ -115,6 +115,15 @@ desktop() {
     QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 "$qt/qmltestrunner" -input "$dir/tests"
 }
 
+# The tray app (desktop/tray, macOS and Windows): its own Cargo project. On Linux it builds
+# its pure menu model and the stub main, which the tests and clippy cover.
+tray() {
+    cd desktop/tray
+    cargo fmt --check
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --locked
+}
+
 # macOS's temporary directory is reached through a symbolic link (/var -> /private/var).
 # Portico resolves links in the paths it writes, so tests that compare those paths with
 # their temporary home need the resolved spelling from the start.
@@ -140,9 +149,12 @@ case "$1" in
     e2e) e2e ;;
     docs) cargo test --test docs ;;
     msrv) msrv ;;
-    audit) ensure_tool audit && cargo audit ;;
-    deny) ensure_tool deny && cargo deny check ;;
+    # Both cover the tray app's own lock file too (deny.toml, read from the
+    # repository root, names its macOS and Windows targets).
+    audit) ensure_tool audit && cargo audit && cargo audit --file desktop/tray/Cargo.lock ;;
+    deny) ensure_tool deny && cargo deny check && cargo deny --manifest-path desktop/tray/Cargo.toml check ;;
     package) cargo package --locked ;;
     desktop) desktop ;;
+    tray) tray ;;
     *) usage ;;
 esac

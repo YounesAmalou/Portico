@@ -332,3 +332,157 @@ fn winget_manifest_refuses_a_zip_of_another_version() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Runs `build-tray.sh` with a fake `cargo` (which writes a binary holding the version it was
+/// built with, where the real one would) and a fake `codesign` first on `PATH`.
+fn build_tray(dir: &std::path::Path, version: &str, target: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fakes = [
+        (
+            "cargo",
+            r#"#!/bin/sh
+case " $* " in *" build --locked --release "*) ;; *) echo "unexpected: $*" >&2; exit 1 ;; esac
+while [ $# -gt 0 ]; do
+    case $1 in --target) t=$2; shift ;; --target-dir) d=$2; shift ;; esac
+    shift
+done
+mkdir -p "$d/$t/release"
+echo "$PORTICO_TRAY_VERSION" > "$d/$t/release/portico-tray"
+echo "$PORTICO_TRAY_VERSION" > "$d/$t/release/portico-tray.exe"
+"#,
+        ),
+        (
+            "codesign",
+            "#!/bin/sh\necho \"$*\" > \"$(dirname \"$0\")/codesign.args\"\n",
+        ),
+    ];
+    for (name, body) in fakes {
+        let path = bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    Command::new(script("build-tray.sh"))
+        .args([version, target])
+        .arg(dir.join("out"))
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", dir.join("target"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn build_tray_requires_a_macos_or_windows_target() {
+    let dir = TempDir::new().unwrap();
+    let output = build_tray(dir.path(), "0.1.0", "x86_64-unknown-linux-gnu");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("macOS or Windows target required"));
+    assert!(!dir.path().join("out").exists());
+}
+
+#[test]
+fn build_tray_refuses_a_v_prefixed_version_and_needs_three_arguments() {
+    let dir = TempDir::new().unwrap();
+    let output = build_tray(dir.path(), "v0.1.0", "aarch64-apple-darwin");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no v prefix"));
+
+    let output = Command::new(script("build-tray.sh"))
+        .args(["0.1.0", "aarch64-apple-darwin"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<outdir>"));
+}
+
+fn archive_entries(archive: &std::path::Path) -> Vec<String> {
+    let listing = Command::new("bsdtar")
+        .arg("-tf")
+        .arg(archive)
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    let mut entries: Vec<String> = String::from_utf8(listing.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn build_tray_packages_a_signed_bundle_with_the_version_for_macos() {
+    let target = "aarch64-apple-darwin";
+    let dir = TempDir::new().unwrap();
+    let output = build_tray(dir.path(), "0.8.0", target);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(
+        archive,
+        dir.path()
+            .join(format!("out/portico-tray-v0.8.0-{target}.tar.gz"))
+    );
+    assert_eq!(fs::read_dir(dir.path().join("out")).unwrap().count(), 1);
+    assert_eq!(
+        archive_entries(&archive),
+        [
+            "Portico Tray.app/",
+            "Portico Tray.app/Contents/",
+            "Portico Tray.app/Contents/Info.plist",
+            "Portico Tray.app/Contents/MacOS/",
+            "Portico Tray.app/Contents/MacOS/portico-tray",
+            "Portico Tray.app/Contents/Resources/",
+            "Portico Tray.app/Contents/Resources/portico.icns",
+        ]
+    );
+    let codesign = fs::read_to_string(dir.path().join("bin/codesign.args")).unwrap();
+    assert!(codesign.starts_with("-s - --force --deep "), "{codesign}");
+
+    let unpacked = dir.path().join("unpacked");
+    fs::create_dir(&unpacked).unwrap();
+    assert!(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&unpacked)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let contents = unpacked.join("Portico Tray.app/Contents");
+    let plist = fs::read_to_string(contents.join("Info.plist")).unwrap();
+    assert!(!plist.contains("@VERSION@"));
+    assert_eq!(plist.matches("<string>0.8.0</string>").count(), 2);
+    // Built with the version exactly as `portico --version` prints it.
+    assert_eq!(
+        fs::read_to_string(contents.join("MacOS/portico-tray")).unwrap(),
+        "0.8.0\n"
+    );
+}
+
+#[test]
+fn build_tray_zips_portico_tray_exe_alone_for_windows() {
+    let target = "x86_64-pc-windows-msvc";
+    let dir = TempDir::new().unwrap();
+    let output = build_tray(dir.path(), "0.8.0", target);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert_eq!(
+        archive,
+        dir.path()
+            .join(format!("out/portico-tray-v0.8.0-{target}.zip"))
+    );
+    assert_eq!(archive_entries(&archive), ["portico-tray.exe"]);
+}

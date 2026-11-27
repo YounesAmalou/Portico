@@ -23,6 +23,7 @@ mod hosts;
 mod json;
 mod migrate;
 mod settings;
+mod tray;
 mod tunnels;
 
 use self::{
@@ -190,8 +191,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Install the desktop panel, a launcher entry and a keybinding, or show or remove them.
-    #[cfg_attr(not(target_os = "linux"), command(hide = true))]
+    /// Install, show or remove the desktop integration: the panel, a launcher entry and a
+    /// keybinding on Linux; the menu bar or tray app on macOS and Windows.
     Desktop {
         #[command(subcommand)]
         command: desktop::DesktopCommand,

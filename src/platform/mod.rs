@@ -26,4 +26,6 @@ pub mod launcher;
 pub mod net;
 pub mod paths;
 pub mod process;
+#[cfg(windows)]
+pub mod registry;
 pub mod time;

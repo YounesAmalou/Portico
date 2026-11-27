@@ -1,6 +1,6 @@
 # Machine-readable output
 
-Portico's read commands, its settings, and starting and stopping tunnels, print a JSON document when given `--json`. This page is the contract for programs that read it, such as a desktop panel: what each command prints, what every field means, how errors look, and what may change between releases. Every example below is printed by Portico's own test suite, so it is exactly what Portico produces (with the home directory shown as `/home/me`).
+Portico's read commands, its settings, and starting and stopping tunnels, print a JSON document when given `--json`. This page is the contract for programs that read it, such as the Linux desktop panel (`desktop/quickshell/`) and the macOS and Windows tray app (`desktop/tray/`): what each command prints, what every field means, how errors look, and what may change between releases. Every example below is printed by Portico's own test suite, so it is exactly what Portico produces (with the home directory shown as `/home/me`).
 
 ## Commands
 
