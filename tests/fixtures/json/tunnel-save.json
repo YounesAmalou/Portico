@@ -1,0 +1,23 @@
+{
+  "note": "saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated",
+  "schema": 1,
+  "tunnel": {
+    "forward": {
+      "bind_address": "127.0.0.1",
+      "bind_port": 8080,
+      "description": "127.0.0.1:8080 → 172.18.0.4:80",
+      "kind": "local",
+      "spec": "127.0.0.1:8080:172.18.0.4:80",
+      "target_host": "172.18.0.4",
+      "target_port": 80
+    },
+    "host": "prod",
+    "name": "web-80",
+    "reaches": "prod",
+    "status": {
+      "state": "stopped"
+    },
+    "temporary": false,
+    "warnings": []
+  }
+}

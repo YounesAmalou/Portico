@@ -23,11 +23,13 @@
         },
         "host": "prod",
         "name": "preview",
+        "reaches": "prod",
         "status": {
           "finished": 1781861043,
           "reason": "the server refused the remote forward on port 8080",
           "state": "failed"
         },
+        "temporary": false,
         "warnings": []
       }
     },

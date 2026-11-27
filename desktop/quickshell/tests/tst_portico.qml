@@ -27,9 +27,11 @@ TestCase {
         var files = ["containers-docker-down.json", "containers.json", "containers-on-host.json",
                      "containers-podman.json", "containers-podman-missing-subuid.json",
                      "containers-proxmox.json", "containers-proxmox-denied.json",
-                     "error-unknown-host.json", "error-usage.json", "hosts.json", "identities.json",
+                     "error-unknown-host.json", "error-usage.json", "forward.json",
+                     "forward-here.json", "hosts.json", "identities.json",
                      "settings.json", "settings-invalid.json", "show.json", "show-unresolved.json",
-                     "tunnel-show.json", "tunnels.json", "tunnel-start.json", "tunnel-stop-all.json"]
+                     "tunnel-save.json", "tunnel-show.json", "tunnels.json", "tunnel-start.json",
+                     "tunnel-stop-all.json"]
         files.forEach(function (file) { doc(file) })
     }
 
@@ -46,7 +48,7 @@ TestCase {
 
     function test_tunnels_have_a_state_and_an_action() {
         var rows = Portico.tunnelRows(doc("tunnels.json"))
-        compare(rows.length, 4)
+        compare(rows.length, 5)
 
         compare(rows[0].name, "busy")
         compare(rows[0].stateText, "Port in use")
@@ -66,6 +68,11 @@ TestCase {
         compare(rows[2].action, "start")
 
         compare(rows[3].description, "socks 127.0.0.1:1")
+
+        // A temporary forward is listed after the saved tunnels, and started or stopped by name.
+        compare(rows[4].name, "_web-80")
+        compare(rows[4].stateText, "Failed")
+        compare(rows[4].action, "start")
     }
 
     function test_tunnel_show_report_is_a_row() {

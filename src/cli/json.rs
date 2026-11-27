@@ -8,16 +8,19 @@ use serde_json::{Map, Value, json};
 
 use super::{
     Interrupts, Step,
+    containers::{listed, resolve_in},
+    forward::{port_required, reachable_here},
     hosts::{format_warning, ownership},
-    tunnels::start_interrupts,
+    tunnels::{save_name, start_interrupts},
 };
 use crate::{
     app::{
-        App, AppError, ContainerError, HostDetails, HostInventory, StartOutcome, StopOutcome,
-        TunnelRefusal,
+        App, AppError, ContainerError, ForwardTarget, HostDetails, HostInventory, StartOutcome,
+        StopOutcome, TunnelRefusal,
     },
     backend::{
-        AUTOMATIC, BackendId, BackendIssue, ContainerList, Target, Via, display_name, group,
+        AUTOMATIC, BackendId, BackendIssue, ContainerList, Problem, Target, Via, display_name,
+        group,
     },
     domain::discovery::DiscoveryWarning,
     domain::explain::Explanation,
@@ -46,7 +49,23 @@ pub(super) enum JsonCommand {
     Settings,
     TunnelShow(Option<String>),
     TunnelStart(Vec<String>),
-    TunnelStop { names: Vec<String>, all: bool },
+    TunnelStop {
+        names: Vec<String>,
+        all: bool,
+    },
+    TunnelSave {
+        name: String,
+        new_name: Option<String>,
+    },
+    /// `portico forward`; `on` is `Some(None)` for a bare `--on`, or when neither a container
+    /// nor a host is given.
+    Forward {
+        container: Option<String>,
+        on: Option<Option<String>>,
+        backend: Option<BackendId>,
+        port: Option<u16>,
+        local: Option<u16>,
+    },
 }
 
 /// Why a JSON command produced an error document.
@@ -289,6 +308,155 @@ fn document(
                 names.iter().map(|name| stop_result(app, name)).collect(),
             ))
         }
+        JsonCommand::TunnelSave { name, new_name } => {
+            let outcome = app.save_tunnel(&name, &save_name(&name, new_name))?;
+            let tunnel = app.tunnel(&outcome.tunnel.name)?;
+            // Saved either way; a restart that failed shows in the status and fails the run.
+            let restart_failed = matches!(outcome.restarted, Some(StartOutcome::Failed { .. }));
+            Ok((
+                json!({
+                    "note": optional_line(outcome.note.as_deref()),
+                    "tunnel": report(&tunnel),
+                }),
+                if restart_failed {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                },
+            ))
+        }
+        JsonCommand::Forward {
+            container,
+            on,
+            backend,
+            port,
+            local,
+        } => {
+            let target = forward_target(app, container, on, backend)?;
+            success(forward_document(app, &target, port, local, handle_signals)?)
+        }
+    }
+}
+
+/// The target of `portico forward --json`: a host, or a container found as `portico shell`
+/// finds it, with every installed backend unless `backend` names one.
+fn forward_target(
+    app: &App,
+    container: Option<String>,
+    on: Option<Option<String>>,
+    backend: Option<BackendId>,
+) -> Result<ForwardTarget, Failure> {
+    let usage = || Failure::usage("forward [<container>] --on <alias>");
+    let target = match on {
+        None => Target::Local,
+        Some(Some(alias)) => Target::Host(alias),
+        Some(None) => return Err(usage()),
+    };
+    let Some(reference) = container else {
+        return match target {
+            Target::Host(alias) => Ok(ForwardTarget::Host(alias)),
+            Target::Local => Err(usage()),
+        };
+    };
+    let backends = backend.map_or(AUTOMATIC.to_vec(), |backend| vec![backend]);
+    let mut lists = Vec::new();
+    // The first refusal, or the first missing backend when none refused.
+    let mut issue: Option<Box<BackendIssue>> = None;
+    for backend in backends {
+        // Batch: ssh must not ask for a password nobody sees.
+        match app.containers(&target, &[backend], true, None) {
+            Ok(list) => lists.push(list),
+            Err(ContainerError::Backend(refused)) => {
+                let replace = match &issue {
+                    None => true,
+                    Some(kept) => {
+                        kept.problem == Problem::NotInstalled
+                            && refused.problem != Problem::NotInstalled
+                    }
+                };
+                if replace {
+                    issue = Some(refused);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if lists.is_empty() {
+        return Err(match issue {
+            Some(issue) => backend_failure(&issue),
+            None => Failure::new("other", format!("no backend lists containers on {target}")),
+        });
+    }
+    let chosen = resolve_in(&target, &reference, &lists)
+        .map_err(|message| Failure::new("other", message))?;
+    let container = listed(&lists, &chosen).ok_or_else(|| {
+        Failure::new(
+            "other",
+            ContainerError::NoMatch {
+                target: target.clone(),
+                reference: reference.clone(),
+            }
+            .to_string(),
+        )
+    })?;
+    Ok(ForwardTarget::Container {
+        target,
+        backend: chosen.backend,
+        container,
+        via: chosen.via,
+    })
+}
+
+/// `portico forward --json`: the started forward's report, or where a container of this
+/// machine is reachable.
+fn forward_document(
+    app: &App,
+    target: &ForwardTarget,
+    port: Option<u16>,
+    local: Option<u16>,
+    handle_signals: bool,
+) -> Result<Value, Failure> {
+    if let ForwardTarget::Container {
+        target: Target::Local,
+        ..
+    } = target
+    {
+        let reachable: Vec<Value> = reachable_here(app, target, port)
+            .map_err(|message| Failure::new("other", message))?
+            .into_iter()
+            .map(|(port, address)| json!({ "address": address, "port": port }))
+            .collect();
+        return Ok(json!({ "reachable": reachable }));
+    }
+    let Some(remote) = port else {
+        // Never interactive: the suggestions are the error's to show.
+        let suggestions = app.forward_suggestions(target, None);
+        return Err(Failure {
+            next: suggestions.unavailable.iter().cloned().collect(),
+            ..Failure::new("usage", port_required(&suggestions))
+        });
+    };
+    let interrupts =
+        start_interrupts(handle_signals).map_err(|error| Failure::new("other", error))?;
+    let result = match interrupts
+        .during(|cancelled| app.quick_forward(target, None, remote, local, Some(cancelled), false))
+    {
+        Step::Done(result) | Step::Late(result) => result,
+    };
+    match result? {
+        (tunnel, StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. }) => {
+            Ok(json!({ "tunnel": report(&app.tunnel(&tunnel.name)?) }))
+        }
+        (
+            _,
+            StartOutcome::Failed {
+                reason,
+                explanation,
+            },
+        ) => Err(match explanation {
+            Some(explanation) => Failure::explained("ssh", &explanation),
+            None => Failure::new("ssh", reason),
+        }),
     }
 }
 
@@ -677,7 +845,9 @@ pub(super) fn report(report: &TunnelReport) -> Value {
         "forward": forward(&report.tunnel.forward),
         "host": report.tunnel.host,
         "name": report.tunnel.name,
+        "reaches": line(&report.reaches),
         "status": status(&report.status),
+        "temporary": report.temporary,
         "warnings": report.warnings.iter().map(tunnel_warning).collect::<Vec<_>>(),
     })
 }

@@ -14,11 +14,12 @@ use crate::{
     domain::adopt::Direction,
     domain::host::{Change, ClearField, Host, HostChanges},
     domain::managed::InitOutcome,
-    picker::{Picker, Row},
+    picker::Picker,
 };
 
 mod containers;
 mod desktop;
+mod forward;
 mod hosts;
 mod json;
 mod migrate;
@@ -27,8 +28,8 @@ mod tunnels;
 
 use self::{
     containers::{
-        Chosen, every_container_row, list_every, list_with_offers, on_argument, print_listings,
-        report_container_failure, resolve_in,
+        Chosen, choose_container, list_every, list_with_offers, on_argument, print_listings,
+        report_container_failure,
     },
     hosts::{
         field_change, finish_connection, format_warning, host_argument, ownership, print_details,
@@ -170,7 +171,10 @@ enum Command {
         #[arg(long, hide = true, value_enum)]
         via: Option<ViaArg>,
     },
-    /// List saved tunnels and their status.
+    /// Forward a port of a host or of a container through a temporary tunnel, or show where a
+    /// container of this machine is reachable.
+    Forward(forward::ForwardCommand),
+    /// List saved tunnels and temporary forwards, and their status.
     Tunnels {
         /// Print one JSON document instead of text (see docs/json-output.md).
         #[arg(long)]
@@ -432,6 +436,13 @@ fn json_command(command: &Command) -> Option<json::JsonCommand> {
             backend.iter().copied().map(BackendId::from).collect(),
         ),
         Command::Tunnels { json: true } => JsonCommand::Tunnels,
+        Command::Forward(forward) if forward.json => JsonCommand::Forward {
+            container: forward.container.clone(),
+            on: forward.on(),
+            backend: forward.backend(),
+            port: forward.port,
+            local: forward.local,
+        },
         Command::Settings { json: true, .. } => JsonCommand::Settings,
         Command::Tunnel { command } => return tunnels::json_command(command),
         _ => return None,
@@ -656,42 +667,21 @@ fn execute<I: BufRead, O: Write, E: Write>(
                     id,
                     via: via.map(Via::from),
                 },
-                container => {
-                    let lists = match backend {
-                        Some(backend) => vec![list_with_offers(
-                            app,
-                            &target,
-                            &[backend],
-                            input,
-                            output,
-                            error,
-                            interactive,
-                        )?],
-                        None => {
-                            list_every(app, &target, &AUTOMATIC, input, output, error, interactive)?
-                                .lists
-                        }
-                    };
-                    if lists.iter().all(|list| list.listing.containers.is_empty()) {
-                        writeln!(error, "No running containers on {target}.")
-                            .map_err(|error| error.to_string())?;
-                        return Ok(ExitCode::FAILURE);
-                    }
-                    match container {
-                        Some(reference) => resolve_in(&target, &reference, &lists)?,
-                        None if interactive && picker.available() => {
-                            let (mut chosen, rows): (Vec<Chosen>, Vec<Row>) =
-                                every_container_row(&lists).into_iter().unzip();
-                            match picker.pick_one("container", rows)? {
-                                Some(index) => chosen.swap_remove(index),
-                                None => return Ok(ExitCode::from(CANCELLED)),
-                            }
-                        }
-                        None => {
-                            return Err("choose a container: portico shell <container> (no terminal for the picker)".into());
-                        }
-                    }
-                }
+                container => match choose_container(
+                    app,
+                    &target,
+                    container,
+                    backend,
+                    "portico shell <container>",
+                    picker,
+                    input,
+                    output,
+                    error,
+                    interactive,
+                )? {
+                    Ok((chosen, _)) => chosen,
+                    Err(exit) => return Ok(exit),
+                },
             };
             let outcome = match app.container_shell(
                 &target,
@@ -708,6 +698,16 @@ fn execute<I: BufRead, O: Write, E: Write>(
             };
             finish_connection(outcome, hold, input, error)
         }
+        Some(Command::Forward(command)) => forward::run(
+            command,
+            app,
+            picker,
+            input,
+            output,
+            error,
+            interactive,
+            handle_signals,
+        ),
         Some(Command::Tunnels { .. }) => tunnels::list(app, output),
         Some(Command::Tunnel { command }) => tunnels::run(
             command,
