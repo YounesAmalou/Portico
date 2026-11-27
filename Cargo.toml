@@ -17,6 +17,7 @@ exclude = [
     ".github/",
     "packaging/aur/",
     "packaging/arch/",
+    "desktop/tray/",
     "desktop/quickshell/tests/",
     "desktop/quickshell/preview.png",
     "tests/docs.rs",

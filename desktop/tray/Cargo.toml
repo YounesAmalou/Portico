@@ -1,0 +1,13 @@
+[package]
+name = "portico-tray"
+version = "0.0.0"
+edition = "2024"
+description = "Portico's menu bar (macOS) and system tray (Windows) app"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+serde_json = "1"
+
+# Its own project: Portico's workspace and lock file know nothing of it.
+[workspace]
