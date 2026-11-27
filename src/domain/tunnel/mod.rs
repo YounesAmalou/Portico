@@ -400,6 +400,25 @@ pub struct ContainerTarget {
     pub port: u16,
 }
 
+impl ContainerTarget {
+    /// The target as a running record's `container` line holds it: `docker shop/api 80`.
+    pub fn record_text(&self) -> String {
+        format!("{} {} {}", self.backend.as_str(), self.reference, self.port)
+    }
+
+    /// The target a running record's `container` line holds, when it reads as one.
+    pub fn from_record_text(text: &str) -> Option<Self> {
+        let [backend, reference, port] = text.split_whitespace().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        Some(Self {
+            backend: BackendId::from_str_name(backend)?,
+            reference: reference.to_owned(),
+            port: port.parse().ok().filter(|port| *port != 0)?,
+        })
+    }
+}
+
 /// A saved tunnel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tunnel {
@@ -901,6 +920,9 @@ pub enum TunnelWarning {
     UnknownHost { host: String },
     /// Another saved tunnel uses the same port; only one of them can run at a time.
     CollidesWith { tunnel: String },
+    /// A running container forward whose log says the container refused a connection: nothing
+    /// listens on `port` at the address the forward reaches it.
+    NothingAnswers { port: u16, reference: String },
 }
 
 impl fmt::Display for TunnelWarning {
@@ -915,6 +937,10 @@ impl fmt::Display for TunnelWarning {
             Self::CollidesWith { tunnel } => write!(
                 formatter,
                 "uses the same port as tunnel {tunnel}; only one of them can run at a time"
+            ),
+            Self::NothingAnswers { port, reference } => write!(
+                formatter,
+                "started, but nothing answers on port {port} inside {reference}; an app that listens only on 127.0.0.1 inside its container cannot be reached"
             ),
         }
     }
@@ -1198,6 +1224,41 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_container_target_round_trips_through_its_record_text() {
+        let target = ContainerTarget {
+            backend: BackendId::Docker,
+            reference: "shop/api".into(),
+            port: 80,
+        };
+        assert_eq!(target.record_text(), "docker shop/api 80");
+        assert_eq!(
+            ContainerTarget::from_record_text("docker shop/api 80"),
+            Some(target)
+        );
+        for bad in [
+            "",
+            "docker shop/api",
+            "lxc web 80",
+            "docker web 0",
+            "docker web x",
+        ] {
+            assert_eq!(ContainerTarget::from_record_text(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn nothing_answers_names_the_port_and_the_container() {
+        let warning = TunnelWarning::NothingAnswers {
+            port: 80,
+            reference: "web".into(),
+        };
+        assert_eq!(
+            warning.to_string(),
+            "started, but nothing answers on port 80 inside web; an app that listens only on 127.0.0.1 inside its container cannot be reached"
+        );
     }
 
     #[test]

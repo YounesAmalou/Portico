@@ -895,7 +895,7 @@ The exit status is 1 when any result failed. Once names are considered, every fa
 <!-- golden: tunnel-save.json -->
 ```json
 {
-  "note": "saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated",
+  "note": null,
   "schema": 1,
   "tunnel": {
     "forward": {
@@ -922,7 +922,7 @@ The exit status is 1 when any result failed. Once names are considered, every fa
 | Field | Meaning |
 |---|---|
 | `tunnel` | The saved tunnel's report, after its restart |
-| `note` | One line to show once: the tunnel reaches a container's current address, which a recreated container does not keep |
+| `note` | One line to show once about the saved tunnel, or `null`; none is said now |
 
 The exit status is 1 when the restart failed: the tunnel is saved either way, and its `status` says why it is not running. A name that is not a temporary forward, or a new name already in use, is an error document.
 

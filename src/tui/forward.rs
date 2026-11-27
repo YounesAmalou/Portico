@@ -867,7 +867,13 @@ mod tests {
             ),
         ]);
         let tunnel = temporary("_prod-80", 8080, TunnelStatus::Stopped).tunnel;
-        state.finish_forward(Ok((tunnel, StartOutcome::Started { pid: 9 })));
+        state.finish_forward(Ok((
+            tunnel,
+            StartOutcome::Started {
+                pid: 9,
+                warning: None,
+            },
+        )));
         assert!(state.forward.is_none());
         assert_eq!(state.tab, Tab::Tunnels);
         assert_eq!(state.tunnels.selected_name(), Some("_prod-80"));
@@ -884,7 +890,13 @@ mod tests {
         press(&mut state, KeyCode::Enter);
         let mut tunnel = temporary("_prod-80", 9000, TunnelStatus::Stopped).tunnel;
         tunnel.forward = Forward::parse(Kind::Local, "127.0.0.1:9000:localhost:8080").unwrap();
-        state.finish_forward(Ok((tunnel, StartOutcome::Started { pid: 9 })));
+        state.finish_forward(Ok((
+            tunnel,
+            StartOutcome::Started {
+                pid: 9,
+                warning: None,
+            },
+        )));
         assert_eq!(
             state.tunnels.status_line().as_deref(),
             Some("Forwarding 127.0.0.1:9000 \u{2192} prod:80 (temporary forward _prod-80)")

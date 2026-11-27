@@ -348,7 +348,7 @@ impl TunnelsScreen {
     pub(super) fn finish_start(&mut self, name: &str, result: Result<StartOutcome, String>) {
         self.starting = None;
         self.status = Some(match result {
-            Ok(StartOutcome::Started { pid }) => format!("Started {name} (pid {pid})"),
+            Ok(StartOutcome::Started { pid, .. }) => format!("Started {name} (pid {pid})"),
             Ok(StartOutcome::AlreadyRunning { pid }) => {
                 format!("{name} is already running (pid {pid})")
             }
@@ -1909,7 +1909,7 @@ pub(super) mod tests {
         .unwrap();
         screen.finish_save(Ok(SaveOutcome {
             tunnel: saved.clone(),
-            restarted: Some(StartOutcome::Started { pid: 9 }),
+            restarted: Some(StartOutcome::Started { pid: 9, warning: None }),
             note: Some("saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated".into()),
             cancelled: false,
         }));

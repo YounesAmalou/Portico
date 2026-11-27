@@ -3540,7 +3540,10 @@ mod tests {
                     Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
                 )
                 .unwrap(),
-                restarted: Some(crate::app::StartOutcome::Started { pid: 9 }),
+                restarted: Some(crate::app::StartOutcome::Started {
+                    pid: 9,
+                    warning: None,
+                }),
                 note: None,
                 cancelled: false,
             })),

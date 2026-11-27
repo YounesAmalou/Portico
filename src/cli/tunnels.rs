@@ -294,7 +294,7 @@ fn start<O: Write, E: Write>(
                 writeln!(output, "{name}: cancelled").map_err(text)?;
                 return Ok(ExitCode::from(CANCELLED));
             }
-            Ok(StartOutcome::Started { pid }) => {
+            Ok(StartOutcome::Started { pid, .. }) => {
                 let line = app
                     .tunnel(name)
                     .map_or(name.clone(), |report| report.tunnel.to_string());

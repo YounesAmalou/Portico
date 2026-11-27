@@ -1,5 +1,5 @@
 {
-  "note": "saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated",
+  "note": null,
   "schema": 1,
   "tunnel": {
     "forward": {

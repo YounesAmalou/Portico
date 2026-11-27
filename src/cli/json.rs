@@ -517,7 +517,7 @@ fn start_results(app: &App, names: &[String], interrupts: &Interrupts) -> Vec<Va
 
 fn start_result(app: &App, name: &str, outcome: Result<StartOutcome, AppError>) -> Value {
     match outcome {
-        Ok(StartOutcome::Started { pid }) => result(app, name, "started", Some(pid), None),
+        Ok(StartOutcome::Started { pid, .. }) => result(app, name, "started", Some(pid), None),
         Ok(StartOutcome::AlreadyRunning { pid }) => {
             result(app, name, "already-running", Some(pid), None)
         }
@@ -834,6 +834,9 @@ fn tunnel_warning(warning: &TunnelWarning) -> Value {
         TunnelWarning::UnknownHost { host } => json!({ "host": host, "kind": "unknown-host" }),
         TunnelWarning::CollidesWith { tunnel } => {
             json!({ "kind": "collides-with", "tunnel": tunnel })
+        }
+        TunnelWarning::NothingAnswers { port, reference } => {
+            json!({ "kind": "nothing-answers", "port": port, "reference": reference })
         }
     };
     value["message"] = json!(line(&warning.to_string()));
