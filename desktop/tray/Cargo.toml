@@ -13,7 +13,7 @@ serde_json = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 # The GUI exists only on macOS and Windows: Linux builds and tests stay free of it.
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
