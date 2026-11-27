@@ -15,6 +15,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
 - Lists the running Docker and Podman containers on this machine or a host, grouped by Compose project, and a Proxmox VE node's LXC containers, and opens a shell in one.
 - Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
+- Forwards a port of a host, container or Proxmox CT to `127.0.0.1` in one step, suggesting the ports it listens on, as a temporary forward you can keep as a tunnel.
 - Prints one versioned JSON document per command for scripts and desktop panels.
 - Comes with a desktop panel for Quickshell and Omarchy (Linux) to open hosts and container shells in a new terminal and to start and stop tunnels.
 - Provides a TUI with Hosts and Tunnels tabs and a tab per container backend (Docker, Podman, Proxmox) when run without a subcommand.
@@ -176,7 +177,9 @@ portico shell [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [
                                 Open a shell in a container
 portico adopt [alias...] [-A|--all] [-y|--yes]   Move external hosts into Portico
 portico export [alias...] [-A|--all] [-y|--yes]  Move managed hosts back to ~/.ssh/config
-portico tunnels                 List saved tunnels and their status
+portico forward [<container>] [--on [<alias>]] [--backend docker|podman|proxmox] [--port <remote>] [--local <port>]
+                                Forward a port of a host or container to 127.0.0.1
+portico tunnels                 List tunnels and temporary forwards, and their status
 portico tunnel add <name> --on [<alias>] (-L|-R|-D) <spec>
                                 Save a tunnel
 portico tunnel edit [<name>] [--name <new>] [--on [<alias>]] [-L|-R|-D <spec>]
@@ -184,9 +187,11 @@ portico tunnel remove [<name>] [-f]
 portico tunnel show [<name>]    Show a tunnel, its command line and its log
 portico tunnel start [<name>...]
 portico tunnel stop [<name>...] [-A|--all]
+portico tunnel save <name> [--name <new>]
+                                Keep a temporary forward as a saved tunnel
 ```
 
-`hosts`, `show`, `identities`, `containers`, `tunnels`, `settings`, `tunnel show`, `tunnel start` and `tunnel stop` also take `--json` (see [Machine-readable output](#machine-readable-output)).
+`hosts`, `show`, `identities`, `containers`, `forward`, `tunnels`, `settings`, `tunnel show`, `tunnel start`, `tunnel stop` and `tunnel save` also take `--json` (see [Machine-readable output](#machine-readable-output)).
 
 ### Picking a host
 
@@ -343,9 +348,21 @@ portico tunnel stop db
 
 Tunnels are saved in `~/.ssh/portico/tunnels` (with the previous version in `tunnels.bak`), a file OpenSSH never reads. Each started tunnel has a small record and ssh's log in `$XDG_RUNTIME_DIR/portico/tunnels/`, or `~/.ssh/portico/run/tunnels/` without a runtime directory (always, on macOS and Windows); if the record is lost while the tunnel runs, Portico finds the process again.
 
+#### Quick port forwards
+
+To reach a port without writing a tunnel first, press `f` on a host or a container in the TUI, or run `portico forward`. Portico suggests the ports the target listens on (a host's listening ports, a container's published and exposed ports, a Proxmox CT's listening ports), picks the local port (the same number when `127.0.0.1` can take it, otherwise the next free one above it, or above the remote port plus 8000 for a port that needs privileges), and starts an `ssh -L` bound to `127.0.0.1` at once:
+
+```sh
+portico forward --on prod --port 5432
+portico forward web --on prod --port 80 --local 8080
+portico tunnel save _web-80 --name web
+```
+
+The forward is temporary: it is named after what it reaches and the remote port (`_prod-5432`, `_web-80`), lives only in the runtime directory, and is listed after the saved tunnels, marked `(temporary)`. Like a saved tunnel it is an ordinary `ssh` process that keeps running after Portico exits, until `portico tunnel stop` ends it, and then it is gone. `portico tunnel save` (or `w` in the Tunnels tab) keeps it as a saved tunnel, by default under its name without the `_`; a running forward is restarted under the new name, so connections through it drop once. A container's port that is not published is reached at the container's current address, and a saved forward keeps that address: it does not follow a recreated container. Without `--on`, a container on this machine needs no forward, and `portico forward` prints where its ports are already reachable.
+
 ### Machine-readable output
 
-For scripts and desktop panels, `portico hosts`, `show`, `identities`, `containers`, `tunnels` and `tunnel show|start|stop` print one JSON document on stdout when given `--json`, success or failure, with a `schema` version:
+For scripts and desktop panels, `portico hosts`, `show`, `identities`, `containers`, `forward`, `tunnels` and `tunnel show|start|stop|save` print one JSON document on stdout when given `--json`, success or failure, with a `schema` version:
 
 ```sh
 portico tunnels --json
@@ -481,6 +498,7 @@ These keys work while a tab is browsing its list. In a filter, a form or a picke
 | `m` | Adopt the selected external host, or export the selected managed host, after a preview |
 | `t` | Test the connection to the selected host (`Ctrl+T` tests the values typed in an add or edit form) |
 | `c` | Show the selected host's containers on the container tab shown last |
+| `f` | Forward a port of the selected host (see [Quick port forwards](#quick-port-forwards)) |
 | `Esc` | Cancel a filter edit or form, or clear the applied filter |
 
 In the filter and the host form, type normally: `Backspace` and `Delete` erase text, `←` / `→` / `Home` / `End` move the cursor, `Enter` applies the filter or saves the form, and `Esc` cancels.
@@ -504,7 +522,7 @@ Use the terminal's normal paste shortcut, commonly `Ctrl+Shift+V`, to paste into
 
 ### Tunnels tab
 
-The Tunnels tab lists the saved tunnels with their status, and the selected one's details: its command line, the status with its PID and age, warnings, and the end of ssh's log after a failure. The statuses are re-read when you open the tab and every 2 seconds while it is shown, from local state only. Running tunnels keep running after you quit, and the tab says so while any runs.
+The Tunnels tab lists the saved tunnels and then the temporary forwards, newest first, each with what it reaches and its status, and the selected one's details: its command line, the status with its PID and age, warnings, and the end of ssh's log after a failure. The statuses are re-read when you open the tab and every 2 seconds while it is shown, from local state only. Running tunnels keep running after you quit, and the tab says so while any runs.
 
 | Key | Action |
 |---|---|
@@ -513,9 +531,12 @@ The Tunnels tab lists the saved tunnels with their status, and the selected one'
 | `s` | Start the selected tunnel, or stop it when it runs; `Esc` cancels a start that is still connecting |
 | `a` | Add a tunnel |
 | `e` | Edit the selected tunnel (not while it runs) |
-| `x` | Remove the selected tunnel, after a confirmation (not while it runs) |
+| `x` | Remove the selected tunnel, after a confirmation (not while it runs); a temporary forward is stopped and removed |
 | `r` / `F5` | Re-read the tunnels and their status |
 | `o` | Show the whole log of a failed tunnel, or its last lines again |
+| `w` | Save the selected temporary forward as a tunnel, under a name you confirm |
+| `y` | Copy the selected tunnel's local address (through the terminal, OSC 52) |
+| `b` | Open `http://` and the selected tunnel's local address in the browser |
 | `Esc` | Clear the applied filter |
 
 In the tunnel form, `↑` / `↓` (or `Tab` / `Shift+Tab`) move between fields: name, host, kind, bind address, bind port, target host and target port (a dynamic forward has no target). While you type a host, a dropdown lists the known hosts that match, as the ProxyJump field does: `↑` / `↓` choose, `Enter` or `Tab` fills in the alias, `Esc` closes the list (a second `Esc` cancels the form), and `Ctrl+Space` opens it before you type. `Space` or `←` / `→` changes the kind, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
@@ -530,6 +551,7 @@ The Docker, Podman and Proxmox tabs each list the containers of one target with 
 | `/` | Filter containers on the name shown, the container name, the Compose project or service, or the image, as the hosts filter matches |
 | `Enter` | Open a shell in this terminal |
 | `n` | Open a shell in a new terminal |
+| `f` | Forward a port of the selected container; on this machine, show where its ports are reachable (`y` copies, `b` opens) |
 | `u` | Set the user for the selected container's shells (empty means the image's user); it is remembered when a shell opens |
 | `h` | Pick the target: type to narrow, `↑` / `↓` choose, `Enter` picks, `Esc` keeps the current one |
 | `L` | Show this machine's containers again |
