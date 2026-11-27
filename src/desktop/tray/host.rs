@@ -67,13 +67,15 @@ fn unsupported() -> String {
 mod shared {
     use std::{
         ffi::{OsStr, OsString},
-        path::Path,
+        path::{Path, PathBuf},
         process::{Command, Stdio},
         thread,
         time::{Duration, Instant},
     };
 
-    use crate::platform::process::{Proc, arg_path, command, current_uid, stop_process};
+    use crate::platform::process::{
+        Proc, arg_path, command, current_uid, hide_console, stop_single_process,
+    };
 
     /// In a debug build, whether the tests asked for the app never to be started (and on
     /// macOS for `launchctl` never to run).
@@ -82,23 +84,20 @@ mod shared {
             && std::env::var_os("PORTICO_TRAY_NO_START").is_some_and(|v| v == "1")
     }
 
-    /// `program` (found on `PATH`) with `args`, its window hidden on Windows.
-    pub(super) fn tool(program: &str, args: &[&OsStr]) -> Command {
+    /// `program` (a path, or a name found on `PATH`) with `args`, its window hidden on Windows.
+    pub(super) fn tool(program: &OsStr, args: &[&OsStr]) -> Command {
         let mut tool = command(program);
         tool.args(args).stdin(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // The installer may run without a console (the app's update): a console program
-            // it starts would otherwise open a window of its own.
-            tool.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        }
+        // The installer may run without a console (the app's update): a console program it
+        // starts would otherwise open a window of its own.
+        hide_console(&mut tool);
         tool
     }
 
     /// Runs `program` with `args`; on failure, the command line with its last stderr line.
-    pub(super) fn run(program: &str, args: &[&OsStr]) -> Result<String, String> {
-        let line = std::iter::once(program.to_string())
+    pub(super) fn run(program: impl AsRef<OsStr>, args: &[&OsStr]) -> Result<String, String> {
+        let program = program.as_ref();
+        let line = std::iter::once(program.to_string_lossy().into_owned())
             .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
             .map(|arg| {
                 if arg.contains(' ') {
@@ -109,9 +108,12 @@ mod shared {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let output = tool(program, args)
-            .output()
-            .map_err(|error| format!("could not run {program} ({line}): {error}"))?;
+        let output = tool(program, args).output().map_err(|error| {
+            format!(
+                "could not run {} ({line}): {error}",
+                program.to_string_lossy()
+            )
+        })?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -168,7 +170,8 @@ mod shared {
         }
         let proc = Proc::system();
         for pid in running() {
-            stop_process(pid, || is_running_app(&proc, pid))
+            // The app alone: during an update this installer is its child, and must outlive it.
+            stop_single_process(pid, || is_running_app(&proc, pid))
                 .map_err(|error| format!("could not stop the app (process {pid}): {error}"))?;
         }
         Ok(())
@@ -193,10 +196,20 @@ mod shared {
         run("curl", &all).map(drop)
     }
 
+    /// Unpacks with the system's own `tar` (`/usr/bin/tar`, Windows' `tar.exe`, a bsdtar
+    /// that reads a zip; another `tar` first on `PATH`, such as Git's GNU tar, cannot), or in
+    /// a debug build the one `PORTICO_TRAY_TAR` names.
     pub(super) fn unpack(flags: &str, archive: &Path, into: &Path) -> Result<(), String> {
+        let tar = match std::env::var_os("PORTICO_TRAY_TAR") {
+            Some(tar) if cfg!(debug_assertions) && !tar.is_empty() => PathBuf::from(tar),
+            #[cfg(windows)]
+            _ => crate::platform::paths::system_program("tar.exe"),
+            #[cfg(not(windows))]
+            _ => PathBuf::from("/usr/bin/tar"),
+        };
         let (flags, change) = (os(flags), os("-C"));
         run(
-            "tar",
+            &tar,
             &[&flags, archive.as_os_str(), &change, into.as_os_str()],
         )
         .map(drop)
@@ -357,7 +370,7 @@ impl TrayHost for SystemHost {
             process::Stdio,
             time::{Duration, Instant},
         };
-        let mut child = shared::tool(&app.to_string_lossy(), &[&shared::os("--version")])
+        let mut child = shared::tool(app.as_os_str(), &[&shared::os("--version")])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

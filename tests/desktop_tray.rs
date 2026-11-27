@@ -1,5 +1,6 @@
 //! `portico desktop` on macOS and Windows: the tray app (the menu bar app on macOS) installed
-//! with a fake `curl` and a `tar` that logs and runs the system's own, in a temporary home.
+//! with a fake `curl` on `PATH` and a `tar` that logs and runs the system's own (named with
+//! `PORTICO_TRAY_TAR`, as Portico runs the system's `tar` by its path), in a temporary home.
 //! The app is never started and `launchctl` never runs (`PORTICO_TRAY_NO_START`), and on
 //! Windows the `Run` value goes to a test key of its own (`PORTICO_TRAY_RUN_KEY`).
 
@@ -97,8 +98,19 @@ impl Tray {
             .env("PATH", path)
             .env("PORTICO_TRAY_NO_START", "1")
             .env("PORTICO_TRAY_RUN_KEY", &self.run_key)
+            .env("PORTICO_TRAY_TAR", self.fake_tar())
             .stdin(Stdio::null());
         command
+    }
+
+    /// The fake `tar` as a program path: its launcher on Windows.
+    fn fake_tar(&self) -> PathBuf {
+        let tar = self.bin.join("tar");
+        if cfg!(windows) {
+            tar.with_extension("exe")
+        } else {
+            tar
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {

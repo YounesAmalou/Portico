@@ -42,6 +42,15 @@ pub(in crate::platform) fn default_config_dir(home: &Path) -> PathBuf {
         .join("portico")
 }
 
+/// A program Windows ships in its system folder (`%SystemRoot%\System32`), such as its own
+/// `tar.exe`, whatever else `PATH` holds.
+pub fn system_program(name: &str) -> PathBuf {
+    absolute_var("SystemRoot")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join(name)
+}
+
 /// The environment variable `name` when it holds an absolute path.
 fn absolute_var(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)

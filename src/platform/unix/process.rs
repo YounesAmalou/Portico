@@ -242,6 +242,17 @@ pub fn current_uid() -> Uid {
 /// How long a tunnel has to exit after SIGTERM before it is killed.
 pub const TERM_GRACE_MS: i32 = 3000;
 
+/// Stops `pid` alone, not what it started, if `verify` still recognises it: on Unix what
+/// `stop_process` does, which signals only `pid`.
+pub fn stop_single_process(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<bool> {
+    stop_process(pid, verify)
+}
+
+/// Keeps a console program `command` starts from opening a window: nothing to do on Unix.
+pub fn hide_console(command: &mut Command) -> &mut Command {
+    command
+}
+
 /// Stops `pid` if `verify` still recognises it once a pin holds it. Returns whether a signal
 /// was sent. Because the pin is taken before `verify` runs, and a pinned process is never
 /// signalled once it has exited, a process that passes `verify` is the one the pin refers to.

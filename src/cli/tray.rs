@@ -140,6 +140,13 @@ fn install_release(
     output: Out,
     interactive: bool,
 ) -> Result<ExitCode, String> {
+    if options.tray_only {
+        return update_only(env, system, host, options, release, output);
+    }
+    // Nothing from a local archive runs (its app is asked its version) before this check.
+    if options.from.is_some() && !options.yes && !interactive {
+        return Err("desktop install requires --yes in non-interactive mode".into());
+    }
     let exe = env
         .exe
         .as_deref()
@@ -148,11 +155,6 @@ fn install_release(
     let paths = tray::paths(system, &env.home, env.local_app_data.as_deref());
     let support = tray::support_dir(system, &env.home, env.local_app_data.as_deref());
     let scratch = Scratch::new(&support)?;
-    if options.tray_only {
-        return update_only(
-            env, system, host, options, release, &paths, &portico, &scratch, output,
-        );
-    }
 
     writeln!(
         output,
@@ -177,6 +179,7 @@ fn install_release(
             release,
             options.from.as_deref(),
             &scratch,
+            output,
         )?),
         None => None,
     };
@@ -216,7 +219,7 @@ fn install_release(
         return Err("desktop install requires --yes in non-interactive mode".into());
     }
     if app_pending && fetched.is_none() {
-        fetched = Some(fetch(env, system, host, release, None, &scratch)?);
+        fetched = Some(fetch(env, system, host, release, None, &scratch, output)?);
     }
 
     let ask = |input: &mut dyn BufRead, output: Out, question: &str| -> Result<bool, String> {
@@ -372,33 +375,52 @@ fn install_release(
 }
 
 /// `--tray-only`, the app's own update: no questions, the login entry left as it is. On
-/// success the update log is removed; on failure whichever app is in place is started, and
-/// the error is the last line the log gets.
-#[allow(clippy::too_many_arguments)]
+/// success the update log is removed; on any failure whichever app is in place is started,
+/// and the error is the last line the log gets.
 fn update_only(
     env: &DesktopEnv,
     system: System,
     host: &dyn TrayHost,
     options: &TrayOptions,
     release: &Release<'_>,
-    paths: &tray::Paths,
-    portico: &Path,
-    scratch: &Scratch,
     output: Out,
 ) -> Result<ExitCode, String> {
+    let paths = tray::paths(system, &env.home, env.local_app_data.as_deref());
+    let support = tray::support_dir(system, &env.home, env.local_app_data.as_deref());
     let placed = paths.placed(system);
-    let via_login = host.login_entry().is_some();
+    let entry = host.login_entry();
+    let via_login = entry.is_some();
+    // The `portico` the app is given: this one, else the one its login entry names.
+    let portico = match env.exe.as_deref() {
+        Some(exe) => tray::stable_portico(exe, env.path.as_deref()),
+        None => entry
+            .as_deref()
+            .and_then(|entry| tray::entry_portico(system, entry))
+            .unwrap_or_else(|| PathBuf::from("portico")),
+    };
     // The app is quitting as it hands over: it is waited for first, so that the app started at
     // the end, new or old, is not refused as a second copy.
-    let updated = host
-        .stop(true)
-        .and_then(|()| fetch(env, system, host, release, options.from.as_deref(), scratch))
-        .and_then(|fetched| {
-            replace(placed, &fetched.app, scratch)?;
-            Ok(fetched.version)
-        });
+    let mut updated = || -> Result<Option<String>, String> {
+        host.stop(true)?;
+        env.exe
+            .as_deref()
+            .ok_or("cannot find portico's executable")?;
+        let scratch = Scratch::new(&support)?;
+        let fetched = fetch(
+            env,
+            system,
+            host,
+            release,
+            options.from.as_deref(),
+            &scratch,
+            &mut *output,
+        )?;
+        replace(placed, &fetched.app, &scratch)?;
+        Ok(fetched.version)
+    };
+    let updated = updated();
     let started = if paths.binary.is_file() {
-        host.start(&paths.binary, portico, via_login)
+        host.start(&paths.binary, &portico, via_login)
     } else {
         Err(format!("{} is not installed", env.show(placed)))
     };
@@ -416,8 +438,7 @@ fn update_only(
             .map_err(w)?;
             started?;
             writeln!(output, "Started the {}.", system.app_noun()).map_err(w)?;
-            let log = tray::support_dir(system, &env.home, env.local_app_data.as_deref())
-                .join(tray::UPDATE_LOG);
+            let log = support.join(tray::UPDATE_LOG);
             match fs::remove_file(&log) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -448,6 +469,7 @@ fn fetch(
     release: &Release<'_>,
     from: Option<&Path>,
     scratch: &Scratch,
+    output: Out,
 ) -> Result<Fetched, String> {
     let (archive, lines) = match from {
         Some(path) => {
@@ -473,6 +495,7 @@ fn fetch(
             )?;
             let name = tray::asset_name(system, release.version, target);
             let archive = scratch.0.join(&name);
+            writeln!(output, "Downloading {name}…").map_err(w)?;
             host.download(&tray::asset_url(release.version, &name), &archive)
                 .map_err(|error| missing_release(release.version, error))?;
             let (expected, against) = match &release.expected {
@@ -532,9 +555,10 @@ fn fetch(
     })
 }
 
-/// A failed download: a 404 means this version has no release.
+/// A failed download: a 404 (as curl's last stderr line reports it, never a number elsewhere
+/// in the command line) means this version has no release.
 fn missing_release(version: &str, error: String) -> String {
-    if error.contains("404") {
+    if error.contains("returned error: 404") {
         format!(
             "Portico {version} has no tray app to download ({error}). Install one from a local archive with --from <path>; scripts/build-tray.sh makes one."
         )
@@ -1080,6 +1104,10 @@ mod tests {
                 setup.host.calls()
             );
             assert!(out.contains("\nDone.\n"), "{out}");
+            assert!(
+                out.contains(&format!("Downloading {}…\n", setup.name())),
+                "{out}"
+            );
             assert!(setup.scratch_removed());
         }
     }
@@ -1097,6 +1125,10 @@ mod tests {
             assert!(!setup.placed().exists(), "{out}");
             assert!(setup.host.login_entry().is_none());
             assert!(!setup.host.calls().iter().any(|c| c.starts_with("start")));
+            assert!(
+                !setup.host.calls().contains(&"unpack".to_string()),
+                "a download that does not match is never unpacked"
+            );
             assert!(setup.scratch_removed());
         }
     }
@@ -1318,12 +1350,106 @@ mod tests {
                 "{out}"
             );
             assert!(
-                setup.host.calls().iter().any(|c| c.starts_with("start")),
+                setup.host.calls().contains(&format!(
+                    "start {} {} false",
+                    paths.binary.display(),
+                    setup.portico().display()
+                )),
                 "{:?}",
                 setup.host.calls()
             );
+            assert!(
+                out.contains(&format!("Started the {} in place.", system.app_noun())),
+                "{out}"
+            );
             assert!(setup.scratch_removed());
         }
+    }
+
+    #[test]
+    fn tray_only_restarts_the_app_when_the_support_dir_cannot_be_made() {
+        for system in SYSTEMS {
+            let setup = Setup::new(system);
+            let paths = setup.paths();
+            make_app(system, paths.placed(system).parent().unwrap(), "0.7.0");
+            *setup.host.entry.borrow_mut() =
+                Some(tray::login_entry(system, &paths.binary, &setup.portico()));
+            let support = setup.support();
+            fs::create_dir_all(support.parent().unwrap()).unwrap();
+            fs::write(&support, "a file where the directory goes").unwrap();
+            let digest = setup.release(VERSION);
+            let options = TrayOptions {
+                yes: true,
+                tray_only: true,
+                ..TrayOptions::default()
+            };
+            let (result, out) = setup.install(options, Expected::Baked(digest), "");
+            let error = result.unwrap_err();
+            assert!(error.contains("cannot create a directory"), "{error}");
+            let calls = setup.host.calls();
+            assert!(calls.contains(&"stop true".to_string()), "{calls:?}");
+            assert!(
+                calls.contains(&format!(
+                    "start {} {} true",
+                    paths.binary.display(),
+                    setup.portico().display()
+                )),
+                "{calls:?}"
+            );
+            assert!(out.contains("in place."), "{out}");
+            assert_eq!(
+                setup.host.app_version(&setup.placed()).as_deref(),
+                Some("0.7.0")
+            );
+        }
+    }
+
+    #[test]
+    fn from_needs_yes_before_reading_the_archive() {
+        for system in SYSTEMS {
+            let setup = Setup::new(system);
+            let archive = setup.dir.path().join("local-archive");
+            fs::write(&archive, VERSION).unwrap();
+            let options = TrayOptions {
+                from: Some(archive),
+                ..TrayOptions::default()
+            };
+            let mut output = Vec::new();
+            let release = Release {
+                version: VERSION,
+                target: Some(target(system)),
+                expected: Expected::Sums,
+            };
+            let result = install_release(
+                &setup.env,
+                system,
+                &setup.host,
+                &options,
+                &release,
+                &mut "".as_bytes(),
+                &mut output,
+                false,
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                "desktop install requires --yes in non-interactive mode"
+            );
+            assert!(setup.host.calls().is_empty(), "{:?}", setup.host.calls());
+        }
+    }
+
+    #[test]
+    fn missing_release_reads_only_curls_status() {
+        let not_found = missing_release(
+            "1.0.0",
+            "curl -o /tmp/x https://h/v1.0.0/a failed (exit status: 22): curl: (22) The requested URL returned error: 404".into(),
+        );
+        assert!(not_found.contains("--from"), "{not_found}");
+        let other = missing_release(
+            "1.0.0",
+            "curl -o /tmp/install-404-abc https://h/v404/a failed (exit status: 6): curl: (6) Could not resolve host: h".into(),
+        );
+        assert!(other.starts_with("cannot download the tray app"), "{other}");
     }
 
     #[test]
