@@ -12,6 +12,18 @@ pub struct Instance {
     _handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
+#[cfg(windows)]
+// SAFETY: a mutex handle is just a kernel object reference; closing it from any thread is fine.
+unsafe impl Send for Instance {}
+
+#[cfg(windows)]
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // SAFETY: the handle is valid and owned by this value, closed only here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self._handle) };
+    }
+}
+
 /// Takes the lock on `dir/tray.lock` (Unix: `flock`) or the named mutex
 /// `Local\PorticoTray` (Windows, where `dir` is unused). `None` when another
 /// instance holds it.

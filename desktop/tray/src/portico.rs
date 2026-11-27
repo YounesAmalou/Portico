@@ -2,7 +2,7 @@
 //! self-update hand-off. Every run is an argument list, never a shell.
 
 use crate::model::{self, Action};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -147,13 +147,17 @@ impl Request {
     }
 }
 
+type Lanes = Arc<Mutex<HashMap<String, VecDeque<Request>>>>;
+
 /// Runs requests on background threads and sends each answer to the channel.
 /// Requests of one kind (a tunnel by name, a host's containers, ...) run one at
-/// a time, in order; the caller never waits.
+/// a time, strictly in the order they were sent, on one thread that ends when
+/// its queue is empty; requests of different kinds run side by side. The
+/// caller never waits.
 pub struct Worker {
     program: PathBuf,
     sender: Sender<(Request, io::Result<Output>)>,
-    lanes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    lanes: Lanes,
 }
 
 impl Worker {
@@ -161,22 +165,37 @@ impl Worker {
         Worker {
             program,
             sender,
-            lanes: Mutex::new(HashMap::new()),
+            lanes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn send(&self, request: Request) {
-        let lane = {
-            let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(lanes.entry(request.key()).or_default())
-        };
+        let key = request.key();
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(queue) = lanes.get_mut(&key) {
+            queue.push_back(request);
+            return;
+        }
+        lanes.insert(key.clone(), VecDeque::from([request]));
+        drop(lanes);
         let program = self.program.clone();
         let sender = self.sender.clone();
+        let lanes = Arc::clone(&self.lanes);
         std::thread::spawn(move || {
-            let _turn = lane.lock().unwrap_or_else(|e| e.into_inner());
-            let result = request.args().and_then(|args| run(&program, &args));
-            // The receiver is gone when the app is quitting.
-            let _ = sender.send((request, result));
+            loop {
+                let next = {
+                    let mut lanes = lanes.lock().unwrap_or_else(|e| e.into_inner());
+                    let next = lanes.get_mut(&key).and_then(VecDeque::pop_front);
+                    if next.is_none() {
+                        lanes.remove(&key);
+                    }
+                    next
+                };
+                let Some(request) = next else { break };
+                let result = request.args().and_then(|args| run(&program, &args));
+                // The receiver is gone when the app is quitting.
+                let _ = sender.send((request, result));
+            }
         });
     }
 }

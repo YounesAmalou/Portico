@@ -133,3 +133,30 @@ fn second_lock_is_refused() {
     drop(first);
     assert!(acquire(tmp.path()).unwrap().is_some());
 }
+
+#[test]
+fn same_kind_requests_run_in_send_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("order");
+    let program = fake(
+        tmp.path(),
+        &format!("sleep 0.05; echo \"$2\" >> {}; echo ok", record.display()),
+    );
+    let (tx, rx) = mpsc::channel();
+    let worker = Worker::spawn(program, tx);
+    let actions = [
+        Action::Start,
+        Action::Stop,
+        Action::Start,
+        Action::Stop,
+        Action::Start,
+    ];
+    for action in actions {
+        worker.send(Request::Tunnel(action, "db".into()));
+    }
+    for _ in actions {
+        rx.recv_timeout(Duration::from_secs(10)).unwrap().1.unwrap();
+    }
+    let order = fs::read_to_string(&record).unwrap();
+    assert_eq!(order, "start\nstop\nstart\nstop\nstart\n");
+}
