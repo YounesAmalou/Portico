@@ -263,9 +263,16 @@ impl App {
         }
         let tunnel = Tunnel::new(name, report.tunnel.host.clone(), report.tunnel.forward)?;
         self.add_tunnel(tunnel.clone())?;
+        // The tunnel is saved from here on: a stop or start refused is its failed start, not an
+        // error, so the save is never half applied. Nothing can cancel this start.
         let restarted = if report.status.is_running() {
-            self.stop_tunnel(&report.tunnel.name)?;
-            Some(self.start_tunnel(&tunnel.name, None, false)?)
+            let started = self
+                .stop_tunnel(&report.tunnel.name)
+                .and_then(|_| self.start_tunnel(&tunnel.name, None, false));
+            Some(started.unwrap_or_else(|error| StartOutcome::Failed {
+                reason: first_line(&error.to_string()),
+                explanation: None,
+            }))
         } else {
             self.forget_run(&report.tunnel.name);
             None
@@ -303,10 +310,12 @@ impl App {
             .map_err(|error| error.to_string())?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.code() == Some(255) && stdout.trim().is_empty() {
-            return Err(self
-                .explain_connection(&alias, &output.stderr, true)
-                .map(|explanation| explanation.headline)
-                .unwrap_or_else(|| last_line(&output.stderr, "ssh failed")));
+            return Err(first_line(
+                &self
+                    .explain_connection(&alias, &output.stderr, true)
+                    .map(|explanation| explanation.headline)
+                    .unwrap_or_else(|| last_line(&output.stderr, "ssh failed")),
+            ));
         }
         let listeners = parse_listeners(&stdout);
         if listeners.is_empty() && !output.status.success() {
@@ -415,7 +424,7 @@ fn reachable_here(reach: &Reach, linux: bool) -> Vec<(u16, String)> {
 
 /// A container error in one line, for a suggestion's `unavailable` or a refusal.
 fn container_reason(error: &ContainerError) -> String {
-    let reason = match error {
+    first_line(&match error {
         ContainerError::Ssh {
             explanation: Some(explanation),
             ..
@@ -424,8 +433,12 @@ fn container_reason(error: &ContainerError) -> String {
             last_line(stderr.as_bytes(), &format!("ssh to {alias} failed"))
         }
         error => error.to_string(),
-    };
-    reason.lines().next().unwrap_or_default().trim().to_owned()
+    })
+}
+
+/// The first line of `text`, trimmed.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().trim().to_owned()
 }
 
 /// The last non-empty line of `bytes`, or `fallback`.
@@ -694,7 +707,12 @@ exit 0
 
         assert!(suggestions.ports.is_empty());
         assert_eq!(suggestions.reach, None);
-        assert!(suggestions.unavailable.is_some());
+        let why = suggestions.unavailable.expect("a reason");
+        assert!(
+            why.starts_with("could not list the ports of web on prod: "),
+            "{why}"
+        );
+        assert!(!why.contains('\n'), "{why}");
     }
 
     #[cfg(target_os = "linux")]
@@ -840,7 +858,10 @@ exit 0
             false,
         );
 
-        assert!(refused.is_err());
+        assert!(
+            matches!(refused, Err(AppError::Tunnel(TunnelRefusal::NoPort))),
+            "{refused:?}"
+        );
         assert_eq!(fixture.read("starts"), "");
     }
 
@@ -1008,6 +1029,50 @@ exit 0
         assert!(reports[0].status.is_running(), "{:?}", reports[0].status);
         assert!(!fixture.app.runtime.record(&temporary.name).exists());
         assert!(!fixture.app.runtime.log(&temporary.name).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_whose_restart_is_refused_stays_saved_and_shows_the_failure() {
+        let fixture = fixture();
+        let local = free_port();
+        let (temporary, _) = fixture
+            .app
+            .quick_forward(
+                &ForwardTarget::Host("prod".into()),
+                None,
+                5432,
+                Some(local),
+                None,
+                false,
+            )
+            .unwrap();
+        // Something else takes the port (the stand-in does not hold it): the restart is refused.
+        let _busy = std::net::TcpListener::bind(("127.0.0.1", local)).unwrap();
+
+        let saved = fixture
+            .app
+            .save_tunnel(&temporary.name, "prod-5432")
+            .unwrap();
+
+        match &saved.restarted {
+            Some(StartOutcome::Failed { reason, .. }) => {
+                assert!(reason.contains(&local.to_string()), "{reason}");
+                assert!(!reason.contains('\n'), "{reason}");
+            }
+            other => panic!("expected a failed restart, got {other:?}"),
+        }
+        let reports = fixture.app.tunnels().unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.tunnel.name == "prod-5432" && !report.temporary),
+            "{reports:?}"
+        );
+        assert!(
+            reports.iter().all(|report| !report.temporary),
+            "{reports:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
