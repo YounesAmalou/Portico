@@ -53,7 +53,22 @@ pub fn reach_words(vmid: &str, via: Option<Via>) -> Vec<String> {
 /// Reads the output of [`REACH_SCRIPT`]: the first address, without its prefix length, and the
 /// suggested ports.
 pub fn parse_reach(stdout: &str) -> Reach {
-    let (addresses, listeners) = stdout.split_once("\n---").unwrap_or((stdout, ""));
+    let mut addresses = String::new();
+    let mut listeners = String::new();
+    let mut past_marker = false;
+    for line in stdout.lines() {
+        if !past_marker && line.trim() == "---" {
+            past_marker = true;
+            continue;
+        }
+        let side = if past_marker {
+            &mut listeners
+        } else {
+            &mut addresses
+        };
+        side.push_str(line);
+        side.push('\n');
+    }
     let address = addresses.lines().find_map(|line| {
         let mut words = line.split_whitespace();
         words.find(|word| *word == "inet")?;
@@ -63,7 +78,7 @@ pub fn parse_reach(stdout: &str) -> Reach {
     Reach {
         address,
         host_network: false,
-        ports: suggested_ports(&parse_ss(listeners))
+        ports: suggested_ports(&parse_ss(&listeners))
             .into_iter()
             .map(|(port, loopback_only)| PortOffer {
                 port,
@@ -676,5 +691,13 @@ VMID       Status     Lock         Name                \n\
             })
         });
         assert!(matches!(failed, Err(ListFailure::Issue(_))));
+    }
+
+    #[test]
+    fn reach_keeps_the_ports_of_a_ct_with_no_address() {
+        let reach = parse_reach("---\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\n");
+        assert_eq!(reach.address, None);
+        assert_eq!(reach.ports.len(), 1);
+        assert_eq!(reach.ports[0].port, 80);
     }
 }

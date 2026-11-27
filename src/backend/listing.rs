@@ -198,18 +198,18 @@ fn pick(mut found: Vec<&Container>) -> Result<&Container, ResolveError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn published_ports_are_the_tcp_mappings_without_repeats() {
         assert_eq!(
-            super::published_ports(
+            published_ports(
                 "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 5432/tcp, 53/udp, 0.0.0.0:53->53/udp"
             ),
             [(8080, 80)]
         );
-        assert!(super::published_ports("").is_empty());
+        assert!(published_ports("").is_empty());
     }
-
-    use super::*;
 
     fn container(
         name: &str,
