@@ -3,7 +3,10 @@
 //! The server runs as the current user (so it can only log that user in) on a
 //! random port of `127.0.0.1`, with every file in a temporary directory.
 //! Interactive sessions never reach the user's login shell: `ForceCommand`
-//! runs a script that prints a banner, echoes one line back and exits.
+//! runs a script that prints a banner, echoes one line back and exits. A
+//! server started with [`SshdOptions::run_commands`] runs a client's remote
+//! command instead, with [`Sshd::bin`] first on `PATH` for the fakes a test
+//! puts there.
 //!
 //! On Windows the server is Win32-OpenSSH's `sshd.exe`, which serves its own
 //! user's key logins without running as a service. It runs `ForceCommand`
@@ -216,6 +219,9 @@ fn config_path(path: &Path) -> String {
 pub struct SshdOptions {
     /// Offer only password authentication, which no test can complete.
     pub password_only: bool,
+    /// Run a client's remote command with `sh`, [`Sshd::bin`] first on `PATH`, rather than the
+    /// session script. Unix only: Win32-OpenSSH runs commands through `cmd.exe`.
+    pub run_commands: bool,
 }
 
 /// A running server; it is killed when dropped, however the test ends.
@@ -242,7 +248,8 @@ impl Sshd {
             &(fs::read_to_string(path.join("client_key.pub")).unwrap()
                 + &fs::read_to_string(path.join("locked_key.pub")).unwrap()),
         );
-        let session = write_session(path);
+        fs::create_dir_all(path.join("bin")).unwrap();
+        let session = write_session(path, options.run_commands);
         let (pubkey, password) = if options.password_only {
             ("no", "yes")
         } else {
@@ -283,6 +290,13 @@ impl Sshd {
         self.port
     }
 
+    /// Where a test puts the programs a remote command finds first, when the server was started
+    /// with [`SshdOptions::run_commands`].
+    #[cfg(unix)]
+    pub fn bin(&self) -> PathBuf {
+        self.dir.path().join("bin")
+    }
+
     pub fn client_key(&self) -> PathBuf {
         self.dir.path().join("client_key")
     }
@@ -317,13 +331,25 @@ fn write_authorized_keys(path: &Path, keys: &str) {
 }
 
 /// Writes the session script `ForceCommand` runs in `dir` and returns its path: it prints a
-/// banner, reads one line and echoes it back.
+/// banner, reads one line and echoes it back. With `run_commands`, a client's remote command
+/// runs instead, with `dir/bin` first on `PATH`.
 #[cfg(unix)]
-fn write_session(dir: &Path) -> PathBuf {
+fn write_session(dir: &Path, run_commands: bool) -> PathBuf {
     let session = dir.join("session.sh");
+    let commands = if run_commands {
+        format!(
+            "if [ -n \"$SSH_ORIGINAL_COMMAND\" ]; then\n  PATH='{}':\"$PATH\"\n  export PATH\n  \
+             exec sh -c \"$SSH_ORIGINAL_COMMAND\"\nfi\n",
+            dir.join("bin").display()
+        )
+    } else {
+        String::new()
+    };
     fs::write(
         &session,
-        "#!/bin/sh\necho portico-e2e ready\nread line\necho \"portico-e2e got $line\"\n",
+        format!(
+            "#!/bin/sh\n{commands}echo portico-e2e ready\nread line\necho \"portico-e2e got $line\"\n"
+        ),
     )
     .unwrap();
     fs::set_permissions(&session, fs::Permissions::from_mode(0o755)).unwrap();
@@ -336,7 +362,7 @@ fn write_session(dir: &Path) -> PathBuf {
 /// holds when it next paints, so an answer the TUI's screen replaced at once might never be
 /// shown.
 #[cfg(windows)]
-fn write_session(dir: &Path) -> PathBuf {
+fn write_session(dir: &Path, _run_commands: bool) -> PathBuf {
     let session = dir.join("session.cmd");
     fs::write(
         &session,
