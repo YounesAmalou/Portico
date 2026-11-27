@@ -574,9 +574,15 @@ mod tests {
         std::fs::write(&real, "x").unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        symlink(&real, &bin.join("portico")).unwrap();
+        // The name `stable_portico` looks for on this system.
+        let name = if cfg!(windows) {
+            "portico.exe"
+        } else {
+            "portico"
+        };
+        symlink(&real, &bin.join(name)).unwrap();
         let path = std::env::join_paths([&bin]).unwrap();
-        assert_eq!(stable_portico(&real, Some(&path)), bin.join("portico"));
+        assert_eq!(stable_portico(&real, Some(&path)), bin.join(name));
     }
 
     #[cfg(unix)]

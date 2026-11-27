@@ -1,8 +1,8 @@
 //! `portico desktop` on macOS and Windows: the tray app (the menu bar app on macOS) installed
 //! with a fake `curl` on `PATH` and a `tar` that logs and runs the system's own (named with
 //! `PORTICO_TRAY_TAR`, as Portico runs the system's `tar` by its path), in a temporary home.
-//! The app is never started and `launchctl` never runs (`PORTICO_TRAY_NO_START`), and on
-//! Windows the `Run` value goes to a test key of its own (`PORTICO_TRAY_RUN_KEY`).
+//! The app is never started or stopped and `launchctl` never runs (`PORTICO_TRAY_NO_START`),
+//! and on Windows the `Run` value goes to a test key of its own (`PORTICO_TRAY_RUN_KEY`).
 
 #![cfg(any(target_os = "macos", windows))]
 
@@ -147,6 +147,8 @@ impl Tray {
             ("/usr/bin/tar", "-czf")
         };
         let status = Command::new(tar)
+            // macOS' tar would otherwise add `._` AppleDouble entries the layout check refuses.
+            .env("COPYFILE_DISABLE", "1")
             .arg(create)
             .arg(&archive)
             .arg("-C")

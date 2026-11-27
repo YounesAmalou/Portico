@@ -2,8 +2,8 @@
 //! on macOS, a `Run` value on Windows), and finding, stopping and starting the app. Elsewhere
 //! (Linux) there is no tray app, and every action fails.
 //!
-//! Test seam: in debug builds, `PORTICO_TRAY_NO_START=1` leaves the app unstarted and skips
-//! `launchctl`, and on Windows `PORTICO_TRAY_RUN_KEY` names the key that holds the `Run` value.
+//! Test seam: in debug builds, `PORTICO_TRAY_NO_START=1` neither starts nor stops the app
+//! (so tests never stop a developer's own running app) and skips `launchctl`, and on Windows `PORTICO_TRAY_RUN_KEY` names the key that holds the `Run` value.
 
 use std::path::Path;
 
@@ -77,8 +77,8 @@ mod shared {
         Proc, arg_path, command, current_uid, hide_console, stop_single_process,
     };
 
-    /// In a debug build, whether the tests asked for the app never to be started (and on
-    /// macOS for `launchctl` never to run).
+    /// In a debug build, whether the tests asked for the app never to be started or stopped
+    /// (and on macOS for `launchctl` never to run).
     pub(super) fn no_start() -> bool {
         cfg!(debug_assertions)
             && std::env::var_os("PORTICO_TRAY_NO_START").is_some_and(|v| v == "1")
@@ -283,7 +283,10 @@ impl TrayHost for SystemHost {
     }
 
     fn stop(&self, during_update: bool) -> Result<(), String> {
-        if !during_update && !shared::no_start() {
+        if shared::no_start() {
+            return Ok(());
+        }
+        if !during_update {
             // Unloads the LaunchAgent, which stops the app it started; a LaunchAgent that is
             // not loaded makes this fail, which is fine.
             let service = format!("{}/{}", Self::domain(), super::LABEL);
@@ -431,6 +434,9 @@ impl TrayHost for SystemHost {
     }
 
     fn stop(&self, during_update: bool) -> Result<(), String> {
+        if shared::no_start() {
+            return Ok(());
+        }
         shared::stop_running(during_update)
     }
 

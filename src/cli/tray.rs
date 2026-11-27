@@ -331,7 +331,11 @@ fn install_release(
                 fetched.version.as_deref().unwrap_or("of unknown version")
             )
         });
+        let replaced_ok = replaced.is_ok();
         report(output, replaced)?;
+        if replaced_ok {
+            clear_update_log(env, &support, output)?;
+        }
     } else if app_pending {
         writeln!(output, "Skipped the {}.", system.app_noun()).map_err(w)?;
     }
@@ -375,8 +379,8 @@ fn install_release(
 }
 
 /// `--tray-only`, the app's own update: no questions, the login entry left as it is. On
-/// success the update log is removed; on any failure whichever app is in place is started,
-/// and the error is the last line the log gets.
+/// success the update log is removed; on any failure the error is written, and then whichever
+/// app is in place is started: the error is the last line it finds in the log.
 fn update_only(
     env: &DesktopEnv,
     system: System,
@@ -419,13 +423,14 @@ fn update_only(
         Ok(fetched.version)
     };
     let updated = updated();
-    let started = if paths.binary.is_file() {
-        host.start(&paths.binary, &portico, via_login)
-    } else {
-        Err(format!("{} is not installed", env.show(placed)))
+    let start = || {
+        if paths.binary.is_file() {
+            host.start(&paths.binary, &portico, via_login)
+        } else {
+            Err(format!("{} is not installed", env.show(placed)))
+        }
+        .map_err(|error| format!("could not start the {}: {error}", system.app_noun()))
     };
-    let started =
-        started.map_err(|error| format!("could not start the {}: {error}", system.app_noun()));
     match updated {
         Ok(version) => {
             writeln!(
@@ -436,26 +441,36 @@ fn update_only(
                 version.as_deref().unwrap_or("of unknown version")
             )
             .map_err(w)?;
-            started?;
+            start()?;
             writeln!(output, "Started the {}.", system.app_noun()).map_err(w)?;
-            let log = support.join(tray::UPDATE_LOG);
-            match fs::remove_file(&log) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    writeln!(output, "note: cannot remove {}: {error}", env.show(&log))
-                        .map_err(w)?;
-                }
-            }
+            clear_update_log(env, &support, output)?;
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => {
-            match started {
-                Ok(()) => writeln!(output, "Started the {} in place.", system.app_noun()),
-                Err(start) => writeln!(output, "{start}"),
+            // The error is in the log before the app in place starts and reads it; nothing
+            // follows it unless that app cannot be started either.
+            if paths.binary.is_file() {
+                writeln!(output, "Starting the {} in place.", system.app_noun()).map_err(w)?;
             }
-            .map_err(w)?;
-            Err(error)
+            writeln!(output, "error: {error}").map_err(w)?;
+            output.flush().map_err(w)?;
+            if let Err(start) = start() {
+                writeln!(output, "error: {start}").map_err(w)?;
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Removes the app's update log after a successful replace or removal, so that no app shows
+/// an earlier "Update failed". A log that cannot be removed is noted, not an error.
+fn clear_update_log(env: &DesktopEnv, support: &Path, output: Out) -> Result<(), String> {
+    let log = support.join(tray::UPDATE_LOG);
+    match fs::remove_file(&log) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            writeln!(output, "note: cannot remove {}: {error}", env.show(&log)).map_err(w)
         }
     }
 }
@@ -727,10 +742,13 @@ pub fn uninstall(
         report(output, removed)?;
     }
     if present {
-        report(
-            output,
-            remove_app(system, &paths).map(|()| format!("Removed {}.", env.show(placed))),
-        )?;
+        let removed = remove_app(system, &paths).map(|()| format!("Removed {}.", env.show(placed)));
+        let removed_ok = removed.is_ok();
+        report(output, removed)?;
+        if removed_ok {
+            let support = tray::support_dir(system, &env.home, env.local_app_data.as_deref());
+            clear_update_log(env, &support, output)?;
+        }
     }
     Ok(if ok {
         ExitCode::SUCCESS
@@ -772,7 +790,9 @@ mod tests {
         cell::RefCell,
         collections::HashMap,
         fs,
+        io::Write,
         path::{Path, PathBuf},
+        rc::Rc,
     };
 
     const VERSION: &str = "0.8.0";
@@ -793,6 +813,24 @@ mod tests {
         entry: RefCell<Option<String>>,
         running: RefCell<Vec<u32>>,
         fail_unpack: bool,
+        /// What the command has written so far, as the update log would hold it.
+        written: Rc<RefCell<Vec<u8>>>,
+        /// The last line written when the app was started, as the started app would read it.
+        last_line_at_start: RefCell<Option<String>>,
+    }
+
+    /// The command's output, shared with the [`FakeHost`].
+    struct Shared(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl FakeHost {
@@ -804,6 +842,8 @@ mod tests {
                 entry: RefCell::new(None),
                 running: RefCell::new(Vec::new()),
                 fail_unpack: false,
+                written: Rc::default(),
+                last_line_at_start: RefCell::new(None),
             }
         }
 
@@ -886,6 +926,8 @@ mod tests {
                 portico.display()
             ));
             *self.running.borrow_mut() = vec![42];
+            let written = String::from_utf8(self.written.borrow().clone()).unwrap();
+            *self.last_line_at_start.borrow_mut() = written.lines().last().map(str::to_string);
             Ok(())
         }
     }
@@ -999,7 +1041,8 @@ mod tests {
             expected: Expected,
             answers: &str,
         ) -> (Result<ExitCode, String>, String) {
-            let mut output = Vec::new();
+            self.host.written.borrow_mut().clear();
+            let mut output = Shared(Rc::clone(&self.host.written));
             let release = Release {
                 version: VERSION,
                 target: Some(target(self.system)),
@@ -1015,11 +1058,12 @@ mod tests {
                 &mut output,
                 true,
             );
-            (result, String::from_utf8(output).unwrap())
+            (result, self.written())
         }
 
         fn uninstall(&self, yes: bool, answers: &str) -> (Result<ExitCode, String>, String) {
-            let mut output = Vec::new();
+            self.host.written.borrow_mut().clear();
+            let mut output = Shared(Rc::clone(&self.host.written));
             let result = uninstall(
                 &self.env,
                 self.system,
@@ -1029,7 +1073,19 @@ mod tests {
                 &mut output,
                 true,
             );
-            (result, String::from_utf8(output).unwrap())
+            (result, self.written())
+        }
+
+        fn written(&self) -> String {
+            String::from_utf8(self.host.written.borrow().clone()).unwrap()
+        }
+
+        /// An update log left by an earlier failed update.
+        fn stale_log(&self) -> PathBuf {
+            let log = self.support().join(tray::UPDATE_LOG);
+            fs::create_dir_all(log.parent().unwrap()).unwrap();
+            fs::write(&log, "error: an earlier failure\n").unwrap();
+            log
         }
 
         fn status(&self) -> String {
@@ -1060,15 +1116,17 @@ mod tests {
             let (app, place, entry) = match system {
                 System::MacOs => (
                     "Menu bar app",
-                    "~/Applications/Portico Tray.app",
+                    "Applications/Portico Tray.app",
                     "LaunchAgent io.github.younesamalou.portico.tray",
                 ),
                 System::Windows => (
                     "Tray app",
-                    "~/AppData/Local/Programs/Portico/portico-tray.exe",
+                    "AppData/Local/Programs/Portico/portico-tray.exe",
                     r"registry value Portico Tray (HKCU\Software\Microsoft\Windows\CurrentVersion\Run)",
                 ),
             };
+            // Shown the way this system writes paths: `~\…` on Windows.
+            let place = setup.env.show(&setup.env.home.join(place));
             let expected = format!(
                 "{app:<19}not installed → Portico Tray 0.8.0\n\
                  {:19}download {} (5 bytes),\n\
@@ -1289,9 +1347,7 @@ mod tests {
                 if with_entry {
                     *setup.host.entry.borrow_mut() = Some("theirs".into());
                 }
-                let log = setup.support().join(tray::UPDATE_LOG);
-                fs::create_dir_all(log.parent().unwrap()).unwrap();
-                fs::write(&log, "error: an earlier failure\n").unwrap();
+                let log = setup.stale_log();
                 let digest = setup.release(VERSION);
                 let options = TrayOptions {
                     yes: true,
@@ -1329,6 +1385,50 @@ mod tests {
     }
 
     #[test]
+    fn install_removes_a_stale_update_log() {
+        for system in SYSTEMS {
+            let setup = Setup::new(system);
+            let paths = setup.paths();
+            make_app(system, paths.placed(system).parent().unwrap(), "0.7.0");
+            let log = setup.stale_log();
+            let digest = setup.release(VERSION);
+            let (result, out) =
+                setup.install(TrayOptions::default(), Expected::Baked(digest), "y\n");
+            assert_eq!(result, Ok(ExitCode::SUCCESS), "{out}");
+            assert_eq!(
+                setup.host.app_version(&setup.placed()).as_deref(),
+                Some(VERSION)
+            );
+            assert!(!log.exists(), "a successful update removes the log: {out}");
+            assert!(setup.scratch_removed());
+
+            // A failed install leaves the log alone.
+            let mut failing = Setup::new(system);
+            failing.host.fail_unpack = true;
+            let log = failing.stale_log();
+            let digest = failing.release(VERSION);
+            let (result, out) =
+                failing.install(TrayOptions::default(), Expected::Baked(digest), "y\n");
+            assert!(result.is_err(), "{out}");
+            assert!(log.exists());
+        }
+    }
+
+    #[test]
+    fn uninstall_removes_a_stale_update_log() {
+        for system in SYSTEMS {
+            let setup = Setup::new(system);
+            let paths = setup.paths();
+            make_app(system, paths.placed(system).parent().unwrap(), "0.7.0");
+            let log = setup.stale_log();
+            let (result, out) = setup.uninstall(true, "");
+            assert_eq!(result, Ok(ExitCode::SUCCESS), "{out}");
+            assert!(!setup.placed().exists(), "{out}");
+            assert!(!log.exists(), "uninstalling removes the log: {out}");
+        }
+    }
+
+    #[test]
     fn tray_only_failure_restarts_old_app() {
         for system in SYSTEMS {
             let mut setup = Setup::new(system);
@@ -1342,8 +1442,21 @@ mod tests {
                 ..TrayOptions::default()
             };
             let (result, out) = setup.install(options, Expected::Baked(digest), "");
-            let error = result.unwrap_err();
-            assert!(error.contains("truncated archive"), "{error}");
+            assert_eq!(result, Ok(ExitCode::FAILURE), "{out}");
+            let error = "error: tar -xzf failed: truncated archive";
+            assert_eq!(out.lines().last(), Some(error), "{out}");
+            assert_eq!(
+                setup.host.last_line_at_start.borrow().as_deref(),
+                Some(error),
+                "the error is in the log before the app in place starts"
+            );
+            assert!(
+                out.contains(&format!(
+                    "Starting the {} in place.\n{error}\n",
+                    system.app_noun()
+                )),
+                "{out}"
+            );
             assert_eq!(
                 setup.host.app_version(&setup.placed()).as_deref(),
                 Some("0.7.0"),
@@ -1357,10 +1470,6 @@ mod tests {
                 )),
                 "{:?}",
                 setup.host.calls()
-            );
-            assert!(
-                out.contains(&format!("Started the {} in place.", system.app_noun())),
-                "{out}"
             );
             assert!(setup.scratch_removed());
         }
@@ -1384,8 +1493,16 @@ mod tests {
                 ..TrayOptions::default()
             };
             let (result, out) = setup.install(options, Expected::Baked(digest), "");
-            let error = result.unwrap_err();
-            assert!(error.contains("cannot create a directory"), "{error}");
+            assert_eq!(result, Ok(ExitCode::FAILURE), "{out}");
+            let last = out.lines().last().unwrap_or_default();
+            assert!(
+                last.starts_with("error: cannot create a directory"),
+                "{out}"
+            );
+            assert_eq!(
+                setup.host.last_line_at_start.borrow().as_deref(),
+                Some(last)
+            );
             let calls = setup.host.calls();
             assert!(calls.contains(&"stop true".to_string()), "{calls:?}");
             assert!(
@@ -1396,7 +1513,7 @@ mod tests {
                 )),
                 "{calls:?}"
             );
-            assert!(out.contains("in place."), "{out}");
+            assert!(out.contains("in place.\n"), "{out}");
             assert_eq!(
                 setup.host.app_version(&setup.placed()).as_deref(),
                 Some("0.7.0")
@@ -1547,7 +1664,7 @@ mod tests {
             assert!(
                 status.contains(&format!(
                     "points at {}, which no longer exists",
-                    gone.display()
+                    setup.env.show(&gone)
                 )),
                 "{status}"
             );
