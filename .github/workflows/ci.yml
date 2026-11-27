@@ -39,6 +39,7 @@ jobs:
       docs: ${{ steps.filter.outputs.docs }}
       deps: ${{ steps.filter.outputs.deps }}
       desktop: ${{ steps.filter.outputs.desktop }}
+      tray: ${{ steps.filter.outputs.tray }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,36 +55,43 @@ jobs:
           # changed. Without a diff to inspect (a release, a new branch), run everything.
           # desktop: the desktop panel or what it is tested against changed; it is only
           # ever set by a diff, so the optional desktop check never runs for a release.
-          rust=true docs=true deps=true desktop=false
+          # tray: the tray app, what its tests read or how it is built and released changed.
+          rust=true docs=true deps=true desktop=false tray=true
           case "$GITHUB_EVENT_NAME" in
             pull_request) base=HEAD^1 ;;
             push) base=$BEFORE ;;
             *) base= ;;
           esac
           if [ "$SKIP" = true ]; then
-            rust=false docs=false deps=false
+            rust=false docs=false deps=false tray=false
           elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
-            rust=false docs=false
+            rust=false docs=false tray=false
           elif [ -n "$base" ] && files=$(git diff --name-only "$base" HEAD); then
-            rust=false docs=false deps=false
+            rust=false docs=false deps=false tray=false
             while read -r file; do
               case "$file" in
                 "") ;;
+                # The tray app is its own Cargo project, outside Portico's crate; the doc
+                # guards may read its documentation.
+                desktop/tray/*) docs=true ;;
                 # The binary embeds the panel's files, and the doc guards read them.
                 desktop/*) rust=true docs=true ;;
                 *.md | docs/*) docs=true ;;
                 *) rust=true ;;
               esac
               case "$file" in
-                desktop/* | tests/fixtures/json/* | docs/json-output.md | scripts/ci-checks.sh) desktop=true ;;
+                desktop/quickshell/* | tests/fixtures/json/* | docs/json-output.md | scripts/ci-checks.sh) desktop=true ;;
               esac
               case "$file" in
-                Cargo.toml | Cargo.lock | deny.toml | .github/workflows/ci.yml | scripts/ci-*.sh) deps=true ;;
+                desktop/tray/* | tests/fixtures/json/* | scripts/build-tray.sh | scripts/ci-*.sh | deny.toml | .github/workflows/*) tray=true ;;
+              esac
+              case "$file" in
+                Cargo.toml | Cargo.lock | desktop/tray/Cargo.toml | desktop/tray/Cargo.lock | deny.toml | .github/workflows/ci.yml | scripts/ci-*.sh) deps=true ;;
               esac
             done <<< "$files"
           fi
-          echo "rust=$rust docs=$docs deps=$deps desktop=$desktop"
-          { echo "rust=$rust"; echo "docs=$docs"; echo "deps=$deps"; echo "desktop=$desktop"; } >> "$GITHUB_OUTPUT"
+          echo "rust=$rust docs=$docs deps=$deps desktop=$desktop tray=$tray"
+          { echo "rust=$rust"; echo "docs=$docs"; echo "deps=$deps"; echo "desktop=$desktop"; echo "tray=$tray"; } >> "$GITHUB_OUTPUT"
 
   fmt:
     needs: changes
@@ -253,6 +261,103 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/ci-container.sh package
+
+  # The tray app (desktop/tray, its own Cargo project) on Linux, as the other Linux checks run:
+  # fmt, clippy and its tests, which build its pure menu model and read the golden files. The
+  # tray jobs always run, and their steps only when `changes` says the tray needs them, because
+  # a skipped job would keep the release workflow from reusing a run on main.
+  tray:
+    name: tray (linux)
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - if: ${{ needs.changes.outputs.tray != 'false' }}
+        run: pacman -Syu --noconfirm rustup git openssh python
+      - if: ${{ needs.changes.outputs.tray != 'false' }}
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+        with:
+          workspaces: desktop/tray
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: ${{ needs.changes.outputs.tray != 'false' }}
+        run: scripts/ci-container.sh tray
+
+  # The tray app on macOS (Apple silicon) and Windows (x64), as the runners' own users: clippy
+  # for the native menu and event loop, which Linux cannot build, then the archive the release
+  # ships, built by scripts/build-tray.sh. Footprint: the job fails when that archive is larger
+  # than 4 MiB (4194304 bytes), about the size of `portico`'s own archive of the same target;
+  # the app is expected at 1-2 MB. On macOS the packaged app's signature and version are
+  # checked too. Its steps run only when the tray needs them, as for the Linux job.
+  tray-native:
+    name: ${{ matrix.system }} (tray)
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: macos
+            runner: macos-latest
+            cargo-home: /Users/runner/.cargo
+            rustup-home: /Users/runner/.rustup
+          - system: windows
+            runner: windows-latest
+            cargo-home: C:\Users\runneradmin\.cargo
+            rustup-home: C:\Users\runneradmin\.rustup
+    env:
+      CARGO_HOME: ${{ matrix.cargo-home }}
+      RUSTUP_HOME: ${{ matrix.rustup-home }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - if: ${{ needs.changes.outputs.tray != 'false' }}
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+        with:
+          workspaces: desktop/tray
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+        working-directory: desktop/tray
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - id: build
+        name: Build and package
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          echo "archive=$(scripts/build-tray.sh 0.0.0 "$target" dist)" >> "$GITHUB_OUTPUT"
+      - name: Check the app's signature and version
+        if: ${{ needs.changes.outputs.tray != 'false' && matrix.system == 'macos' }}
+        env:
+          ARCHIVE: ${{ steps.build.outputs.archive }}
+        run: |
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP"
+          app="$RUNNER_TEMP/Portico Tray.app"
+          codesign --verify --deep --strict "$app"
+          "$app/Contents/MacOS/portico-tray" --version | grep -qx "portico-tray 0.0.0"
+      - name: Check the footprint
+        if: ${{ needs.changes.outputs.tray != 'false' }}
+        env:
+          ARCHIVE: ${{ steps.build.outputs.archive }}
+        run: |
+          size=$(wc -c < "$ARCHIVE" | tr -d ' ')
+          limit=$((4 * 1024 * 1024))
+          echo "$(basename "$ARCHIVE"): $size bytes (limit $limit)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::the tray archive is $size bytes, over the $limit-byte limit"
+            exit 1
+          fi
 
   # Optional: not a required check, and no job depends on it. It lints the desktop panel
   # and tests its JSON parsing against the golden files. The job always runs, and its

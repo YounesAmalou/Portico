@@ -149,8 +149,10 @@ case "$1" in
     e2e) e2e ;;
     docs) cargo test --test docs ;;
     msrv) msrv ;;
-    audit) ensure_tool audit && cargo audit ;;
-    deny) ensure_tool deny && cargo deny check ;;
+    # Both cover the tray app's own lock file too (deny.toml, read from the
+    # repository root, names its macOS and Windows targets).
+    audit) ensure_tool audit && cargo audit && cargo audit --file desktop/tray/Cargo.lock ;;
+    deny) ensure_tool deny && cargo deny check && cargo deny --manifest-path desktop/tray/Cargo.toml check ;;
     package) cargo package --locked ;;
     desktop) desktop ;;
     tray) tray ;;
