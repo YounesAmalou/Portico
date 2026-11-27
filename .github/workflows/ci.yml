@@ -71,6 +71,8 @@ jobs:
             while read -r file; do
               case "$file" in
                 "") ;;
+                # tests/release_scripts.rs packages the bundle's plist and icon.
+                desktop/tray/macos/* | desktop/tray/assets/*) rust=true docs=true ;;
                 # The tray app is its own Cargo project, outside Portico's crate; the doc
                 # guards may read its documentation.
                 desktop/tray/*) docs=true ;;
@@ -336,7 +338,8 @@ jobs:
         if: ${{ needs.changes.outputs.tray != 'false' }}
         run: |
           target=$(rustc -vV | sed -n 's/^host: //p')
-          echo "archive=$(scripts/build-tray.sh 0.0.0 "$target" dist)" >> "$GITHUB_OUTPUT"
+          archive=$(scripts/build-tray.sh 0.0.0 "$target" dist)
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Check the app's signature and version
         if: ${{ needs.changes.outputs.tray != 'false' && matrix.system == 'macos' }}
         env:

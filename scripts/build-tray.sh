@@ -75,7 +75,8 @@ else
     owner=(--uid 0 --gid 0)
 fi
 COPYFILE_DISABLE=1 tar -C "$stage" "${owner[@]}" -czf "$outdir/$name.tar.gz" "Portico Tray.app"
-if tar -tzf "$outdir/$name.tar.gz" | grep -v '^Portico Tray\.app\(/\|$\)' >&2; then
+listing=$(tar -tzf "$outdir/$name.tar.gz")
+if grep -v '^Portico Tray\.app\(/\|$\)' <<< "$listing" >&2; then
     echo "$outdir/$name.tar.gz holds more than Portico Tray.app" >&2
     exit 1
 fi

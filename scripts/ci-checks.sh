@@ -120,8 +120,8 @@ desktop() {
 tray() {
     cd desktop/tray
     cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --locked
 }
 
 # macOS's temporary directory is reached through a symbolic link (/var -> /private/var).
