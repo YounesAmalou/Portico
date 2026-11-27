@@ -326,7 +326,9 @@ impl Forward {
         }
     }
 
-    fn destination_text(&self) -> Option<String> {
+    /// Where a local or remote forward connects to, as `host:port` (an IPv6 address in
+    /// brackets); `None` for a dynamic forward.
+    pub fn destination_text(&self) -> Option<String> {
         self.destination
             .as_ref()
             .map(|destination| format!("{}:{}", bracketed(&destination.host), destination.port))
@@ -824,12 +826,17 @@ impl fmt::Display for TunnelWarning {
     }
 }
 
-/// A saved tunnel with its status, as every interface shows it.
+/// A saved tunnel or a temporary forward with its status, as every interface shows it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TunnelReport {
     pub tunnel: Tunnel,
     pub status: TunnelStatus,
     pub warnings: Vec<TunnelWarning>,
+    /// Whether this is a temporary forward, which lives only in the runtime directory.
+    pub temporary: bool,
+    /// What the tunnel reaches, for display: a saved tunnel's host alias, a temporary
+    /// forward's label (`web on prod`), or its destination when its record has none.
+    pub reaches: String,
 }
 
 /// The `ssh` arguments that start `forward` through `host`, logging to `log`: in the background

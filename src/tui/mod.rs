@@ -2670,6 +2670,8 @@ mod tests {
                 .unwrap(),
             status: TunnelStatus::Running { pid: 7, started: 0 },
             warnings: Vec::new(),
+            temporary: false,
+            reaches: "dev".into(),
         }]);
         state
     }

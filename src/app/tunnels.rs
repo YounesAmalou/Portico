@@ -1,5 +1,5 @@
-//! Saved tunnels as the CLI and the TUI use them: their reports, their changes, and starting and
-//! stopping them.
+//! Saved tunnels and temporary forwards as the CLI and the TUI use them: their reports, their
+//! changes, and starting and stopping them.
 
 use std::{
     cell::OnceCell,
@@ -21,8 +21,9 @@ use crate::{
     domain::openssh::OpenSshError,
     domain::probe::{Failure, diagnose},
     domain::tunnel::{
-        Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile, addresses_overlap,
-        check_args, collide, collisions, listeners_in_effective_config,
+        Forward, Kind, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile,
+        addresses_overlap, check_args, collide, collisions, is_temporary,
+        listeners_in_effective_config,
         runtime::{
             Bind, Identity, READY_BOUND, Record, RunningRecord, authenticated, find_in, listening,
             log_reason, log_tail, now, ready, try_bind, up_at_bound,
@@ -58,6 +59,8 @@ pub enum TunnelRefusal {
     Denied { address: String, port: u16 },
     #[error("tunnel {0} is running on the same port; stop it first")]
     Collides(String),
+    #[error("{0} is not a temporary forward")]
+    NotTemporary(String),
     #[error("cannot keep tunnel state in {path}: {source}", path = .path.display())]
     Runtime {
         path: PathBuf,
@@ -101,6 +104,63 @@ fn runtime_error(path: PathBuf) -> impl FnOnce(io::Error) -> TunnelRefusal {
     move |source| TunnelRefusal::Runtime { path, source }
 }
 
+/// A temporary forward as its record describes it.
+struct Temporary {
+    name: String,
+    /// `None` for a failed record without its host and forward, which cannot be started again.
+    tunnel: Option<Tunnel>,
+    /// The record's `reaches` line.
+    reaches: Option<String>,
+    status: TunnelStatus,
+    /// When it started, or for a failed record when it failed, in Unix seconds.
+    since: u64,
+}
+
+impl Temporary {
+    fn report(self) -> TunnelReport {
+        let reaches = self
+            .reaches
+            .or_else(|| {
+                self.tunnel
+                    .as_ref()
+                    .and_then(|tunnel| tunnel.forward.destination_text())
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let tunnel = self.tunnel.unwrap_or_else(|| Tunnel {
+            name: self.name,
+            host: String::new(),
+            forward: Forward {
+                kind: Kind::Dynamic,
+                bind_address: None,
+                bind_port: 0,
+                destination: None,
+            },
+        });
+        TunnelReport {
+            tunnel,
+            status: self.status,
+            warnings: Vec::new(),
+            temporary: true,
+            reaches,
+        }
+    }
+}
+
+/// The tunnel a record's `host` and `forward` lines (`-L 127.0.0.1:8080:localhost:80`) describe.
+fn recorded_tunnel(name: &str, host: &str, forward: &str) -> Option<Tunnel> {
+    let (flag, spec) = forward.split_once(' ')?;
+    Some(Tunnel {
+        name: name.to_owned(),
+        host: host.to_owned(),
+        forward: Forward::parse(Kind::from_flag(flag)?, spec).ok()?,
+    })
+}
+
+/// A forward as a record's `forward` line writes it.
+fn forward_text(forward: &Forward) -> String {
+    format!("{} {}", forward.kind.flag(), forward.spec())
+}
+
 /// `address:port`, with an IPv6 address in brackets.
 fn socket_text(address: &str, port: u16) -> String {
     if address.contains(':') {
@@ -111,7 +171,8 @@ fn socket_text(address: &str, port: u16) -> String {
 }
 
 impl App {
-    /// Every saved tunnel with its status and warnings, in name order.
+    /// Every saved tunnel with its status and warnings, in name order, then every temporary
+    /// forward, newest first.
     pub fn tunnels(&self) -> Result<Vec<TunnelReport>, AppError> {
         let file = self.tunnels.load()?;
         let known = self.hosts().ok().map(|inventory| {
@@ -132,13 +193,23 @@ impl App {
                 )
             })
             .collect();
-        Ok(running
+        let temporaries = self.temporaries(&scan, false);
+        // What can hold a saved tunnel's port: the saved tunnels and the temporary forwards.
+        let holders: Vec<(Tunnel, TunnelStatus)> = running
+            .iter()
+            .cloned()
+            .chain(temporaries.iter().filter_map(|temporary| {
+                let tunnel = temporary.tunnel.clone()?;
+                Some((tunnel, temporary.status.clone()))
+            }))
+            .collect();
+        let mut reports: Vec<TunnelReport> = running
             .iter()
             .map(|(tunnel, state)| {
                 let status = if state.is_running() {
                     state.clone()
                 } else {
-                    self.port_status(tunnel, &running)
+                    self.port_status(tunnel, &holders)
                         .unwrap_or_else(|| state.clone())
                 };
                 let mut warnings = Vec::new();
@@ -160,12 +231,83 @@ impl App {
                     tunnel: tunnel.clone(),
                     status,
                     warnings,
+                    temporary: false,
+                    reaches: tunnel.host.clone(),
                 }
             })
-            .collect())
+            .collect();
+        reports.extend(temporaries.into_iter().map(Temporary::report));
+        Ok(reports)
     }
 
-    /// One saved tunnel's report.
+    /// The temporary forwards that have a record, or a process whose record is gone, newest
+    /// first. `holds_lock` says the caller holds `start.lock`.
+    fn temporaries(&self, scan: &OnceCell<Vec<Logged>>, holds_lock: bool) -> Vec<Temporary> {
+        let mut temporaries: Vec<Temporary> = self
+            .temporary_names(scan)
+            .into_iter()
+            .filter_map(|name| {
+                // Rebuilds the record of a process found without one.
+                let status = self.run_state_in(&name, scan, holds_lock);
+                let (tunnel, reaches, since) = match Record::read(&self.runtime.record(&name))? {
+                    Record::Running(record) => (
+                        recorded_tunnel(&name, &record.host, &record.forward),
+                        record.reaches,
+                        record.started,
+                    ),
+                    Record::Failed {
+                        finished,
+                        host,
+                        forward,
+                        reaches,
+                        ..
+                    } => (
+                        host.zip(forward)
+                            .and_then(|(host, forward)| recorded_tunnel(&name, &host, &forward)),
+                        reaches,
+                        finished,
+                    ),
+                };
+                Some(Temporary {
+                    name,
+                    tunnel,
+                    reaches,
+                    status,
+                    since,
+                })
+            })
+            .collect();
+        temporaries.sort_by(|a, b| b.since.cmp(&a.since).then_with(|| a.name.cmp(&b.name)));
+        temporaries
+    }
+
+    /// The names of the temporary forwards with a record or a process, in no particular order.
+    fn temporary_names(&self, scan: &OnceCell<Vec<Logged>>) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .runtime
+            .recorded_names()
+            .into_iter()
+            .filter(|name| is_temporary(name))
+            .collect();
+        for process in scan.get_or_init(|| self.proc.scan(&current_uid())) {
+            if process.log.parent() != Some(self.runtime.path()) {
+                continue;
+            }
+            if let Some(name) = process
+                .log
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".log"))
+                && is_temporary(name)
+                && !names.iter().any(|known| known == name)
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names
+    }
+
+    /// One tunnel's report, saved or temporary.
     pub fn tunnel(&self, name: &str) -> Result<TunnelReport, AppError> {
         self.tunnels()?
             .into_iter()
@@ -243,19 +385,69 @@ impl App {
         Ok(())
     }
 
-    /// Starts a saved tunnel and waits until ssh has established it or failed. `cancelled`
-    /// kills ssh while it is still connecting.
+    /// Starts a saved tunnel, or a listed temporary forward again from its record, and waits
+    /// until ssh has established it or failed. `cancelled` kills ssh while it is still
+    /// connecting.
     pub fn start_tunnel(
         &self,
         name: &str,
         cancelled: Option<&AtomicBool>,
         in_tui: bool,
     ) -> Result<StartOutcome, AppError> {
+        if let Some(tunnel) = self.tunnels.load()?.find(name).cloned() {
+            return self.launch_checked(&tunnel, None, cancelled, in_tui);
+        }
+        let unknown = || AppError::from(TunnelRefusal::Unknown(name.into()));
+        if !is_temporary(name) {
+            return Err(unknown());
+        }
+        let temporary = self
+            .temporaries(&OnceCell::new(), false)
+            .into_iter()
+            .find(|temporary| temporary.name.eq_ignore_ascii_case(name))
+            .ok_or_else(unknown)?;
+        let tunnel = temporary.tunnel.ok_or_else(unknown)?;
+        self.launch_checked(&tunnel, temporary.reaches.as_deref(), cancelled, in_tui)
+    }
+
+    /// Starts a new temporary forward (`tunnel.name` is a temporary name) that reaches
+    /// `reaches`, and waits as `start_tunnel` does. A first start that does not succeed leaves
+    /// nothing behind; a failed forward of the same name is replaced, and stays listed as
+    /// failed if this start fails too.
+    pub fn start_temporary(
+        &self,
+        tunnel: Tunnel,
+        reaches: &str,
+        cancelled: Option<&AtomicBool>,
+        in_tui: bool,
+    ) -> Result<StartOutcome, AppError> {
+        if !is_temporary(&tunnel.name) {
+            return Err(TunnelRefusal::NotTemporary(tunnel.name).into());
+        }
+        let first = !self.runtime.record(&tunnel.name).exists();
+        let outcome = self.launch_checked(&tunnel, Some(reaches), cancelled, in_tui);
+        if first
+            && !matches!(
+                outcome,
+                Ok(StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. })
+            )
+        {
+            self.forget_run(&tunnel.name);
+        }
+        outcome
+    }
+
+    /// Starts `tunnel`, saved or temporary, once nothing stands in its way: it is not running
+    /// yet, OpenSSH accepts it, no running tunnel or temporary forward uses its port and its
+    /// local addresses are free. `reaches` is a temporary forward's label, kept in its record.
+    fn launch_checked(
+        &self,
+        tunnel: &Tunnel,
+        reaches: Option<&str>,
+        cancelled: Option<&AtomicBool>,
+        in_tui: bool,
+    ) -> Result<StartOutcome, AppError> {
         let file = self.tunnels.load()?;
-        let tunnel = file
-            .find(name)
-            .cloned()
-            .ok_or_else(|| TunnelRefusal::Unknown(name.into()))?;
         let dir = self.runtime.path().to_path_buf();
         self.runtime.ensure().map_err(runtime_error(dir))?;
         let lock_path = self.runtime.lock();
@@ -274,14 +466,21 @@ impl App {
         if let TunnelStatus::Running { pid, .. } = self.run_state_locked(&tunnel.name) {
             return Ok(StartOutcome::AlreadyRunning { pid });
         }
-        let effective = self.check_tunnel(&tunnel)?;
-        let running: Vec<Tunnel> = file
+        let effective = self.check_tunnel(tunnel)?;
+        let scan = OnceCell::new();
+        let mut running: Vec<Tunnel> = file
             .tunnels()
             .iter()
-            .filter(|other| self.run_state_locked(&other.name).is_running())
+            .filter(|other| self.run_state_in(&other.name, &scan, true).is_running())
             .cloned()
             .collect();
-        if let Some(other) = running.iter().find(|other| collide(&tunnel, other)) {
+        running.extend(
+            self.temporaries(&scan, true)
+                .into_iter()
+                .filter(|temporary| temporary.status.is_running())
+                .filter_map(|temporary| temporary.tunnel),
+        );
+        if let Some(other) = running.iter().find(|other| collide(tunnel, other)) {
             return Err(TunnelRefusal::Collides(other.name.clone()).into());
         }
         let mut listeners = listeners_in_effective_config(&effective);
@@ -312,14 +511,16 @@ impl App {
                 Bind::Denied => return Err(TunnelRefusal::Denied { address, port }.into()),
             }
         }
-        self.launch(&tunnel, cancelled, in_tui)
+        self.launch(tunnel, reaches, cancelled, in_tui)
     }
 
     /// Runs the tunnel's ssh, waits for it to background itself (or, where ssh cannot, for its
-    /// forward to come up while it runs detached), and records the result.
+    /// forward to come up while it runs detached), and records the result. A temporary
+    /// forward's failed record keeps its host, forward and `reaches`, so it can start again.
     fn launch(
         &self,
         tunnel: &Tunnel,
+        reaches: Option<&str>,
         cancelled: Option<&AtomicBool>,
         in_tui: bool,
     ) -> Result<StartOutcome, AppError> {
@@ -327,6 +528,15 @@ impl App {
             self.runtime.record(&tunnel.name),
             self.runtime.log(&tunnel.name),
         );
+        let temporary = is_temporary(&tunnel.name);
+        let failed = |reason: &str, exit: Option<i32>| Record::Failed {
+            reason: reason.to_owned(),
+            exit,
+            finished: now(),
+            host: temporary.then(|| tunnel.host.clone()),
+            forward: temporary.then(|| forward_text(&tunnel.forward)),
+            reaches: reaches.filter(|_| temporary).map(str::to_owned),
+        };
         Record::remove(&record_path).map_err(runtime_error(record_path.clone()))?;
         let create = |path: &PathBuf| {
             private(
@@ -401,7 +611,7 @@ impl App {
             {
                 // ssh keeps writing to its open file; the name is no longer needed.
                 let _ = Record::remove(&stderr_path);
-                return self.record_started(tunnel, &record_path, child.id(), start);
+                return self.record_started(tunnel, reaches, &record_path, child.id(), start);
             }
             if timed_out {
                 end_tree(&mut child);
@@ -410,16 +620,9 @@ impl App {
                     "ssh did not report the forward up within {} s",
                     READY_BOUND.as_secs()
                 );
-                Record::Failed {
-                    reason: reason.clone(),
-                    exit: None,
-                    finished: now(),
-                    host: None,
-                    forward: None,
-                    reaches: None,
-                }
-                .write(&record_path)
-                .map_err(runtime_error(record_path))?;
+                failed(&reason, None)
+                    .write(&record_path)
+                    .map_err(runtime_error(record_path))?;
                 return Ok(StartOutcome::Failed {
                     reason,
                     explanation: None,
@@ -439,7 +642,7 @@ impl App {
         if status.success()
             && let Some((pid, start)) = self.proc.find_tunnel(&log, &uid, since)
         {
-            return self.record_started(tunnel, &record_path, pid, start);
+            return self.record_started(tunnel, reaches, &record_path, pid, start);
         }
         let mut text = log_tail(&log, 200).join("\n");
         text.push('\n');
@@ -452,26 +655,21 @@ impl App {
         } else {
             self.explain_tunnel_failure(&tunnel.host, &text, in_tui)
         };
-        Record::Failed {
-            reason: reason.clone(),
-            exit: status.code(),
-            finished: now(),
-            host: None,
-            forward: None,
-            reaches: None,
-        }
-        .write(&record_path)
-        .map_err(runtime_error(record_path))?;
+        failed(&reason, status.code())
+            .write(&record_path)
+            .map_err(runtime_error(record_path))?;
         Ok(StartOutcome::Failed {
             reason,
             explanation,
         })
     }
 
-    /// Records that `tunnel` runs as `pid`, which started at `start`.
+    /// Records that `tunnel`, reaching `reaches` when it is a temporary forward, runs as `pid`,
+    /// which started at `start`.
     fn record_started(
         &self,
         tunnel: &Tunnel,
+        reaches: Option<&str>,
         record_path: &Path,
         pid: u32,
         start: u64,
@@ -482,22 +680,33 @@ impl App {
             boot: self.proc.boot_id().unwrap_or_default(),
             started: now(),
             host: tunnel.host.clone(),
-            forward: format!("{} {}", tunnel.forward.kind.flag(), tunnel.forward.spec()),
-            reaches: None,
+            forward: forward_text(&tunnel.forward),
+            reaches: reaches.map(str::to_owned),
         })
         .write(record_path)
         .map_err(runtime_error(record_path.to_path_buf()))?;
         Ok(StartOutcome::Started { pid })
     }
 
-    /// Stops a tunnel: its process when one is running, and its record and log in any case.
+    /// Stops a tunnel: its process when one is running, and its record and log in any case. A
+    /// temporary forward stopped this way is gone.
     pub fn stop_tunnel(&self, name: &str) -> Result<StopOutcome, AppError> {
         let name = self.saved_name(name).or_else(|error| {
-            // A tunnel removed from the file while it ran can still be stopped.
+            // A tunnel removed from the file while it ran can still be stopped, and so can a
+            // temporary forward, even one whose record is gone.
             self.runtime
                 .recorded_names()
                 .into_iter()
                 .find(|recorded| recorded.eq_ignore_ascii_case(name))
+                .or_else(|| {
+                    is_temporary(name)
+                        .then(|| self.temporary_names(&OnceCell::new()))
+                        .and_then(|names| {
+                            names
+                                .into_iter()
+                                .find(|known| known.eq_ignore_ascii_case(name))
+                        })
+                })
                 .ok_or(error)
         })?;
         let record_path = self.runtime.record(&name);
@@ -523,7 +732,8 @@ impl App {
         })
     }
 
-    /// The names of the tunnels that run now, including any no longer saved.
+    /// The names of the tunnels that run now, including any no longer saved and the temporary
+    /// forwards.
     pub fn running_tunnels(&self) -> Result<Vec<String>, AppError> {
         // An unreadable tunnels file must not keep running tunnels from being stopped.
         let mut names: Vec<String> = self
@@ -536,7 +746,13 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        for recorded in self.runtime.recorded_names() {
+        let scan = OnceCell::new();
+        for recorded in self
+            .runtime
+            .recorded_names()
+            .into_iter()
+            .chain(self.temporary_names(&scan))
+        {
             if !names
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&recorded))
@@ -544,7 +760,6 @@ impl App {
                 names.push(recorded);
             }
         }
-        let scan = OnceCell::new();
         Ok(names
             .into_iter()
             .filter(|name| self.run_state_in(name, &scan, false).is_running())
@@ -989,5 +1204,337 @@ mod tests {
             "{status:?}"
         );
         assert!(app.runtime.record("db").exists());
+    }
+
+    /// An app with the host `prod` whose `ssh` fakes tunnel starts: `-G` answers like OpenSSH,
+    /// and a start leaves a background stand-in that carries its arguments, as ssh's background
+    /// process does, unless `<dir>/fail-start` exists, when it fails as ssh does on a refused
+    /// forward.
+    #[cfg(target_os = "linux")]
+    fn tunnel_app(dir: &Path) -> App {
+        use crate::{domain::host::Host, test_executable::write_executable};
+
+        let ssh = dir.join("ssh");
+        write_executable(
+            &ssh,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = -G ]; then printf 'hostname x\nport 22\n'; exit 0; fi
+elog=/dev/null
+prev=
+for arg do
+  [ "$prev" = -E ] && elog=$arg
+  prev=$arg
+done
+if [ -f '{fail}' ]; then
+  echo 'Error: remote port forwarding failed for listen port 8080' >> "$elog"
+  exit 255
+fi
+setsid sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1 &
+exit 0
+"#,
+                fail = dir.join("fail-start").display()
+            ),
+        );
+        fs::create_dir_all(dir.join("home/.ssh")).unwrap();
+        let app = App::new(
+            ManagedStore::new(ConfigPaths::from_home(dir.join("home"))),
+            OpenSsh::new(ssh, "terminal".into()),
+        )
+        .with_runtime_dir(RuntimeDir::at(dir.join("run")));
+        app.initialize(true).unwrap();
+        app.add(Host::new("prod", "x", None, None, None, None).unwrap())
+            .unwrap();
+        app
+    }
+
+    /// A port nobody uses: bound, read, released.
+    #[cfg(target_os = "linux")]
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A temporary forward from `127.0.0.1:<port>` to port 80 of `prod`.
+    #[cfg(target_os = "linux")]
+    fn temporary(port: u16) -> Tunnel {
+        use crate::domain::tunnel::{Kind, temporary_name};
+
+        Tunnel {
+            name: temporary_name("prod", port),
+            host: "prod".into(),
+            forward: Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:localhost:80"))
+                .unwrap(),
+        }
+    }
+
+    /// Stops every tunnel when dropped, so no stand-in outlives a failed test.
+    #[cfg(target_os = "linux")]
+    struct StopAll<'a>(&'a App);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for StopAll<'_> {
+        fn drop(&mut self) {
+            for name in self.0.running_tunnels().unwrap_or_default() {
+                let _ = self.0.stop_tunnel(&name);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_temporary_forward_starts_lists_and_stops() {
+        use crate::domain::tunnel::Kind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        let saved = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{}", free_port())).unwrap();
+        app.add_tunnel(Tunnel::new("socks", "prod", saved).unwrap())
+            .unwrap();
+        let tunnel = temporary(free_port());
+        let name = tunnel.name.clone();
+
+        let outcome = app.start_temporary(tunnel, "prod", None, false).unwrap();
+        assert!(
+            matches!(outcome, StartOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        let record = fs::read_to_string(app.runtime.record(&name)).unwrap();
+        assert!(record.contains("reaches prod\n"), "{record}");
+
+        let reports = app.tunnels().unwrap();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert_eq!(reports[0].tunnel.name, "socks");
+        assert!(!reports[0].temporary);
+        assert_eq!(reports[0].reaches, "prod");
+        let last = &reports[1];
+        assert_eq!(last.tunnel.name, name);
+        assert!(last.temporary);
+        assert_eq!(last.reaches, "prod");
+        assert!(last.status.is_running(), "{:?}", last.status);
+        assert_eq!(app.running_tunnels().unwrap(), vec![name.clone()]);
+        assert_eq!(app.tunnel(&name).unwrap().tunnel.name, name);
+
+        assert_eq!(app.stop_tunnel(&name).unwrap(), StopOutcome::Stopped);
+        assert!(!app.runtime.record(&name).exists());
+        assert!(!app.runtime.log(&name).exists());
+        assert!(
+            app.tunnels()
+                .unwrap()
+                .iter()
+                .all(|report| !report.temporary)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_temporary_forward_that_fails_first_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        fs::write(dir.path().join("fail-start"), "").unwrap();
+        let tunnel = temporary(free_port());
+        let name = tunnel.name.clone();
+
+        let outcome = app.start_temporary(tunnel, "prod", None, false).unwrap();
+        assert!(
+            matches!(outcome, StartOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert!(!app.runtime.record(&name).exists());
+        assert!(!app.runtime.log(&name).exists());
+        assert!(app.tunnels().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_restart_keeps_the_temporary_forward_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        let tunnel = temporary(free_port());
+        let name = tunnel.name.clone();
+        let StartOutcome::Started { pid } =
+            app.start_temporary(tunnel, "prod", None, false).unwrap()
+        else {
+            panic!("the forward did not start");
+        };
+
+        // The ssh exits (the network dropped): the forward is listed as failed.
+        Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.run_state(&name).is_running() {
+            assert!(Instant::now() < deadline, "the stand-in survived");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        fs::write(dir.path().join("fail-start"), "").unwrap();
+        let outcome = app.start_tunnel(&name, None, false).unwrap();
+        assert!(
+            matches!(outcome, StartOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let Some(Record::Failed {
+            host,
+            forward,
+            reaches,
+            ..
+        }) = Record::read(&app.runtime.record(&name))
+        else {
+            panic!("no failed record");
+        };
+        assert_eq!(host.as_deref(), Some("prod"));
+        assert!(forward.is_some_and(|forward| forward.starts_with("-L 127.0.0.1:")));
+        assert_eq!(reaches.as_deref(), Some("prod"));
+        let reports = app.tunnels().unwrap();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].tunnel.name, name);
+        assert_eq!(reports[0].status.name(), "failed");
+        assert_eq!(reports[0].reaches, "prod");
+
+        // And it can be started again from its record.
+        fs::remove_file(dir.path().join("fail-start")).unwrap();
+        let outcome = app.start_tunnel(&name, None, false).unwrap();
+        assert!(
+            matches!(outcome, StartOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_saved_tunnel_cannot_start_on_a_temporary_forwards_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        let port = free_port();
+        let tunnel = temporary(port);
+        let name = tunnel.name.clone();
+        app.start_temporary(tunnel, "prod", None, false).unwrap();
+        let forward = Forward::parse(
+            crate::domain::tunnel::Kind::Local,
+            &format!("127.0.0.1:{port}:localhost:22"),
+        )
+        .unwrap();
+        app.add_tunnel(Tunnel::new("web", "prod", forward).unwrap())
+            .unwrap();
+
+        let refused = app
+            .start_tunnel("web", None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(&format!("tunnel {name}")), "{refused}");
+
+        // And the reverse: a temporary forward on a running saved tunnel's port.
+        app.stop_tunnel(&name).unwrap();
+        app.start_tunnel("web", None, false).unwrap();
+        let refused = app
+            .start_temporary(temporary(port), "prod", None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("tunnel web"), "{refused}");
+        assert!(!app.runtime.record(&name).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_local_port_refuses_a_temporary_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let _stop = StopAll(&app);
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let tunnel = temporary(port);
+        let name = tunnel.name.clone();
+
+        let refused = app.start_temporary(tunnel, "prod", None, false);
+        assert!(
+            matches!(
+                refused,
+                Err(AppError::Tunnel(TunnelRefusal::PortInUse { port: busy, .. })) if busy == port
+            ),
+            "{refused:?}"
+        );
+        assert!(!app.runtime.record(&name).exists());
+        assert!(!app.runtime.log(&name).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_temporary_name_starts_a_temporary_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = tunnel_app(dir.path());
+        let mut tunnel = temporary(free_port());
+        tunnel.name = "web".into();
+        let refused = app.start_temporary(tunnel, "prod", None, false);
+        assert!(
+            matches!(
+                &refused,
+                Err(AppError::Tunnel(TunnelRefusal::NotTemporary(name))) if name == "web"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_temporary_record_without_its_forward_is_listed_but_cannot_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        app.runtime.ensure().unwrap();
+        Record::Failed {
+            reason: "exited".into(),
+            exit: None,
+            finished: 0,
+            host: None,
+            forward: None,
+            reaches: None,
+        }
+        .write(&app.runtime.record("_web-80"))
+        .unwrap();
+        let reports = app.tunnels().unwrap();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].tunnel.name, "_web-80");
+        assert!(reports[0].temporary);
+        assert_eq!(reports[0].reaches, "unknown");
+        assert!(matches!(
+            app.start_tunnel("_web-80", None, false),
+            Err(AppError::Tunnel(TunnelRefusal::Unknown(_)))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temporary_forwards_follow_the_saved_ones_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        app.runtime.ensure().unwrap();
+        for (name, finished) in [("_old-80", 100), ("_new-81", 200)] {
+            Record::Failed {
+                reason: "exited".into(),
+                exit: None,
+                finished,
+                host: Some("prod".into()),
+                forward: Some("-L 127.0.0.1:8080:172.18.0.4:80".into()),
+                reaches: None,
+            }
+            .write(&app.runtime.record(name))
+            .unwrap();
+        }
+        let reports = app.tunnels().unwrap();
+        let names: Vec<&str> = reports
+            .iter()
+            .map(|report| report.tunnel.name.as_str())
+            .collect();
+        assert_eq!(names, ["_new-81", "_old-80"]);
+        // A record without `reaches` shows the destination.
+        assert_eq!(reports[0].reaches, "172.18.0.4:80");
     }
 }

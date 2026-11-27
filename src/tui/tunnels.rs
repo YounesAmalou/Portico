@@ -1065,6 +1065,8 @@ pub(super) mod tests {
             .unwrap(),
             status,
             warnings: Vec::new(),
+            temporary: false,
+            reaches: "prod".into(),
         }
     }
 

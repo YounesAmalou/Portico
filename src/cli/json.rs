@@ -796,6 +796,8 @@ mod tests {
                     tunnel: "pg".into(),
                 },
             ],
+            temporary: false,
+            reaches: "prod".into(),
         });
         assert_eq!(value["forward"]["target_port"], 5432);
         assert_eq!(value["warnings"][0]["kind"], "unknown-host");
