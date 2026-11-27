@@ -13,6 +13,7 @@ use proxmox::Proxmox;
 
 pub use listing::{
     Container, Group, Listing, Published, ResolveError, display_name, group, remember_key, resolve,
+    resolve_lowest,
 };
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
