@@ -53,7 +53,7 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `cli` | Arguments (`mod`), one module per command group (`hosts`, `tunnels`, `containers`, `desktop`, `migrate`, `settings`) and the JSON documents (`json`) |
 | `picker` | The inline pickers the CLI opens when a host or container is missing; also used by the TUI |
 | `tui` | The event loop (`mod`, `events`), the terminal session (`terminal`, `hangup`), shared widgets (`text_input`, `dropdown`), the config watch (`watch`, which keeps only its file identity in `platform::fs`), one module per tab (`hosts`, `tunnels`, `containers`, with the hosts tab's form and its tests in `form`), and the workers that keep the interface responsive (`lister`, `tester`, `planner`, `identities`), `init`, `migrate` and the `settings` overlay |
-| `desktop` | `portico desktop` plans: the Quickshell panel, the launcher entry and the keybinding; used by the CLI and, on Linux, the TUI's settings overlay. Linux only: on macOS and Windows the command is hidden and refused, the overlay leaves the desktop integration out, and the panel refresh is skipped (`main`) |
+| `desktop` | `portico desktop` plans: on Linux the Quickshell panel, the launcher entry and the keybinding; on macOS and Windows the tray app (`tray`: the release asset, its digest, the install paths and the login entry, with `TrayHost` and the system's `SystemHost` running `curl`, `tar`, `launchctl` and the registry). Used by the CLI (`cli::desktop`, `cli::tray`) and the TUI's settings overlay; the panel refresh in `main` is Linux only |
 
 ## The backend interface
 

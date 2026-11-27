@@ -11,35 +11,54 @@ use crate::desktop::{
     self, BindingPlan, DesktopEnv, Link, Step, Target,
     combo::Combo,
     keybinding::{self, Unavailable},
-    launcher, panel,
+    launcher, panel, tray,
 };
 
 #[derive(clap::Subcommand, Debug)]
 pub enum DesktopCommand {
-    /// Install the desktop panel, a launcher entry and a keybinding, each after a preview and
-    /// a confirmation.
+    /// Install the desktop integration, each piece after a preview and a confirmation: on
+    /// Linux the panel, a launcher entry and a keybinding; on macOS and Windows the menu bar or
+    /// tray app and starting it at login.
     Install {
         /// Install the panel as an Omarchy plugin.
         #[arg(long, conflicts_with = "quickshell")]
+        #[cfg_attr(not(target_os = "linux"), arg(hide = true))]
         omarchy: bool,
         /// Install the panel as a plain Quickshell configuration.
         #[arg(long)]
+        #[cfg_attr(not(target_os = "linux"), arg(hide = true))]
         quickshell: bool,
         /// Propose this key combination instead of SUPER + ALT + P.
         #[arg(long, value_name = "COMBO", conflicts_with = "no_bind")]
+        #[cfg_attr(not(target_os = "linux"), arg(hide = true))]
         bind: Option<String>,
         /// Leave out the keybinding.
         #[arg(long)]
+        #[cfg_attr(not(target_os = "linux"), arg(hide = true))]
         no_bind: bool,
         /// Leave out the panel (and the keybinding, which needs it).
         #[arg(long)]
+        #[cfg_attr(not(target_os = "linux"), arg(hide = true))]
         no_panel: bool,
         /// Leave out the launcher entry.
         #[arg(long)]
+        #[cfg_attr(not(target_os = "linux"), arg(hide = true))]
         no_launcher: bool,
         /// Accept every proposal without asking; a taken combination is still refused.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Leave out starting the app at login.
+        #[arg(long)]
+        #[cfg_attr(target_os = "linux", arg(hide = true))]
+        no_login: bool,
+        /// Install the app from a local archive in the release layout instead of downloading
+        /// it (its digest is not checked); scripts/build-tray.sh makes one.
+        #[arg(long, value_name = "PATH")]
+        #[cfg_attr(target_os = "linux", arg(hide = true))]
+        from: Option<PathBuf>,
+        /// Update only the app and leave its login entry as it is: what the app's update runs.
+        #[arg(long, hide = true)]
+        tray_only: bool,
     },
     /// Remove what `portico desktop install` created, after a preview.
     Uninstall {
@@ -50,9 +69,9 @@ pub enum DesktopCommand {
     Status,
 }
 
-type Out<'a> = &'a mut dyn Write;
+pub(super) type Out<'a> = &'a mut dyn Write;
 
-fn w(error: std::io::Error) -> String {
+pub(super) fn w(error: std::io::Error) -> String {
     error.to_string()
 }
 
@@ -63,6 +82,10 @@ pub fn run(
     output: Out,
     interactive: bool,
 ) -> Result<ExitCode, String> {
+    if let Some(system) = tray::System::current() {
+        let host = tray::SystemHost::new(env);
+        return super::tray::run(command, env, system, &host, input, output, interactive);
+    }
     match command {
         DesktopCommand::Install {
             omarchy,
@@ -72,7 +95,18 @@ pub fn run(
             no_panel,
             no_launcher,
             yes,
+            no_login,
+            from,
+            tray_only,
         } => {
+            let tray_only_flags = [
+                ("--no-login", no_login),
+                ("--from", from.is_some()),
+                ("--tray-only", tray_only),
+            ];
+            if let Some((flag, _)) = tray_only_flags.iter().find(|(_, set)| *set) {
+                return Err(format!("{flag} is only on macOS and Windows"));
+            }
             let forced = match (omarchy, quickshell) {
                 (true, _) => Some(Target::Omarchy),
                 (_, true) => Some(Target::Quickshell),
@@ -726,7 +760,11 @@ fn confirm_binding(
     }
 }
 
-fn prompt(input: &mut dyn BufRead, output: Out, question: &str) -> Result<String, String> {
+pub(super) fn prompt(
+    input: &mut dyn BufRead,
+    output: Out,
+    question: &str,
+) -> Result<String, String> {
     write!(output, "{question}").map_err(w)?;
     output.flush().map_err(w)?;
     let mut answer = String::new();
@@ -978,6 +1016,9 @@ mod tests {
                 no_panel: false,
                 no_launcher: false,
                 yes: false,
+                no_login: false,
+                from: None,
+                tray_only: false,
             },
             env,
             &mut answers.as_bytes(),

@@ -37,8 +37,10 @@ pub struct DesktopEnv {
     pub hyprland: bool,
     /// `SWAYSOCK` is set.
     pub sway: bool,
-    /// The running binary, for the launcher entry's `Exec=`.
+    /// The running binary, for the launcher entry's `Exec=` and the tray app's login entry.
     pub exe: Option<PathBuf>,
+    /// `LOCALAPPDATA` (Windows), where the tray app is installed.
+    pub local_app_data: Option<PathBuf>,
 }
 
 impl DesktopEnv {
@@ -71,6 +73,7 @@ impl DesktopEnv {
             hyprland: set("HYPRLAND_INSTANCE_SIGNATURE"),
             sway: set("SWAYSOCK"),
             exe,
+            local_app_data: absolute("LOCALAPPDATA"),
             home,
         }
     }

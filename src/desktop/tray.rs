@@ -17,8 +17,12 @@ use sha2::{Digest, Sha256};
 pub const LABEL: &str = "io.github.younesamalou.portico.tray";
 /// The value name under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 pub const RUN_VALUE: &str = "Portico Tray";
-/// The self-update log, in Portico's runtime directory.
+/// The self-update log, in the app's support directory (`support_dir`).
 pub const UPDATE_LOG: &str = "tray-update.log";
+/// The app's name, as its bundle and the previews call it.
+pub const PRODUCT: &str = "Portico Tray";
+/// The registry key, under `HKEY_CURRENT_USER`, that holds `RUN_VALUE`.
+pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 const RELEASES: &str = "https://github.com/YounesAmalou/Portico/releases/download";
 const APP_DIR: &str = "Portico Tray.app";
@@ -49,6 +53,30 @@ impl System {
         match self {
             System::MacOs => "Menu bar app",
             System::Windows => "Tray app",
+        }
+    }
+
+    /// `app_name` inside a sentence.
+    pub fn app_noun(self) -> &'static str {
+        match self {
+            System::MacOs => "menu bar app",
+            System::Windows => "tray app",
+        }
+    }
+
+    /// The system's name, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            System::MacOs => "macOS",
+            System::Windows => "Windows",
+        }
+    }
+
+    /// What starts the app at login, for messages.
+    pub fn login_name(self) -> String {
+        match self {
+            System::MacOs => format!("LaunchAgent {LABEL}"),
+            System::Windows => format!("registry value {RUN_VALUE} (HKCU\\{RUN_KEY})"),
         }
     }
 }
@@ -175,6 +203,91 @@ pub fn paths(system: System, home: &Path, local_app_data: Option<&Path>) -> Path
         }
     }
 }
+
+impl Paths {
+    /// What install puts in place and uninstall removes: the bundle on macOS, the executable
+    /// on Windows (whose directory may hold nothing else of Portico's).
+    pub fn placed(&self, system: System) -> &Path {
+        match system {
+            System::MacOs => &self.app,
+            System::Windows => &self.binary,
+        }
+    }
+}
+
+/// Where the app keeps its single-instance lock and the self-update log, as the app computes
+/// it: `~/Library/Application Support/Portico` on macOS, `%LOCALAPPDATA%\Portico` on Windows
+/// (`<home>/AppData/Local` when it is unset).
+pub fn support_dir(system: System, home: &Path, local_app_data: Option<&Path>) -> PathBuf {
+    match system {
+        System::MacOs => home.join("Library/Application Support/Portico"),
+        System::Windows => local_app_data
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join("AppData").join("Local"))
+            .join("Portico"),
+    }
+}
+
+/// The login entry's text: the LaunchAgent's plist on macOS, the `Run` value on Windows.
+pub fn login_entry(system: System, binary: &Path, portico: &Path) -> String {
+    match system {
+        System::MacOs => launch_agent_plist(binary, portico),
+        System::Windows => run_value(binary, portico),
+    }
+}
+
+/// The `portico` a login entry (`login_entry`'s text, or one like it) passes the app with
+/// `--portico`, `None` when the entry is not in that form.
+pub fn entry_portico(system: System, entry: &str) -> Option<PathBuf> {
+    let path = match system {
+        System::MacOs => {
+            let after = entry.split_once("<string>--portico</string>")?.1;
+            let value = after.trim_start().strip_prefix("<string>")?;
+            xml_unescape(value.split_once("</string>")?.0)
+        }
+        System::Windows => entry
+            .split_once("--portico \"")?
+            .1
+            .split_once('"')?
+            .0
+            .to_string(),
+    };
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// What installing, starting and stopping the app does on the system: run `curl` and `tar`,
+/// read the app's version, write the login entry, and find, stop and start the app. The real
+/// one is `SystemHost`; the CLI's tests replace it.
+pub trait TrayHost {
+    /// Downloads `url` to the file `to`.
+    fn download(&self, url: &str, to: &Path) -> Result<(), String>;
+    /// Unpacks the release archive `archive` into the directory `into`.
+    fn unpack(&self, archive: &Path, into: &Path) -> Result<(), String>;
+    /// The version of the app at `app` (`Paths::placed`, or the same in an unpacked archive).
+    fn app_version(&self, app: &Path) -> Option<String>;
+    /// The login entry's text (`login_entry`), when there is one.
+    fn login_entry(&self) -> Option<String>;
+    /// Writes the login entry that starts `binary` with `--portico <portico>`.
+    fn set_login_entry(&self, binary: &Path, portico: &Path) -> Result<(), String>;
+    /// Removes the login entry; no entry is not an error.
+    fn remove_login_entry(&self) -> Result<(), String>;
+    /// The process IDs of this user's running apps.
+    fn running(&self) -> Vec<u32>;
+    /// Stops the running app. `during_update`: the app is quitting on its own, so wait for it
+    /// first, and never unload its LaunchAgent.
+    fn stop(&self, during_update: bool) -> Result<(), String>;
+    /// Starts `binary` with `--portico <portico>`, through its login entry when `via_login`.
+    fn start(&self, binary: &Path, portico: &Path, via_login: bool) -> Result<(), String>;
+}
+
+mod host;
+pub use host::SystemHost;
 
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -531,6 +644,42 @@ mod tests {
         assert!(win.launch_agent.is_none());
         let fallback = paths(System::Windows, home, None);
         assert_eq!(fallback.app, Path::new("/h/AppData/Local/Programs/Portico"));
+    }
+
+    #[test]
+    fn entry_portico_reads_both_forms() {
+        let plist = launch_agent_plist(Path::new("/a/tray"), Path::new("/b&c/portico"));
+        assert_eq!(
+            entry_portico(System::MacOs, &plist).unwrap(),
+            Path::new("/b&c/portico")
+        );
+        let value = run_value(
+            Path::new(r"C:\A B\portico-tray.exe"),
+            Path::new(r"C:\P Q\portico.exe"),
+        );
+        assert_eq!(
+            entry_portico(System::Windows, &value).unwrap(),
+            Path::new(r"C:\P Q\portico.exe")
+        );
+        assert_eq!(entry_portico(System::Windows, "other.exe"), None);
+        assert_eq!(entry_portico(System::MacOs, "<plist/>"), None);
+    }
+
+    #[test]
+    fn support_dir_per_system() {
+        let home = Path::new("/h");
+        assert_eq!(
+            support_dir(System::MacOs, home, None),
+            Path::new("/h/Library/Application Support/Portico")
+        );
+        assert_eq!(
+            support_dir(System::Windows, home, Some(Path::new("/lad"))),
+            Path::new("/lad/Portico")
+        );
+        assert_eq!(
+            support_dir(System::Windows, home, None),
+            Path::new("/h/AppData/Local/Portico")
+        );
     }
 
     #[test]
