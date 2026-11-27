@@ -875,13 +875,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tells_a_listener_from_a_closed_port() {
+    fn accepts_sees_a_listener_at_its_address_and_through_the_wildcard() {
+        // A closed port is not asserted: another test may take it, and a connection to a free
+        // ephemeral port on loopback can connect to itself.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(accepts(SocketAddr::from(([127, 0, 0, 1], port))));
         assert!(accepts(SocketAddr::from(([0, 0, 0, 0], port))));
-        drop(listener);
-        assert!(!accepts(SocketAddr::from(([127, 0, 0, 1], port))));
     }
 
     #[test]
