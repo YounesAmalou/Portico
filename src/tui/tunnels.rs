@@ -1163,6 +1163,7 @@ impl TunnelsScreen {
                     name: form.value(0).to_owned(),
                     host: form.value(1).to_owned(),
                     forward,
+                    container: None,
                 };
                 let saved: Vec<Tunnel> = self
                     .reports
@@ -1766,6 +1767,7 @@ pub(super) mod tests {
                 name: name.into(),
                 host: "prod".into(),
                 forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                container: None,
             },
             status,
             warnings: Vec::new(),
@@ -1786,6 +1788,7 @@ pub(super) mod tests {
                     bind_port: 0,
                     destination: None,
                 },
+                container: None,
             },
             status: TunnelStatus::Failed {
                 reason: "exited".into(),

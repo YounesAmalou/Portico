@@ -16,7 +16,7 @@ interfaces   src/tui/, src/cli/            (and src/desktop/, used by both)
 
 A layer uses only the layers below it, never the ones above:
 
-- `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files, processes, sockets and the clock through `platform` and plain `std`, and calls no `libc` or `std::os::unix` itself. One exception is sideways: `domain::settings` imports `backend::BackendId`, a plain enum, to map a backend to its tab setting, and calls nothing in `backend`. `domain` never calls `app`, `cli` or `tui`.
+- `domain` knows nothing about the terminal UI or the CLI's output format. It reaches files, processes, sockets and the clock through `platform` and plain `std`, and calls no `libc` or `std::os::unix` itself. Two exceptions are sideways: `domain::settings` imports `backend::BackendId`, a plain enum, to map a backend to its tab setting, and `domain::tunnel` imports it to name the backend of a container tunnel; neither calls anything in `backend`. `domain` never calls `app`, `cli` or `tui`.
 - `backend` adapters use `platform` and the domain's host types, never `app` or an interface.
 - `app` is the entry point the interfaces use for anything that reads or changes state.
 - An interface does not call another interface, with two deliberate cases. `portico` with no subcommand starts the TUI: `cli::run` calls `crate::tui::run` (`src/cli/mod.rs`). And `src/picker.rs`, the inline pickers and the fuzzy-ranked rows both interfaces use, sits at the crate root: the CLI and the TUI's hosts, containers, tunnels and migrate screens use it. It is not clean, though: it imports `TextInput` and `display_width` from `crate::tui`, which is a known exception to the rule.
@@ -41,7 +41,7 @@ The boundaries are kept in review, not by the compiler. The layers are modules o
 | `domain::managed` | The managed host file: store and transactions (`store`), parser (`config`), renderer (`render`), setup of the entry config (`init`) |
 | `domain::openssh` | `ssh -G` resolution (`config`), connection outcomes (`connect`), `known_hosts` and key fetch (`keys`), reading a child's output pipes (`pipes`) |
 | `domain::adopt` | Adoption and export plans: scanning (`scan`) and previews (`diff`) |
-| `domain::tunnel` | Saved port forwards, their store, and the runtime state of started ones, temporary forwards included (`runtime`, including the `Proc` methods specific to tunnels, the `reaches` label and the temporary names); reading the ports a host listens on from `ss` or `netstat` output (`ports`) |
+| `domain::tunnel` | Saved port forwards (a tunnel may name a container as its target, `ContainerTarget`), their store, and the runtime state of started ones, temporary forwards included (`runtime`, including the `Proc` methods specific to tunnels, the `reaches` label and the temporary names); reading the ports a host listens on from `ss` or `netstat` output (`ports`) |
 | `domain::settings` | The preferences file: reading, defaults, the remembered container users (`UserKey`, `remember_user`), keeping comments on write |
 | `domain::probe` | The connection test: its options and outcomes |
 | `domain::identity`, `suggest`, `fuzzy`, `explain`, `config_error` | Identity data, jump-host suggestions, fuzzy matching, failure explanations, configuration errors |

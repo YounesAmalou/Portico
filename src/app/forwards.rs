@@ -246,6 +246,7 @@ impl App {
                 bind_port: local,
                 destination: Some(destination),
             },
+            container: None,
         };
         let outcome = self.start_temporary(tunnel.clone(), &label, cancelled, in_tui)?;
         Ok((tunnel, outcome))

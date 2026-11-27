@@ -153,6 +153,7 @@ impl Temporary {
                 bind_port: 0,
                 destination: None,
             },
+            container: None,
         });
         TunnelReport {
             tunnel,
@@ -171,6 +172,7 @@ fn recorded_tunnel(name: &str, host: &str, forward: &str) -> Option<Tunnel> {
         name: name.to_owned(),
         host: host.to_owned(),
         forward: Forward::parse(Kind::from_flag(flag)?, spec).ok()?,
+        container: None,
     })
 }
 
@@ -1330,6 +1332,7 @@ exit 0
             host: "prod".into(),
             forward: Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:localhost:80"))
                 .unwrap(),
+            container: None,
         }
     }
 

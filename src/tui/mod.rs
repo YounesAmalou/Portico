@@ -3560,6 +3560,7 @@ mod tests {
                 name: "_prod-80".into(),
                 host: "prod".into(),
                 forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                container: None,
             },
             status: TunnelStatus::Running { pid: 7, started: 0 },
             warnings: Vec::new(),

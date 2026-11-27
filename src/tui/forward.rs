@@ -775,6 +775,7 @@ mod tests {
                 host: "prod".into(),
                 forward: Forward::parse(Kind::Local, &format!("127.0.0.1:{local}:localhost:80"))
                     .unwrap(),
+                container: None,
             },
             status,
             warnings: Vec::new(),

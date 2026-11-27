@@ -154,6 +154,11 @@ impl BackendId {
         }
     }
 
+    /// The backend with this id (`docker`, `podman` or `proxmox`).
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        AUTOMATIC.into_iter().find(|id| id.as_str() == name)
+    }
+
     /// The program the backend runs, as messages name it.
     pub fn program(self) -> &'static str {
         match self {
