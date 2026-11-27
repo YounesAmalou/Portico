@@ -15,6 +15,15 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 
+# The GUI exists only on macOS and Windows: Linux builds and tests stay free of it.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tray-icon = { version = "0.27", default-features = false }
+tao = { version = "0.38", default-features = false }
+png = "0.18"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
+
 [dev-dependencies]
 tempfile = "3"
 

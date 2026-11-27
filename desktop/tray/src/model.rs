@@ -104,7 +104,7 @@ pub enum TunnelState {
 }
 
 /// What clicking a tunnel does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Start,
     Stop,
