@@ -16,6 +16,7 @@ use crate::{
     backend::{BackendId, Target},
     domain::openssh::OpenSshError,
     domain::tunnel::Tunnel,
+    domain::tunnel::printable,
     picker::{Picker, Row},
 };
 
@@ -276,7 +277,8 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
         Ok((tunnel, StartOutcome::Started { warning, .. })) => {
             print_started(output, &target, &tunnel, remote)?;
             if let Some(warning) = warning {
-                writeln!(output, "Warning: {warning}").map_err(|error| error.to_string())?;
+                writeln!(output, "Warning: {}", printable(&warning))
+                    .map_err(|error| error.to_string())?;
             }
             ExitCode::SUCCESS
         }

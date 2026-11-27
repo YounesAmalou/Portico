@@ -226,7 +226,7 @@ impl App {
                 })?;
                 container_target = Some(ContainerTarget {
                     backend: *backend,
-                    reference: saved_reference(*backend, container),
+                    reference: temporary_reference(*backend, container),
                     port: remote,
                 });
                 (alias, destination)
@@ -287,12 +287,21 @@ impl App {
             return Err(TunnelRefusal::Unknown(temporary.into()).into());
         }
         let tunnel = match report.tunnel.container {
-            Some(target) => Tunnel::to_container(
-                name,
-                report.tunnel.host.clone(),
-                report.tunnel.forward,
-                target,
-            )?,
+            Some(mut target) => {
+                // A temporary forward to one replica keeps its number; a saved tunnel does not.
+                if target.reference.contains('/')
+                    && let Some((service, number)) = target.reference.rsplit_once('#')
+                    && number.parse::<u32>().is_ok()
+                {
+                    target.reference = service.to_owned();
+                }
+                Tunnel::to_container(
+                    name,
+                    report.tunnel.host.clone(),
+                    report.tunnel.forward,
+                    target,
+                )?
+            }
             None => Tunnel::new(name, report.tunnel.host.clone(), report.tunnel.forward)?,
         };
         self.add_tunnel(tunnel.clone())?;
@@ -536,6 +545,19 @@ fn saved_reference(backend: BackendId, container: &Container) -> String {
     match backend {
         BackendId::Proxmox => container.id.clone(),
         _ => remember_key(container),
+    }
+}
+
+/// The reference a temporary forward keeps for its container: as [`saved_reference`], except
+/// that a numbered Compose replica keeps its number (`project/service#n`), so a restart goes
+/// back to the same replica.
+fn temporary_reference(backend: BackendId, container: &Container) -> String {
+    match (backend, container.number) {
+        (BackendId::Proxmox, _) | (_, None) => saved_reference(backend, container),
+        (_, Some(number)) if container.project.is_some() && container.service.is_some() => {
+            format!("{}#{number}", remember_key(container))
+        }
+        _ => saved_reference(backend, container),
     }
 }
 
@@ -1464,6 +1486,51 @@ exit 0
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_temporary_forward_to_a_replica_restarts_at_it_but_saves_the_service() {
+        let fixture = fixture();
+        fixture.docker(
+            &[
+                ps_line("shop-api-1", Some(("shop", "api", 1))),
+                ps_line("shop-api-2", Some(("shop", "api", 2))),
+            ],
+            &inspect_at("172.18.0.4"),
+        );
+        let mut replica = container("shop-api-2", "");
+        replica.project = Some("shop".into());
+        replica.service = Some("api".into());
+        replica.number = Some(2);
+        let target = ForwardTarget::Container {
+            target: Target::Host("prod".into()),
+            backend: BackendId::Docker,
+            container: replica,
+            via: None,
+        };
+        let (temporary, _) = fixture
+            .app
+            .quick_forward(&target, None, 80, Some(free_port()), None, false)
+            .unwrap();
+
+        let kept = fixture.app.tunnel(&temporary.name).unwrap();
+        assert_eq!(kept.tunnel.container.unwrap().reference, "shop/api#2");
+        assert!(
+            fixture.read("remote").contains("shop-api-2-id"),
+            "{}",
+            fixture.read("remote")
+        );
+
+        let saved = fixture
+            .app
+            .save_tunnel(&temporary.name, "api", None)
+            .unwrap();
+        assert_eq!(saved.tunnel.container.unwrap().reference, "shop/api");
+        assert_eq!(
+            temporary_reference(BackendId::Docker, &container("web", "")),
+            "web"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn a_saved_container_tunnel_starts_at_the_current_address_and_follows_it() {
         let fixture = fixture();
         fixture.docker(&[ps_line("web", None)], &inspect_at("172.18.0.4"));
@@ -1550,6 +1617,20 @@ exit 0
         }
         assert_eq!(fixture.read("starts"), "");
         assert!(!fixture.app.runtime.record("api").exists());
+    }
+
+    #[test]
+    fn an_ambiguous_container_message_strips_escapes_from_names() {
+        let refusal = TunnelRefusal::AmbiguousContainer {
+            reference: "api".into(),
+            host: "prod".into(),
+            candidates: vec!["a\u{1b}[31mb".into(), "c".into()],
+        };
+
+        let message = refusal.to_string();
+
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(message.contains(", c"), "{message:?}");
     }
 
     #[test]
@@ -1712,7 +1793,7 @@ exit 0
         let tunnel = quick_shop_api(&fixture, local);
         let record = fs::read_to_string(fixture.app.runtime.record(&tunnel.name)).unwrap();
         assert!(
-            record.contains("container docker shop/api 80\n"),
+            record.contains("container docker shop/api#1 80\n"),
             "{record}"
         );
         assert!(
@@ -1763,7 +1844,7 @@ exit 0
         );
         let record = fs::read_to_string(fixture.app.runtime.record(&tunnel.name)).unwrap();
         assert!(
-            record.contains("container docker shop/api 80\n"),
+            record.contains("container docker shop/api#1 80\n"),
             "{record}"
         );
         assert_eq!(

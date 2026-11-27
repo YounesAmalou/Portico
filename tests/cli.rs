@@ -1477,6 +1477,35 @@ fn tunnel_start_of_a_container_explains_a_refused_login() {
 }
 
 #[test]
+fn a_multi_tunnel_start_names_the_tunnel_whose_container_failure_it_explains() {
+    let env = container_env(SHOP_API, false);
+    with_container_tunnel(&env);
+    let other = free_port();
+    stdout_of(env.run([
+        "tunnel",
+        "add",
+        "web",
+        "--on",
+        "prod",
+        "--container",
+        "shop/api",
+        "--backend",
+        "docker",
+        "--port",
+        "80",
+        "--local",
+        &other.to_string(),
+    ]));
+    std::fs::write(
+        env.home().parent().unwrap().join("remote-calls"),
+        "printf 'user@h: Permission denied (publickey).\\n' >&2\nexit 255\n",
+    )
+    .unwrap();
+    env.run(["tunnel", "start", "api", "web"])
+        .assert_exit_code_and_stderr_contains(1, "api: could not start\n");
+}
+
+#[test]
 fn tunnel_add_container_defaults_its_local_port() {
     let env = container_env(SHOP_API, false);
     stdout_of(env.run([

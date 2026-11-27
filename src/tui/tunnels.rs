@@ -439,7 +439,12 @@ impl TunnelsScreen {
     pub(super) fn finish_start(&mut self, name: &str, result: Result<StartOutcome, String>) {
         self.starting = None;
         self.status = Some(match result {
-            Ok(StartOutcome::Started { pid, .. }) => format!("Started {name} (pid {pid})"),
+            Ok(StartOutcome::Started { pid, warning }) => {
+                let warning = warning.map_or(String::new(), |warning| {
+                    format!("; {}", printable(&warning))
+                });
+                format!("Started {name} (pid {pid}){warning}")
+            }
             Ok(StartOutcome::AlreadyRunning { pid }) => {
                 format!("{name} is already running (pid {pid})")
             }
@@ -492,7 +497,13 @@ impl TunnelsScreen {
                 let name = outcome.tunnel.name;
                 let mut status = format!("saved {}", printable(&name));
                 match outcome.restarted {
-                    Some(StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. }) => {
+                    Some(StartOutcome::Started { warning, .. }) => {
+                        status.push_str("; restarted it (connections through it were interrupted)");
+                        if let Some(warning) = warning {
+                            status.push_str(&format!("; {}", printable(&warning)));
+                        }
+                    }
+                    Some(StartOutcome::AlreadyRunning { .. }) => {
                         status.push_str("; restarted it (connections through it were interrupted)");
                     }
                     Some(StartOutcome::Failed { reason, .. }) => {
@@ -1583,6 +1594,22 @@ pub(super) mod tests {
         );
         assert!(screen.footer().contains("s stop"));
         assert!(screen.any_running());
+    }
+
+    #[test]
+    fn a_start_warning_is_appended_to_the_status_line() {
+        let mut screen = screen_with(vec![report("db", TunnelStatus::Stopped)]);
+        screen.finish_start(
+            "db",
+            Ok(StartOutcome::Started {
+                pid: 4,
+                warning: Some("started, but nothing answers\u{1b}[31m".into()),
+            }),
+        );
+        assert_eq!(
+            screen.status_line().as_deref(),
+            Some("Started db (pid 4); started, but nothing answers")
+        );
     }
 
     #[test]

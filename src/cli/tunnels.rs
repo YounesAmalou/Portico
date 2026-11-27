@@ -15,7 +15,7 @@ use crate::{
     domain::explain::Explanation,
     domain::openssh::OpenSshError,
     domain::tunnel::{
-        ContainerTarget, Forward, Kind, Tunnel, TunnelReport, TunnelStatus,
+        ContainerTarget, Forward, Kind, Tunnel, TunnelReport, TunnelStatus, printable,
         runtime::{default_local_port, try_bind},
         saved_name_for,
     },
@@ -304,7 +304,7 @@ fn print_list<O: Write>(output: &mut O, reports: &[TunnelReport]) -> Result<(), 
                 } else {
                     report.tunnel.name.clone()
                 },
-                crate::domain::tunnel::printable(&report.reaches),
+                printable(&report.reaches),
                 report.tunnel.describe(),
                 report.status.name().into(),
                 report.status.detail(),
@@ -366,7 +366,7 @@ fn print_report<O: Write>(output: &mut O, app: &App, report: &TunnelReport) -> R
     writeln!(output, "Status:  {status}").map_err(text)?;
     writeln!(output, "Command: {}", app.tunnel_command(tunnel).join(" ")).map_err(text)?;
     for warning in &report.warnings {
-        writeln!(output, "Warning: {warning}").map_err(text)?;
+        writeln!(output, "Warning: {}", printable(&warning.to_string())).map_err(text)?;
     }
     if matches!(report.status, TunnelStatus::Failed { .. }) {
         let log = app.tunnel_log(&tunnel.name, 20);
@@ -456,7 +456,7 @@ fn start<O: Write, E: Write>(
                     .map_or(name.clone(), |report| report.tunnel.to_string());
                 writeln!(output, "Started {line}, pid {pid}.").map_err(text)?;
                 if let Some(warning) = warning {
-                    writeln!(output, "Warning: {warning}").map_err(text)?;
+                    writeln!(output, "Warning: {}", printable(&warning)).map_err(text)?;
                 }
             }
             Ok(StartOutcome::AlreadyRunning { pid }) => {
@@ -471,6 +471,10 @@ fn start<O: Write, E: Write>(
             }
             Err(refusal) => {
                 failed = true;
+                // A container failure is explained over several lines: name its tunnel first.
+                if names.len() > 1 && matches!(refusal, AppError::Container(_)) {
+                    writeln!(error, "{name}: could not start").map_err(text)?;
+                }
                 let message = app_failure(error, refusal)?;
                 if !message.is_empty() {
                     writeln!(error, "error: {message}").map_err(text)?;

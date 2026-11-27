@@ -25,7 +25,7 @@ use crate::{
     domain::tunnel::{
         ContainerTarget, Destination, Forward, Kind, Tunnel, TunnelReport, TunnelStatus,
         TunnelWarning, TunnelsFile, addresses_overlap, check_args, collide, collisions,
-        is_temporary, listeners_in_effective_config,
+        is_temporary, listeners_in_effective_config, printable,
         runtime::{
             Bind, Identity, READY_BOUND, Record, RunningRecord, authenticated, find_in, listening,
             log_reason, log_tail, nothing_answers, now, ready, try_bind, up_at_bound,
@@ -87,7 +87,14 @@ pub enum TunnelRefusal {
     #[error("tunnel {0} is a remote forward; only a local forward can reach a container")]
     RemoteToContainer(String),
     /// A container tunnel's reference names several running containers of its host.
-    #[error("{reference} matches several containers on {host}: {}", candidates.join(", "))]
+    #[error(
+        "{reference} matches several containers on {host}: {}",
+        candidates
+            .iter()
+            .map(|name| printable(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
     AmbiguousContainer {
         reference: String,
         host: String,
@@ -410,7 +417,7 @@ impl App {
                         .unwrap_or_else(|| state.clone())
                 };
                 let mut warnings = Vec::new();
-                if tunnel.container.is_some() {
+                if tunnel.container.is_some() && status.is_running() {
                     warnings.extend(answer_warning(
                         tunnel,
                         &status,
