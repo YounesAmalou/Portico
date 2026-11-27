@@ -10,9 +10,11 @@ mod containers;
 mod identities;
 
 pub(crate) use identities::key_files_in;
+mod forwards;
 mod tunnels;
 
 pub use containers::{ContainerError, ContainerPrograms};
+pub use forwards::{ForwardTarget, PortSuggestion, SaveOutcome, Suggestions};
 pub use tunnels::{StartOutcome, StopOutcome, TunnelChanges, TunnelRefusal};
 
 use crate::{

@@ -249,7 +249,7 @@ impl App {
     }
 
     /// The target with a host's alias spelled as the inventory spells it.
-    fn container_target(&self, target: &Target) -> Result<Target, ContainerError> {
+    pub(super) fn container_target(&self, target: &Target) -> Result<Target, ContainerError> {
         Ok(match target {
             Target::Local => Target::Local,
             Target::Host(alias) => Target::Host(self.connectable_alias(alias)?),
@@ -259,7 +259,7 @@ impl App {
     /// Runs `words` on `target` with stdout and stderr captured. On a host, ssh's own failure
     /// (255 with nothing on stdout) is an `Ssh` error. On this machine, a program that cannot
     /// be found means `missing` is not installed, when given.
-    fn capture(
+    pub(super) fn capture(
         &self,
         target: &Target,
         words: &[String],

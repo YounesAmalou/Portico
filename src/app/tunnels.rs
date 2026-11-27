@@ -61,6 +61,18 @@ pub enum TunnelRefusal {
     Collides(String),
     #[error("{0} is not a temporary forward")]
     NotTemporary(String),
+    /// A container whose port is neither published nor at an address the host can use.
+    #[error("{label} has no address the host can reach; publish the port")]
+    Unreachable { label: String },
+    /// A container on this machine is reached at its own addresses, without a forward.
+    #[error("a container on this machine needs no forward; use its address directly")]
+    LocalTarget,
+    /// Asking where a container can be reached failed, before any forward started.
+    #[error("could not find where {label} can be reached: {reason}")]
+    ReachFailed { label: String, reason: String },
+    /// A quick forward needs a remote port.
+    #[error("no remote port given; type the port to forward")]
+    NoPort,
     #[error("cannot keep tunnel state in {path}: {source}", path = .path.display())]
     Runtime {
         path: PathBuf,
@@ -812,7 +824,7 @@ impl App {
     }
 
     /// Removes the record and log of a tunnel that is not running.
-    fn forget_run(&self, name: &str) {
+    pub(super) fn forget_run(&self, name: &str) {
         let _ = Record::remove(&self.runtime.record(name));
         let _ = Record::remove(&self.runtime.log(name));
     }
