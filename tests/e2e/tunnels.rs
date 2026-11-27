@@ -473,16 +473,23 @@ fn a_tunnel_through_a_jump_host_returns_and_stops_with_its_proxy() {
     }
 }
 
-/// A TCP server on `127.0.0.1` that writes one byte to each connection, for as long as the test
-/// runs.
+/// A TCP server on `127.0.0.1`, and on `::1` where this machine has it, that writes one byte to
+/// each connection, for as long as the test runs: a quick forward to a host goes to its
+/// `localhost`, which the server may resolve to either address first.
 fn byte_server(byte: u8) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let _ = stream.write_all(&[byte]);
-        }
-    });
+    let serve = move |listener: TcpListener| {
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.write_all(&[byte]);
+            }
+        });
+    };
+    if let Ok(v6) = TcpListener::bind(("::1", port)) {
+        serve(v6);
+    }
+    serve(listener);
     port
 }
 

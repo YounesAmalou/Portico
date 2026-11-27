@@ -346,12 +346,35 @@ pub fn try_bind(address: &str, port: u16) -> Bind {
         };
         match bound {
             Ok(()) => {}
+            // Without SO_REUSEADDR a closed connection of the port's last listener, lingering in
+            // TIME_WAIT, refuses the bind too, though ssh (which sets it) can listen there: only
+            // a port that accepts a connection is taken.
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse
+                    && !cfg!(target_os = "linux")
+                    && !accepts(address) => {}
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => return Bind::InUse,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Bind::Denied,
             Err(_) => {}
         }
     }
     Bind::Free
+}
+
+/// Whether something listens on `address`: a connection to it (to loopback for a wildcard
+/// address) is accepted within a short bound. A refused or unanswered connection means only a
+/// closed connection holds the address.
+fn accepts(address: SocketAddr) -> bool {
+    let target = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), address.port())
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), address.port())
+        }
+        _ => address,
+    };
+    std::net::TcpStream::connect_timeout(&target, Duration::from_millis(500)).is_ok()
 }
 
 /// How long a foreground ssh must keep running after it authenticated before its forward
@@ -849,6 +872,16 @@ mod tests {
         fs::write(runtime.record("db"), "").unwrap();
         fs::write(runtime.log("db"), "").unwrap();
         assert_eq!(runtime.recorded_names(), ["db"]);
+    }
+
+    #[test]
+    fn accepts_tells_a_listener_from_a_closed_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(accepts(SocketAddr::from(([127, 0, 0, 1], port))));
+        assert!(accepts(SocketAddr::from(([0, 0, 0, 0], port))));
+        drop(listener);
+        assert!(!accepts(SocketAddr::from(([127, 0, 0, 1], port))));
     }
 
     #[test]
