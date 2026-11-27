@@ -472,3 +472,95 @@ fn a_tunnel_through_a_jump_host_returns_and_stops_with_its_proxy() {
         wait_gone(proxy);
     }
 }
+
+/// A TCP server on `127.0.0.1` that writes one byte to each connection, for as long as the test
+/// runs.
+fn byte_server(byte: u8) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.write_all(&[byte]);
+        }
+    });
+    port
+}
+
+/// Connects to `port` and reads the one byte the server writes.
+fn read_byte(port: u16) -> u8 {
+    let mut stream = connect(port);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut byte = [0; 1];
+    stream.read_exact(&mut byte).unwrap();
+    byte[0]
+}
+
+/// The entry named `name` of `portico tunnels --json`.
+fn listed(client: &Client, name: &str) -> serde_json::Value {
+    let document: serde_json::Value =
+        serde_json::from_str(&run_ok(client, &["tunnels", "--json"])).unwrap();
+    document["tunnels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tunnel| tunnel["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no tunnel {name} in {document}"))
+}
+
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn a_quick_forward_reaches_a_port_and_is_saved() {
+    let real_home = RealHome::snapshot();
+    let (_sshd, client) = setup();
+    let _stop = StopAll(&client);
+    // The server is this machine, so a port listening here is the host's port.
+    let remote = byte_server(42);
+    let local = free_port();
+    let name = format!("_box-{remote}");
+
+    let started: serde_json::Value = serde_json::from_str(&run_ok(
+        &client,
+        &[
+            "forward",
+            "--on",
+            "box",
+            "--port",
+            &remote.to_string(),
+            "--local",
+            &local.to_string(),
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(started["tunnel"]["name"], name.as_str(), "{started}");
+    assert_eq!(started["tunnel"]["temporary"], true, "{started}");
+    assert_eq!(
+        started["tunnel"]["forward"]["bind_port"], local,
+        "{started}"
+    );
+    assert_eq!(read_byte(local), 42);
+
+    let temporary = listed(&client, &name);
+    assert_eq!(temporary["temporary"], true, "{temporary}");
+    assert_eq!(temporary["reaches"], "box", "{temporary}");
+    assert_eq!(temporary["status"]["state"], "running", "{temporary}");
+
+    let saved = run_ok(&client, &["tunnel", "save", &name, "--name", "kept"]);
+    assert!(saved.contains("Saved kept."), "{saved}");
+    let kept = listed(&client, "kept");
+    assert_eq!(kept["temporary"], false, "{kept}");
+    assert_eq!(kept["status"]["state"], "running", "{kept}");
+    assert!(!run_ok(&client, &["tunnels"]).contains(&name));
+    assert_eq!(read_byte(local), 42);
+
+    let pid = pid_of(&client, "kept");
+    let stopped = run_ok(&client, &["tunnel", "stop", "kept"]);
+    assert!(stopped.contains("Stopped kept."), "{stopped}");
+    wait_gone(pid);
+    assert!(TcpStream::connect(("127.0.0.1", local)).is_err());
+
+    real_home.assert_unchanged();
+}
