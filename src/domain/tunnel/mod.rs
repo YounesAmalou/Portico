@@ -95,6 +95,10 @@ pub struct Forward {
 pub enum TunnelField {
     Name,
     Host,
+    /// The container a tunnel reaches, as its reference.
+    Container,
+    /// The backend that lists the container.
+    Backend,
     Kind,
     BindAddress,
     BindPort,
@@ -107,6 +111,8 @@ impl fmt::Display for TunnelField {
         formatter.write_str(match self {
             Self::Name => "name",
             Self::Host => "host",
+            Self::Container => "container",
+            Self::Backend => "backend",
             Self::Kind => "kind",
             Self::BindAddress => "bind address",
             Self::BindPort => "bind port",
@@ -126,7 +132,7 @@ impl TunnelField {
             Self::Name => HostField::Alias.permits(character),
             Self::BindPort | Self::TargetPort => character.is_ascii_digit(),
             Self::BindAddress | Self::TargetHost => !"[]/".contains(character),
-            Self::Host | Self::Kind => true,
+            Self::Host | Self::Container | Self::Backend | Self::Kind => true,
         }
     }
 }
@@ -482,7 +488,7 @@ impl Tunnel {
                 .any(|c| c.is_whitespace() || c.is_control())
         {
             return Err(invalid(
-                TunnelField::TargetHost,
+                TunnelField::Container,
                 "must be one word without whitespace or control characters",
             ));
         }
@@ -1353,7 +1359,11 @@ mod tests {
                     port: 80,
                 },
             );
-            assert!(result.is_err(), "{reference:?}");
+            assert_eq!(
+                result.map_err(|error| error.field()),
+                Err(TunnelField::Container),
+                "{reference:?}"
+            );
         }
     }
 
