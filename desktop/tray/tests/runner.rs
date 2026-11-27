@@ -7,7 +7,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
+
+/// Tests take turns: a fork running in one test (between fork and exec) holds copies of
+/// every open descriptor, which makes another test's fake script "text file busy" or
+/// keeps a dropped lock held. One test at a time avoids both.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn fake(dir: &Path, body: &str) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
@@ -19,6 +29,7 @@ fn fake(dir: &Path, body: &str) -> PathBuf {
 
 #[test]
 fn locate_prefers_recorded() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let recorded = fake(&tmp.path().join("rec"), "");
     let on_path = fake(&tmp.path().join("bin"), "");
@@ -32,6 +43,7 @@ fn locate_prefers_recorded() {
 
 #[test]
 fn locate_falls_back_when_recorded_path_is_gone() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let recorded = fake(&tmp.path().join("rec"), "");
     fs::remove_file(&recorded).unwrap();
@@ -46,6 +58,7 @@ fn locate_falls_back_when_recorded_path_is_gone() {
 
 #[test]
 fn locate_well_known_after_path() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let cargo = fake(&tmp.path().join(".cargo/bin"), "");
     let found = locate(None, Some("".as_ref()), tmp.path());
@@ -55,6 +68,7 @@ fn locate_well_known_after_path() {
 
 #[test]
 fn run_reports_exit_and_streams() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let program = fake(tmp.path(), "echo \"out $1\"; echo err >&2; exit 3");
     let out = run(&program, &["a".to_string()]).unwrap();
@@ -65,6 +79,7 @@ fn run_reports_exit_and_streams() {
 
 #[test]
 fn worker_answers_requests_in_background() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let program = fake(tmp.path(), "echo \"$@\"");
     let (tx, rx) = mpsc::channel();
@@ -89,6 +104,7 @@ fn worker_answers_requests_in_background() {
 
 #[test]
 fn update_runs_detached_and_logs() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let program = fake(tmp.path(), "echo \"$@\"; echo 'error: boom' >&2");
     let log = tmp.path().join("run/tray-update.log");
@@ -107,6 +123,7 @@ fn update_runs_detached_and_logs() {
 
 #[test]
 fn update_failure_reads_last_error_line() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("u.log");
     let past = SystemTime::now() - Duration::from_secs(3600);
@@ -126,6 +143,7 @@ fn update_failure_reads_last_error_line() {
 
 #[test]
 fn second_lock_is_refused() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let first = acquire(tmp.path()).unwrap();
     assert!(first.is_some());
@@ -136,6 +154,7 @@ fn second_lock_is_refused() {
 
 #[test]
 fn same_kind_requests_run_in_send_order() {
+    let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let record = tmp.path().join("order");
     let program = fake(
