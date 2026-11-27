@@ -10,7 +10,7 @@ use super::{
     hosts::host_argument, json::JsonCommand,
 };
 use crate::{
-    app::{App, AppError, StartOutcome, StopOutcome, TunnelChanges},
+    app::{App, AppError, StartOutcome, StopOutcome, TunnelChanges, TunnelRefusal},
     backend::BackendId,
     domain::explain::Explanation,
     domain::openssh::OpenSshError,
@@ -225,11 +225,16 @@ fn container_change<E: Write>(
                 _ => None,
             })
             .ok_or("give --port, the port inside the container")?;
-        let (backend, reference) = match (backend, &current.container) {
-            (Some(backend), _) => (backend, reference),
-            (None, Some(target)) => (target.backend, reference),
-            (None, None) => app
-                .find_container(host, &reference)
+        // Without --backend the container is looked up, the tunnel's backend first, and saved
+        // as `add` saves it.
+        let (backend, reference) = match backend {
+            Some(backend) => (backend, reference),
+            None => app
+                .find_container(
+                    host,
+                    &reference,
+                    current.container.as_ref().map(|target| target.backend),
+                )
                 .map_err(|failure| failed(error, failure))?,
         };
         return Ok(Some((
@@ -575,7 +580,7 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
                     let (backend, reference) = match backend {
                         Some(backend) => (BackendId::from(backend), reference),
                         None => app
-                            .find_container(&host, &reference)
+                            .find_container(&host, &reference, None)
                             .map_err(|failure| failed(error, failure))?,
                     };
                     let target = ContainerTarget {
@@ -634,7 +639,12 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
                 port,
                 address,
             };
-            let current = app.tunnel(&name).map_err(text)?.tunnel;
+            let report = app.tunnel(&name).map_err(text)?;
+            // A running tunnel is refused before any container is listed.
+            if report.status.is_running() {
+                return Err(TunnelRefusal::Running(report.tunnel.name).to_string());
+            }
+            let current = report.tunnel;
             let through = host.clone().unwrap_or_else(|| current.host.clone());
             let (forward, container) =
                 match container_change(app, &current, &through, flags, error)? {

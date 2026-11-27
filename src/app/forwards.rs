@@ -327,8 +327,8 @@ impl App {
 
     /// The backend whose containers on host `host` include `reference`, with the reference a
     /// saved tunnel keeps for the container (`project/service` for a Compose container, a CT's
-    /// VMID): each backend installed there is listed in turn, in the [`backend::AUTOMATIC`]
-    /// order (ssh never prompts), and the first whose listing resolves the reference (a Compose
+    /// VMID): each backend installed there is listed in turn, `first` (when given) then the
+    /// others in the [`backend::AUTOMATIC`] order (ssh never prompts), and the first whose listing resolves the reference (a Compose
     /// service to its lowest replica) is the one. A reference matching several containers of
     /// one backend is refused as a start refuses it. When no backend has it, the first backend
     /// that refused to list is the failure, or else the container is not running there.
@@ -336,10 +336,16 @@ impl App {
         &self,
         host: &str,
         reference: &str,
+        first: Option<BackendId>,
     ) -> Result<(BackendId, String), AppError> {
         let on = Target::Host(self.connectable_alias(host)?);
         let mut refused = None;
-        for backend in backend::AUTOMATIC {
+        let order = first.into_iter().chain(
+            backend::AUTOMATIC
+                .into_iter()
+                .filter(|id| Some(*id) != first),
+        );
+        for backend in order {
             let list = match self.containers(&on, &[backend], true, None) {
                 Ok(list) => list,
                 Err(ContainerError::Backend(issue))

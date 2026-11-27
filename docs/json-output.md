@@ -772,7 +772,7 @@ A Proxmox shell always runs as root inside the container, so `portico shell` ref
 | `forward.bind_port` | The listen port |
 | `container` | For a tunnel to a container, `backend` (`docker`, `podman` or `proxmox`), `reference` (its name, `project/service` or CT ID) and `port` (the port inside it); otherwise `null`. The container's address is looked up at each start |
 | `forward.target_host`, `forward.target_port` | Where the forward connects, or `null` for a dynamic forward. For a container tunnel, the container's `reference` and the port inside it, even once a start has resolved its address |
-| `forward.spec` | The forward in ssh's syntax (the argument of `-L`, `-R` or `-D`) |
+| `forward.spec` | The forward in ssh's syntax (the argument of `-L`, `-R` or `-D`). For a saved container tunnel it holds the container's reference in place of the host (`127.0.0.1:8080:shop/api:80`) and is not what ssh is given; a started temporary container forward's holds the address it resolved to |
 | `forward.description` | The forward as Portico shows it; for a container tunnel `<listen> → <reference>:<port>` |
 | `status` | Below |
 | `warnings[]` | `kind` `unknown-host` (with `host`: the alias is no longer known), `collides-with` (with `tunnel`: another tunnel uses the same port) or `nothing-answers` (with `reference` and `port`: a running container tunnel's container refused a connection to that port, as an app listening only on 127.0.0.1 inside its container does), and `message` |

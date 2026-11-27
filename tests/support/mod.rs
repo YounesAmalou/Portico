@@ -425,8 +425,8 @@ fn shim_passes_arguments_and_exit_code() {
 /// background stand-in that carries them, as the real ssh's background process does (or, with
 /// `-N`, stays in the foreground authenticated), unless `fail-start` exists, when it fails as
 /// ssh would on a busy remote port, or `exit-after-auth`, when it does so half a second after
-/// authenticating. A start also appends `start-log`, when it exists, to its log. Any other call runs `remote-calls`' script when it exists, so a test can
-/// answer a remote command. Returns the log of the tunnel starts.
+/// authenticating. A start also appends `start-log`, when it exists, to its log. Any other call
+/// runs `remote-calls`' script when it exists, so a test can answer a remote command. Returns the log of the tunnel starts.
 pub fn install_tunnel_ssh(env: &TestEnv) -> PathBuf {
     let log = env.home().parent().unwrap().join("ssh-calls");
     let fail = env.home().parent().unwrap().join("fail-start");

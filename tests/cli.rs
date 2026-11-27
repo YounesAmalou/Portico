@@ -1475,3 +1475,83 @@ fn tunnel_start_of_a_container_explains_a_refused_login() {
             "user@h: Permission denied (publickey).\n\nprod: failed \u{2014} the server refused the login\n",
         );
 }
+
+#[test]
+fn tunnel_add_container_defaults_its_local_port() {
+    let env = container_env(SHOP_API, false);
+    stdout_of(env.run([
+        "tunnel",
+        "add",
+        "api",
+        "--on",
+        "prod",
+        "--container",
+        "shop/api",
+        "--port",
+        "80",
+    ]));
+    let file = tunnels_file(&env);
+    let line = file
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ContainerForward 127.0.0.1:"))
+        .unwrap_or_else(|| panic!("{file}"));
+    let (local, rest) = line.split_once(' ').unwrap();
+    assert_eq!(rest, "docker shop/api 80");
+    // The port inside, or when it cannot be bound the next free one from it (or from 8080 for a
+    // privileged one).
+    let local: u16 = local.parse().unwrap();
+    assert!(local == 80 || local >= 8080, "{local}");
+}
+
+#[test]
+fn tunnel_edit_looks_a_new_container_up_and_saves_it_as_add_does() {
+    let env = container_env(SHOP_API, false);
+    let local = with_container_tunnel(&env);
+    stdout_of(env.run(["tunnel", "edit", "api", "--backend", "podman"]));
+    // Without --backend the container is listed: found by Docker, saved as its service.
+    stdout_of(env.run(["tunnel", "edit", "api", "--container", "shop-api-1"]));
+    let file = tunnels_file(&env);
+    assert!(
+        file.contains(&format!(
+            "ContainerForward 127.0.0.1:{local} docker shop/api 80"
+        )),
+        "{file}"
+    );
+    // A container no backend has is refused, leaving the file as it was.
+    env.run(["tunnel", "edit", "api", "--container", "gone"])
+        .assert_exit_code_and_stderr(
+            1,
+            "error: gone is not running on prod; give --backend to save it anyway\n",
+        );
+    assert_eq!(tunnels_file(&env), file);
+}
+
+#[test]
+fn tunnel_edit_turns_a_container_tunnel_into_an_address_and_port() {
+    let env = container_env(SHOP_API, false);
+    let local = with_container_tunnel(&env);
+    stdout_of(env.run(["tunnel", "edit", "api", "--address", "db", "--port", "5432"]));
+    let file = tunnels_file(&env);
+    assert!(
+        file.contains(&format!("LocalForward 127.0.0.1:{local} db:5432")),
+        "{file}"
+    );
+    assert!(!file.contains("ContainerForward"), "{file}");
+}
+
+#[test]
+fn tunnel_edit_of_a_running_tunnel_lists_no_container() {
+    let env = container_env(SHOP_API, false);
+    let _stop = StopAll(&env);
+    with_container_tunnel(&env);
+    stdout_of(env.run(["tunnel", "start", "api"]));
+    let marker = env.home().parent().unwrap().join("listed");
+    std::fs::write(
+        env.home().parent().unwrap().join("remote-calls"),
+        format!("touch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    env.run(["tunnel", "edit", "api", "--container", "shop-api-1"])
+        .assert_exit_code_and_stderr(1, "error: tunnel api is running; stop it first\n");
+    assert!(!marker.exists());
+}
