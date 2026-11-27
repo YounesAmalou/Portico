@@ -683,6 +683,11 @@ impl TunnelsScreen {
                 let Some(name) = self.selected_name().map(str::to_owned) else {
                     return TunnelAction::None;
                 };
+                // Stopping a temporary forward removes it: ask, as x does.
+                if running && temporary {
+                    self.screen = Screen::ConfirmRemove;
+                    return TunnelAction::None;
+                }
                 if running {
                     return TunnelAction::Stop(name);
                 }
@@ -1990,6 +1995,29 @@ pub(super) mod tests {
             TunnelAction::None
         );
         screen.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('y'))),
+            TunnelAction::Stop("_prod-80".into())
+        );
+    }
+
+    #[test]
+    fn s_on_a_running_temporary_forward_asks_before_stopping_it() {
+        let mut screen = screen_with(vec![temporary(
+            "_prod-80",
+            TunnelStatus::Running { pid: 7, started: 0 },
+        )]);
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('s'))),
+            TunnelAction::None
+        );
+        assert_eq!(screen.screen, Screen::ConfirmRemove);
+        assert_eq!(screen.confirmation(), "Stop and remove _prod-80? (y/n)");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char('n'))),
+            TunnelAction::None
+        );
+        screen.handle_key(key(KeyCode::Char('s')));
         assert_eq!(
             screen.handle_key(key(KeyCode::Char('y'))),
             TunnelAction::Stop("_prod-80".into())

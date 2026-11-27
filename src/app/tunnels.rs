@@ -64,6 +64,9 @@ pub enum TunnelRefusal {
     /// A container whose port is neither published nor at an address the host can use.
     #[error("{label} has no address the host can reach; publish the port")]
     Unreachable { label: String },
+    /// A Proxmox CT whose address could not be read: it has no ports to publish.
+    #[error("could not read the address of CT {id} on {host}")]
+    NoCtAddress { id: String, host: String },
     /// A container on this machine is reached at its own addresses, without a forward.
     #[error("a container on this machine needs no forward; use its address directly")]
     LocalTarget,
@@ -73,6 +76,9 @@ pub enum TunnelRefusal {
     /// A quick forward needs a remote port.
     #[error("no remote port given; type the port to forward")]
     NoPort,
+    /// A quick forward's local port, when given, is a port.
+    #[error("local port 0 is not a port; give one from 1 through 65535")]
+    NoLocalPort,
     #[error("cannot keep tunnel state in {path}: {source}", path = .path.display())]
     Runtime {
         path: PathBuf,
@@ -442,9 +448,11 @@ impl App {
     }
 
     /// Starts a new temporary forward (`tunnel.name` is a temporary name) that reaches
-    /// `reaches`, and waits as `start_tunnel` does. A first start that does not succeed leaves
-    /// nothing behind; a failed forward of the same name is replaced, and stays listed as
-    /// failed if this start fails too.
+    /// `reaches`, and waits as `start_tunnel` does. A start that does not succeed leaves
+    /// nothing behind when no record of that name existed; when one did (the caller kept a
+    /// failed forward's record), the outcome of this start replaces it. [`App::quick_forward`]
+    /// forgets a failed forward of the same name first, so a quick forward that fails leaves
+    /// nothing behind either.
     pub fn start_temporary(
         &self,
         tunnel: Tunnel,

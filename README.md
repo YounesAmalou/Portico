@@ -528,7 +528,7 @@ The Tunnels tab lists the saved tunnels and then the temporary forwards, newest 
 |---|---|
 | `↑` / `↓` / `j` / `k` | Move through tunnels |
 | `/` | Filter tunnels by name, host or forward |
-| `s` | Start the selected tunnel, or stop it when it runs; `Esc` cancels a start that is still connecting |
+| `s` | Start the selected tunnel, or stop it when it runs (a running temporary forward is stopped and removed after a confirmation); `Esc` cancels a start that is still connecting |
 | `a` | Add a tunnel |
 | `e` | Edit the selected tunnel (not while it runs) |
 | `x` | Remove the selected tunnel, after a confirmation (not while it runs); a temporary forward is stopped and removed |

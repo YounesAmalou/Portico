@@ -657,6 +657,20 @@ fn forward_without_a_port_is_a_usage_error_with_the_suggestions() {
 }
 
 #[test]
+fn forward_refuses_a_local_port_of_zero() {
+    let fixture = setup();
+    let output = fixture.run(&[
+        "forward", "--on", "prod", "--port", "80", "--local", "0", "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document["error"]["message"],
+        "local port 0 is not a port; give one from 1 through 65535"
+    );
+}
+
+#[test]
 fn tunnel_save_keeps_a_temporary_forward() {
     let fixture = setup();
     let document = fixture.golden(

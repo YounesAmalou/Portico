@@ -1098,6 +1098,17 @@ fn forward_requires_a_port_when_not_interactive() {
 }
 
 #[test]
+fn forward_refuses_a_local_port_of_zero() {
+    let env = forward_env();
+    let output = env.run(["forward", "--on", "prod", "--port", "5432", "--local", "0"]);
+    output.assert_exit_code_and_stderr(
+        1,
+        "error: local port 0 is not a port; give one from 1 through 65535\n",
+    );
+    assert!(env.run(["tunnels"]).0.stdout.starts_with(b"No tunnels."));
+}
+
+#[test]
 fn forward_prints_the_address_and_how_to_keep_it() {
     let env = forward_env();
     let _stop = StopAll(&env);

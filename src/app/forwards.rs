@@ -167,6 +167,9 @@ impl App {
         if remote == 0 {
             return Err(TunnelRefusal::NoPort.into());
         }
+        if local == Some(0) {
+            return Err(TunnelRefusal::NoLocalPort.into());
+        }
         let label = target.label();
         let (host, destination) = match target {
             ForwardTarget::Host(alias) => (
@@ -210,10 +213,15 @@ impl App {
                         &asked
                     }
                 };
-                let destination =
-                    destination(reach, remote).ok_or_else(|| TunnelRefusal::Unreachable {
+                let destination = destination(reach, remote).ok_or_else(|| match backend {
+                    BackendId::Proxmox => TunnelRefusal::NoCtAddress {
+                        id: container.id.clone(),
+                        host: alias.clone(),
+                    },
+                    _ => TunnelRefusal::Unreachable {
                         label: label.clone(),
-                    })?;
+                    },
+                })?;
                 (alias, destination)
             }
         };
@@ -841,6 +849,49 @@ exit 0
             ),
             other => panic!("expected Unreachable, got {other:?}"),
         }
+        assert_eq!(fixture.read("starts"), "");
+    }
+
+    #[test]
+    fn a_ct_without_an_address_says_so_rather_than_to_publish() {
+        let fixture = fixture();
+        fixture.behave("printf -- '---\\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\\n'\n");
+        let target = ForwardTarget::Container {
+            target: Target::Host("prod".into()),
+            backend: BackendId::Proxmox,
+            container: container("101", ""),
+            via: None,
+        };
+
+        let refused = fixture
+            .app
+            .quick_forward(&target, None, 80, Some(free_port()), None, false);
+
+        match refused {
+            Err(AppError::Tunnel(refusal @ TunnelRefusal::NoCtAddress { .. })) => assert_eq!(
+                refusal.to_string(),
+                "could not read the address of CT 101-id on prod"
+            ),
+            other => panic!("expected NoCtAddress, got {other:?}"),
+        }
+        assert_eq!(fixture.read("starts"), "");
+    }
+
+    #[test]
+    fn a_local_port_of_zero_is_refused() {
+        let fixture = fixture();
+        let refused = fixture.app.quick_forward(
+            &ForwardTarget::Host("prod".into()),
+            None,
+            80,
+            Some(0),
+            None,
+            false,
+        );
+        assert!(
+            matches!(refused, Err(AppError::Tunnel(TunnelRefusal::NoLocalPort))),
+            "{refused:?}"
+        );
         assert_eq!(fixture.read("starts"), "");
     }
 

@@ -551,15 +551,19 @@ impl UiState {
         let Some(dialog) = self.forward.take() else {
             return;
         };
-        let message = format!(
-            "Forwarding 127.0.0.1:{} \u{2192} {}:{} (temporary forward {})",
-            tunnel.forward.bind_port,
-            dialog.target.short(),
+        // The port of the target, as typed: a published port's destination is the host's.
+        let remote = dialog.remote.as_str().parse::<u16>().ok().or_else(|| {
             tunnel
                 .forward
                 .destination
                 .as_ref()
-                .map_or(0, |destination| destination.port),
+                .map(|destination| destination.port)
+        });
+        let message = format!(
+            "Forwarding 127.0.0.1:{} \u{2192} {}:{} (temporary forward {})",
+            tunnel.forward.bind_port,
+            dialog.target.short(),
+            remote.unwrap_or(0),
             tunnel.name,
         );
         if self.tabs.tunnels {
@@ -869,6 +873,20 @@ mod tests {
         assert_eq!(
             state.tunnels.status_line().as_deref(),
             Some("Forwarding 127.0.0.1:8080 \u{2192} prod:80 (temporary forward _prod-80)")
+        );
+    }
+
+    #[test]
+    fn a_published_port_is_named_by_the_port_typed_not_the_host_one() {
+        let mut state = dialog_state();
+        type_text(&mut state, "80");
+        press(&mut state, KeyCode::Enter);
+        let mut tunnel = temporary("_prod-80", 9000, TunnelStatus::Stopped).tunnel;
+        tunnel.forward = Forward::parse(Kind::Local, "127.0.0.1:9000:localhost:8080").unwrap();
+        state.finish_forward(Ok((tunnel, StartOutcome::Started { pid: 9 })));
+        assert_eq!(
+            state.tunnels.status_line().as_deref(),
+            Some("Forwarding 127.0.0.1:9000 \u{2192} prod:80 (temporary forward _prod-80)")
         );
     }
 
