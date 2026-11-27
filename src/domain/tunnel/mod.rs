@@ -5,6 +5,7 @@
 //! collisions between saved tunnels, the status types every interface renders, and the ssh
 //! arguments of a start. Processes and files live in `runtime` and `store`.
 
+pub mod ports;
 pub mod runtime;
 pub mod store;
 
