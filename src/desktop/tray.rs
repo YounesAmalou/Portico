@@ -250,7 +250,8 @@ pub fn check_layout(dir: &Path, system: System) -> Result<PathBuf, String> {
     }
 }
 
-/// Fails on a symlink at `path` or anywhere below it. Never follows a link.
+/// Fails on a symlink or a special file (FIFO, device) at `path` or anywhere below it. Never
+/// follows a link.
 fn no_symlinks(path: &Path) -> Result<(), String> {
     let meta =
         fs::symlink_metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -264,6 +265,8 @@ fn no_symlinks(path: &Path) -> Result<(), String> {
             let entry = entry.map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             no_symlinks(&entry.path())?;
         }
+    } else if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
     }
     Ok(())
 }
@@ -283,18 +286,21 @@ pub fn stable_portico(exe: &Path, path_var: Option<&OsStr>) -> PathBuf {
     path_var
         .into_iter()
         .flat_map(std::env::split_paths)
+        // An empty or relative entry would resolve against the working directory and put a
+        // relative path in the login entry.
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| fs::canonicalize(candidate).is_ok_and(|c| c == real))
         .unwrap_or_else(|| exe.to_path_buf())
 }
 
 /// `CFBundleShortVersionString` from a bundle's `Info.plist` text: the `<string>` that follows
-/// the key.
+/// the key (only whitespace may sit between them). Reads text plists only, not binary ones.
 pub fn plist_version(info_plist: &str) -> Option<String> {
     let after = info_plist
         .split_once("<key>CFBundleShortVersionString</key>")?
         .1;
-    let value = after.split_once("<string>")?.1;
+    let value = after.trim_start().strip_prefix("<string>")?;
     Some(value.split_once("</string>")?.0.trim().to_string())
 }
 
@@ -333,6 +339,16 @@ mod tests {
         let sums = "aaaa  other.zip\nBBBB  a.zip\ncccc *b.zip\n";
         assert_eq!(sums_digest(sums, "a.zip").as_deref(), Some("bbbb"));
         assert_eq!(sums_digest(sums, "b.zip").as_deref(), Some("cccc"));
+    }
+
+    #[test]
+    fn sums_digest_ignores_look_alike_names_and_reads_crlf() {
+        let sums = "aaaa  xa.zip\nbbbb  a.zip.sig\ncccc  a.zip\r\n";
+        assert_eq!(sums_digest(sums, "a.zip").as_deref(), Some("cccc"));
+        assert_eq!(
+            sums_digest("aaaa  xa.zip\nbbbb  a.zip.sig\n", "a.zip"),
+            None
+        );
     }
 
     #[test]
@@ -448,6 +464,37 @@ mod tests {
         symlink(&real, &bin.join("portico")).unwrap();
         let path = std::env::join_paths([&bin]).unwrap();
         assert_eq!(stable_portico(&real, Some(&path)), bin.join("portico"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_portico_skips_empty_and_relative_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("portico");
+        std::fs::write(&real, "x").unwrap();
+        // A relative entry that reaches the exe from the working directory, without changing it.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(dir.path().strip_prefix("/").unwrap());
+        let path = std::env::join_paths([Path::new(""), rel.as_path()]).unwrap();
+        let result = stable_portico(&real, Some(&path));
+        assert!(result.is_absolute());
+        assert_eq!(result, real);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn layout_rejects_special_file() {
+        let dir = tempfile::tempdir().unwrap();
+        make_app(dir.path());
+        let fifo = dir.path().join("Portico Tray.app/Contents/fifo");
+        let ok = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if ok.is_ok_and(|s| s.success()) {
+            assert!(check_layout(dir.path(), System::MacOs).is_err());
+        }
     }
 
     #[test]
