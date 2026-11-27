@@ -9,7 +9,7 @@ use std::{
 use super::{
     BackendArg, CANCELLED, Step,
     containers::{choose_container, on_argument},
-    tunnels::{print_failed_start, start_interrupts},
+    tunnels::{app_failure, print_failed_start, start_interrupts},
 };
 use crate::{
     app::{App, AppError, ForwardTarget, StartOutcome, Suggestions},
@@ -272,8 +272,15 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             writeln!(output, "cancelled").map_err(|error| error.to_string())?;
             return Ok(ExitCode::from(CANCELLED));
         }
-        Err(refusal) => return Err(refusal.to_string()),
-        Ok((tunnel, StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. })) => {
+        Err(refusal) => return Err(app_failure(error, refusal)?),
+        Ok((tunnel, StartOutcome::Started { warning, .. })) => {
+            print_started(output, &target, &tunnel, remote)?;
+            if let Some(warning) = warning {
+                writeln!(output, "Warning: {warning}").map_err(|error| error.to_string())?;
+            }
+            ExitCode::SUCCESS
+        }
+        Ok((tunnel, StartOutcome::AlreadyRunning { .. })) => {
             print_started(output, &target, &tunnel, remote)?;
             ExitCode::SUCCESS
         }

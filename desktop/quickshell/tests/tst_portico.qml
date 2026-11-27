@@ -48,7 +48,7 @@ TestCase {
 
     function test_tunnels_have_a_state_and_an_action() {
         var rows = Portico.tunnelRows(doc("tunnels.json"))
-        compare(rows.length, 5)
+        compare(rows.length, 6)
 
         compare(rows[0].name, "busy")
         compare(rows[0].stateText, "Port in use")
@@ -69,10 +69,15 @@ TestCase {
 
         compare(rows[3].description, "socks 127.0.0.1:1")
 
-        // A temporary forward is listed after the saved tunnels, and started or stopped by name.
-        compare(rows[4].name, "_web-80")
-        compare(rows[4].stateText, "Failed")
+        // A container tunnel describes its container.
+        compare(rows[4].name, "web")
+        compare(rows[4].description, "127.0.0.1:2 → shop/web:80")
         compare(rows[4].action, "start")
+
+        // A temporary forward is listed after the saved tunnels, and started or stopped by name.
+        compare(rows[5].name, "_web-80")
+        compare(rows[5].stateText, "Failed")
+        compare(rows[5].action, "start")
     }
 
     function test_tunnel_show_report_is_a_row() {

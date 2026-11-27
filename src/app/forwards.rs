@@ -325,6 +325,58 @@ impl App {
         })
     }
 
+    /// The backend whose containers on host `host` include `reference`, with the reference a
+    /// saved tunnel keeps for the container (`project/service` for a Compose container, a CT's
+    /// VMID): each backend installed there is listed in turn, in the [`backend::AUTOMATIC`]
+    /// order (ssh never prompts), and the first whose listing resolves the reference (a Compose
+    /// service to its lowest replica) is the one. A reference matching several containers of
+    /// one backend is refused as a start refuses it. When no backend has it, the first backend
+    /// that refused to list is the failure, or else the container is not running there.
+    pub fn find_container(
+        &self,
+        host: &str,
+        reference: &str,
+    ) -> Result<(BackendId, String), AppError> {
+        let on = Target::Host(self.connectable_alias(host)?);
+        let mut refused = None;
+        for backend in backend::AUTOMATIC {
+            let list = match self.containers(&on, &[backend], true, None) {
+                Ok(list) => list,
+                Err(ContainerError::Backend(issue))
+                    if issue.problem == backend::Problem::NotInstalled =>
+                {
+                    continue;
+                }
+                Err(ContainerError::Backend(issue)) => {
+                    refused.get_or_insert(ContainerError::Backend(issue));
+                    continue;
+                }
+                Err(ContainerError::App(error)) => return Err(error),
+                Err(error) => return Err(AppError::Container(Box::new(error))),
+            };
+            match resolve_lowest(reference, &list.listing.containers) {
+                Ok(container) => return Ok((backend, saved_reference(backend, container))),
+                Err(ResolveError::NotFound) => {}
+                Err(ResolveError::Ambiguous(candidates)) => {
+                    return Err(TunnelRefusal::AmbiguousContainer {
+                        reference: reference.to_owned(),
+                        host: host.to_owned(),
+                        candidates,
+                    }
+                    .into());
+                }
+            }
+        }
+        Err(match refused {
+            Some(error) => AppError::Container(Box::new(error)),
+            None => TunnelRefusal::NotRunningAnywhere {
+                reference: reference.to_owned(),
+                host: host.to_owned(),
+            }
+            .into(),
+        })
+    }
+
     /// Container tunnel `tunnel` as it starts now: the containers of its host listed with its
     /// backend, its reference resolved (a Compose service to its lowest replica), and its
     /// destination found as a quick forward's is. The tunnel keeps its name, listen side and

@@ -2,6 +2,7 @@
   "schema": 1,
   "tunnels": [
     {
+      "container": null,
       "forward": {
         "bind_address": "127.0.0.1",
         "bind_port": 5433,
@@ -23,6 +24,7 @@
       "warnings": []
     },
     {
+      "container": null,
       "forward": {
         "bind_address": "127.0.0.1",
         "bind_port": 1,
@@ -48,6 +50,7 @@
       ]
     },
     {
+      "container": null,
       "forward": {
         "bind_address": null,
         "bind_port": 8080,
@@ -69,6 +72,7 @@
       "warnings": []
     },
     {
+      "container": null,
       "forward": {
         "bind_address": "127.0.0.1",
         "bind_port": 1,
@@ -94,6 +98,31 @@
       ]
     },
     {
+      "container": {
+        "backend": "docker",
+        "port": 80,
+        "reference": "shop/web"
+      },
+      "forward": {
+        "bind_address": "127.0.0.1",
+        "bind_port": 2,
+        "description": "127.0.0.1:2 → shop/web:80",
+        "kind": "local",
+        "spec": "127.0.0.1:2:shop/web:80",
+        "target_host": "shop/web",
+        "target_port": 80
+      },
+      "host": "prod",
+      "name": "web",
+      "reaches": "shop/web on prod",
+      "status": {
+        "state": "stopped"
+      },
+      "temporary": false,
+      "warnings": []
+    },
+    {
+      "container": null,
       "forward": {
         "bind_address": "127.0.0.1",
         "bind_port": 8080,

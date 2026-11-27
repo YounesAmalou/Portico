@@ -755,6 +755,7 @@ impl TunnelsScreen {
                                 name: Some(tunnel.name),
                                 host: Some(tunnel.host),
                                 forward: Some(tunnel.forward),
+                                container: None,
                             },
                         },
                         None => TunnelAction::Add(tunnel),

@@ -12,6 +12,7 @@
       "outcome": "failed",
       "pid": null,
       "tunnel": {
+        "container": null,
         "forward": {
           "bind_address": null,
           "bind_port": 8080,
@@ -31,7 +32,8 @@
         },
         "temporary": false,
         "warnings": []
-      }
+      },
+      "warning": null
     },
     {
       "error": {
@@ -42,7 +44,8 @@
       "name": "nope",
       "outcome": "failed",
       "pid": null,
-      "tunnel": null
+      "tunnel": null,
+      "warning": null
     }
   ],
   "schema": 1

@@ -425,12 +425,13 @@ fn shim_passes_arguments_and_exit_code() {
 /// background stand-in that carries them, as the real ssh's background process does (or, with
 /// `-N`, stays in the foreground authenticated), unless `fail-start` exists, when it fails as
 /// ssh would on a busy remote port, or `exit-after-auth`, when it does so half a second after
-/// authenticating. Any other call runs `remote-calls`' script when it exists, so a test can
+/// authenticating. A start also appends `start-log`, when it exists, to its log. Any other call runs `remote-calls`' script when it exists, so a test can
 /// answer a remote command. Returns the log of the tunnel starts.
 pub fn install_tunnel_ssh(env: &TestEnv) -> PathBuf {
     let log = env.home().parent().unwrap().join("ssh-calls");
     let fail = env.home().parent().unwrap().join("fail-start");
     let exit_after_auth = env.home().parent().unwrap().join("exit-after-auth");
+    let start_log = env.home().parent().unwrap().join("start-log");
     env.install_program(
         "ssh",
         &format!(
@@ -453,6 +454,7 @@ if [ "$1" = -f ] || [ "$1" = -N ]; then
     [ "$prev" = -E ] && elog=$arg
     prev=$arg
   done
+  if [ -f '{start_log}' ]; then cat '{start_log}' >> "$elog"; fi
   if [ -f '{fail}' ]; then
     printf '\033[31mError: remote port forwarding failed for listen port 8080\033[0m\a\n' >> "$elog"
     exit 255
@@ -488,6 +490,7 @@ exit 0
             log = log.display(),
             fail = fail.display(),
             exit_after_auth = exit_after_auth.display(),
+            start_log = start_log.display(),
             remote = env.home().parent().unwrap().join("remote-calls").display(),
             hold = hold_forward(),
         ),

@@ -406,6 +406,16 @@ impl ContainerTarget {
         format!("{} {} {}", self.backend.as_str(), self.reference, self.port)
     }
 
+    /// The target for people: `shop/api:80 (docker)`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}:{} ({})",
+            self.reference,
+            self.port,
+            self.backend.as_str()
+        )
+    }
+
     /// The target a running record's `container` line holds, when it reads as one.
     pub fn from_record_text(text: &str) -> Option<Self> {
         let [backend, reference, port] = text.split_whitespace().collect::<Vec<_>>()[..] else {
@@ -445,6 +455,15 @@ impl Tunnel {
         validate_name(&tunnel.name)?;
         validate_host(&tunnel.host)?;
         Ok(tunnel)
+    }
+
+    /// The tunnel's forward in a few words for lists, as [`Forward::describe`] says it, except
+    /// that a container tunnel names its container: `127.0.0.1:8080 → shop/api:80 (docker)`.
+    pub fn describe(&self) -> String {
+        match &self.container {
+            Some(target) => format!("{} \u{2192} {}", self.forward.listen(), target.describe()),
+            None => self.forward.describe(),
+        }
     }
 
     /// A tunnel to a container: a local forward listening as `listen` does (its destination is

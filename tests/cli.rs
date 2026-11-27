@@ -1171,3 +1171,307 @@ fn tunnel_save_keeps_a_temporary_forward() {
     env.run(["tunnel", "save", "pg"])
         .assert_failure_stderr_contains("pg is not a temporary forward");
 }
+
+/// `docker ps` of `prod`: the Compose service `shop/api`, on `shop_default`.
+const SHOP_API: &str = r#"{"id":"bbbb2222","name":"shop-api-1","image":"api","command":"","running_for":"","status":"Up 2 hours","ports":"","networks":"shop_default","mounts":"","project":"shop","service":"api","number":"1","working_dir":""}"#;
+
+/// `forward_env` whose `prod` lists `listing` with Docker, at 172.18.0.4 for `docker inspect`,
+/// and has neither Podman nor Proxmox; with `refused`, ssh's login is refused instead.
+fn container_env(listing: &str, refused: bool) -> TestEnv {
+    let env = forward_env();
+    let refusal = if refused {
+        "printf 'user@h: Permission denied (publickey).\\n' >&2\nexit 255\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        env.home().parent().unwrap().join("remote-calls"),
+        format!(
+            "{refusal}for a; do last=$a; done\ncase $last in\n  *'docker inspect'*) echo '{{\"shop_default\":{{\"IPAddress\":\"172.18.0.4\"}}}}|{{\"80/tcp\":{{}}}}|default'; exit 0 ;;\n  *'docker ps'*)\ncat <<'EOF'\n{listing}\nEOF\n  exit 0 ;;\n  *'podman ps'*) echo 'sh: 2: exec: podman: not found' >&2; exit 127 ;;\n  *'pct list'*) echo 'portico: no pct' >&2; exit 127 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    env
+}
+
+fn tunnels_file(env: &TestEnv) -> String {
+    std::fs::read_to_string(env.home().join(".ssh/portico/tunnels")).unwrap_or_default()
+}
+
+#[test]
+fn tunnel_add_container_saves_the_backend_that_lists_it() {
+    let env = container_env(SHOP_API, false);
+    let local = free_port();
+    let output = stdout_of(env.run([
+        "tunnel",
+        "add",
+        "api",
+        "--on",
+        "prod",
+        "--container",
+        "shop/api",
+        "--port",
+        "80",
+        "--local",
+        &local.to_string(),
+    ]));
+    assert_eq!(
+        output,
+        format!("Added api (127.0.0.1:{local} \u{2192} shop/api:80 through prod).\n")
+    );
+    let file = tunnels_file(&env);
+    assert!(
+        file.contains(&format!(
+            "ContainerForward 127.0.0.1:{local} docker shop/api 80"
+        )),
+        "{file}"
+    );
+    let show = stdout_of(env.run(["tunnel", "show", "api"]));
+    assert!(
+        show.contains(&format!(
+            "Forward: local 127.0.0.1:{local} \u{2192} shop/api:80 (docker)"
+        )),
+        "{show}"
+    );
+    // The address is looked up at each start, so the command shows the reference in its place.
+    assert!(
+        show.contains(&format!("-L 127.0.0.1:{local}:<shop/api>:80 ")),
+        "{show}"
+    );
+    let list = stdout_of(env.run(["tunnels"]));
+    assert!(list.contains("shop/api on prod"), "{list}");
+    assert!(list.contains("shop/api:80 (docker)"), "{list}");
+}
+
+#[test]
+fn tunnel_add_container_needs_its_port() {
+    let env = container_env(SHOP_API, false);
+    env.run([
+        "tunnel",
+        "add",
+        "api",
+        "--on",
+        "prod",
+        "--container",
+        "shop/api",
+    ])
+    .assert_exit_code_and_stderr_contains(2, "--port");
+    assert_eq!(tunnels_file(&env).matches("Tunnel ").count(), 0);
+}
+
+#[test]
+fn tunnel_add_of_a_container_not_running_needs_its_backend() {
+    let env = container_env("", false);
+    let local = free_port().to_string();
+    let add = |backend: Option<&str>| {
+        let mut args = vec![
+            "tunnel",
+            "add",
+            "api",
+            "--on",
+            "prod",
+            "--container",
+            "shop/api",
+            "--port",
+            "80",
+            "--local",
+            &local,
+        ];
+        if let Some(backend) = backend {
+            args.extend(["--backend", backend]);
+        }
+        env.run(args)
+    };
+    add(None).assert_exit_code_and_stderr(
+        1,
+        "error: shop/api is not running on prod; give --backend to save it anyway\n",
+    );
+    assert!(!tunnels_file(&env).contains("Tunnel api"));
+    stdout_of(add(Some("podman")));
+    assert!(
+        tunnels_file(&env).contains(&format!(
+            "ContainerForward 127.0.0.1:{local} podman shop/api 80"
+        )),
+        "{}",
+        tunnels_file(&env)
+    );
+}
+
+#[test]
+fn tunnel_add_container_explains_a_refused_login() {
+    let env = container_env(SHOP_API, true);
+    env.run([
+        "tunnel",
+        "add",
+        "api",
+        "--on",
+        "prod",
+        "--container",
+        "shop/api",
+        "--port",
+        "80",
+    ])
+    .assert_exit_code_and_stderr_contains(
+        1,
+        "user@h: Permission denied (publickey).\n\nprod: failed \u{2014} the server refused the login\n",
+    );
+}
+
+/// `container_env` with the container tunnel `api` to `shop/api`'s port 80 through `prod`;
+/// returns its local port.
+fn with_container_tunnel(env: &TestEnv) -> u16 {
+    let local = free_port();
+    stdout_of(env.run([
+        "tunnel",
+        "add",
+        "api",
+        "--on",
+        "prod",
+        "--container",
+        "shop/api",
+        "--backend",
+        "docker",
+        "--port",
+        "80",
+        "--local",
+        &local.to_string(),
+    ]));
+    local
+}
+
+#[test]
+fn tunnel_edit_refuses_a_forward_for_a_container_tunnel() {
+    let env = container_env(SHOP_API, false);
+    with_container_tunnel(&env);
+    let before = tunnels_file(&env);
+    env.run(["tunnel", "edit", "api", "-L", "127.0.0.1:9000:db:5432"])
+        .assert_exit_code_and_stderr_contains(1, "tunnel api forwards to a container");
+    assert_eq!(tunnels_file(&env), before);
+    // `-L` and `--container` exclude each other.
+    env.run([
+        "tunnel",
+        "edit",
+        "api",
+        "-L",
+        "127.0.0.1:9000:db:5432",
+        "--container",
+        "web",
+    ])
+    .assert_exit_code(2);
+    assert_eq!(tunnels_file(&env), before);
+}
+
+#[test]
+fn tunnel_edit_refuses_a_backend_or_port_without_a_container() {
+    let env = container_env(SHOP_API, false);
+    stdout_of(env.run([
+        "tunnel",
+        "add",
+        "db",
+        "--on",
+        "prod",
+        "-L",
+        "127.0.0.1:1:localhost:5432",
+    ]));
+    let before = tunnels_file(&env);
+    for flag in [["--backend", "docker"], ["--port", "80"]] {
+        env.run(["tunnel", "edit", "db", flag[0], flag[1]])
+            .assert_exit_code_and_stderr_contains(1, "tunnel db reaches no container");
+    }
+    env.run(["tunnel", "edit", "db", "--address", "db"])
+        .assert_exit_code_and_stderr_contains(1, "tunnel db reaches no container");
+    assert_eq!(tunnels_file(&env), before);
+}
+
+#[test]
+fn tunnel_edit_changes_a_container_tunnel_and_turns_it_into_an_address_one() {
+    let env = container_env(SHOP_API, false);
+    let local = with_container_tunnel(&env);
+    stdout_of(env.run([
+        "tunnel",
+        "edit",
+        "api",
+        "--port",
+        "81",
+        "--backend",
+        "podman",
+    ]));
+    assert!(
+        tunnels_file(&env).contains(&format!(
+            "ContainerForward 127.0.0.1:{local} podman shop/api 81"
+        )),
+        "{}",
+        tunnels_file(&env)
+    );
+    // A rename keeps the container.
+    stdout_of(env.run(["tunnel", "edit", "api", "--name", "app"]));
+    assert!(
+        tunnels_file(&env).contains(&format!(
+            "ContainerForward 127.0.0.1:{local} podman shop/api 81"
+        )),
+        "{}",
+        tunnels_file(&env)
+    );
+    stdout_of(env.run(["tunnel", "edit", "app", "--address", "db"]));
+    let file = tunnels_file(&env);
+    assert!(
+        file.contains(&format!("LocalForward 127.0.0.1:{local} db:81")),
+        "{file}"
+    );
+    assert!(!file.contains("ContainerForward"), "{file}");
+    // Back to a container, found by its listing, keeping the port.
+    stdout_of(env.run(["tunnel", "edit", "app", "--container", "shop/api"]));
+    assert!(
+        tunnels_file(&env).contains(&format!(
+            "ContainerForward 127.0.0.1:{local} docker shop/api 81"
+        )),
+        "{}",
+        tunnels_file(&env)
+    );
+}
+
+#[test]
+fn tunnel_start_prints_that_nothing_answers_on_its_own_line() {
+    let env = container_env(SHOP_API, false);
+    let _stop = StopAll(&env);
+    let local = with_container_tunnel(&env);
+    std::fs::write(
+        env.home().parent().unwrap().join("start-log"),
+        "channel 2: open failed: connect failed: Connection refused\n",
+    )
+    .unwrap();
+    let output = stdout_of(env.run(["tunnel", "start", "api"]));
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 2, "{output}");
+    assert!(
+        lines[0].starts_with(&format!(
+            "Started api (127.0.0.1:{local} \u{2192} shop/api:80 through prod), pid "
+        )),
+        "{output}"
+    );
+    assert_eq!(
+        lines[1],
+        "Warning: started, but nothing answers on port 80 inside shop/api; an app that listens only on 127.0.0.1 inside its container cannot be reached"
+    );
+    let starts = std::fs::read_to_string(env.home().parent().unwrap().join("ssh-calls")).unwrap();
+    assert!(
+        starts.contains(&format!("127.0.0.1:{local}:172.18.0.4:80")),
+        "{starts}"
+    );
+}
+
+#[test]
+fn tunnel_start_of_a_container_explains_a_refused_login() {
+    let env = container_env(SHOP_API, false);
+    with_container_tunnel(&env);
+    std::fs::write(
+        env.home().parent().unwrap().join("remote-calls"),
+        "printf 'user@h: Permission denied (publickey).\\n' >&2\nexit 255\n",
+    )
+    .unwrap();
+    env.run(["tunnel", "start", "api"])
+        .assert_exit_code_and_stderr_contains(
+            1,
+            "user@h: Permission denied (publickey).\n\nprod: failed \u{2014} the server refused the login\n",
+        );
+}

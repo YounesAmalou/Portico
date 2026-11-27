@@ -73,6 +73,19 @@ pub enum TunnelRefusal {
         host: String,
         backend: BackendId,
     },
+    /// A container tunnel being saved without a backend: no installed backend of its host has
+    /// the container.
+    #[error("{reference} is not running on {host}; give --backend to save it anyway")]
+    NotRunningAnywhere { reference: String, host: String },
+    /// An edit that replaces the forward of a container tunnel without saying what becomes of
+    /// its container.
+    #[error(
+        "tunnel {0} forwards to a container; change its container, backend or port, or give it an address"
+    )]
+    ForwardOfContainer(String),
+    /// A container tunnel is a local forward; a remote forward's listen side is on the host.
+    #[error("tunnel {0} is a remote forward; only a local forward can reach a container")]
+    RemoteToContainer(String),
     /// A container tunnel's reference names several running containers of its host.
     #[error("{reference} matches several containers on {host}: {}", candidates.join(", "))]
     AmbiguousContainer {
@@ -114,7 +127,12 @@ pub enum TunnelRefusal {
 pub struct TunnelChanges {
     pub name: Option<String>,
     pub host: Option<String>,
+    /// For a container tunnel, only its listen side counts. A container tunnel's forward is
+    /// replaced only with `container` given.
     pub forward: Option<Forward>,
+    /// `Some(Some(target))` makes the tunnel reach that container, `Some(None)` turns a
+    /// container tunnel into an address one (with `forward` its new forward).
+    pub container: Option<Option<ContainerTarget>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -520,13 +538,20 @@ impl App {
         log_tail(&self.runtime.log(name), lines)
     }
 
-    /// The command line a start of `tunnel` runs, for showing it.
+    /// The command line a start of `tunnel` runs, for showing it. A saved container tunnel's
+    /// destination is shown as `<reference>`: its address is looked up at each start.
     pub fn tunnel_command(&self, tunnel: &Tunnel) -> Vec<String> {
+        let mut forward = tunnel.forward.clone();
+        if let (Some(target), Some(destination)) = (&tunnel.container, &mut forward.destination)
+            && destination.host == target.reference
+        {
+            destination.host = format!("<{}>", target.reference);
+        }
         std::iter::once(self.openssh.ssh_program().as_os_str().to_owned())
             .chain(start_args(
                 &self.runtime.log(&tunnel.name),
                 &tunnel.host,
-                &tunnel.forward,
+                &forward,
                 SSH_BACKGROUNDS,
             ))
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -553,14 +578,29 @@ impl App {
                 .find(name)
                 .cloned()
                 .ok_or_else(|| TunnelRefusal::Unknown(name.into()))?;
-            let checked = changes.host.is_some() || changes.forward.is_some();
-            let edited = Tunnel::new(
-                changes.name.unwrap_or_else(|| current.name.clone()),
-                changes.host.unwrap_or_else(|| current.host.clone()),
-                changes.forward.unwrap_or_else(|| current.forward.clone()),
-            )?;
+            let checked =
+                changes.host.is_some() || changes.forward.is_some() || changes.container.is_some();
+            let name = changes.name.unwrap_or_else(|| current.name.clone());
+            let host = changes.host.unwrap_or_else(|| current.host.clone());
+            let container = match changes.container {
+                Some(container) => container,
+                None if current.container.is_some() && changes.forward.is_some() => {
+                    return Err(TunnelRefusal::ForwardOfContainer(current.name.clone()).into());
+                }
+                None => current.container.clone(),
+            };
+            let forward = changes.forward.unwrap_or_else(|| current.forward.clone());
+            let edited = match container {
+                Some(target) => {
+                    if forward.kind == Kind::Remote {
+                        return Err(TunnelRefusal::RemoteToContainer(current.name.clone()).into());
+                    }
+                    Tunnel::to_container(name, host, forward, target)?
+                }
+                None => Tunnel::new(name, host, forward)?,
+            };
             if checked {
-                self.check_tunnel(&edited)?;
+                self.check_tunnel(&stand_in(&edited))?;
             }
             file.replace(&current.name, edited.clone())
                 .map_err(|_| AppError::from(TunnelRefusal::Exists(edited.name.clone())))?;

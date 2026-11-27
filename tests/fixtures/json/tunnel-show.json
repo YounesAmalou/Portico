@@ -26,6 +26,7 @@
   ],
   "schema": 1,
   "tunnel": {
+    "container": null,
     "forward": {
       "bind_address": null,
       "bind_port": 8080,

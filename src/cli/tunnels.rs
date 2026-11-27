@@ -5,12 +5,20 @@ use std::{
     process::ExitCode,
 };
 
-use super::{CANCELLED, Interrupts, Step, confirm, hosts::host_argument, json::JsonCommand};
+use super::{
+    BackendArg, CANCELLED, Interrupts, Step, confirm, containers::report_container_failure,
+    hosts::host_argument, json::JsonCommand,
+};
 use crate::{
     app::{App, AppError, StartOutcome, StopOutcome, TunnelChanges},
+    backend::BackendId,
     domain::explain::Explanation,
     domain::openssh::OpenSshError,
-    domain::tunnel::{Forward, Kind, Tunnel, TunnelReport, TunnelStatus, saved_name_for},
+    domain::tunnel::{
+        ContainerTarget, Forward, Kind, Tunnel, TunnelReport, TunnelStatus,
+        runtime::{default_local_port, try_bind},
+        saved_name_for,
+    },
     picker::{Picker, Row},
 };
 
@@ -23,7 +31,7 @@ pub(super) enum TunnelCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Save a tunnel: one forward through a host.
+    /// Save a tunnel: one forward through a host, or to a port of a container on it.
     Add {
         name: String,
         /// The host the tunnel goes through; without an alias, choose one.
@@ -31,6 +39,19 @@ pub(super) enum TunnelCommand {
         on: Option<Option<String>>,
         #[command(flatten)]
         forward: ForwardArgs,
+        /// Forward to a container on the host: its name, `project/service` or CT ID. Its address
+        /// is looked up at each start.
+        #[arg(long, value_name = "REF", conflicts_with_all = ["local", "remote", "dynamic"], requires = "port")]
+        container: Option<String>,
+        /// The backend that lists the container; by default the installed one that has it.
+        #[arg(long, value_enum, requires = "container")]
+        backend: Option<BackendArg>,
+        /// The port inside the container.
+        #[arg(long, value_name = "PORT", requires = "container")]
+        port: Option<u16>,
+        /// The local port; by default the container's port, or the next free one above it.
+        #[arg(long = "local", value_name = "PORT", requires = "container")]
+        local_port: Option<u16>,
     },
     /// Change a saved tunnel.
     Edit {
@@ -41,6 +62,18 @@ pub(super) enum TunnelCommand {
         on: Option<Option<String>>,
         #[command(flatten)]
         forward: ForwardArgs,
+        /// Forward to this container on the host instead (name, `project/service` or CT ID).
+        #[arg(long, value_name = "REF", conflicts_with_all = ["local", "remote", "dynamic", "address"])]
+        container: Option<String>,
+        /// The backend that lists the tunnel's container.
+        #[arg(long, value_enum, conflicts_with_all = ["local", "remote", "dynamic", "address"])]
+        backend: Option<BackendArg>,
+        /// The port inside the tunnel's container (with --address, the port at that address).
+        #[arg(long, value_name = "PORT", conflicts_with_all = ["local", "remote", "dynamic"])]
+        port: Option<u16>,
+        /// Turn a container tunnel into one to this address, keeping its local side and port.
+        #[arg(long, value_name = "HOST", conflicts_with_all = ["local", "remote", "dynamic"])]
+        address: Option<String>,
     },
     /// Delete a saved tunnel.
     Remove {
@@ -135,6 +168,119 @@ fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+/// Reports `failure` as other container failures are reported when a container listing failed
+/// (ssh's output and its explanation printed on `error`), and returns what is left to print:
+/// the message, or nothing.
+pub(super) fn app_failure<E: Write>(error: &mut E, failure: AppError) -> Result<String, String> {
+    match failure {
+        AppError::Container(failure) => report_container_failure(error, *failure),
+        failure => Ok(failure.to_string()),
+    }
+}
+
+/// `app_failure` as the `Err` of a command: an empty message once it is printed.
+fn failed<E: Write>(error: &mut E, failure: AppError) -> String {
+    app_failure(error, failure).unwrap_or_else(|message| message)
+}
+
+/// The local forward a container tunnel listens with: `127.0.0.1:<local>`, `local` defaulting
+/// as a quick forward's does to the port inside the container or the next free one above it.
+fn container_listen(local: Option<u16>, port: u16) -> Result<Forward, String> {
+    let local = match local {
+        Some(local) => local,
+        None => default_local_port(port, |port| try_bind("127.0.0.1", port))
+            .ok_or_else(|| format!("no free local port from {port} up; give --local"))?,
+    };
+    Forward::parse(Kind::Local, &format!("127.0.0.1:{local}:localhost:{port}")).map_err(text)
+}
+
+/// What the container flags of `tunnel edit` change in `current`, a saved tunnel going through
+/// `host`: `None` when none is given.
+fn container_change<E: Write>(
+    app: &App,
+    current: &Tunnel,
+    host: &str,
+    flags: ContainerFlags,
+    error: &mut E,
+) -> Result<Option<ContainerChange>, String> {
+    let ContainerFlags {
+        container,
+        backend,
+        port,
+        address,
+    } = flags;
+    if container.is_none() && backend.is_none() && port.is_none() && address.is_none() {
+        return Ok(None);
+    }
+    let name = &current.name;
+    if let Some(reference) = container {
+        let port = port
+            .or(current.container.as_ref().map(|target| target.port))
+            .or(match &current.forward {
+                Forward {
+                    kind: Kind::Local,
+                    destination: Some(destination),
+                    ..
+                } => Some(destination.port),
+                _ => None,
+            })
+            .ok_or("give --port, the port inside the container")?;
+        let (backend, reference) = match (backend, &current.container) {
+            (Some(backend), _) => (backend, reference),
+            (None, Some(target)) => (target.backend, reference),
+            (None, None) => app
+                .find_container(host, &reference)
+                .map_err(|failure| failed(error, failure))?,
+        };
+        return Ok(Some((
+            None,
+            Some(ContainerTarget {
+                backend,
+                reference,
+                port,
+            }),
+        )));
+    }
+    let Some(target) = &current.container else {
+        return Err(format!(
+            "tunnel {name} reaches no container; --backend, --port and --address change a container tunnel, --container makes one"
+        ));
+    };
+    let port = port.unwrap_or(target.port);
+    match address {
+        Some(address) => {
+            let address = if address.contains(':') {
+                format!("[{address}]")
+            } else {
+                address
+            };
+            let spec = format!("{}:{address}:{port}", current.forward.listen());
+            let forward = Forward::parse(Kind::Local, &spec).map_err(text)?;
+            Ok(Some((Some(forward), None)))
+        }
+        None => Ok(Some((
+            None,
+            Some(ContainerTarget {
+                backend: backend.unwrap_or(target.backend),
+                reference: target.reference.clone(),
+                port,
+            }),
+        ))),
+    }
+}
+
+/// What the container flags of `tunnel edit` change: the forward replacing the tunnel's, when
+/// one does, and the container the tunnel then reaches, if any.
+type ContainerChange = (Option<Forward>, Option<ContainerTarget>);
+
+/// The container flags of `tunnel edit`.
+struct ContainerFlags {
+    container: Option<String>,
+    backend: Option<BackendId>,
+    port: Option<u16>,
+    address: Option<String>,
+}
+
 fn print_list<O: Write>(output: &mut O, reports: &[TunnelReport]) -> Result<(), String> {
     if reports.is_empty() {
         writeln!(
@@ -154,7 +300,7 @@ fn print_list<O: Write>(output: &mut O, reports: &[TunnelReport]) -> Result<(), 
                     report.tunnel.name.clone()
                 },
                 crate::domain::tunnel::printable(&report.reaches),
-                report.tunnel.forward.describe(),
+                report.tunnel.describe(),
                 report.status.name().into(),
                 report.status.detail(),
             ]
@@ -196,13 +342,21 @@ fn print_report<O: Write>(output: &mut O, app: &App, report: &TunnelReport) -> R
     };
     writeln!(output, "Tunnel:  {}", tunnel.name).map_err(text)?;
     writeln!(output, "Host:    {}", tunnel.host).map_err(text)?;
-    writeln!(
-        output,
-        "Forward: {} {} {}",
-        tunnel.forward.kind.name(),
-        tunnel.forward.kind.flag(),
-        tunnel.forward.spec()
-    )
+    match &tunnel.container {
+        Some(_) => writeln!(
+            output,
+            "Forward: {} {}",
+            tunnel.forward.kind.name(),
+            tunnel.describe()
+        ),
+        None => writeln!(
+            output,
+            "Forward: {} {} {}",
+            tunnel.forward.kind.name(),
+            tunnel.forward.kind.flag(),
+            tunnel.forward.spec()
+        ),
+    }
     .map_err(text)?;
     writeln!(output, "Status:  {status}").map_err(text)?;
     writeln!(output, "Command: {}", app.tunnel_command(tunnel).join(" ")).map_err(text)?;
@@ -253,10 +407,7 @@ fn pick_tunnel(
         .iter()
         .map(|report| Row {
             fields: vec![report.tunnel.name.clone(), report.tunnel.host.clone()],
-            extra: vec![
-                report.tunnel.forward.describe(),
-                report.status.name().into(),
-            ],
+            extra: vec![report.tunnel.describe(), report.status.name().into()],
         })
         .collect();
     Ok(picker
@@ -294,11 +445,14 @@ fn start<O: Write, E: Write>(
                 writeln!(output, "{name}: cancelled").map_err(text)?;
                 return Ok(ExitCode::from(CANCELLED));
             }
-            Ok(StartOutcome::Started { pid, .. }) => {
+            Ok(StartOutcome::Started { pid, warning }) => {
                 let line = app
                     .tunnel(name)
                     .map_or(name.clone(), |report| report.tunnel.to_string());
                 writeln!(output, "Started {line}, pid {pid}.").map_err(text)?;
+                if let Some(warning) = warning {
+                    writeln!(output, "Warning: {warning}").map_err(text)?;
+                }
             }
             Ok(StartOutcome::AlreadyRunning { pid }) => {
                 writeln!(output, "{name} is already running (pid {pid}).").map_err(text)?;
@@ -312,7 +466,10 @@ fn start<O: Write, E: Write>(
             }
             Err(refusal) => {
                 failed = true;
-                writeln!(error, "error: {refusal}").map_err(text)?;
+                let message = app_failure(error, refusal)?;
+                if !message.is_empty() {
+                    writeln!(error, "error: {message}").map_err(text)?;
+                }
             }
         }
         // A signal after this start finished leaves it standing but starts no other.
@@ -385,10 +542,23 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             print_report(output, app, &report)?;
             Ok(ExitCode::SUCCESS)
         }
-        TunnelCommand::Add { name, on, forward } => {
-            let forward = forward
-                .forward()?
-                .ok_or("give the forward: -L, -R or -D <spec>")?;
+        TunnelCommand::Add {
+            name,
+            on,
+            forward,
+            container,
+            backend,
+            port,
+            local_port,
+        } => {
+            let forward = forward.forward()?;
+            let listen = match (&container, port) {
+                (Some(_), Some(port)) => Some(container_listen(local_port, port)?),
+                _ => None,
+            };
+            if forward.is_none() && container.is_none() {
+                return Err("give the forward: -L, -R or -D <spec>, or --container <ref>".into());
+            }
             let Some(host) = host_argument(
                 on.flatten(),
                 app,
@@ -400,9 +570,27 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             else {
                 return Ok(ExitCode::from(CANCELLED));
             };
-            let tunnel = Tunnel::new(name, host, forward).map_err(text)?;
+            let tunnel = match (container, listen, port, forward) {
+                (Some(reference), Some(listen), Some(port), _) => {
+                    let (backend, reference) = match backend {
+                        Some(backend) => (BackendId::from(backend), reference),
+                        None => app
+                            .find_container(&host, &reference)
+                            .map_err(|failure| failed(error, failure))?,
+                    };
+                    let target = ContainerTarget {
+                        backend,
+                        reference,
+                        port,
+                    };
+                    Tunnel::to_container(name, host, listen, target).map_err(text)?
+                }
+                (_, _, _, Some(forward)) => Tunnel::new(name, host, forward).map_err(text)?,
+                _ => return Err("give --port, the port inside the container".into()),
+            };
             let line = tunnel.to_string();
-            app.add_tunnel(tunnel).map_err(text)?;
+            app.add_tunnel(tunnel)
+                .map_err(|failure| failed(error, failure))?;
             writeln!(output, "Added {line}.").map_err(text)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -411,6 +599,10 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
             new_name,
             on,
             forward,
+            container,
+            backend,
+            port,
+            address,
         } => {
             // The flags are checked before a tunnel is picked, so a mistake does not cost a pick.
             let forward = forward.forward()?;
@@ -436,6 +628,19 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
                     }
                 }
             };
+            let flags = ContainerFlags {
+                container,
+                backend: backend.map(BackendId::from),
+                port,
+                address,
+            };
+            let current = app.tunnel(&name).map_err(text)?.tunnel;
+            let through = host.clone().unwrap_or_else(|| current.host.clone());
+            let (forward, container) =
+                match container_change(app, &current, &through, flags, error)? {
+                    Some((changed, container)) => (changed.or(forward), Some(container)),
+                    None => (forward, None),
+                };
             let renamed = new_name.clone().unwrap_or_else(|| name.clone());
             app.edit_tunnel(
                 &name,
@@ -443,9 +648,10 @@ pub(super) fn run<I: BufRead, O: Write, E: Write>(
                     name: new_name,
                     host,
                     forward,
+                    container,
                 },
             )
-            .map_err(text)?;
+            .map_err(|failure| failed(error, failure))?;
             writeln!(output, "Updated {renamed}.").map_err(text)?;
             Ok(ExitCode::SUCCESS)
         }
