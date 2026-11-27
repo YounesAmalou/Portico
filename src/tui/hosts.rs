@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use std::path::Path;
 
-use crate::app::{HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget};
+use crate::app::{
+    ForwardTarget, HostDetails, HostInventory, HostSummary, Ownership, TestOutcome, TestTarget,
+};
 use crate::domain::discovery::DiscoveryWarning;
 use crate::domain::explain::Explanation;
 use crate::domain::host::Host;
@@ -307,6 +309,11 @@ impl UiState {
                 return self.connect_action(true);
             }
             KeyCode::Char('n') => return self.connect_action(true),
+            KeyCode::Char('f') => {
+                if let Some(alias) = self.selected_alias() {
+                    return self.open_forward(ForwardTarget::Host(alias.to_owned()));
+                }
+            }
             KeyCode::Char('r') | KeyCode::F(5) => return UiAction::Refresh,
             KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.test_selected();

@@ -24,6 +24,7 @@ mod containers;
 mod dropdown;
 mod events;
 mod form;
+mod forward;
 mod hangup;
 mod hosts;
 mod identities;
@@ -39,7 +40,10 @@ mod tunnels;
 mod watch;
 
 use crate::{
-    app::{App, AppError, HostDetails, HostInventory, HostSummary, Ownership, TestTarget},
+    app::{
+        App, AppError, ForwardTarget, HostDetails, HostInventory, HostSummary, Ownership,
+        TestTarget,
+    },
     backend::{AUTOMATIC, BackendId, Target},
     desktop::{
         DesktopEnv,
@@ -61,6 +65,7 @@ use containers::{
 };
 use events::{Step, TerminalEvents};
 use form::{FORM_FIELDS, FormState, IDENTITY_FILE, PROXY_JUMP};
+use forward::{ForwardDialog, Suggester};
 pub(crate) use hangup::read_event;
 use hangup::{HangupWatch, wait_for_enter};
 use hosts::{DetailsCache, PendingTrust, PerHost, TestMark, details_for_selected, render_hosts};
@@ -74,7 +79,7 @@ use terminal::{PanicHook, Signals, TerminalGuard, TerminalSession, suspended};
 use tester::{Job, Origin, Tester};
 pub(crate) use text_input::TextInput;
 use thiserror::Error;
-use tunnels::{Starter, TunnelAction, TunnelsScreen};
+use tunnels::{Finished, Starter, TunnelAction, TunnelsScreen};
 use watch::ConfigWatch;
 
 /// Longest quiet period after a selection change before the host is resolved.
@@ -191,6 +196,11 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             continue;
         }
         if let Event::Paste(text) = event {
+            if state.forward.is_some() {
+                state.paste_forward(&text);
+                redraw = true;
+                continue;
+            }
             if state.handle_paste(&text) == UiAction::FormEdited {
                 workers
                     .tester
@@ -221,6 +231,26 @@ fn browse_hosts<B: Backend<Error = io::Error>>(
             UiAction::Quit => return Ok(()),
             UiAction::Tunnels(action) => {
                 run_tunnel_action(app, &mut state, &mut workers.starter, action)
+            }
+            UiAction::OpenForward(target) => workers.suggester.request(target),
+            UiAction::CloseForward => workers.suggester.cancel(),
+            UiAction::Copy(text) => {
+                let status = match terminal::copy_osc52(&text) {
+                    Ok(()) => format!("copied {text}"),
+                    Err(error) => format!("could not copy {text}: {error}"),
+                };
+                if let Some(dialog) = &mut state.forward {
+                    dialog.set_status(status);
+                }
+            }
+            UiAction::OpenUrl(url) => {
+                let status = match crate::platform::launcher::open_url(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(error) => format!("could not open {url}: {error}"),
+                };
+                if let Some(dialog) = &mut state.forward {
+                    dialog.set_status(status);
+                }
             }
             UiAction::Connect {
                 alias,
@@ -483,8 +513,17 @@ fn on_tick(
     if state.in_form() {
         workers.indexer.request();
     }
-    if let Some((name, result)) = workers.starter.poll() {
-        state.tunnels.finish_start(&name, result);
+    if let Some(loaded) = workers.suggester.try_finished()
+        && let Some(dialog) = &mut state.forward
+    {
+        dialog.finish_loading(loaded);
+        redraw = true;
+    }
+    if let Some(finished) = workers.starter.poll() {
+        match finished {
+            Finished::Tunnel(name, result) => state.tunnels.finish_start(&name, result),
+            Finished::Forward(result) => state.finish_forward(result),
+        }
         state.tunnels.reload(app);
         redraw = true;
     }
@@ -523,6 +562,16 @@ fn run_tunnel_action(app: &App, state: &mut UiState, starter: &mut Starter, acti
         TunnelAction::Refresh => screen.set_status("Refreshed"),
         TunnelAction::Start(name) => {
             starter.start(name);
+            screen.set_starting(starter.running().map(str::to_owned));
+            return;
+        }
+        TunnelAction::Forward {
+            target,
+            reach,
+            remote,
+            local,
+        } => {
+            starter.forward(target, reach, remote, local);
             screen.set_starting(starter.running().map(str::to_owned));
             return;
         }
@@ -799,6 +848,7 @@ struct Workers {
     planner: Planner,
     indexer: Indexer,
     starter: Starter,
+    suggester: Suggester,
 }
 
 impl Workers {
@@ -813,6 +863,7 @@ impl Workers {
             planner: Planner::spawn(scope, app),
             indexer: Indexer::spawn(scope, app),
             starter: Starter::spawn(scope, app),
+            suggester: Suggester::spawn(scope, app),
         }
     }
 
@@ -832,6 +883,7 @@ impl Workers {
             || self.planner.is_running()
             || self.indexer.is_running()
             || self.starter.running().is_some()
+            || self.suggester.is_running()
     }
 }
 
@@ -1080,6 +1132,8 @@ struct UiState {
     /// Whether the settings file read at startup was valid: an invalid one is never written,
     /// so a shell's user is not remembered.
     settings_valid: bool,
+    /// The forward dialog, over the hosts or a container tab while it is open.
+    forward: Option<ForwardDialog>,
 }
 
 type TestResults = PerHost<TestMark>;
@@ -1128,6 +1182,14 @@ enum UiAction {
     Setting(Key),
     /// Runs a desktop integration action of the open overlay.
     Desktop(DesktopRun),
+    /// Asks for the suggestions of the forward dialog just opened for the target.
+    OpenForward(ForwardTarget),
+    /// The forward dialog closed: its suggestions are no longer wanted.
+    CloseForward,
+    /// Puts the text on the terminal's clipboard.
+    Copy(String),
+    /// Opens the URL in the browser.
+    OpenUrl(String),
 }
 
 impl UiState {
@@ -1170,6 +1232,7 @@ impl UiState {
             settings: None,
             settings_path: PathBuf::new(),
             settings_valid: false,
+            forward: None,
         }
     }
 
@@ -1268,6 +1331,9 @@ impl UiState {
         if self.mode == Mode::Settings {
             return self.handle_settings_key(key);
         }
+        if self.forward.is_some() {
+            return self.handle_forward_key(key);
+        }
         if let Some(action) = self.handle_tab_key(key) {
             return action;
         }
@@ -1301,6 +1367,17 @@ impl UiState {
                         self.containers.panel_mut(backend).choose_target(hosts);
                         UiAction::None
                     }
+                    PanelAction::Forward {
+                        target,
+                        backend,
+                        container,
+                        via,
+                    } => self.open_forward(ForwardTarget::Container {
+                        target,
+                        backend,
+                        container,
+                        via,
+                    }),
                     action => self.containers.after_key(backend, &before, action),
                 }
             }
@@ -1452,6 +1529,9 @@ fn render(frame: &mut Frame<'_>, state: &UiState) {
         }
         Tab::Containers(backend) => render_containers(frame, body, state, backend),
     }
+    if let Some(dialog) = &state.forward {
+        dialog.render(frame, body, &state.home);
+    }
     if let Some(overlay) = &state.settings {
         overlay.render(
             frame,
@@ -1588,7 +1668,7 @@ fn footer_text(state: &UiState) -> String {
             let containers = state.containers_hint();
             let tab_keys = state.tab_keys_hint();
             let connect = format!(
-                "{output}t test  Enter connect  {new_terminal}  {containers}{tab_keys}, settings  q quit"
+                "{output}t test  Enter connect  {new_terminal}  f forward  {containers}{tab_keys}, settings  q quit"
             );
             let clear_filter = if state.filter.is_empty() {
                 ""

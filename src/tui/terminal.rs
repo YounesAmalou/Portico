@@ -1,7 +1,8 @@
 //! The terminal session: raw mode, the alternate screen, signals and handing the terminal to a child.
 
 use std::{
-    io, panic,
+    io::{self, Write},
+    panic,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +26,44 @@ use ratatui::{Terminal, backend::Backend, layout::Rect};
 
 use super::TuiError;
 use crate::platform::process::HANGUP_SIGNALS;
+
+/// Puts `text` on the clipboard of the terminal Portico runs in, with the OSC 52 escape
+/// sequence: it reaches the local clipboard over ssh too, without a clipboard tool. A terminal
+/// that does not support it ignores the sequence.
+pub(super) fn copy_osc52(text: &str) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(osc52(text).as_bytes())?;
+    stdout.flush()
+}
+
+/// The OSC 52 sequence that sets the clipboard (`c`) to `text`.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text))
+}
+
+/// `text` in standard base64, padded with `=`.
+fn base64(text: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(text.len().div_ceil(3) * 4);
+    for chunk in text.as_bytes().chunks(3) {
+        let bytes = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let group = u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                encoded.push(char::from(
+                    ALPHABET[(group >> (18 - 6 * index) & 63) as usize],
+                ));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    encoded
+}
 
 /// Clears the alternate screen and forgets what was drawn, so the next frame repaints everything.
 ///
@@ -555,5 +594,19 @@ mod tests {
         draw(&mut terminal);
 
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "p");
+    }
+
+    #[test]
+    fn osc52_carries_the_text_in_base64() {
+        assert_eq!(base64("127.0.0.1:8080"), "MTI3LjAuMC4xOjgwODA=");
+        assert_eq!(base64(""), "");
+        assert_eq!(base64("f"), "Zg==");
+        assert_eq!(base64("fo"), "Zm8=");
+        assert_eq!(base64("foo"), "Zm9v");
+        assert_eq!(base64("\u{ff}\u{fe}"), "w7/Dvg==");
+        assert_eq!(
+            osc52("127.0.0.1:8080"),
+            "\x1b]52;c;MTI3LjAuMC4xOjgwODA=\x07"
+        );
     }
 }

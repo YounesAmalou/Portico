@@ -26,7 +26,8 @@ use super::{
     dropdown::{SUGGESTION_ROWS, Suggestions, suggestion_lines},
 };
 use crate::{
-    app::{App, AppError, Ownership, StartOutcome, TunnelChanges, TunnelRefusal},
+    app::{App, AppError, ForwardTarget, Ownership, StartOutcome, TunnelChanges, TunnelRefusal},
+    backend::Reach,
     domain::fuzzy,
     domain::suggest::{self, Candidate},
     domain::tunnel::{
@@ -182,6 +183,10 @@ enum Screen {
 
 /// What the screen asks the event loop to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one is made per key and handled at once; boxing the forward's target buys nothing"
+)]
 pub(super) enum TunnelAction {
     None,
     Quit,
@@ -195,6 +200,14 @@ pub(super) enum TunnelAction {
         changes: TunnelChanges,
     },
     Remove(String),
+    /// Starts a temporary forward from the forward dialog of the hosts or a container tab.
+    Forward {
+        target: ForwardTarget,
+        /// Where the container is reached, as its suggestions found it.
+        reach: Option<Reach>,
+        remote: u16,
+        local: Option<u16>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -228,7 +241,9 @@ const LOG_LINES: usize = 3;
 impl TunnelsScreen {
     /// Re-reads the tunnels, their statuses and the host aliases, keeping the selection.
     pub(super) fn reload(&mut self, app: &App) {
-        let selected = self.selected_name().map(str::to_owned);
+        // A tunnel waiting to be selected wins over the selection it replaces.
+        let selected =
+            (self.pending_select.take()).or_else(|| self.selected_name().map(str::to_owned));
         match app.tunnels() {
             Ok(reports) => {
                 self.extras = reports
@@ -365,6 +380,12 @@ impl TunnelsScreen {
         }
     }
 
+    /// Selects tunnel `name`, now if it is listed and otherwise once the list is next rebuilt.
+    pub(super) fn select_new(&mut self, name: &str) {
+        self.select(name);
+        self.pending_select = Some(name.to_owned());
+    }
+
     fn select(&mut self, name: &str) {
         if let Some(index) = self
             .reports
@@ -380,7 +401,7 @@ impl TunnelsScreen {
         self.selected.map(|index| &self.reports[index])
     }
 
-    fn selected_name(&self) -> Option<&str> {
+    pub(super) fn selected_name(&self) -> Option<&str> {
         self.selected().map(|report| report.tunnel.name.as_str())
     }
 
@@ -947,16 +968,39 @@ fn status_span(status: &TunnelStatus) -> Span<'static> {
     Span::styled(status.name(), style)
 }
 
+/// What the starter starts: a tunnel by its name, or a temporary forward.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one is sent per start; boxing the forward's target buys nothing"
+)]
+enum Job {
+    Tunnel(String),
+    Forward {
+        target: ForwardTarget,
+        reach: Option<Reach>,
+        remote: u16,
+        local: Option<u16>,
+    },
+}
+
 struct Request {
     generation: u64,
-    name: String,
+    job: Job,
     cancelled: Arc<AtomicBool>,
 }
 
 struct Delivered {
     generation: u64,
-    name: String,
-    result: Result<StartOutcome, String>,
+    finished: Finished,
+}
+
+/// A start's result.
+#[derive(Debug)]
+pub(super) enum Finished {
+    /// Tunnel `.0`'s start.
+    Tunnel(String, Result<StartOutcome, String>),
+    /// A temporary forward's start, with the forward it started under its name.
+    Forward(Result<(Tunnel, StartOutcome), String>),
 }
 
 /// Starts one tunnel at a time on a worker thread, with the scheme of the connection tester:
@@ -980,16 +1024,30 @@ impl Starter {
                 if request.cancelled.load(Ordering::Relaxed) {
                     continue;
                 }
-                let result = app
-                    .start_tunnel(&request.name, Some(&request.cancelled), true)
-                    .map_err(|error| error.to_string());
+                let cancelled = Some(request.cancelled.as_ref());
+                let finished = match request.job {
+                    Job::Tunnel(name) => {
+                        let result = app
+                            .start_tunnel(&name, cancelled, true)
+                            .map_err(|error| error.to_string());
+                        Finished::Tunnel(name, result)
+                    }
+                    Job::Forward {
+                        target,
+                        reach,
+                        remote,
+                        local,
+                    } => Finished::Forward(
+                        app.quick_forward(&target, reach.as_ref(), remote, local, cancelled, true)
+                            .map_err(|error| error.to_string()),
+                    ),
+                };
                 if request.cancelled.load(Ordering::Relaxed) {
                     continue;
                 }
                 let delivered = Delivered {
                     generation: request.generation,
-                    name: request.name,
-                    result,
+                    finished,
                 };
                 if sender.send(delivered).is_err() {
                     return;
@@ -1004,17 +1062,44 @@ impl Starter {
         }
     }
 
+    /// Starts tunnel `name`, cancelling the start still running.
     pub(super) fn start(&mut self, name: String) {
+        self.send(name.clone(), Job::Tunnel(name));
+    }
+
+    /// Starts a temporary forward to port `remote` of `target`, cancelling the start still
+    /// running.
+    pub(super) fn forward(
+        &mut self,
+        target: ForwardTarget,
+        reach: Option<Reach>,
+        remote: u16,
+        local: Option<u16>,
+    ) {
+        let shown = format!("a forward to {}:{remote}", target.label());
+        self.send(
+            shown,
+            Job::Forward {
+                target,
+                reach,
+                remote,
+                local,
+            },
+        );
+    }
+
+    /// Sends `job`, shown as `shown` while it runs.
+    fn send(&mut self, shown: String, job: Job) {
         self.cancel();
         self.generation += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         let request = Request {
             generation: self.generation,
-            name: name.clone(),
+            job,
             cancelled: Arc::clone(&cancelled),
         };
         if self.requests.send(request).is_ok() {
-            self.running = Some((name, cancelled));
+            self.running = Some((shown, cancelled));
         }
     }
 
@@ -1028,12 +1113,12 @@ impl Starter {
         self.running.as_ref().map(|(name, _)| name.as_str())
     }
 
-    pub(super) fn poll(&mut self) -> Option<(String, Result<StartOutcome, String>)> {
+    pub(super) fn poll(&mut self) -> Option<Finished> {
         let mut current = None;
         while let Ok(delivered) = self.results.try_recv() {
             if self.running.is_some() && delivered.generation == self.generation {
                 self.running = None;
-                current = Some((delivered.name, delivered.result));
+                current = Some(delivered.finished);
             }
         }
         current

@@ -1,4 +1,5 @@
-//! Running a terminal launcher: a program that opens a command in a new terminal window.
+//! Running a terminal launcher: a program that opens a command in a new terminal window; and
+//! running the system's opener on a URL.
 
 use std::{
     ffi::OsString,
@@ -59,4 +60,19 @@ pub fn run(launcher: &Path, command: &[OsString]) -> io::Result<Launch> {
             }
         }
     }
+}
+
+/// Runs `program` with `args` and null stdio without waiting for it: an opener hands its work
+/// to the desktop and its exit tells nothing more. A thread reaps it once it exits.
+pub fn spawn_detached(program: &str, args: &[&str]) -> io::Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }

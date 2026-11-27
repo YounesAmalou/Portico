@@ -10,12 +10,17 @@ use std::{
 };
 
 use super::super::{
-    common::launcher::{Launch, run},
+    common::launcher::{Launch, run, spawn_detached},
     unix::fs::write_unique,
 };
 
 /// The launcher run when none is configured: `open(1)`, which Portico drives itself.
 pub const DEFAULT_LAUNCHER: &str = "open";
+
+/// Opens `url` in the default browser with `open(1)`, without waiting for it.
+pub fn open_url(url: &str) -> io::Result<()> {
+    spawn_detached("open", &[url])
+}
 
 /// A terminal application Portico knows how to hand a command to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
