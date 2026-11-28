@@ -7,6 +7,24 @@ may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-28
+
+### Added
+
+- Forward to a container or CT by name, following it across redeploys ([#89](https://github.com/YounesAmalou/Portico/pull/89))
+- Forward a port of a host, container or CT in one step ([#88](https://github.com/YounesAmalou/Portico/pull/88))
+- Add macOS menu bar and Windows tray apps, installed by portico desktop ([#87](https://github.com/YounesAmalou/Portico/pull/87))
+- Support Windows, with winget and release builds for x64 and arm64 ([#86](https://github.com/YounesAmalou/Portico/pull/86))
+- Remember the user of each container's shell in the TUI ([#85](https://github.com/YounesAmalou/Portico/pull/85))
+- Add a settings overlay and preferences file to hide tabs and manage the desktop integration ([#84](https://github.com/YounesAmalou/Portico/pull/84))
+- Support macOS, with Homebrew and release builds for Apple silicon and Intel ([#82](https://github.com/YounesAmalou/Portico/pull/82))
+- Open shells in Podman containers, with a TUI tab per container backend ([#83](https://github.com/YounesAmalou/Portico/pull/83))
+- Open shells in Proxmox VE containers, listed like Docker containers ([#81](https://github.com/YounesAmalou/Portico/pull/81))
+
+### Changed
+
+- Split Portico into platform, domain, backend and interface layers ([#78](https://github.com/YounesAmalou/Portico/pull/78))
+
 ## [0.7.0] - 2026-10-21
 
 ### Added
