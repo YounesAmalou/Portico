@@ -174,9 +174,40 @@ pub fn resolve<'a>(
     reference: &str,
     containers: &'a [Container],
 ) -> Result<&'a Container, ResolveError> {
+    pick(candidates(reference, containers))
+}
+
+/// As `resolve`, except that when every match is a replica of one Compose
+/// service (one `project` and `service`) it returns the lowest replica
+/// number, a container without a number sorting last. Matches spread over
+/// several projects or services stay ambiguous.
+pub fn resolve_lowest<'a>(
+    reference: &str,
+    containers: &'a [Container],
+) -> Result<&'a Container, ResolveError> {
+    let mut found = candidates(reference, containers);
+    let one_service = found.first().is_some_and(|first| {
+        first.project.is_some()
+            && first.service.is_some()
+            && found
+                .iter()
+                .all(|c| c.project == first.project && c.service == first.service)
+    });
+    if found.len() > 1 && one_service {
+        found.sort_by(|a, b| {
+            let rank = |c: &Container| (c.number.is_none(), c.number, c.name.clone());
+            rank(a).cmp(&rank(b))
+        });
+        found.truncate(1);
+    }
+    pick(found)
+}
+
+/// The containers matched by the first form of `reference` that matches any.
+fn candidates<'a>(reference: &str, containers: &'a [Container]) -> Vec<&'a Container> {
     let by_name = matching(containers, |c| c.name == reference);
     if !by_name.is_empty() {
-        return pick(by_name);
+        return by_name;
     }
     if let Some((project, rest)) = reference.split_once('/') {
         let (service, number) = match rest.split_once('#') {
@@ -190,12 +221,12 @@ pub fn resolve<'a>(
                 && (!wants_number || (number.is_some() && c.number == number))
         });
         if !found.is_empty() {
-            return pick(found);
+            return found;
         }
     }
     let by_service = matching(containers, |c| c.service.as_deref() == Some(reference));
     if !by_service.is_empty() {
-        return pick(by_service);
+        return by_service;
     }
     // `service#n`, as `display_name` shows a replica.
     if let Some((service, number)) = reference.split_once('#')
@@ -205,19 +236,19 @@ pub fn resolve<'a>(
             c.service.as_deref() == Some(service) && c.number == Some(number)
         });
         if !found.is_empty() {
-            return pick(found);
+            return found;
         }
     }
     let by_id = matching(containers, |c| c.id == reference);
     if !by_id.is_empty() {
-        return pick(by_id);
+        return by_id;
     }
     let is_id_prefix = reference.len() >= 4 && reference.chars().all(|c| c.is_ascii_hexdigit());
     if is_id_prefix {
         let prefix = reference.to_ascii_lowercase();
-        return pick(matching(containers, |c| c.id.starts_with(&prefix)));
+        return matching(containers, |c| c.id.starts_with(&prefix));
     }
-    Err(ResolveError::NotFound)
+    Vec::new()
 }
 
 fn matching(containers: &[Container], test: impl Fn(&Container) -> bool) -> Vec<&Container> {
@@ -428,6 +459,33 @@ mod tests {
             container("shop-db-1", Some("shop"), Some("db"), 1),
         ];
         assert_eq!(resolved("db", &all), Ok("shop-db-1"));
+    }
+
+    #[test]
+    fn resolve_lowest_takes_the_lowest_replica_of_one_service() {
+        let all = vec![
+            container("shop-api-2", Some("shop"), Some("api"), 2),
+            container("shop-api-1", Some("shop"), Some("api"), 1),
+        ];
+        let name = |r: &str| resolve_lowest(r, &all).map(|c| c.name.as_str());
+        assert_eq!(name("shop/api"), Ok("shop-api-1"));
+        assert_eq!(name("api"), Ok("shop-api-1"));
+        assert_eq!(name("shop/api#2"), Ok("shop-api-2"));
+        assert_eq!(name("nope"), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn resolve_lowest_keeps_other_ambiguity_and_plain_names() {
+        let all = vec![
+            container("shop-web-1", Some("shop"), Some("web"), 1),
+            container("blog-web-1", Some("blog"), Some("web"), 1),
+            container("cache", None, None, 0),
+        ];
+        assert_eq!(
+            resolve_lowest("web", &all).map(|c| c.name.as_str()),
+            ambiguous(&["blog-web-1", "shop-web-1"])
+        );
+        assert_eq!(resolve_lowest("cache", &all).unwrap().name, "cache");
     }
 
     #[test]

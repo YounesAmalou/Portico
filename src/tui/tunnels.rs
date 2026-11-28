@@ -30,12 +30,12 @@ use crate::{
         App, AppError, ForwardTarget, Ownership, SaveOutcome, StartOutcome, TunnelChanges,
         TunnelRefusal,
     },
-    backend::Reach,
+    backend::{AUTOMATIC, BackendId, Reach},
     domain::fuzzy,
     domain::suggest::{self, Candidate},
     domain::tunnel::{
-        Forward, Kind, Tunnel, TunnelError, TunnelField, TunnelReport, TunnelStatus, collisions,
-        printable, saved_name_for,
+        ContainerTarget, Forward, Kind, Tunnel, TunnelError, TunnelField, TunnelReport,
+        TunnelStatus, collisions, printable, saved_name_for,
     },
     picker::HIT,
 };
@@ -44,7 +44,7 @@ use crate::{
 pub(super) const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// The form's rows, in order.
-const FIELDS: [(TunnelField, &str, &str, &str); 7] = [
+const FIELDS: [(TunnelField, &str, &str, &str); 9] = [
     (
         TunnelField::Name,
         "Name",
@@ -56,6 +56,18 @@ const FIELDS: [(TunnelField, &str, &str, &str); 7] = [
         "Host",
         "prod-db",
         "The host the tunnel goes through, as you would type it after ssh. Known aliases are suggested as you type; Ctrl+Space lists them.",
+    ),
+    (
+        TunnelField::Container,
+        "Container",
+        "",
+        "A container or Proxmox CT on the host, as the pickers name it (shop/api, web, 101): its address is looked up at every start. Leave empty for an address.",
+    ),
+    (
+        TunnelField::Backend,
+        "Backend",
+        "",
+        "The tool that runs the container. Space or ←→ changes it.",
     ),
     (
         TunnelField::Kind,
@@ -89,15 +101,30 @@ const FIELDS: [(TunnelField, &str, &str, &str); 7] = [
     ),
 ];
 
-const KIND: usize = 2;
+/// Target port's label, placeholder and help while the form names a container.
+const PORT_INSIDE: (&str, &str, &str) = (
+    "Port inside",
+    "80",
+    "The port the container's app listens on, from 1 through 65535.",
+);
+
 const HOST: usize = 1;
+const CONTAINER: usize = 2;
+const BACKEND: usize = 3;
+const KIND: usize = 4;
+const BIND_ADDRESS: usize = 5;
+const BIND_PORT: usize = 6;
+const TARGET_HOST: usize = 7;
+const TARGET_PORT: usize = 8;
 
 #[derive(Clone, Debug, Default)]
 struct TunnelForm {
     /// The saved name when editing.
     editing: Option<String>,
-    values: [TextInput; 7],
+    values: [TextInput; 9],
     kind: Option<Kind>,
+    /// The backend of the container, when Container is filled.
+    backend: BackendId,
     active: usize,
     error: Option<(TunnelField, String)>,
     /// The dropdown under Host, while it is open.
@@ -105,23 +132,35 @@ struct TunnelForm {
 }
 
 impl TunnelForm {
+    /// The forward's kind: always local for a container.
     fn kind(&self) -> Kind {
-        self.kind.unwrap_or(Kind::Local)
+        if self.names_container() {
+            Kind::Local
+        } else {
+            self.kind.unwrap_or(Kind::Local)
+        }
+    }
+
+    /// Whether the tunnel reaches a container: Container is filled.
+    fn names_container(&self) -> bool {
+        !self.value(CONTAINER).is_empty()
     }
 
     fn for_tunnel(tunnel: &Tunnel) -> Self {
         let forward = &tunnel.forward;
-        let (target_host, target_port) = forward
-            .destination
-            .as_ref()
-            .map_or((String::new(), String::new()), |destination| {
-                (destination.host.clone(), destination.port.to_string())
-            });
+        let (target_host, target_port) = match (&tunnel.container, &forward.destination) {
+            (Some(target), _) => (String::new(), target.port.to_string()),
+            (None, Some(destination)) => (destination.host.clone(), destination.port.to_string()),
+            (None, None) => (String::new(), String::new()),
+        };
+        let container = tunnel.container.as_ref();
         Self {
             editing: Some(tunnel.name.clone()),
             values: [
                 TextInput::new(&tunnel.name),
                 TextInput::new(&tunnel.host),
+                TextInput::new(container.map_or("", |target| target.reference.as_str())),
+                TextInput::new(""),
                 TextInput::new(""),
                 TextInput::new(forward.bind_address.as_deref().unwrap_or_default()),
                 TextInput::new(&forward.bind_port.to_string()),
@@ -129,17 +168,34 @@ impl TunnelForm {
                 TextInput::new(&target_port),
             ],
             kind: Some(forward.kind),
+            backend: container.map(|target| target.backend).unwrap_or_default(),
             active: 0,
             error: None,
             suggestions: None,
         }
     }
 
-    /// The rows shown: a dynamic forward has no target.
+    /// The rows shown: Backend only for a container, which has no target host; a dynamic
+    /// forward has no target.
     fn rows(&self) -> Vec<usize> {
+        let container = self.names_container();
         (0..FIELDS.len())
-            .filter(|&row| self.kind() != Kind::Dynamic || row < 5)
+            .filter(|&row| match row {
+                BACKEND => container,
+                TARGET_HOST => !container && self.kind() != Kind::Dynamic,
+                TARGET_PORT => self.kind() != Kind::Dynamic,
+                _ => true,
+            })
             .collect()
+    }
+
+    /// A row's label, placeholder and help, as the form shows them now.
+    fn texts(&self, row: usize) -> (&'static str, &'static str, &'static str) {
+        if row == TARGET_PORT && self.names_container() {
+            return PORT_INSIDE;
+        }
+        let (_, label, placeholder, help) = FIELDS[row];
+        (label, placeholder, help)
     }
 
     fn step(&mut self, by: isize) {
@@ -153,26 +209,61 @@ impl TunnelForm {
         self.values[row].as_str()
     }
 
+    /// The forward; a container's listens as typed and goes to the port inside, the
+    /// destination host standing in until the tunnel names its container.
     fn forward(&self) -> Result<Forward, TunnelError> {
+        let target_host = if self.names_container() {
+            "localhost"
+        } else {
+            self.value(TARGET_HOST)
+        };
         Forward::from_fields(
             self.kind(),
-            self.value(3),
-            self.value(4),
-            self.value(5),
-            self.value(6),
+            self.value(BIND_ADDRESS),
+            self.value(BIND_PORT),
+            target_host,
+            self.value(TARGET_PORT),
         )
     }
 
     fn build(&self) -> Result<Tunnel, TunnelError> {
-        Tunnel::new(self.value(0), self.value(1), self.forward()?)
+        let forward = self.forward()?;
+        if !self.names_container() {
+            return Tunnel::new(self.value(0), self.value(HOST), forward);
+        }
+        let target = ContainerTarget {
+            backend: self.backend,
+            reference: self.value(CONTAINER).to_owned(),
+            port: forward
+                .destination
+                .as_ref()
+                .map_or(0, |destination| destination.port),
+        };
+        Tunnel::to_container(self.value(0), self.value(HOST), forward, target)
     }
 
     fn cycle_kind(&mut self, by: isize) {
+        if self.names_container() {
+            return;
+        }
         let at = Kind::ALL
             .iter()
             .position(|kind| *kind == self.kind())
             .unwrap_or(0) as isize;
         self.kind = Some(Kind::ALL[(at + by).rem_euclid(3) as usize]);
+    }
+
+    fn cycle_backend(&mut self, by: isize) {
+        let at = AUTOMATIC
+            .iter()
+            .position(|backend| *backend == self.backend)
+            .unwrap_or(0) as isize;
+        self.backend = AUTOMATIC[(at + by).rem_euclid(AUTOMATIC.len() as isize) as usize];
+    }
+
+    /// Whether the active row is a chooser rather than a text field.
+    fn on_chooser(&self) -> bool {
+        matches!(self.active, KIND | BACKEND)
     }
 }
 
@@ -348,7 +439,12 @@ impl TunnelsScreen {
     pub(super) fn finish_start(&mut self, name: &str, result: Result<StartOutcome, String>) {
         self.starting = None;
         self.status = Some(match result {
-            Ok(StartOutcome::Started { pid }) => format!("Started {name} (pid {pid})"),
+            Ok(StartOutcome::Started { pid, warning }) => {
+                let warning = warning.map_or(String::new(), |warning| {
+                    format!("; {}", printable(&warning))
+                });
+                format!("Started {name} (pid {pid}){warning}")
+            }
             Ok(StartOutcome::AlreadyRunning { pid }) => {
                 format!("{name} is already running (pid {pid})")
             }
@@ -401,7 +497,13 @@ impl TunnelsScreen {
                 let name = outcome.tunnel.name;
                 let mut status = format!("saved {}", printable(&name));
                 match outcome.restarted {
-                    Some(StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. }) => {
+                    Some(StartOutcome::Started { warning, .. }) => {
+                        status.push_str("; restarted it (connections through it were interrupted)");
+                        if let Some(warning) = warning {
+                            status.push_str(&format!("; {}", printable(&warning)));
+                        }
+                    }
+                    Some(StartOutcome::AlreadyRunning { .. }) => {
                         status.push_str("; restarted it (connections through it were interrupted)");
                     }
                     Some(StartOutcome::Failed { reason, .. }) => {
@@ -599,7 +701,7 @@ impl TunnelsScreen {
                 self.refilter();
             }
             Screen::SaveName => self.save_name.paste(text),
-            Screen::Form if self.form.active != KIND => {
+            Screen::Form if !self.form.on_chooser() => {
                 let field = FIELDS[self.form.active].0;
                 let text: String = text.chars().filter(|c| field.permits(*c)).collect();
                 let before = self.form.value(self.form.active).to_owned();
@@ -745,6 +847,8 @@ impl TunnelsScreen {
             KeyCode::Down | KeyCode::Tab => form.step(1),
             KeyCode::Left if form.active == KIND => form.cycle_kind(-1),
             KeyCode::Right | KeyCode::Char(' ') if form.active == KIND => form.cycle_kind(1),
+            KeyCode::Left if form.active == BACKEND => form.cycle_backend(-1),
+            KeyCode::Right | KeyCode::Char(' ') if form.active == BACKEND => form.cycle_backend(1),
             KeyCode::Enter => {
                 form.error = None;
                 return match form.build() {
@@ -755,6 +859,9 @@ impl TunnelsScreen {
                                 name: Some(tunnel.name),
                                 host: Some(tunnel.host),
                                 forward: Some(tunnel.forward),
+                                // Always said, so a container tunnel keeps or changes its
+                                // container and an address one stays or becomes one.
+                                container: Some(tunnel.container),
                             },
                         },
                         None => TunnelAction::Add(tunnel),
@@ -768,7 +875,7 @@ impl TunnelsScreen {
                     }
                 };
             }
-            _ if form.active != KIND => {
+            _ if !form.on_chooser() => {
                 let field = FIELDS[form.active].0;
                 let input = &mut form.values[form.active];
                 let before = input.clone();
@@ -849,7 +956,9 @@ impl TunnelsScreen {
             }
             Screen::Form => {
                 let special = match self.form.active {
+                    KIND if self.form.names_container() => "",
                     KIND => "  Space/←→ change kind",
+                    BACKEND => "  Space/←→ change backend",
                     HOST => "  Ctrl+Space suggest",
                     _ => "",
                 };
@@ -1075,12 +1184,20 @@ impl TunnelsScreen {
             Line::raw(format!("Name:    {}{temporary}", printable(&tunnel.name))),
             Line::raw(format!("Reaches: {}", printable(&report.reaches))),
             Line::raw(format!("Host:    {}", tunnel.host)),
-            Line::raw(format!(
-                "Forward: {} {} {}",
-                tunnel.forward.kind.name(),
-                tunnel.forward.kind.flag(),
-                tunnel.forward.spec()
-            )),
+            Line::raw(match &tunnel.container {
+                // A container's address is looked up at each start: the target names it.
+                Some(_) => format!(
+                    "Forward: {} {}",
+                    tunnel.forward.kind.name(),
+                    printable(&tunnel.describe())
+                ),
+                None => format!(
+                    "Forward: {} {} {}",
+                    tunnel.forward.kind.name(),
+                    tunnel.forward.kind.flag(),
+                    tunnel.forward.spec()
+                ),
+            }),
             Line::from(status),
         ];
         if let Some((command, _)) = self.selected.and_then(|index| self.extras.get(index)) {
@@ -1114,20 +1231,27 @@ impl TunnelsScreen {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let mut lines = Vec::new();
         for row in form.rows() {
-            let (field, label, placeholder, _) = FIELDS[row];
+            let field = FIELDS[row].0;
+            let (label, placeholder, _) = form.texts(row);
             let focused = row == form.active;
             let mut spans = vec![Span::raw(format!(
                 "{} {label}: ",
                 if focused { '>' } else { ' ' }
             ))];
-            if row == KIND {
+            let chosen = Style::default().add_modifier(Modifier::REVERSED);
+            if row == KIND && form.names_container() {
+                // A container is reached by a local forward; there is nothing to choose.
+                spans.push(Span::styled(Kind::Local.name(), chosen));
+            } else if row == KIND {
                 for kind in Kind::ALL {
-                    let style = if kind == form.kind() {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        dim
-                    };
+                    let style = if kind == form.kind() { chosen } else { dim };
                     spans.push(Span::styled(kind.name(), style));
+                    spans.push(Span::raw(" "));
+                }
+            } else if row == BACKEND {
+                for backend in AUTOMATIC {
+                    let style = if backend == form.backend { chosen } else { dim };
+                    spans.push(Span::styled(backend.as_str(), style));
                     spans.push(Span::raw(" "));
                 }
             } else {
@@ -1156,13 +1280,14 @@ impl TunnelsScreen {
                     .clamp(1, SUGGESTION_ROWS);
                 lines.extend(suggestion_lines(list, label, &self.home, width, rows));
             }
-            if row == 4
+            if row == BIND_PORT
                 && let Ok(forward) = form.forward()
             {
                 let tunnel = Tunnel {
                     name: form.value(0).to_owned(),
                     host: form.value(1).to_owned(),
                     forward,
+                    container: None,
                 };
                 let saved: Vec<Tunnel> = self
                     .reports
@@ -1185,7 +1310,7 @@ impl TunnelsScreen {
             }
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(FIELDS[form.active].3, dim));
+        lines.push(Line::styled(form.texts(form.active).2, dim));
         if let Some((field, error)) = &form.error
             && !form.rows().iter().any(|&row| FIELDS[row].0 == *field)
         {
@@ -1396,7 +1521,7 @@ impl Drop for Starter {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::domain::tunnel::TunnelWarning;
+    use crate::domain::tunnel::{ContainerTarget, TunnelWarning};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1472,6 +1597,22 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_start_warning_is_appended_to_the_status_line() {
+        let mut screen = screen_with(vec![report("db", TunnelStatus::Stopped)]);
+        screen.finish_start(
+            "db",
+            Ok(StartOutcome::Started {
+                pid: 4,
+                warning: Some("started, but nothing answers\u{1b}[31m".into()),
+            }),
+        );
+        assert_eq!(
+            screen.status_line().as_deref(),
+            Some("Started db (pid 4); started, but nothing answers")
+        );
+    }
+
+    #[test]
     fn a_start_in_progress_shows_and_esc_cancels_it() {
         let mut screen = screen_with(vec![report("db", TunnelStatus::Stopped)]);
         screen.set_starting(Some("db".into()));
@@ -1531,16 +1672,27 @@ pub(super) mod tests {
             "a pick closes the dropdown"
         );
         screen.handle_key(key(KeyCode::Tab));
-        assert_eq!(screen.form.active, KIND, "Tab without a dropdown moves on");
+        assert_eq!(
+            screen.form.active, CONTAINER,
+            "Tab without a dropdown moves on"
+        );
+        screen.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            screen.form.active, KIND,
+            "Backend is hidden without a container"
+        );
         screen.handle_key(key(KeyCode::Char(' ')));
         screen.handle_key(key(KeyCode::Right));
         assert_eq!(screen.form.kind(), Kind::Dynamic);
-        assert_eq!(screen.form.rows(), [0, 1, 2, 3, 4]);
+        assert_eq!(
+            screen.form.rows(),
+            [0, HOST, CONTAINER, KIND, BIND_ADDRESS, BIND_PORT]
+        );
         screen.handle_key(key(KeyCode::Down));
         screen.handle_key(key(KeyCode::Down));
         type_text(&mut screen, "10x80");
         assert_eq!(
-            screen.form.value(4),
+            screen.form.value(BIND_PORT),
             "1080",
             "a letter is refused in a port"
         );
@@ -1566,7 +1718,7 @@ pub(super) mod tests {
             screen.form.error.as_ref().map(|error| error.0),
             Some(TunnelField::BindPort)
         );
-        assert_eq!(screen.form.active, 4);
+        assert_eq!(screen.form.active, BIND_PORT);
         screen.finish_change(
             Err(AppError::Tunnel(TunnelRefusal::UnknownHost {
                 name: "db".into(),
@@ -1586,7 +1738,7 @@ pub(super) mod tests {
         let mut screen = screen_with(vec![report("db", TunnelStatus::Stopped)]);
         screen.handle_key(key(KeyCode::Char('e')));
         assert_eq!(screen.form.editing.as_deref(), Some("db"));
-        assert_eq!(screen.form.value(4), "5432");
+        assert_eq!(screen.form.value(BIND_PORT), "5432");
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(&action, TunnelAction::Edit { name, changes } if name == "db" && changes.name.as_deref() == Some("db")),
@@ -1766,6 +1918,7 @@ pub(super) mod tests {
                 name: name.into(),
                 host: "prod".into(),
                 forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                container: None,
             },
             status,
             warnings: Vec::new(),
@@ -1786,6 +1939,7 @@ pub(super) mod tests {
                     bind_port: 0,
                     destination: None,
                 },
+                container: None,
             },
             status: TunnelStatus::Failed {
                 reason: "exited".into(),
@@ -1906,7 +2060,7 @@ pub(super) mod tests {
         .unwrap();
         screen.finish_save(Ok(SaveOutcome {
             tunnel: saved.clone(),
-            restarted: Some(StartOutcome::Started { pid: 9 }),
+            restarted: Some(StartOutcome::Started { pid: 9, warning: None }),
             note: Some("saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated".into()),
             cancelled: false,
         }));
@@ -2089,5 +2243,205 @@ pub(super) mod tests {
         screen.handle_key(key(KeyCode::BackTab));
         assert!(screen.form.suggestions.is_none());
         assert_eq!(screen.form.active, 0);
+    }
+
+    fn container_report(name: &str, backend: BackendId, status: TunnelStatus) -> TunnelReport {
+        let target = ContainerTarget {
+            backend,
+            reference: "shop/api".into(),
+            port: 80,
+        };
+        TunnelReport {
+            tunnel: Tunnel::to_container(
+                name,
+                "prod",
+                Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                target,
+            )
+            .unwrap(),
+            status,
+            warnings: Vec::new(),
+            temporary: false,
+            reaches: "shop/api on prod".into(),
+        }
+    }
+
+    fn form_text(screen: &TunnelsScreen) -> Vec<String> {
+        screen
+            .form_lines(80, 40)
+            .iter()
+            .map(Line::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_container_hides_the_target_host_and_is_saved() {
+        let mut screen = screen_with(Vec::new());
+        screen.handle_key(key(KeyCode::Char('a')));
+        type_text(&mut screen, "api");
+        screen.handle_key(key(KeyCode::Down));
+        type_text(&mut screen, "prod");
+        assert!(
+            screen.form.suggestions.is_none(),
+            "an exact match closes it"
+        );
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(screen.form.active, CONTAINER);
+        assert!(
+            !screen.form.rows().contains(&BACKEND),
+            "no backend without a container"
+        );
+        type_text(&mut screen, "shop/api");
+        assert!(!screen.form.rows().contains(&TARGET_HOST));
+        assert!(screen.form.rows().contains(&BACKEND));
+        let text = form_text(&screen);
+        assert!(
+            text.iter().any(|line| line.contains("Port inside")),
+            "{text:?}"
+        );
+        assert!(!text.iter().any(|line| line.contains("Target host")));
+        assert!(text.iter().any(|line| line.contains("Backend: docker")));
+        // Backend, Kind, Bind address, Bind port.
+        for _ in 0..4 {
+            screen.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(screen.form.active, BIND_PORT);
+        type_text(&mut screen, "8080");
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(screen.form.active, TARGET_PORT, "Target host is skipped");
+        type_text(&mut screen, "80");
+        let action = screen.handle_key(key(KeyCode::Enter));
+        let TunnelAction::Add(tunnel) = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(
+            tunnel.container,
+            Some(ContainerTarget {
+                backend: BackendId::Docker,
+                reference: "shop/api".into(),
+                port: 80,
+            })
+        );
+        assert_eq!(tunnel.forward.kind, Kind::Local);
+        assert_eq!(tunnel.forward.bind_port, 8080);
+    }
+
+    #[test]
+    fn space_cycles_the_backend_and_leaves_a_container_tunnel_local() {
+        let mut screen = screen_with(Vec::new());
+        screen.handle_key(key(KeyCode::Char('a')));
+        screen.form.active = CONTAINER;
+        type_text(&mut screen, "web");
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(screen.form.active, BACKEND);
+        assert!(screen.footer().contains("change backend"));
+        screen.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(screen.form.backend, BackendId::Podman);
+        screen.handle_key(key(KeyCode::Right));
+        assert_eq!(screen.form.backend, BackendId::Proxmox);
+        screen.handle_key(key(KeyCode::Right));
+        assert_eq!(screen.form.backend, BackendId::Docker);
+        screen.handle_key(key(KeyCode::Left));
+        assert_eq!(screen.form.backend, BackendId::Proxmox);
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(screen.form.active, KIND);
+        screen.handle_key(key(KeyCode::Char(' ')));
+        screen.handle_key(key(KeyCode::Right));
+        assert_eq!(screen.form.kind(), Kind::Local, "Kind is fixed to local");
+        let text = form_text(&screen);
+        assert!(
+            text.iter()
+                .any(|line| line.trim_end().ends_with("Kind: local")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn editing_a_container_tunnel_prefills_it_and_keeps_its_container() {
+        let mut screen = screen_with(vec![container_report(
+            "api",
+            BackendId::Podman,
+            TunnelStatus::Stopped,
+        )]);
+        screen.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(screen.form.value(CONTAINER), "shop/api");
+        assert_eq!(screen.form.backend, BackendId::Podman);
+        assert_eq!(screen.form.value(BIND_ADDRESS), "127.0.0.1");
+        assert_eq!(screen.form.value(BIND_PORT), "8080");
+        assert_eq!(screen.form.value(TARGET_PORT), "80");
+        assert!(!screen.form.rows().contains(&TARGET_HOST));
+        type_text(&mut screen, "2");
+        let action = screen.handle_key(key(KeyCode::Enter));
+        let TunnelAction::Edit { name, changes } = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(name, "api");
+        assert_eq!(changes.name.as_deref(), Some("api2"));
+        assert_eq!(
+            changes.container,
+            Some(Some(ContainerTarget {
+                backend: BackendId::Podman,
+                reference: "shop/api".into(),
+                port: 80,
+            }))
+        );
+    }
+
+    #[test]
+    fn clearing_the_container_restores_an_address_form() {
+        let mut screen = screen_with(vec![container_report(
+            "api",
+            BackendId::Docker,
+            TunnelStatus::Stopped,
+        )]);
+        screen.handle_key(key(KeyCode::Char('e')));
+        screen.form.active = CONTAINER;
+        for _ in 0.."shop/api".len() {
+            screen.handle_key(key(KeyCode::Backspace));
+        }
+        assert_eq!(screen.form.value(CONTAINER), "");
+        assert!(screen.form.rows().contains(&TARGET_HOST));
+        assert!(!screen.form.rows().contains(&BACKEND));
+        let text = form_text(&screen);
+        assert!(text.iter().any(|line| line.contains("Target port")));
+        assert!(!text.iter().any(|line| line.contains("Port inside")));
+        screen.form.active = TARGET_HOST;
+        type_text(&mut screen, "db");
+        let action = screen.handle_key(key(KeyCode::Enter));
+        let TunnelAction::Edit { changes, .. } = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(changes.container, Some(None));
+        assert_eq!(changes.forward.unwrap().spec(), "127.0.0.1:8080:db:80");
+    }
+
+    #[test]
+    fn details_show_a_container_target_and_the_nothing_answers_warning() {
+        let mut running = container_report(
+            "api",
+            BackendId::Docker,
+            TunnelStatus::Running { pid: 7, started: 0 },
+        );
+        running.warnings.push(TunnelWarning::NothingAnswers {
+            port: 80,
+            reference: "shop/api".into(),
+        });
+        let screen = screen_with(vec![running]);
+        let text: Vec<String> = screen
+            .detail_lines()
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(
+            text.contains(
+                &"Forward: local 127.0.0.1:8080 \u{2192} shop/api:80 (docker)".to_owned()
+            ),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line
+                .starts_with("Warning: started, but nothing answers on port 80 inside shop/api")),
+            "{text:?}"
+        );
     }
 }

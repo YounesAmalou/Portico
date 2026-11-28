@@ -14,7 +14,7 @@ Portico manages hosts, adopts existing ones from your own SSH configuration, tes
 - Tests on demand whether a host's login works, without opening a shell.
 - Shows which identities each host offers (key files, agent keys, including 1Password's SSH agent) and whether each is available, without ever reading a private key.
 - Lists the running Docker and Podman containers on this machine or a host, grouped by Compose project, and a Proxmox VE node's LXC containers, and opens a shell in one.
-- Saves port forwards as named tunnels and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
+- Saves port forwards as named tunnels, to an address or to a container whose address is looked up at every start, and starts or stops them on demand, as ordinary `ssh` processes that keep running after Portico exits.
 - Forwards a port of a host, container or Proxmox CT to `127.0.0.1` in one step, suggesting the ports it listens on, as a temporary forward you can keep as a tunnel.
 - Prints one versioned JSON document per command for scripts and desktop panels.
 - Comes with a desktop panel for Quickshell and Omarchy (Linux), a menu bar app (macOS) and a tray app (Windows) to open hosts and container shells in a new terminal and to start and stop tunnels.
@@ -182,7 +182,10 @@ portico forward [<container>] [--on [<alias>]] [--backend docker|podman|proxmox]
 portico tunnels                 List tunnels and temporary forwards, and their status
 portico tunnel add <name> --on [<alias>] (-L|-R|-D) <spec>
                                 Save a tunnel
+portico tunnel add <name> --on [<alias>] --container <ref> [--backend docker|podman|proxmox] --port <inside> [--local <port>]
+                                Save a tunnel to a port of a container
 portico tunnel edit [<name>] [--name <new>] [--on [<alias>]] [-L|-R|-D <spec>]
+                    [--container <ref>] [--backend docker|podman|proxmox] [--port <inside>] [--address <host>]
 portico tunnel remove [<name>] [-f]
 portico tunnel show [<name>]    Show a tunnel, its command line and its log
 portico tunnel start [<name>...]
@@ -329,7 +332,7 @@ portico remove development --force
 
 ### Tunnels
 
-A tunnel is a saved port forward through a host Portico knows: a local (`-L`), remote (`-R`) or dynamic SOCKS (`-D`) forward of a TCP port, written in ssh's own syntax.
+A tunnel is a saved port forward through a host Portico knows: a local (`-L`), remote (`-R`) or dynamic SOCKS (`-D`) forward of a TCP port, written in ssh's own syntax, or a forward to a port of a container on the host (see [Container tunnels](#container-tunnels)).
 
 ```sh
 portico tunnel add db --on prod-db -L 127.0.0.1:5432:localhost:5432
@@ -358,7 +361,27 @@ portico forward web --on prod --port 80 --local 8080
 portico tunnel save _web-80 --name web
 ```
 
-The forward is temporary: it is named after what it reaches and the remote port (`_prod-5432`, `_web-80`), lives only in the runtime directory, and is listed after the saved tunnels, marked `(temporary)`. Like a saved tunnel it is an ordinary `ssh` process that keeps running after Portico exits, until `portico tunnel stop` ends it, and then it is gone. `portico tunnel save` (or `w` in the Tunnels tab) keeps it as a saved tunnel, by default under its name without the `_`; a running forward is restarted under the new name, so connections through it drop once. A container's published port is reached through the host's published port, on the address it is published on when that is one specific address. A container's port that is not published is reached at the container's current address, and a saved forward keeps that address: it does not follow a recreated container. Without `--on`, a container on this machine needs no forward, and `portico forward` prints where its ports are already reachable.
+The forward is temporary: it is named after what it reaches and the remote port (`_prod-5432`, `_web-80`), lives only in the runtime directory, and is listed after the saved tunnels, marked `(temporary)`. Like a saved tunnel it is an ordinary `ssh` process that keeps running after Portico exits, until `portico tunnel stop` ends it, and then it is gone. `portico tunnel save` (or `w` in the Tunnels tab) keeps it as a saved tunnel, by default under its name without the `_`; a running forward is restarted under the new name, so connections through it drop once. A container's published port is reached through the host's published port, on the address it is published on when that is one specific address. A container's port that is not published is reached at the container's current address, looked up again whenever the forward starts, and saving the forward keeps the container rather than its address (see [Container tunnels](#container-tunnels)). Without `--on`, a container on this machine needs no forward, and `portico forward` prints where its ports are already reachable.
+
+#### Container tunnels
+
+A tunnel can name a container instead of an address: a Docker or Podman container or a Proxmox CT on the host, named the way the pickers name it (a Compose `project/service`, a container name or a CT ID), and the port inside it.
+
+```sh
+portico tunnel add api --on prod --container shop/api --port 80 --local 8080
+portico tunnel add pg --on pve --container 101 --backend proxmox --port 5432
+```
+
+Without `--backend`, Portico lists the host with every installed backend, as `portico shell` does, and saves the one that has the container; a container that is not running needs `--backend`. `--local` defaults as for a quick forward. `portico tunnel edit` changes the target with `--container`, `--backend` and `--port`, and `--address <host>` turns it back into a tunnel to an address, keeping its local side and port. In the TUI's tunnel form, fill in the Container field and choose the backend next to it; the tunnel is then a local forward, and its target port is the port inside the container. The tunnels file holds it as one line, `ContainerForward 127.0.0.1:8080 docker shop/api 80`, and `portico tunnel show` shows the target as `shop/api:80 (docker)`.
+
+The address is looked up at every start, never stored: Portico lists the host's containers with the tunnel's backend, finds the container, and reaches its port as a quick forward does (through the published port when there is one, else at the container's current address). A container recreated by a redeploy or `docker compose up`, or a CT with a new DHCP lease, is followed at the next start; nothing watches it in between, so a running tunnel keeps the address it started with. A Compose service with several running replicas is reached at its lowest-numbered one; `shop/api#2` pins one. A container that is not running refuses the start, naming it: `web is not running on prod (docker)`.
+
+Saving a quick forward to a container (`w`, or `portico tunnel save`) saves it by name: its Compose `project/service`, else its container name, or a CT's ID. A plain container whose name changes on every deploy cannot be followed; give it a Compose service or a fixed name.
+
+Two kinds of container cannot be reached, and Portico installs nothing in a container to change that:
+
+- An app that listens only on `127.0.0.1` inside its container answers nothing from the host. The start succeeds with a warning, `started, but nothing answers on port 80 inside web; an app that listens only on 127.0.0.1 inside its container cannot be reached`, which `portico tunnels` and the Tunnels tab keep showing while the tunnel runs. Make the app listen on every address.
+- A container on a network the host cannot route to (rootless Podman, Docker Desktop's VM, a macvlan network) refuses the start. Publish the port, or attach the container to a network the host routes.
 
 ### Machine-readable output
 
@@ -562,7 +585,7 @@ The Tunnels tab lists the saved tunnels and then the temporary forwards, newest 
 | `b` | Open `http://` and the selected tunnel's local address in the browser |
 | `Esc` | Clear the applied filter |
 
-In the tunnel form, `↑` / `↓` (or `Tab` / `Shift+Tab`) move between fields: name, host, kind, bind address, bind port, target host and target port (a dynamic forward has no target). While you type a host, a dropdown lists the known hosts that match, as the ProxyJump field does: `↑` / `↓` choose, `Enter` or `Tab` fills in the alias, `Esc` closes the list (a second `Esc` cancels the form), and `Ctrl+Space` opens it before you type. `Space` or `←` / `→` changes the kind, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
+In the tunnel form, `↑` / `↓` (or `Tab` / `Shift+Tab`) move between fields: name, host, container, kind, bind address, bind port, target host and target port (a dynamic forward has no target). Naming a container shows its backend after it, changed with `Space` or `←` / `→`, makes the tunnel a local forward, hides the target host and makes the target port the port inside the container (see [Container tunnels](#container-tunnels)). While you type a host, a dropdown lists the known hosts that match, as the ProxyJump field does: `↑` / `↓` choose, `Enter` or `Tab` fills in the alias, `Esc` closes the list (a second `Esc` cancels the form), and `Ctrl+Space` opens it before you type. `Space` or `←` / `→` changes the kind, `Enter` saves and `Esc` cancels. Fields only take characters they can hold, errors appear under their field, and a port another saved tunnel uses shows a warning without blocking the save.
 
 ### Container tabs
 

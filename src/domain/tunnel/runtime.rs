@@ -108,6 +108,9 @@ pub struct RunningRecord {
     /// What a temporary forward reaches, for display: `web on prod`. Absent from saved tunnels'
     /// records and from rebuilt ones.
     pub reaches: Option<String>,
+    /// The container a temporary forward reaches, as `<backend> <reference> <port>`, so a
+    /// restart looks its address up again. Absent from saved tunnels' records.
+    pub container: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +125,8 @@ pub enum Record {
         host: Option<String>,
         forward: Option<String>,
         reaches: Option<String>,
+        /// As [`RunningRecord::container`].
+        container: Option<String>,
     },
 }
 
@@ -138,14 +143,15 @@ impl Record {
     pub fn render(&self) -> String {
         match self {
             Record::Running(record) => format!(
-                "state running\npid {}\nstart {}\nboot {}\nstarted {}\n{}{}{}",
+                "state running\npid {}\nstart {}\nboot {}\nstarted {}\n{}{}{}{}",
                 record.pid,
                 record.start,
                 record.boot,
                 record.started,
                 line("host", Some(&record.host)),
                 line("forward", Some(&record.forward)),
-                line("reaches", record.reaches.as_deref())
+                line("reaches", record.reaches.as_deref()),
+                line("container", record.container.as_deref())
             ),
             Record::Failed {
                 reason,
@@ -154,15 +160,17 @@ impl Record {
                 host,
                 forward,
                 reaches,
+                container,
             } => {
                 let exit = exit.map_or(String::new(), |code| format!("exit {code}\n"));
                 // The reason is one line, so the record stays one value per line.
                 let reason = super::printable(reason.lines().next().unwrap_or_default());
                 format!(
-                    "state failed\nreason {reason}\n{exit}finished {finished}\n{}{}{}",
+                    "state failed\nreason {reason}\n{exit}finished {finished}\n{}{}{}{}",
                     line("host", host.as_deref()),
                     line("forward", forward.as_deref()),
-                    line("reaches", reaches.as_deref())
+                    line("reaches", reaches.as_deref()),
+                    line("container", container.as_deref())
                 )
             }
         }
@@ -184,6 +192,7 @@ impl Record {
                 host: value("host")?,
                 forward: value("forward")?,
                 reaches: value("reaches"),
+                container: value("container"),
             })),
             "failed" => Some(Record::Failed {
                 reason: value("reason")?,
@@ -192,6 +201,7 @@ impl Record {
                 host: value("host"),
                 forward: value("forward"),
                 reaches: value("reaches"),
+                container: value("container"),
             }),
             _ => None,
         }
@@ -264,6 +274,7 @@ impl Proc {
             host,
             forward,
             reaches: None,
+            container: None,
         })
     }
 
@@ -425,6 +436,17 @@ pub fn authenticated(log: &Path) -> bool {
     })
 }
 
+/// What ssh logs, at its default level, when the far side of a local forward refuses the
+/// connection: `channel 2: open failed: connect failed: Connection refused`.
+pub const NOTHING_ANSWERS_LOG: &str = "open failed: connect failed";
+
+/// Whether the tunnel's log says the far side refused a connection through it.
+pub fn nothing_answers(log: &Path) -> bool {
+    log_tail(log, 200)
+        .iter()
+        .any(|line| line.contains(NOTHING_ANSWERS_LOG))
+}
+
 /// The last line of a tunnel's log that says something, debug output left out.
 pub fn log_reason(log: &Path) -> Option<String> {
     log_tail(log, 1).pop()
@@ -537,6 +559,7 @@ mod tests {
             host: "prod-db".into(),
             forward: "-L 5432:db:5432".into(),
             reaches: None,
+            container: None,
         }
     }
 
@@ -790,6 +813,7 @@ mod tests {
             host: None,
             forward: None,
             reaches: None,
+            container: None,
         };
         assert_eq!(
             Record::parse(&failed.render()),
@@ -800,6 +824,7 @@ mod tests {
                 host: None,
                 forward: None,
                 reaches: None,
+                container: None,
             })
         );
         assert_eq!(Record::parse("state running\npid x\n"), None);
@@ -875,13 +900,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tells_a_listener_from_a_closed_port() {
+    fn accepts_sees_a_listener_at_its_address_and_through_the_wildcard() {
+        // A closed port is not asserted: another test may take it, and a connection to a free
+        // ephemeral port on loopback can connect to itself.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(accepts(SocketAddr::from(([127, 0, 0, 1], port))));
         assert!(accepts(SocketAddr::from(([0, 0, 0, 0], port))));
-        drop(listener);
-        assert!(!accepts(SocketAddr::from(([127, 0, 0, 1], port))));
     }
 
     #[test]
@@ -1019,6 +1044,21 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_channel_in_the_log_means_nothing_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("api.log");
+        assert!(!nothing_answers(&log));
+        fs::write(&log, "Authenticated to x.\n").unwrap();
+        assert!(!nothing_answers(&log));
+        fs::write(
+            &log,
+            "Authenticated to x.\nchannel 2: open failed: connect failed: Connection refused\n",
+        )
+        .unwrap();
+        assert!(nothing_answers(&log));
+    }
+
+    #[test]
     fn record_keeps_what_a_temporary_forward_reaches() {
         let running = Record::Running(RunningRecord {
             reaches: Some("web on prod".into()),
@@ -1031,7 +1071,7 @@ mod tests {
         let Some(Record::Running(old)) = Record::parse(old) else {
             panic!("an older record must parse");
         };
-        assert_eq!(old.reaches, None);
+        assert_eq!((old.reaches, old.container), (None, None));
 
         let failed = Record::Failed {
             reason: "no route".into(),
@@ -1040,7 +1080,9 @@ mod tests {
             host: Some("prod".into()),
             forward: Some("-L 127.0.0.1:80:localhost:80".into()),
             reaches: Some("web on prod".into()),
+            container: Some("docker shop/api 80".into()),
         };
+        assert!(failed.render().contains("container docker shop/api 80\n"));
         assert_eq!(Record::parse(&failed.render()), Some(failed));
         let saved = Record::Failed {
             reason: "no route".into(),
@@ -1049,10 +1091,14 @@ mod tests {
             host: None,
             forward: None,
             reaches: None,
+            container: None,
         };
         let text = saved.render();
         assert!(
-            !text.contains("host ") && !text.contains("forward ") && !text.contains("reaches ")
+            !text.contains("host ")
+                && !text.contains("forward ")
+                && !text.contains("reaches ")
+                && !text.contains("container ")
         );
         assert_eq!(Record::parse(&text), Some(saved));
     }

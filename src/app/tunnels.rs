@@ -4,7 +4,8 @@
 use std::{
     cell::OnceCell,
     fs::{File, OpenOptions},
-    io,
+    io::{self, Read},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -17,16 +18,17 @@ use thiserror::Error;
 
 use super::{App, AppError};
 use crate::{
+    backend::BackendId,
     domain::explain::{Explanation, Operation},
     domain::openssh::OpenSshError,
     domain::probe::{Failure, diagnose},
     domain::tunnel::{
-        Forward, Kind, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, TunnelsFile,
-        addresses_overlap, check_args, collide, collisions, is_temporary,
-        listeners_in_effective_config,
+        ContainerTarget, Destination, Forward, Kind, Tunnel, TunnelReport, TunnelStatus,
+        TunnelWarning, TunnelsFile, addresses_overlap, check_args, collide, collisions,
+        is_temporary, listeners_in_effective_config, printable,
         runtime::{
             Bind, Identity, READY_BOUND, Record, RunningRecord, authenticated, find_in, listening,
-            log_reason, log_tail, now, ready, try_bind, up_at_bound,
+            log_reason, log_tail, nothing_answers, now, ready, try_bind, up_at_bound,
         },
         start_args,
     },
@@ -64,6 +66,46 @@ pub enum TunnelRefusal {
     /// A container whose port is neither published nor at an address the host can use.
     #[error("{label} has no address the host can reach; publish the port")]
     Unreachable { label: String },
+    /// A container tunnel's container is not among the running containers of its host.
+    #[error("{reference} is not running on {host} ({})", backend.as_str())]
+    NotRunning {
+        reference: String,
+        host: String,
+        backend: BackendId,
+    },
+    /// A container tunnel being saved without a backend: no installed backend of its host has
+    /// the container.
+    #[error("{reference} is not running on {host}; give --backend to save it anyway")]
+    NotRunningAnywhere { reference: String, host: String },
+    /// An edit that replaces the forward of a container tunnel without saying what becomes of
+    /// its container.
+    #[error(
+        "tunnel {0} forwards to a container; change its container, backend or port, or give it an address"
+    )]
+    ForwardOfContainer(String),
+    /// A container tunnel is a local forward; a remote forward's listen side is on the host.
+    #[error("tunnel {0} is a remote forward; only a local forward can reach a container")]
+    RemoteToContainer(String),
+    /// A container tunnel's reference names several running containers of its host.
+    #[error(
+        "{reference} matches several containers on {host}: {}",
+        candidates
+            .iter()
+            .map(|name| printable(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    AmbiguousContainer {
+        reference: String,
+        host: String,
+        candidates: Vec<String>,
+    },
+    /// A container tunnel's container has neither the port published nor an address its host
+    /// routes to.
+    #[error(
+        "{reference} on {host} has no address the host can route to; publish the port, or attach it to a network {host} routes"
+    )]
+    Unroutable { reference: String, host: String },
     /// A Proxmox CT whose address could not be read: it has no ports to publish.
     #[error("could not read the address of CT {id} on {host}")]
     NoCtAddress { id: String, host: String },
@@ -92,13 +134,21 @@ pub enum TunnelRefusal {
 pub struct TunnelChanges {
     pub name: Option<String>,
     pub host: Option<String>,
+    /// For a container tunnel, only its listen side counts. A container tunnel's forward is
+    /// replaced only with `container` given.
     pub forward: Option<Forward>,
+    /// `Some(Some(target))` makes the tunnel reach that container, `Some(None)` turns a
+    /// container tunnel into an address one (with `forward` its new forward).
+    pub container: Option<Option<ContainerTarget>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartOutcome {
+    /// `warning`, for a container forward, says that the container refused the test
+    /// connection made right after the start.
     Started {
         pid: u32,
+        warning: Option<String>,
     },
     AlreadyRunning {
         pid: u32,
@@ -130,6 +180,8 @@ struct Temporary {
     /// The record's `reaches` line.
     reaches: Option<String>,
     status: TunnelStatus,
+    /// Whether the log says the container it reaches refused a connection.
+    refused: bool,
     /// When it started, or for a failed record when it failed, in Unix seconds.
     since: u64,
 }
@@ -144,6 +196,12 @@ impl Temporary {
                     .and_then(|tunnel| tunnel.forward.destination_text())
             })
             .unwrap_or_else(|| "unknown".into());
+        let warnings = self
+            .tunnel
+            .as_ref()
+            .and_then(|tunnel| answer_warning(tunnel, &self.status, self.refused))
+            .into_iter()
+            .collect();
         let tunnel = self.tunnel.unwrap_or_else(|| Tunnel {
             name: self.name,
             host: String::new(),
@@ -153,25 +211,133 @@ impl Temporary {
                 bind_port: 0,
                 destination: None,
             },
+            container: None,
         });
         TunnelReport {
             tunnel,
             status: self.status,
-            warnings: Vec::new(),
+            warnings,
             temporary: true,
             reaches,
         }
     }
 }
 
-/// The tunnel a record's `host` and `forward` lines (`-L 127.0.0.1:8080:localhost:80`) describe.
-fn recorded_tunnel(name: &str, host: &str, forward: &str) -> Option<Tunnel> {
+/// The tunnel a record's `host` and `forward` lines (`-L 127.0.0.1:8080:localhost:80`)
+/// describe, with the container of its `container` line.
+fn recorded_tunnel(
+    name: &str,
+    host: &str,
+    forward: &str,
+    container: Option<&str>,
+) -> Option<Tunnel> {
     let (flag, spec) = forward.split_once(' ')?;
     Some(Tunnel {
         name: name.to_owned(),
         host: host.to_owned(),
         forward: Forward::parse(Kind::from_flag(flag)?, spec).ok()?,
+        container: container.and_then(ContainerTarget::from_record_text),
     })
+}
+
+/// The "nothing answers" warning of a running container tunnel whose log has `refused` a
+/// connection.
+fn answer_warning(tunnel: &Tunnel, status: &TunnelStatus, refused: bool) -> Option<TunnelWarning> {
+    let target = tunnel.container.as_ref()?;
+    (refused && status.is_running()).then(|| TunnelWarning::NothingAnswers {
+        port: target.port,
+        reference: target.reference.clone(),
+    })
+}
+
+/// A temporary forward's `container` line, from its container target.
+fn container_text(tunnel: &Tunnel) -> Option<String> {
+    tunnel
+        .container
+        .as_ref()
+        .filter(|_| is_temporary(&tunnel.name))
+        .map(ContainerTarget::record_text)
+}
+
+/// The addresses a test connection to local listeners on `addresses`, port `port`, goes to: a
+/// wildcard address is reached at the loopback of its family, and a host name at what it
+/// resolves to.
+fn local_sockets(addresses: &[String], port: u16) -> Vec<SocketAddr> {
+    let mut sockets = Vec::new();
+    for address in addresses {
+        let resolved: Vec<SocketAddr> = match address.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => (address.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+                .unwrap_or_default(),
+        };
+        for socket in resolved {
+            let ip = match socket.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ip => ip,
+            };
+            let socket = SocketAddr::new(ip, port);
+            if !sockets.contains(&socket) {
+                sockets.push(socket);
+            }
+        }
+    }
+    sockets
+}
+
+/// Whether a container forward's far side refuses a connection: connects to the first of
+/// `addresses` that accepts (each tried in turn, again until [`ANSWER_WAIT`] has passed, as a
+/// listener may come up on one address before another), then waits, within the same bound,
+/// for `log` to say ssh's channel was refused. A byte from the far side means something
+/// answers; a connection ssh closed without that line in the log a short while later means
+/// nothing is known. The connection is closed on return.
+fn refused_after_connect(addresses: &[SocketAddr], log: &Path) -> bool {
+    let started = Instant::now();
+    let left = || ANSWER_WAIT.saturating_sub(started.elapsed());
+    let mut stream = None;
+    'connect: while !addresses.is_empty() {
+        for address in addresses {
+            let wait = left().min(CONNECT_WAIT);
+            if wait.is_zero() {
+                break 'connect;
+            }
+            if let Ok(connected) = TcpStream::connect_timeout(address, wait) {
+                stream = Some(connected);
+                break 'connect;
+            }
+        }
+        thread::sleep(POLL.min(left()));
+    }
+    let Some(mut stream) = stream else {
+        return nothing_answers(log);
+    };
+    let _ = stream.set_nonblocking(true);
+    let mut closed_at = None;
+    loop {
+        if nothing_answers(log) {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= ANSWER_WAIT {
+            return false;
+        }
+        let mut byte = [0; 1];
+        match stream.read(&mut byte) {
+            // The far side answered: something listens.
+            Ok(1..) => return false,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            // ssh closed the connection: its log line follows shortly, if it says anything.
+            _ => {
+                let closed = *closed_at.get_or_insert(elapsed);
+                if elapsed - closed >= CLOSED_GRACE {
+                    return false;
+                }
+            }
+        }
+        thread::sleep(POLL);
+    }
 }
 
 /// The record of a failed start of `tunnel`: a temporary forward's keeps its host, forward and
@@ -190,6 +356,7 @@ fn failed_record(
         host: temporary.then(|| tunnel.host.clone()),
         forward: temporary.then(|| forward_text(&tunnel.forward)),
         reaches: reaches.filter(|_| temporary).map(str::to_owned),
+        container: container_text(tunnel),
     }
 }
 
@@ -250,6 +417,13 @@ impl App {
                         .unwrap_or_else(|| state.clone())
                 };
                 let mut warnings = Vec::new();
+                if tunnel.container.is_some() && status.is_running() {
+                    warnings.extend(answer_warning(
+                        tunnel,
+                        &status,
+                        nothing_answers(&self.runtime.log(&tunnel.name)),
+                    ));
+                }
                 if let Some(known) = &known
                     && !known
                         .iter()
@@ -269,7 +443,10 @@ impl App {
                     status,
                     warnings,
                     temporary: false,
-                    reaches: tunnel.host.clone(),
+                    reaches: match &tunnel.container {
+                        Some(target) => format!("{} on {}", target.reference, tunnel.host),
+                        None => tunnel.host.clone(),
+                    },
                 }
             })
             .collect();
@@ -288,7 +465,12 @@ impl App {
                 let status = self.run_state_in(&name, scan, holds_lock);
                 let (tunnel, reaches, since) = match Record::read(&self.runtime.record(&name))? {
                     Record::Running(record) => (
-                        recorded_tunnel(&name, &record.host, &record.forward),
+                        recorded_tunnel(
+                            &name,
+                            &record.host,
+                            &record.forward,
+                            record.container.as_deref(),
+                        ),
                         record.reaches,
                         record.started,
                     ),
@@ -297,19 +479,25 @@ impl App {
                         host,
                         forward,
                         reaches,
+                        container,
                         ..
                     } => (
-                        host.zip(forward)
-                            .and_then(|(host, forward)| recorded_tunnel(&name, &host, &forward)),
+                        host.zip(forward).and_then(|(host, forward)| {
+                            recorded_tunnel(&name, &host, &forward, container.as_deref())
+                        }),
                         reaches,
                         finished,
                     ),
                 };
+                let refused = tunnel.as_ref().is_some_and(|tunnel| {
+                    tunnel.container.is_some() && nothing_answers(&self.runtime.log(&name))
+                });
                 Some(Temporary {
                     name,
                     tunnel,
                     reaches,
                     status,
+                    refused,
                     since,
                 })
             })
@@ -357,13 +545,20 @@ impl App {
         log_tail(&self.runtime.log(name), lines)
     }
 
-    /// The command line a start of `tunnel` runs, for showing it.
+    /// The command line a start of `tunnel` runs, for showing it. A saved container tunnel's
+    /// destination is shown as `<reference>`: its address is looked up at each start.
     pub fn tunnel_command(&self, tunnel: &Tunnel) -> Vec<String> {
+        let mut forward = tunnel.forward.clone();
+        if let (Some(target), Some(destination)) = (&tunnel.container, &mut forward.destination)
+            && destination.host == target.reference
+        {
+            destination.host = format!("<{}>", target.reference);
+        }
         std::iter::once(self.openssh.ssh_program().as_os_str().to_owned())
             .chain(start_args(
                 &self.runtime.log(&tunnel.name),
                 &tunnel.host,
-                &tunnel.forward,
+                &forward,
                 SSH_BACKGROUNDS,
             ))
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -375,7 +570,7 @@ impl App {
             if file.find(&tunnel.name).is_some() {
                 return Err(TunnelRefusal::Exists(tunnel.name.clone()).into());
             }
-            self.check_tunnel(&tunnel)?;
+            self.check_tunnel(&stand_in(&tunnel))?;
             file.insert(tunnel.clone())
                 .map_err(|_| TunnelRefusal::Exists(tunnel.name).into())
         })
@@ -390,14 +585,29 @@ impl App {
                 .find(name)
                 .cloned()
                 .ok_or_else(|| TunnelRefusal::Unknown(name.into()))?;
-            let checked = changes.host.is_some() || changes.forward.is_some();
-            let edited = Tunnel::new(
-                changes.name.unwrap_or_else(|| current.name.clone()),
-                changes.host.unwrap_or_else(|| current.host.clone()),
-                changes.forward.unwrap_or_else(|| current.forward.clone()),
-            )?;
+            let checked =
+                changes.host.is_some() || changes.forward.is_some() || changes.container.is_some();
+            let name = changes.name.unwrap_or_else(|| current.name.clone());
+            let host = changes.host.unwrap_or_else(|| current.host.clone());
+            let container = match changes.container {
+                Some(container) => container,
+                None if current.container.is_some() && changes.forward.is_some() => {
+                    return Err(TunnelRefusal::ForwardOfContainer(current.name.clone()).into());
+                }
+                None => current.container.clone(),
+            };
+            let forward = changes.forward.unwrap_or_else(|| current.forward.clone());
+            let edited = match container {
+                Some(target) => {
+                    if forward.kind == Kind::Remote {
+                        return Err(TunnelRefusal::RemoteToContainer(current.name.clone()).into());
+                    }
+                    Tunnel::to_container(name, host, forward, target)?
+                }
+                None => Tunnel::new(name, host, forward)?,
+            };
             if checked {
-                self.check_tunnel(&edited)?;
+                self.check_tunnel(&stand_in(&edited))?;
             }
             file.replace(&current.name, edited.clone())
                 .map_err(|_| AppError::from(TunnelRefusal::Exists(edited.name.clone())))?;
@@ -432,7 +642,7 @@ impl App {
         in_tui: bool,
     ) -> Result<StartOutcome, AppError> {
         if let Some(tunnel) = self.tunnels.load()?.find(name).cloned() {
-            return self.launch_checked(&tunnel, None, cancelled, in_tui);
+            return self.launch_resolved(&tunnel, None, cancelled, in_tui);
         }
         let unknown = || AppError::from(TunnelRefusal::Unknown(name.into()));
         if !is_temporary(name) {
@@ -444,7 +654,58 @@ impl App {
             .find(|temporary| temporary.name.eq_ignore_ascii_case(name))
             .ok_or_else(unknown)?;
         let tunnel = temporary.tunnel.ok_or_else(unknown)?;
-        self.launch_checked(&tunnel, temporary.reaches.as_deref(), cancelled, in_tui)
+        self.launch_resolved(&tunnel, temporary.reaches.as_deref(), cancelled, in_tui)
+    }
+
+    /// `launch_checked`, a container tunnel's address looked up first (unless it runs) and
+    /// its start followed by the "nothing answers" check. A tunnel that cannot be resolved is
+    /// refused before anything changes.
+    fn launch_resolved(
+        &self,
+        tunnel: &Tunnel,
+        reaches: Option<&str>,
+        cancelled: Option<&AtomicBool>,
+        in_tui: bool,
+    ) -> Result<StartOutcome, AppError> {
+        let Some(target) = &tunnel.container else {
+            return self.launch_checked(tunnel, reaches, cancelled, in_tui);
+        };
+        if let TunnelStatus::Running { pid, .. } = self.run_state(&tunnel.name) {
+            return Ok(StartOutcome::AlreadyRunning { pid });
+        }
+        let resolved = self.resolve_container(tunnel, target, cancelled)?;
+        let outcome = self.launch_checked(&resolved, reaches, cancelled, in_tui);
+        self.check_answers(&resolved, outcome)
+    }
+
+    /// Adds the "nothing answers" warning to the start of container tunnel `tunnel`: one test
+    /// connection to its local port, then up to [`ANSWER_WAIT`] for ssh's log to say the
+    /// container refused it. The connection is closed at once and not reused.
+    fn check_answers(
+        &self,
+        tunnel: &Tunnel,
+        outcome: Result<StartOutcome, AppError>,
+    ) -> Result<StartOutcome, AppError> {
+        let (Ok(StartOutcome::Started { pid, warning: None }), Some(target)) =
+            (&outcome, &tunnel.container)
+        else {
+            return outcome;
+        };
+        let addresses = local_sockets(&tunnel.forward.listen_addresses(), tunnel.forward.bind_port);
+        let refused = refused_after_connect(&addresses, &self.runtime.log(&tunnel.name));
+        if !refused {
+            return outcome;
+        }
+        Ok(StartOutcome::Started {
+            pid: *pid,
+            warning: Some(
+                TunnelWarning::NothingAnswers {
+                    port: target.port,
+                    reference: target.reference.clone(),
+                }
+                .to_string(),
+            ),
+        })
     }
 
     /// Starts a new temporary forward (`tunnel.name` is a temporary name) that reaches
@@ -465,6 +726,7 @@ impl App {
         }
         let first = !self.runtime.record(&tunnel.name).exists();
         let outcome = self.launch_checked(&tunnel, Some(reaches), cancelled, in_tui);
+        let outcome = self.check_answers(&tunnel, outcome);
         if first
             && !matches!(
                 outcome,
@@ -737,10 +999,11 @@ impl App {
             host: tunnel.host.clone(),
             forward: forward_text(&tunnel.forward),
             reaches: reaches.map(str::to_owned),
+            container: container_text(tunnel),
         })
         .write(record_path)
         .map_err(runtime_error(record_path.to_path_buf()))?;
-        Ok(StartOutcome::Started { pid })
+        Ok(StartOutcome::Started { pid, warning: None })
     }
 
     /// Stops a tunnel: its process when one is running, and its record and log in any case. A
@@ -1078,6 +1341,32 @@ impl App {
     }
 }
 
+/// How long a container tunnel's start waits for ssh to report the test connection refused.
+const ANSWER_WAIT: Duration = Duration::from_millis(800);
+
+/// How long one connection attempt to a local listener may take.
+const CONNECT_WAIT: Duration = Duration::from_millis(200);
+
+/// How long after ssh closes the test connection its log may still gain the refused line.
+const CLOSED_GRACE: Duration = Duration::from_millis(200);
+
+/// How often the test connection and the log are looked at.
+const POLL: Duration = Duration::from_millis(20);
+
+/// `tunnel` as `ssh -G` checks it when it is saved: a container tunnel's destination, the
+/// reference, stands in as `localhost:<port inside>`, which validates the host and the listen
+/// side.
+fn stand_in(tunnel: &Tunnel) -> Tunnel {
+    let mut checked = tunnel.clone();
+    if let Some(target) = &tunnel.container {
+        checked.forward.destination = Some(Destination {
+            host: "localhost".into(),
+            port: target.port,
+        });
+    }
+    checked
+}
+
 /// Ends a start's ssh and what it started: a ProxyCommand child would outlive ssh, so the
 /// whole tree goes.
 fn end_tree(child: &mut Child) {
@@ -1204,6 +1493,7 @@ mod tests {
             host: "prod".into(),
             forward: "-D 1080".into(),
             reaches: None,
+            container: None,
         })
         .write(&record)
         .unwrap();
@@ -1330,6 +1620,7 @@ exit 0
             host: "prod".into(),
             forward: Forward::parse(Kind::Local, &format!("127.0.0.1:{port}:localhost:80"))
                 .unwrap(),
+            container: None,
         }
     }
 
@@ -1420,7 +1711,7 @@ exit 0
         let _stop = StopAll(&app);
         let tunnel = temporary(free_port());
         let name = tunnel.name.clone();
-        let StartOutcome::Started { pid } =
+        let StartOutcome::Started { pid, .. } =
             app.start_temporary(tunnel, "prod", None, false).unwrap()
         else {
             panic!("the forward did not start");
@@ -1558,6 +1849,7 @@ exit 0
             host: None,
             forward: None,
             reaches: None,
+            container: None,
         }
         .write(&app.runtime.record("_web-80"))
         .unwrap();
@@ -1586,6 +1878,7 @@ exit 0
                 host: Some("prod".into()),
                 forward: Some("-L 127.0.0.1:8080:172.18.0.4:80".into()),
                 reaches: None,
+                container: None,
             }
             .write(&app.runtime.record(name))
             .unwrap();
@@ -1683,5 +1976,167 @@ exit 0
             unreachable!()
         };
         assert_eq!(reason, "cancelled");
+    }
+
+    /// What `refused_after_connect` says, and how long it took, while a listener the test owns
+    /// accepts the connection and `serve` handles it; `serve` gets the log path. The accepted
+    /// connection stays open until the probe returns unless `serve` shuts it down.
+    fn probe(
+        serve: impl FnOnce(&mut std::net::TcpStream, &Path) + Send + 'static,
+    ) -> (bool, Duration) {
+        probe_through(false, serve)
+    }
+
+    /// `probe`, with an address that refuses tried first when `refusing_first`: the
+    /// listener's port at `127.0.0.2`, which nothing else can bind while the test holds
+    /// `127.0.0.1` on it (a released port could be taken by another test meanwhile).
+    fn probe_through(
+        refusing_first: bool,
+        serve: impl FnOnce(&mut std::net::TcpStream, &Path) + Send + 'static,
+    ) -> (bool, Duration) {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("api.log");
+        fs::write(&log, "Authenticated to x.\n").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, finished) = mpsc::channel::<()>();
+        let server = {
+            let log = log.clone();
+            thread::spawn(move || {
+                // Never waits past a probe that did not connect.
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "the probe never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                serve(&mut stream, &log);
+                let _ = finished.recv();
+            })
+        };
+        let mut addresses = vec![address];
+        if refusing_first {
+            addresses.insert(0, SocketAddr::new([127, 0, 0, 2].into(), address.port()));
+        }
+        let started = Instant::now();
+        let refused = refused_after_connect(&addresses, &log);
+        let elapsed = started.elapsed();
+        drop(done);
+        server.join().unwrap();
+        (refused, elapsed)
+    }
+
+    #[test]
+    fn a_refused_channel_logged_after_the_connection_is_nothing_answering() {
+        let (refused, elapsed) = probe(|stream, log| {
+            thread::sleep(Duration::from_millis(100));
+            let mut text = fs::read_to_string(log).unwrap();
+            text.push_str("channel 2: open failed: connect failed: Connection refused\n");
+            fs::write(log, text).unwrap();
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(refused);
+        assert!(
+            elapsed < ANSWER_WAIT + Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_byte_from_the_far_side_is_an_answer_at_once() {
+        use std::io::Write;
+
+        let (refused, elapsed) = probe(|stream, _| {
+            stream.write_all(b"S").unwrap();
+        });
+        assert!(!refused);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_address_that_refuses_is_passed_over_for_the_next() {
+        use std::io::Write;
+
+        let (refused, elapsed) = probe_through(true, |stream, _| {
+            stream.write_all(b"S").unwrap();
+        });
+        assert!(!refused);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_silent_far_side_is_given_the_whole_wait_and_no_more() {
+        let (refused, elapsed) = probe(|_, _| {});
+        assert!(!refused);
+        assert!(elapsed >= ANSWER_WAIT, "{elapsed:?}");
+        assert!(
+            elapsed < ANSWER_WAIT + Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_closed_without_a_logged_refusal_says_nothing() {
+        let (refused, elapsed) = probe(|stream, _| {
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(!refused);
+        assert!(elapsed < ANSWER_WAIT, "{elapsed:?}");
+    }
+
+    #[test]
+    fn nothing_to_connect_to_reads_the_log_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("api.log");
+        let started = Instant::now();
+        assert!(!refused_after_connect(&[], &log));
+        fs::write(
+            &log,
+            "channel 2: open failed: connect failed: Connection refused\n",
+        )
+        .unwrap();
+        assert!(refused_after_connect(&[], &log));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn listen_addresses_become_the_sockets_a_test_connection_reaches() {
+        let sockets = local_sockets(
+            &[
+                "0.0.0.0".into(),
+                "::".into(),
+                "127.0.0.1".into(),
+                "localhost".into(),
+            ],
+            8080,
+        );
+        assert_eq!(sockets[0], "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(sockets[1], "[::1]:8080".parse().unwrap());
+        // The duplicate is dropped; `localhost` resolves to the loopback.
+        assert_eq!(
+            sockets.iter().filter(|s| s.port() == 8080).count(),
+            sockets.len()
+        );
+        assert_eq!(
+            sockets
+                .iter()
+                .filter(|s| **s == "127.0.0.1:8080".parse().unwrap())
+                .count(),
+            1
+        );
+        assert!(
+            sockets.iter().all(|socket| socket.ip().is_loopback()),
+            "{sockets:?}"
+        );
     }
 }

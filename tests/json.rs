@@ -119,6 +119,23 @@ fn setup() -> Fixture {
         env.run(["tunnel", "add", args[0], "--on", "prod", args[1], args[2]])
             .assert_success();
     }
+    // A container tunnel to `shop/web`, saved without a listing.
+    env.run([
+        "tunnel",
+        "add",
+        "web",
+        "--on",
+        "prod",
+        "--container",
+        "shop/web",
+        "--backend",
+        "docker",
+        "--port",
+        "80",
+        "--local",
+        "2",
+    ])
+    .assert_success();
     // `preview` failed earlier.
     let runtime = env.home().join(".ssh/portico/run/tunnels");
     fs::create_dir_all(&runtime).unwrap();
@@ -578,7 +595,14 @@ fn tunnels() {
         .collect();
     assert_eq!(
         states,
-        ["port-in-use", "stopped", "failed", "stopped", "failed"]
+        [
+            "port-in-use",
+            "stopped",
+            "failed",
+            "stopped",
+            "stopped",
+            "failed"
+        ]
     );
     let temporary: Vec<(&str, bool)> = document["tunnels"]
         .as_array()
@@ -598,9 +622,22 @@ fn tunnels() {
             ("prod", false),
             ("prod", false),
             ("prod", false),
+            ("shop/web on prod", false),
             ("web on prod", true)
         ]
     );
+    let web = &document["tunnels"][4];
+    assert_eq!(
+        web["container"],
+        serde_json::json!({ "backend": "docker", "port": 80, "reference": "shop/web" })
+    );
+    assert_eq!(web["forward"]["target_host"], "shop/web");
+    assert_eq!(web["forward"]["target_port"], 80);
+    assert_eq!(
+        web["forward"]["description"],
+        "127.0.0.1:2 \u{2192} shop/web:80"
+    );
+    assert_eq!(document["tunnels"][0]["container"], Value::Null);
 }
 
 /// A port nobody uses: bound, read, released.

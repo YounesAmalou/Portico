@@ -378,9 +378,11 @@ fn the_tui_adds_starts_and_stops_a_tunnel() {
     terminal.type_text("db");
     terminal.key(Key::Tab);
     terminal.type_text("bo");
-    // Tab completes the alias, and then moves on.
+    // Tab completes the alias, and then moves on: past Container (left empty, so Backend is
+    // not offered) and Kind.
     terminal.key(Key::Tab);
     for field in [
+        "",
         "",
         "127.0.0.1",
         &port.to_string(),
@@ -568,6 +570,119 @@ fn a_quick_forward_reaches_a_port_and_is_saved() {
     assert!(stopped.contains("Stopped kept."), "{stopped}");
     wait_gone(pid);
     assert!(TcpStream::connect(("127.0.0.1", local)).is_err());
+
+    real_home.assert_unchanged();
+}
+
+/// Installs a fake `docker` on `sshd`'s side that lists one running container `web`, outside
+/// any Compose project and publishing nothing, while `state/address` exists, and inspects it at
+/// the address that file holds, exposing `port`. No file, no container.
+#[cfg(unix)]
+fn install_docker(sshd: &Sshd, state: &std::path::Path, port: u16) {
+    let ps = r#"{"id":"c0ffee00c0ffee00","name":"web","image":"nginx","command":"","running_for":"","status":"Up 1 minute","ports":"","networks":"bridge","mounts":"","project":"","service":"","number":"","working_dir":""}"#;
+    crate::executable::write_executable(
+        sshd.bin().join("docker"),
+        &format!(
+            r#"#!/bin/sh
+address='{address}'
+case "$1" in
+  ps) [ -f "$address" ] && printf '%s\n' '{ps}'; exit 0 ;;
+  inspect) printf '{{"bridge":{{"IPAddress":"%s"}}}}|{{"{port}/tcp":{{}}}}|default\n' "$(cat "$address")"; exit 0 ;;
+esac
+exit 1
+"#,
+            address = state.join("address").display(),
+        ),
+    );
+}
+
+/// A TCP server on `address`:`port` that writes one byte to each connection, for as long as
+/// the test runs.
+#[cfg(target_os = "linux")]
+fn byte_server_at(address: &str, port: u16, byte: u8) {
+    let listener = TcpListener::bind((address, port)).unwrap();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.write_all(&[byte]);
+        }
+    });
+}
+
+// The fake `docker` is a shell script the server runs as a remote command; Win32-OpenSSH runs
+// remote commands through `cmd.exe`, so the test is about Unix servers alone.
+#[cfg(unix)]
+#[test]
+#[ignore = "end-to-end: run with scripts/ci-checks.sh e2e"]
+fn a_container_tunnel_follows_its_container() {
+    let real_home = RealHome::snapshot();
+    let sshd = Sshd::start_with(crate::sshd::SshdOptions {
+        run_commands: true,
+        ..Default::default()
+    });
+    let client = Client::new();
+    client.init();
+    client.add_host("box", &sshd, &sshd.client_key());
+    client.trust("box");
+    let _stop = StopAll(&client);
+    // The server is this machine: the container's port is a port listening here.
+    let port = byte_server(1);
+    let local = free_port();
+    let state = tempfile::tempdir().unwrap();
+    let address = state.path().join("address");
+    install_docker(&sshd, state.path(), port);
+    fs::write(&address, "127.0.0.1").unwrap();
+
+    run_ok(
+        &client,
+        &[
+            "tunnel",
+            "add",
+            "api",
+            "--on",
+            "box",
+            "--container",
+            "web",
+            "--backend",
+            "docker",
+            "--port",
+            &port.to_string(),
+            "--local",
+            &local.to_string(),
+        ],
+    );
+    let started = run_ok(&client, &["tunnel", "start", "api"]);
+    assert!(started.contains("Started api"), "{started}");
+    assert!(!started.contains("nothing answers"), "{started}");
+    assert_eq!(read_byte(local), 1);
+    let api = listed(&client, "api");
+    assert_eq!(api["reaches"], "web on box", "{api}");
+
+    // The container moved: the next start looks its address up again. Only Linux answers on
+    // the whole of 127.0.0.0/8 without configuration.
+    #[cfg(target_os = "linux")]
+    {
+        byte_server_at("127.0.0.2", port, 2);
+        fs::write(&address, "127.0.0.2").unwrap();
+        let pid = pid_of(&client, "api");
+        run_ok(&client, &["tunnel", "stop", "api"]);
+        wait_gone(pid);
+        let started = run_ok(&client, &["tunnel", "start", "api"]);
+        assert!(started.contains("Started api"), "{started}");
+        assert_eq!(read_byte(local), 2);
+    }
+
+    // The container is gone: the start is refused before ssh runs.
+    let pid = pid_of(&client, "api");
+    run_ok(&client, &["tunnel", "stop", "api"]);
+    wait_gone(pid);
+    fs::remove_file(&address).unwrap();
+    let refused = client.run(&["tunnel", "start", "api"]);
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("web is not running on box (docker)"),
+        "{}",
+        text(&refused)
+    );
 
     real_home.assert_unchanged();
 }

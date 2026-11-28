@@ -13,7 +13,10 @@ use std::{ffi::OsString, fmt, path::Path};
 
 use thiserror::Error;
 
-use crate::domain::host::{HostField, parse_port};
+use crate::{
+    backend::BackendId,
+    domain::host::{HostField, parse_port},
+};
 
 /// The kind of forward a tunnel opens.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -92,6 +95,10 @@ pub struct Forward {
 pub enum TunnelField {
     Name,
     Host,
+    /// The container a tunnel reaches, as its reference.
+    Container,
+    /// The backend that lists the container.
+    Backend,
     Kind,
     BindAddress,
     BindPort,
@@ -104,6 +111,8 @@ impl fmt::Display for TunnelField {
         formatter.write_str(match self {
             Self::Name => "name",
             Self::Host => "host",
+            Self::Container => "container",
+            Self::Backend => "backend",
             Self::Kind => "kind",
             Self::BindAddress => "bind address",
             Self::BindPort => "bind port",
@@ -123,7 +132,7 @@ impl TunnelField {
             Self::Name => HostField::Alias.permits(character),
             Self::BindPort | Self::TargetPort => character.is_ascii_digit(),
             Self::BindAddress | Self::TargetHost => !"[]/".contains(character),
-            Self::Host | Self::Kind => true,
+            Self::Host | Self::Container | Self::Backend | Self::Kind => true,
         }
     }
 }
@@ -386,12 +395,55 @@ pub fn listen_addresses(bind_address: Option<&str>, gateway_ports: bool) -> Vec<
     }
 }
 
+/// The container a tunnel reaches, resolved to an address at each start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerTarget {
+    /// The backend that lists the container.
+    pub backend: BackendId,
+    /// The reference as the pickers accept it: a name, `project/service` or a VMID.
+    pub reference: String,
+    /// The port inside the container.
+    pub port: u16,
+}
+
+impl ContainerTarget {
+    /// The target as a running record's `container` line holds it: `docker shop/api 80`.
+    pub fn record_text(&self) -> String {
+        format!("{} {} {}", self.backend.as_str(), self.reference, self.port)
+    }
+
+    /// The target for people: `shop/api:80 (docker)`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}:{} ({})",
+            self.reference,
+            self.port,
+            self.backend.as_str()
+        )
+    }
+
+    /// The target a running record's `container` line holds, when it reads as one.
+    pub fn from_record_text(text: &str) -> Option<Self> {
+        let [backend, reference, port] = text.split_whitespace().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        Some(Self {
+            backend: BackendId::from_str_name(backend)?,
+            reference: reference.to_owned(),
+            port: port.parse().ok().filter(|port| *port != 0)?,
+        })
+    }
+}
+
 /// A saved tunnel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tunnel {
     pub name: String,
     pub host: String,
     pub forward: Forward,
+    /// Set for a tunnel to a container: a local forward whose destination is the reference,
+    /// replaced by the container's address at each start.
+    pub container: Option<ContainerTarget>,
 }
 
 impl Tunnel {
@@ -404,9 +456,52 @@ impl Tunnel {
             name: name.into(),
             host: host.into(),
             forward,
+            container: None,
         };
         validate_name(&tunnel.name)?;
         validate_host(&tunnel.host)?;
+        Ok(tunnel)
+    }
+
+    /// The tunnel's forward in a few words for lists, as [`Forward::describe`] says it, except
+    /// that a container tunnel names its container: `127.0.0.1:8080 → shop/api:80 (docker)`.
+    pub fn describe(&self) -> String {
+        match &self.container {
+            Some(target) => format!("{} \u{2192} {}", self.forward.listen(), target.describe()),
+            None => self.forward.describe(),
+        }
+    }
+
+    /// A tunnel to a container: a local forward listening as `listen` does (its destination is
+    /// ignored), whose destination becomes the reference, so every reader of `destination`
+    /// sees what the tunnel reaches.
+    pub fn to_container(
+        name: impl Into<String>,
+        host: impl Into<String>,
+        listen: Forward,
+        target: ContainerTarget,
+    ) -> Result<Self, TunnelError> {
+        if target.reference.is_empty()
+            || target
+                .reference
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(invalid(
+                TunnelField::Container,
+                "must be one word without whitespace or control characters",
+            ));
+        }
+        let forward = Forward {
+            kind: Kind::Local,
+            destination: Some(Destination {
+                host: target.reference.clone(),
+                port: target.port,
+            }),
+            ..listen
+        };
+        let mut tunnel = Self::new(name, host, forward)?;
+        tunnel.container = Some(target);
         Ok(tunnel)
     }
 }
@@ -503,6 +598,7 @@ impl TunnelsFile {
             name: String,
             host: Option<String>,
             forward: Option<Forward>,
+            container: Option<ContainerTarget>,
         }
         fn finish(block: Block) -> Result<Tunnel, TunnelFileError> {
             let error = |reason: String| TunnelFileError {
@@ -517,7 +613,11 @@ impl TunnelsFile {
                 .forward
                 .clone()
                 .ok_or_else(|| error(format!("tunnel {} has no forward", block.name)))?;
-            Tunnel::new(block.name.clone(), host, forward).map_err(|e| error(e.to_string()))
+            match block.container.clone() {
+                Some(target) => Tunnel::to_container(block.name.clone(), host, forward, target),
+                None => Tunnel::new(block.name.clone(), host, forward),
+            }
+            .map_err(|e| error(e.to_string()))
         }
         let mut file = Self::default();
         let mut block: Option<Block> = None;
@@ -544,6 +644,7 @@ impl TunnelsFile {
                     name: value.into(),
                     host: None,
                     forward: None,
+                    container: None,
                 });
                 continue;
             }
@@ -572,6 +673,30 @@ impl TunnelsFile {
                 };
                 current.forward =
                     Some(Forward::parse(kind, &spec).map_err(|e| error(e.to_string()))?);
+            } else if directive.eq_ignore_ascii_case("ContainerForward") {
+                if current.forward.is_some() {
+                    return Err(error("a tunnel holds exactly one forward".into()));
+                }
+                let [listen, backend, reference, port] =
+                    value.split_whitespace().collect::<Vec<_>>()[..]
+                else {
+                    return Err(error(format!("malformed {directive}")));
+                };
+                let backend = BackendId::from_str_name(backend)
+                    .ok_or_else(|| error(format!("unknown backend {backend}")))?;
+                let port =
+                    check_port(TunnelField::TargetPort, port).map_err(|e| error(e.to_string()))?;
+                let listen =
+                    Forward::parse(Kind::Dynamic, listen).map_err(|e| error(e.to_string()))?;
+                current.forward = Some(Forward {
+                    kind: Kind::Local,
+                    ..listen
+                });
+                current.container = Some(ContainerTarget {
+                    backend,
+                    reference: reference.into(),
+                    port,
+                });
             } else {
                 return Err(error(format!("unknown directive {directive}")));
             }
@@ -603,12 +728,25 @@ impl TunnelsFile {
     pub fn render(&self) -> String {
         let mut output = FILE_HEADER.to_owned();
         for tunnel in &self.tunnels {
+            let (directive, value) = match &tunnel.container {
+                Some(target) => (
+                    "ContainerForward",
+                    format!(
+                        "{} {} {} {}",
+                        tunnel.forward.listen(),
+                        target.backend.as_str(),
+                        target.reference,
+                        target.port
+                    ),
+                ),
+                None => (
+                    tunnel.forward.kind.directive(),
+                    tunnel.forward.directive_value(),
+                ),
+            };
             output.push_str(&format!(
-                "\nTunnel {}\n    Host {}\n    {} {}\n",
-                tunnel.name,
-                tunnel.host,
-                tunnel.forward.kind.directive(),
-                tunnel.forward.directive_value()
+                "\nTunnel {}\n    Host {}\n    {directive} {value}\n",
+                tunnel.name, tunnel.host
             ));
         }
         output
@@ -807,6 +945,9 @@ pub enum TunnelWarning {
     UnknownHost { host: String },
     /// Another saved tunnel uses the same port; only one of them can run at a time.
     CollidesWith { tunnel: String },
+    /// A running container forward whose log says the container refused a connection: nothing
+    /// listens on `port` at the address the forward reaches it.
+    NothingAnswers { port: u16, reference: String },
 }
 
 impl fmt::Display for TunnelWarning {
@@ -821,6 +962,10 @@ impl fmt::Display for TunnelWarning {
             Self::CollidesWith { tunnel } => write!(
                 formatter,
                 "uses the same port as tunnel {tunnel}; only one of them can run at a time"
+            ),
+            Self::NothingAnswers { port, reference } => write!(
+                formatter,
+                "started, but nothing answers on port {port} inside {reference}; an app that listens only on 127.0.0.1 inside its container cannot be reached"
             ),
         }
     }
@@ -1090,6 +1235,136 @@ mod tests {
         );
         assert_eq!(TunnelsFile::parse(&text).unwrap(), file);
         assert_eq!(TunnelsFile::parse("").unwrap(), TunnelsFile::default());
+    }
+
+    fn container(host: &str, spec: &str, backend: BackendId, reference: &str, port: u16) -> Tunnel {
+        Tunnel::to_container(
+            "api",
+            host,
+            local(&format!("{spec}:x:1")),
+            ContainerTarget {
+                backend,
+                reference: reference.into(),
+                port,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_container_target_round_trips_through_its_record_text() {
+        let target = ContainerTarget {
+            backend: BackendId::Docker,
+            reference: "shop/api".into(),
+            port: 80,
+        };
+        assert_eq!(target.record_text(), "docker shop/api 80");
+        assert_eq!(
+            ContainerTarget::from_record_text("docker shop/api 80"),
+            Some(target)
+        );
+        for bad in [
+            "",
+            "docker shop/api",
+            "lxc web 80",
+            "docker web 0",
+            "docker web x",
+        ] {
+            assert_eq!(ContainerTarget::from_record_text(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn nothing_answers_names_the_port_and_the_container() {
+        let warning = TunnelWarning::NothingAnswers {
+            port: 80,
+            reference: "web".into(),
+        };
+        assert_eq!(
+            warning.to_string(),
+            "started, but nothing answers on port 80 inside web; an app that listens only on 127.0.0.1 inside its container cannot be reached"
+        );
+    }
+
+    #[test]
+    fn a_container_tunnel_round_trips_and_shows_its_container() {
+        let api = container("prod", "127.0.0.1:8080", BackendId::Docker, "shop/api", 80);
+        assert_eq!(api.forward.kind, Kind::Local);
+        assert_eq!(
+            api.forward.destination_text().as_deref(),
+            Some("shop/api:80")
+        );
+        let mut file = TunnelsFile::default();
+        file.insert(api.clone()).unwrap();
+        let text = file.render();
+        assert!(
+            text.contains(
+                "\nTunnel api\n    Host prod\n    ContainerForward 127.0.0.1:8080 docker shop/api 80\n"
+            ),
+            "{text}"
+        );
+        let parsed = TunnelsFile::parse(&text).unwrap();
+        assert_eq!(parsed, file);
+        assert_eq!(parsed.tunnels()[0].container, api.container);
+        assert_eq!(
+            api.to_string(),
+            "api (127.0.0.1:8080 \u{2192} shop/api:80 through prod)"
+        );
+        let v6 = container("prod", "[::1]:8080", BackendId::Proxmox, "101", 22);
+        let mut file = TunnelsFile::default();
+        file.insert(v6).unwrap();
+        assert_eq!(TunnelsFile::parse(&file.render()).unwrap(), file);
+        assert!(
+            file.render()
+                .contains("ContainerForward [::1]:8080 proxmox 101 22")
+        );
+    }
+
+    #[test]
+    fn a_file_without_containers_renders_as_before() {
+        let text = "# Portico tunnels. Managed by Portico: edit with `portico tunnel` or the TUI.\n# This file is not read by OpenSSH.\n\nTunnel db\n    Host a\n    LocalForward 127.0.0.1:5432 localhost:5432\n";
+        let file = TunnelsFile::parse(text).unwrap();
+        assert_eq!(file.tunnels()[0].container, None);
+        assert_eq!(file.render(), text);
+    }
+
+    #[test]
+    fn a_bad_container_forward_is_refused_on_its_line() {
+        for (line, reason) in [
+            ("ContainerForward 127.0.0.1:8080 lxc web 80", "backend"),
+            ("ContainerForward 127.0.0.1:8080 docker web", "malformed"),
+            ("ContainerForward 127.0.0.1:8080 docker web x", "port"),
+            ("ContainerForward 127.0.0.1:8080 docker web 0", "port"),
+            ("ContainerForward 0 docker web 80", "port"),
+        ] {
+            let text = format!("Tunnel api\n Host a\n {line}\n");
+            let error = TunnelsFile::parse(&text).unwrap_err();
+            assert_eq!(error.line, 3, "{line}: {error}");
+            assert!(error.reason.contains(reason), "{line}: {error}");
+        }
+        let two = "Tunnel api\n Host a\n LocalForward 1 b:2\n ContainerForward 3 docker web 80\n";
+        assert_eq!(TunnelsFile::parse(two).unwrap_err().line, 4);
+    }
+
+    #[test]
+    fn a_container_reference_is_checked() {
+        for reference in ["", "a b", "a\tb"] {
+            let result = Tunnel::to_container(
+                "api",
+                "prod",
+                local("8080:x:1"),
+                ContainerTarget {
+                    backend: BackendId::Docker,
+                    reference: reference.into(),
+                    port: 80,
+                },
+            );
+            assert_eq!(
+                result.map_err(|error| error.field()),
+                Err(TunnelField::Container),
+                "{reference:?}"
+            );
+        }
     }
 
     #[test]

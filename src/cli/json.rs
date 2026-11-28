@@ -29,7 +29,9 @@ use crate::{
     },
     domain::openssh::OpenSshError,
     domain::settings::{Key, SettingsError},
-    domain::tunnel::{Forward, TunnelReport, TunnelStatus, TunnelWarning, printable},
+    domain::tunnel::{
+        ContainerTarget, Forward, Tunnel, TunnelReport, TunnelStatus, TunnelWarning, printable,
+    },
 };
 
 /// The contract's version: raised only by a breaking change.
@@ -114,6 +116,10 @@ impl Failure {
 
 impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
+        let error = match error {
+            AppError::Container(error) => return (*error).into(),
+            error => error,
+        };
         let kind = match &error {
             AppError::UnknownHost(_) | AppError::Tunnel(TunnelRefusal::UnknownHost { .. }) => {
                 "unknown-host"
@@ -491,6 +497,20 @@ fn result(
     })
 }
 
+/// A start's result: [`result`] with the start's warning, or `null`.
+fn started(
+    app: &App,
+    name: &str,
+    outcome: &str,
+    pid: Option<u32>,
+    failure: Option<Failure>,
+    warning: Option<String>,
+) -> Value {
+    let mut value = result(app, name, outcome, pid, failure);
+    value["warning"] = json!(warning.map(|warning| line(&warning)));
+    value
+}
+
 /// Starts `names` in turn. Once a signal cancels a start, or arrives after one, no other is
 /// tried: each name left fails with the cancellation.
 fn start_results(app: &App, names: &[String], interrupts: &Interrupts) -> Vec<Value> {
@@ -499,7 +519,7 @@ fn start_results(app: &App, names: &[String], interrupts: &Interrupts) -> Vec<Va
     for name in names {
         if cancelled {
             let failure = AppError::from(OpenSshError::Cancelled).into();
-            results.push(result(app, name, "failed", None, Some(failure)));
+            results.push(started(app, name, "failed", None, Some(failure), None));
             continue;
         }
         let outcome = match interrupts.during(|flag| app.start_tunnel(name, Some(flag), false)) {
@@ -517,9 +537,11 @@ fn start_results(app: &App, names: &[String], interrupts: &Interrupts) -> Vec<Va
 
 fn start_result(app: &App, name: &str, outcome: Result<StartOutcome, AppError>) -> Value {
     match outcome {
-        Ok(StartOutcome::Started { pid }) => result(app, name, "started", Some(pid), None),
+        Ok(StartOutcome::Started { pid, warning }) => {
+            started(app, name, "started", Some(pid), None, warning)
+        }
         Ok(StartOutcome::AlreadyRunning { pid }) => {
-            result(app, name, "already-running", Some(pid), None)
+            started(app, name, "already-running", Some(pid), None, None)
         }
         Ok(StartOutcome::Failed {
             reason,
@@ -529,9 +551,9 @@ fn start_result(app: &App, name: &str, outcome: Result<StartOutcome, AppError>) 
                 Some(explanation) => Failure::explained("ssh", &explanation),
                 None => Failure::new("ssh", reason),
             };
-            result(app, name, "failed", None, Some(failure))
+            started(app, name, "failed", None, Some(failure), None)
         }
-        Err(error) => result(app, name, "failed", None, Some(error.into())),
+        Err(error) => started(app, name, "failed", None, Some(error.into()), None),
     }
 }
 
@@ -816,6 +838,31 @@ fn forward(forward: &Forward) -> Value {
     })
 }
 
+/// A tunnel's forward; a container tunnel's targets its container's reference and port, even
+/// when the forward holds the address a start resolved.
+fn tunnel_forward(tunnel: &Tunnel) -> Value {
+    let mut value = forward(&tunnel.forward);
+    if let Some(target) = &tunnel.container {
+        value["description"] = json!(format!(
+            "{} \u{2192} {}:{}",
+            tunnel.forward.listen(),
+            target.reference,
+            target.port
+        ));
+        value["target_host"] = json!(target.reference);
+        value["target_port"] = json!(target.port);
+    }
+    value
+}
+
+fn container(target: &ContainerTarget) -> Value {
+    json!({
+        "backend": target.backend.as_str(),
+        "port": target.port,
+        "reference": target.reference,
+    })
+}
+
 pub(super) fn status(status: &TunnelStatus) -> Value {
     let mut value = match status {
         TunnelStatus::Stopped => json!({}),
@@ -835,6 +882,9 @@ fn tunnel_warning(warning: &TunnelWarning) -> Value {
         TunnelWarning::CollidesWith { tunnel } => {
             json!({ "kind": "collides-with", "tunnel": tunnel })
         }
+        TunnelWarning::NothingAnswers { port, reference } => {
+            json!({ "kind": "nothing-answers", "port": port, "reference": reference })
+        }
     };
     value["message"] = json!(line(&warning.to_string()));
     value
@@ -842,7 +892,8 @@ fn tunnel_warning(warning: &TunnelWarning) -> Value {
 
 pub(super) fn report(report: &TunnelReport) -> Value {
     json!({
-        "forward": forward(&report.tunnel.forward),
+        "container": report.tunnel.container.as_ref().map(container),
+        "forward": tunnel_forward(&report.tunnel),
         "host": report.tunnel.host,
         "name": report.tunnel.name,
         "reaches": line(&report.reaches),
@@ -882,6 +933,58 @@ mod tests {
             assert_eq!(result["tunnel"]["status"]["state"], "stopped", "{result}");
         }
         assert_eq!(results(started).1, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn a_start_result_carries_its_warning() {
+        let (_dir, app) = crate::cli::tunnels::tests::two_tunnels();
+        let warned = start_result(
+            &app,
+            "db",
+            Ok(StartOutcome::Started {
+                pid: 7,
+                warning: Some("started, but nothing answers".into()),
+            }),
+        );
+        assert_eq!(warned["outcome"], "started");
+        assert_eq!(warned["warning"], "started, but nothing answers");
+        let plain = start_result(&app, "db", Ok(StartOutcome::AlreadyRunning { pid: 7 }));
+        assert_eq!(plain["warning"], Value::Null);
+    }
+
+    #[test]
+    fn a_container_forward_targets_its_reference_even_once_resolved() {
+        // A temporary container forward's forward holds the address it resolved to.
+        let tunnel = Tunnel {
+            container: Some(ContainerTarget {
+                backend: BackendId::Podman,
+                reference: "shop/api".into(),
+                port: 80,
+            }),
+            ..Tunnel::new(
+                "api-80",
+                "prod",
+                Forward::parse(Kind::Local, "127.0.0.1:8080:172.18.0.4:80").unwrap(),
+            )
+            .unwrap()
+        };
+        let value = report(&TunnelReport {
+            tunnel,
+            status: TunnelStatus::Stopped,
+            warnings: Vec::new(),
+            temporary: true,
+            reaches: "shop/api on prod".into(),
+        });
+        assert_eq!(
+            value["container"],
+            json!({ "backend": "podman", "port": 80, "reference": "shop/api" })
+        );
+        assert_eq!(value["forward"]["target_host"], "shop/api");
+        assert_eq!(value["forward"]["target_port"], 80);
+        assert_eq!(
+            value["forward"]["description"],
+            "127.0.0.1:8080 \u{2192} shop/api:80"
+        );
     }
 
     fn text(document: Value) -> String {

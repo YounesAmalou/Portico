@@ -748,7 +748,8 @@ fn may_have_changed_inventory(error: &AppError) -> bool {
         | AppError::KnownHosts { .. }
         | AppError::TunnelStore(_)
         | AppError::InvalidTunnel(_)
-        | AppError::Tunnel(_) => false,
+        | AppError::Tunnel(_)
+        | AppError::Container(_) => false,
     }
 }
 
@@ -3540,7 +3541,10 @@ mod tests {
                     Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
                 )
                 .unwrap(),
-                restarted: Some(crate::app::StartOutcome::Started { pid: 9 }),
+                restarted: Some(crate::app::StartOutcome::Started {
+                    pid: 9,
+                    warning: None,
+                }),
                 note: None,
                 cancelled: false,
             })),
@@ -3560,6 +3564,7 @@ mod tests {
                 name: "_prod-80".into(),
                 host: "prod".into(),
                 forward: Forward::parse(Kind::Local, "127.0.0.1:8080:localhost:80").unwrap(),
+                container: None,
             },
             status: TunnelStatus::Running { pid: 7, started: 0 },
             warnings: Vec::new(),

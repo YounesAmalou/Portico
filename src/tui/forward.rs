@@ -522,10 +522,18 @@ impl UiState {
     /// selected (or, with that tab hidden, the status line says where it listens); otherwise
     /// the dialog stays open with the reason.
     pub(super) fn finish_forward(&mut self, result: Result<(Tunnel, StartOutcome), String>) {
+        let mut warning = None;
         let tunnel = match result {
-            Ok((tunnel, StartOutcome::Started { .. } | StartOutcome::AlreadyRunning { .. })) => {
+            Ok((
+                tunnel,
+                StartOutcome::Started {
+                    warning: started, ..
+                },
+            )) => {
+                warning = started;
                 tunnel
             }
+            Ok((tunnel, StartOutcome::AlreadyRunning { .. })) => tunnel,
             Ok((
                 _,
                 StartOutcome::Failed {
@@ -559,13 +567,16 @@ impl UiState {
                 .as_ref()
                 .map(|destination| destination.port)
         });
-        let message = format!(
+        let mut message = format!(
             "Forwarding 127.0.0.1:{} \u{2192} {}:{} (temporary forward {})",
             tunnel.forward.bind_port,
             dialog.target.short(),
             remote.unwrap_or(0),
             tunnel.name,
         );
+        if let Some(warning) = warning {
+            message.push_str(&format!("; {}", crate::domain::tunnel::printable(&warning)));
+        }
         if self.tabs.tunnels {
             self.tab = Tab::Tunnels;
             self.tunnels.select_new(&tunnel.name);
@@ -775,6 +786,7 @@ mod tests {
                 host: "prod".into(),
                 forward: Forward::parse(Kind::Local, &format!("127.0.0.1:{local}:localhost:80"))
                     .unwrap(),
+                container: None,
             },
             status,
             warnings: Vec::new(),
@@ -866,7 +878,13 @@ mod tests {
             ),
         ]);
         let tunnel = temporary("_prod-80", 8080, TunnelStatus::Stopped).tunnel;
-        state.finish_forward(Ok((tunnel, StartOutcome::Started { pid: 9 })));
+        state.finish_forward(Ok((
+            tunnel,
+            StartOutcome::Started {
+                pid: 9,
+                warning: None,
+            },
+        )));
         assert!(state.forward.is_none());
         assert_eq!(state.tab, Tab::Tunnels);
         assert_eq!(state.tunnels.selected_name(), Some("_prod-80"));
@@ -877,13 +895,38 @@ mod tests {
     }
 
     #[test]
+    fn a_start_warning_is_appended_to_the_status_line() {
+        let mut state = dialog_state();
+        let tunnel = temporary("_prod-80", 8080, TunnelStatus::Stopped).tunnel;
+        state.finish_forward(Ok((
+            tunnel,
+            StartOutcome::Started {
+                pid: 9,
+                warning: Some("started, but nothing answers\u{1b}[31m".into()),
+            },
+        )));
+        assert_eq!(
+            state.tunnels.status_line().as_deref(),
+            Some(
+                "Forwarding 127.0.0.1:8080 \u{2192} prod:80 (temporary forward _prod-80); started, but nothing answers"
+            )
+        );
+    }
+
+    #[test]
     fn a_published_port_is_named_by_the_port_typed_not_the_host_one() {
         let mut state = dialog_state();
         type_text(&mut state, "80");
         press(&mut state, KeyCode::Enter);
         let mut tunnel = temporary("_prod-80", 9000, TunnelStatus::Stopped).tunnel;
         tunnel.forward = Forward::parse(Kind::Local, "127.0.0.1:9000:localhost:8080").unwrap();
-        state.finish_forward(Ok((tunnel, StartOutcome::Started { pid: 9 })));
+        state.finish_forward(Ok((
+            tunnel,
+            StartOutcome::Started {
+                pid: 9,
+                warning: None,
+            },
+        )));
         assert_eq!(
             state.tunnels.status_line().as_deref(),
             Some("Forwarding 127.0.0.1:9000 \u{2192} prod:80 (temporary forward _prod-80)")

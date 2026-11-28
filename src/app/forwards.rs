@@ -6,11 +6,12 @@ use std::sync::atomic::AtomicBool;
 use super::{App, AppError, ContainerError, StartOutcome, TunnelRefusal};
 use crate::{
     backend::{
-        self, BackendId, Container, ListFailure, Reach, RunFailure, Target, Via, display_name,
+        self, BackendId, Container, ListFailure, Reach, ResolveError, RunFailure, Target, Via,
+        display_name, remember_key, resolve_lowest,
     },
     domain::openssh::OpenSshError,
     domain::tunnel::{
-        Destination, Forward, Kind, Tunnel, TunnelReport, is_temporary,
+        ContainerTarget, Destination, Forward, Kind, Tunnel, TunnelReport, is_temporary,
         ports::{HOST_PORTS_SCRIPT, parse_listeners, suggested_ports},
         runtime::{default_local_port, try_bind},
         temporary_name, unique_name,
@@ -58,7 +59,7 @@ pub struct SaveOutcome {
     pub tunnel: Tunnel,
     /// The saved tunnel's start, when the temporary forward was running.
     pub restarted: Option<StartOutcome>,
-    /// Said once: the saved tunnel reaches a container's address, which can change.
+    /// Something to say once about the saved tunnel; none is said now.
     pub note: Option<String>,
     /// Whether the restart was cancelled: the tunnel is saved but not started.
     pub cancelled: bool,
@@ -171,6 +172,7 @@ impl App {
             return Err(TunnelRefusal::NoLocalPort.into());
         }
         let label = target.label();
+        let mut container_target = None;
         let (host, destination) = match target {
             ForwardTarget::Host(alias) => (
                 self.connectable_alias(alias)?,
@@ -222,6 +224,11 @@ impl App {
                         label: label.clone(),
                     },
                 })?;
+                container_target = Some(ContainerTarget {
+                    backend: *backend,
+                    reference: temporary_reference(*backend, container),
+                    port: remote,
+                });
                 (alias, destination)
             }
         };
@@ -246,6 +253,7 @@ impl App {
                 bind_port: local,
                 destination: Some(destination),
             },
+            container: container_target,
         };
         let outcome = self.start_temporary(tunnel.clone(), &label, cancelled, in_tui)?;
         Ok((tunnel, outcome))
@@ -261,8 +269,9 @@ impl App {
     /// Saves temporary forward `temporary` as tunnel `name`, as the tunnel form would. A
     /// running forward is stopped and the saved tunnel started at once (ssh finds a tunnel by
     /// its log path, which cannot change while it runs); a failed one is saved without
-    /// starting. The note says when the tunnel reaches a container's address. Setting
-    /// `cancelled` cancels the restart, never the save.
+    /// starting. A forward to a container is saved as a container tunnel, which looks the
+    /// container's address up at each start. Setting `cancelled` cancels the restart, never
+    /// the save.
     pub fn save_tunnel(
         &self,
         temporary: &str,
@@ -277,7 +286,24 @@ impl App {
         if !report.temporary || report.tunnel.host.is_empty() {
             return Err(TunnelRefusal::Unknown(temporary.into()).into());
         }
-        let tunnel = Tunnel::new(name, report.tunnel.host.clone(), report.tunnel.forward)?;
+        let tunnel = match report.tunnel.container {
+            Some(mut target) => {
+                // A temporary forward to one replica keeps its number; a saved tunnel does not.
+                if target.reference.contains('/')
+                    && let Some((service, number)) = target.reference.rsplit_once('#')
+                    && number.parse::<u32>().is_ok()
+                {
+                    target.reference = service.to_owned();
+                }
+                Tunnel::to_container(
+                    name,
+                    report.tunnel.host.clone(),
+                    report.tunnel.forward,
+                    target,
+                )?
+            }
+            None => Tunnel::new(name, report.tunnel.host.clone(), report.tunnel.forward)?,
+        };
         self.add_tunnel(tunnel.clone())?;
         // The tunnel is saved from here on: a stop or start refused is its failed start, not an
         // error, so the save is never half applied. A cancelled start leaves it saved.
@@ -300,22 +326,131 @@ impl App {
             self.forget_run(&report.tunnel.name);
             None
         };
-        let note = tunnel
-            .forward
-            .destination
-            .as_ref()
-            .filter(|destination| destination.host != "localhost")
-            .map(|destination| {
-                format!(
-                    "saved with the container's current address {}; it will not follow the container if it is recreated",
-                    destination.host
-                )
-            });
         Ok(SaveOutcome {
             tunnel,
             restarted,
-            note,
+            note: None,
             cancelled: restart_cancelled,
+        })
+    }
+
+    /// The backend whose containers on host `host` include `reference`, with the reference a
+    /// saved tunnel keeps for the container (`project/service` for a Compose container, a CT's
+    /// VMID): each backend installed there is listed in turn, `first` (when given) then the
+    /// others in the [`backend::AUTOMATIC`] order (ssh never prompts), and the first whose listing resolves the reference (a Compose
+    /// service to its lowest replica) is the one. A reference matching several containers of
+    /// one backend is refused as a start refuses it. When no backend has it, the first backend
+    /// that refused to list is the failure, or else the container is not running there.
+    pub fn find_container(
+        &self,
+        host: &str,
+        reference: &str,
+        first: Option<BackendId>,
+    ) -> Result<(BackendId, String), AppError> {
+        let on = Target::Host(self.connectable_alias(host)?);
+        let mut refused = None;
+        let order = first.into_iter().chain(
+            backend::AUTOMATIC
+                .into_iter()
+                .filter(|id| Some(*id) != first),
+        );
+        for backend in order {
+            let list = match self.containers(&on, &[backend], true, None) {
+                Ok(list) => list,
+                Err(ContainerError::Backend(issue))
+                    if issue.problem == backend::Problem::NotInstalled =>
+                {
+                    continue;
+                }
+                Err(ContainerError::Backend(issue)) => {
+                    refused.get_or_insert(ContainerError::Backend(issue));
+                    continue;
+                }
+                Err(ContainerError::App(error)) => return Err(error),
+                Err(error) => return Err(AppError::Container(Box::new(error))),
+            };
+            match resolve_lowest(reference, &list.listing.containers) {
+                Ok(container) => return Ok((backend, saved_reference(backend, container))),
+                Err(ResolveError::NotFound) => {}
+                Err(ResolveError::Ambiguous(candidates)) => {
+                    return Err(TunnelRefusal::AmbiguousContainer {
+                        reference: reference.to_owned(),
+                        host: host.to_owned(),
+                        candidates,
+                    }
+                    .into());
+                }
+            }
+        }
+        Err(match refused {
+            Some(error) => AppError::Container(Box::new(error)),
+            None => TunnelRefusal::NotRunningAnywhere {
+                reference: reference.to_owned(),
+                host: host.to_owned(),
+            }
+            .into(),
+        })
+    }
+
+    /// Container tunnel `tunnel` as it starts now: the containers of its host listed with its
+    /// backend, its reference resolved (a Compose service to its lowest replica), and its
+    /// destination found as a quick forward's is. The tunnel keeps its name, listen side and
+    /// container target. ssh never prompts; `cancelled` stops it.
+    pub(super) fn resolve_container(
+        &self,
+        tunnel: &Tunnel,
+        target: &ContainerTarget,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Tunnel, AppError> {
+        let host = &tunnel.host;
+        let on = Target::Host(self.connectable_alias(host)?);
+        let list = self
+            .containers(&on, &[target.backend], true, cancelled)
+            .map_err(|error| match error {
+                ContainerError::App(error) => error,
+                error => AppError::Container(Box::new(error)),
+            })?;
+        let container = resolve_lowest(&target.reference, &list.listing.containers).map_err(
+            |error| match error {
+                ResolveError::NotFound => TunnelRefusal::NotRunning {
+                    reference: target.reference.clone(),
+                    host: host.clone(),
+                    backend: target.backend,
+                },
+                ResolveError::Ambiguous(candidates) => TunnelRefusal::AmbiguousContainer {
+                    reference: target.reference.clone(),
+                    host: host.clone(),
+                    candidates,
+                },
+            },
+        )?;
+        let reach = self
+            .container_reach(&on, target.backend, container, list.via, cancelled)
+            .map_err(|error| match error {
+                ContainerError::App(error) => error,
+                error => TunnelRefusal::ReachFailed {
+                    label: format!("{} on {host}", target.reference),
+                    reason: container_reason(&error),
+                }
+                .into(),
+            })?;
+        let destination = destination(&reach, target.port).ok_or_else(|| match target.backend {
+            BackendId::Proxmox => TunnelRefusal::NoCtAddress {
+                id: container.id.clone(),
+                host: host.clone(),
+            },
+            _ => TunnelRefusal::Unroutable {
+                reference: target.reference.clone(),
+                host: host.clone(),
+            },
+        })?;
+        Ok(Tunnel {
+            forward: Forward {
+                kind: Kind::Local,
+                destination: Some(destination),
+                ..tunnel.forward.clone()
+            },
+            ..tunnel.clone()
         })
     }
 
@@ -401,6 +536,28 @@ impl App {
             self.forget_run(&name);
         }
         Ok(name)
+    }
+}
+
+/// The reference a container is saved under, the one that survives a redeploy: a CT's VMID,
+/// a Compose container's `project/service`, any other container's name.
+fn saved_reference(backend: BackendId, container: &Container) -> String {
+    match backend {
+        BackendId::Proxmox => container.id.clone(),
+        _ => remember_key(container),
+    }
+}
+
+/// The reference a temporary forward keeps for its container: as [`saved_reference`], except
+/// that a numbered Compose replica keeps its number (`project/service#n`), so a restart goes
+/// back to the same replica.
+fn temporary_reference(backend: BackendId, container: &Container) -> String {
+    match (backend, container.number) {
+        (BackendId::Proxmox, _) | (_, None) => saved_reference(backend, container),
+        (_, Some(number)) if container.project.is_some() && container.service.is_some() => {
+            format!("{}#{number}", remember_key(container))
+        }
+        _ => saved_reference(backend, container),
     }
 }
 
@@ -507,8 +664,9 @@ LISTEN 0 244 [::1]:5432 [::]:*\n";
 
     /// An app with the host `prod` whose `ssh` is a fake: `-G` answers like OpenSSH, a tunnel
     /// start (`-f`) logs its arguments to `starts` and leaves a background stand-in that
-    /// carries them, as ssh's background process does; any other call logs its remote command
-    /// to `remote` and sources `behaviour` when it exists.
+    /// carries them, as ssh's background process does (and when `refuse` exists, logs a
+    /// refused channel as ssh does when nothing answers); any other call logs its remote
+    /// command to `remote` and sources `behaviour` when it exists.
     struct Fixture {
         dir: TempDir,
         app: App,
@@ -525,6 +683,13 @@ LISTEN 0 244 [::1]:5432 [::]:*\n";
 if [ "$1" = -G ]; then printf 'hostname x\nport 22\n'; exit 0; fi
 if [ "$1" = -f ]; then
   printf '%s\n' "$*" >> '{starts}'
+  if [ -f '{refuse}' ]; then
+    prev=
+    for arg do
+      [ "$prev" = -E ] && echo 'channel 2: open failed: connect failed: Connection refused' >> "$arg"
+      prev=$arg
+    done
+  fi
   setsid sh -c 'sleep 60; exit 0' sh "$@" </dev/null >/dev/null 2>&1 &
   exit 0
 fi
@@ -536,6 +701,7 @@ exit 0
                 starts = base.join("starts").display(),
                 remote = base.join("remote").display(),
                 behaviour = base.join("behaviour").display(),
+                refuse = base.join("refuse").display(),
             ),
         );
         fs::create_dir_all(base.join("home/.ssh")).unwrap();
@@ -566,9 +732,23 @@ exit 0
                 host: Some("prod".into()),
                 forward: Some(forward.into()),
                 reaches: Some("prod".into()),
+                container: None,
             }
             .write(&path)
             .unwrap();
+        }
+
+        /// Makes the fake host's docker list `ps` (one line per container) and inspect every
+        /// container as `inspect`; either can change between calls.
+        fn docker(&self, ps: &[String], inspect: &str) {
+            let base = self.dir.path();
+            fs::write(base.join("ps"), ps.join("\n") + "\n").unwrap();
+            fs::write(base.join("inspect"), format!("{inspect}\n")).unwrap();
+            self.behave(&format!(
+                "case \"$last\" in\n  *'ps --no-trunc'*) cat '{}' ;;\n  *inspect*) cat '{}' ;;\nesac\n",
+                base.join("ps").display(),
+                base.join("inspect").display()
+            ));
         }
 
         fn read(&self, name: &str) -> String {
@@ -601,6 +781,36 @@ exit 0
             number: None,
             working_dir: None,
         }
+    }
+
+    /// A `docker ps` line of a running container, of a Compose service when `compose` gives
+    /// its project, service and replica number.
+    fn ps_line(name: &str, compose: Option<(&str, &str, u32)>) -> String {
+        let (project, service, number) = compose.map_or(
+            (String::new(), String::new(), String::new()),
+            |(p, s, n)| (p.to_owned(), s.to_owned(), n.to_string()),
+        );
+        format!(
+            r#"{{"id":"{name}-id","name":"{name}","image":"nginx","command":"","running_for":"","status":"Up","ports":"","networks":"","mounts":"","project":"{project}","service":"{service}","number":"{number}","working_dir":""}}"#
+        )
+    }
+
+    /// `docker inspect` of a container on a bridge network at `address`, exposing 80.
+    fn inspect_at(address: &str) -> String {
+        format!(r#"{{"bridge":{{"IPAddress":"{address}"}}}}|{{"80/tcp":{{}}}}|default"#)
+    }
+
+    /// Saved container tunnel `api` on `prod`, from `127.0.0.1:<local>` to port 80 of
+    /// `reference` (docker).
+    fn add_container_tunnel(app: &App, reference: &str, local: u16) {
+        let listen = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{local}")).unwrap();
+        let target = ContainerTarget {
+            backend: BackendId::Docker,
+            reference: reference.into(),
+            port: 80,
+        };
+        app.add_tunnel(Tunnel::to_container("api", "prod", listen, target).unwrap())
+            .unwrap();
     }
 
     fn docker_web() -> ForwardTarget {
@@ -1206,29 +1416,6 @@ exit 0
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn saving_a_forward_to_a_container_address_says_it_will_not_follow() {
-        let fixture = fixture();
-        fixture.behave(&format!("echo '{INSPECT}'\n"));
-        let (temporary, _) = fixture
-            .app
-            .quick_forward(&docker_web(), None, 443, Some(free_port()), None, false)
-            .unwrap();
-
-        let saved = fixture
-            .app
-            .save_tunnel(&temporary.name, "web-443", None)
-            .unwrap();
-
-        assert_eq!(
-            saved.note.as_deref(),
-            Some(
-                "saved with the container's current address 172.18.0.4; it will not follow the container if it is recreated"
-            )
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn a_cancelled_restart_leaves_the_forward_saved() {
         let fixture = fixture();
         let (temporary, _) = fixture
@@ -1294,6 +1481,403 @@ exit 0
                 Err(AppError::Tunnel(TunnelRefusal::NotTemporary(_)))
             ),
             "{refused:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_temporary_forward_to_a_replica_restarts_at_it_but_saves_the_service() {
+        let fixture = fixture();
+        fixture.docker(
+            &[
+                ps_line("shop-api-1", Some(("shop", "api", 1))),
+                ps_line("shop-api-2", Some(("shop", "api", 2))),
+            ],
+            &inspect_at("172.18.0.4"),
+        );
+        let mut replica = container("shop-api-2", "");
+        replica.project = Some("shop".into());
+        replica.service = Some("api".into());
+        replica.number = Some(2);
+        let target = ForwardTarget::Container {
+            target: Target::Host("prod".into()),
+            backend: BackendId::Docker,
+            container: replica,
+            via: None,
+        };
+        let (temporary, _) = fixture
+            .app
+            .quick_forward(&target, None, 80, Some(free_port()), None, false)
+            .unwrap();
+
+        let kept = fixture.app.tunnel(&temporary.name).unwrap();
+        assert_eq!(kept.tunnel.container.unwrap().reference, "shop/api#2");
+        assert!(
+            fixture.read("remote").contains("shop-api-2-id"),
+            "{}",
+            fixture.read("remote")
+        );
+
+        let saved = fixture
+            .app
+            .save_tunnel(&temporary.name, "api", None)
+            .unwrap();
+        assert_eq!(saved.tunnel.container.unwrap().reference, "shop/api");
+        assert_eq!(
+            temporary_reference(BackendId::Docker, &container("web", "")),
+            "web"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_saved_container_tunnel_starts_at_the_current_address_and_follows_it() {
+        let fixture = fixture();
+        fixture.docker(&[ps_line("web", None)], &inspect_at("172.18.0.4"));
+        let local = free_port();
+        add_container_tunnel(&fixture.app, "web", local);
+
+        let outcome = fixture.app.start_tunnel("api", None, false).unwrap();
+        assert!(
+            matches!(outcome, StartOutcome::Started { warning: None, .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            fixture
+                .read("starts")
+                .contains(&format!("-L 127.0.0.1:{local}:172.18.0.4:80 ")),
+            "{}",
+            fixture.read("starts")
+        );
+        let report = fixture.app.tunnel("api").unwrap();
+        assert_eq!(report.reaches, "web on prod");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // A saved tunnel's target is read from the file, not from its record.
+        let record = fs::read_to_string(fixture.app.runtime.record("api")).unwrap();
+        assert!(!record.contains("container "), "{record}");
+
+        // The container is recreated at another address: the next start follows it.
+        fixture.app.stop_tunnel("api").unwrap();
+        fixture.docker(&[ps_line("web", None)], &inspect_at("172.18.0.9"));
+        fixture.app.start_tunnel("api", None, false).unwrap();
+        assert!(
+            fixture
+                .read("starts")
+                .contains(&format!("-L 127.0.0.1:{local}:172.18.0.9:80 ")),
+            "{}",
+            fixture.read("starts")
+        );
+        // The file still names the container, not an address.
+        let file = fixture.app.tunnels.load().unwrap().render();
+        assert!(
+            file.contains(&format!("ContainerForward 127.0.0.1:{local} docker web 80")),
+            "{file}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_compose_service_starts_against_its_lowest_replica() {
+        let fixture = fixture();
+        fixture.docker(
+            &[
+                ps_line("shop-api-2", Some(("shop", "api", 2))),
+                ps_line("shop-api-1", Some(("shop", "api", 1))),
+            ],
+            &inspect_at("172.18.0.4"),
+        );
+        add_container_tunnel(&fixture.app, "shop/api", free_port());
+
+        let outcome = fixture.app.start_tunnel("api", None, false).unwrap();
+
+        assert!(
+            matches!(outcome, StartOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            fixture.read("remote").contains("shop-api-1-id"),
+            "{}",
+            fixture.read("remote")
+        );
+    }
+
+    #[test]
+    fn a_container_that_is_not_running_is_refused_and_leaves_no_record() {
+        let fixture = fixture();
+        fixture.docker(&[ps_line("db", None)], &inspect_at("172.18.0.4"));
+        add_container_tunnel(&fixture.app, "web", free_port());
+
+        let refused = fixture.app.start_tunnel("api", None, false);
+
+        match refused {
+            Err(AppError::Tunnel(refusal @ TunnelRefusal::NotRunning { .. })) => {
+                assert_eq!(refusal.to_string(), "web is not running on prod (docker)")
+            }
+            other => panic!("expected NotRunning, got {other:?}"),
+        }
+        assert_eq!(fixture.read("starts"), "");
+        assert!(!fixture.app.runtime.record("api").exists());
+    }
+
+    #[test]
+    fn an_ambiguous_container_message_strips_escapes_from_names() {
+        let refusal = TunnelRefusal::AmbiguousContainer {
+            reference: "api".into(),
+            host: "prod".into(),
+            candidates: vec!["a\u{1b}[31mb".into(), "c".into()],
+        };
+
+        let message = refusal.to_string();
+
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(message.contains(", c"), "{message:?}");
+    }
+
+    #[test]
+    fn a_service_of_several_projects_is_refused_with_their_names() {
+        let fixture = fixture();
+        fixture.docker(
+            &[
+                ps_line("shop-api-1", Some(("shop", "api", 1))),
+                ps_line("blog-api-1", Some(("blog", "api", 1))),
+            ],
+            &inspect_at("172.18.0.4"),
+        );
+        add_container_tunnel(&fixture.app, "api", free_port());
+
+        let refused = fixture.app.start_tunnel("api", None, false);
+
+        match refused {
+            Err(AppError::Tunnel(refusal @ TunnelRefusal::AmbiguousContainer { .. })) => {
+                assert_eq!(
+                    refusal.to_string(),
+                    "api matches several containers on prod: blog-api-1, shop-api-1"
+                )
+            }
+            other => panic!("expected AmbiguousContainer, got {other:?}"),
+        }
+        assert_eq!(fixture.read("starts"), "");
+    }
+
+    #[test]
+    fn a_container_without_a_routable_address_is_refused() {
+        let fixture = fixture();
+        fixture.docker(&[ps_line("web", None)], &inspect_at(""));
+        add_container_tunnel(&fixture.app, "web", free_port());
+
+        let refused = fixture.app.start_tunnel("api", None, false);
+
+        match refused {
+            Err(AppError::Tunnel(refusal @ TunnelRefusal::Unroutable { .. })) => assert_eq!(
+                refusal.to_string(),
+                "web on prod has no address the host can route to; publish the port, or attach it to a network prod routes"
+            ),
+            other => panic!("expected Unroutable, got {other:?}"),
+        }
+        assert_eq!(fixture.read("starts"), "");
+        assert!(!fixture.app.runtime.record("api").exists());
+    }
+
+    #[test]
+    fn a_listing_that_fails_is_its_own_explained_failure() {
+        let fixture = fixture();
+        fixture.behave(
+            "case \"$last\" in\n  *'ps --no-trunc'*) echo 'Error: something odd happened' >&2; exit 1 ;;\nesac\n",
+        );
+        add_container_tunnel(&fixture.app, "web", free_port());
+
+        let refused = fixture.app.start_tunnel("api", None, false);
+
+        match refused {
+            Err(AppError::Container(error)) => {
+                assert!(matches!(*error, ContainerError::Backend(_)), "{error:?}");
+            }
+            other => panic!("expected the listing's failure, got {other:?}"),
+        }
+        assert!(!fixture.read("remote").contains("inspect"));
+        assert_eq!(fixture.read("starts"), "");
+        assert!(!fixture.app.runtime.record("api").exists());
+    }
+
+    #[test]
+    fn a_ct_tunnel_without_an_address_says_so() {
+        let fixture = fixture();
+        fixture.behave(
+            "case \"$last\" in\n  *'pct exec'*) printf -- '---\\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\\n' ;;\n  *'pct list'*) printf 'via=none\\nVMID       Status     Lock         Name\\n101        running                 db\\n' ;;\nesac\n",
+        );
+        let listen = Forward::parse(Kind::Dynamic, &format!("127.0.0.1:{}", free_port())).unwrap();
+        let target = ContainerTarget {
+            backend: BackendId::Proxmox,
+            reference: "101".into(),
+            port: 80,
+        };
+        fixture
+            .app
+            .add_tunnel(Tunnel::to_container("db", "prod", listen, target).unwrap())
+            .unwrap();
+
+        let refused = fixture.app.start_tunnel("db", None, false);
+
+        match refused {
+            Err(AppError::Tunnel(refusal @ TunnelRefusal::NoCtAddress { .. })) => assert_eq!(
+                refusal.to_string(),
+                "could not read the address of CT 101 on prod"
+            ),
+            other => panic!("expected NoCtAddress, got {other:?}"),
+        }
+        assert!(fixture.read("remote").contains("pct exec"));
+        assert_eq!(fixture.read("starts"), "");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_container_that_refuses_the_test_connection_starts_with_a_warning() {
+        let fixture = fixture();
+        fixture.docker(&[ps_line("web", None)], &inspect_at("172.18.0.4"));
+        fs::write(fixture.dir.path().join("refuse"), "").unwrap();
+        add_container_tunnel(&fixture.app, "web", free_port());
+        let warning = "started, but nothing answers on port 80 inside web; an app that listens only on 127.0.0.1 inside its container cannot be reached";
+
+        let outcome = fixture.app.start_tunnel("api", None, false).unwrap();
+
+        match outcome {
+            StartOutcome::Started {
+                warning: Some(text),
+                ..
+            } => assert_eq!(text, warning),
+            other => panic!("expected a warning, got {other:?}"),
+        }
+        let report = fixture.app.tunnel("api").unwrap();
+        assert_eq!(
+            report.warnings,
+            vec![crate::domain::tunnel::TunnelWarning::NothingAnswers {
+                port: 80,
+                reference: "web".into()
+            }]
+        );
+        assert_eq!(report.warnings[0].to_string(), warning);
+    }
+
+    /// A quick forward to port 80 of Compose service `shop/api`, whose one replica is at
+    /// 172.18.0.4.
+    #[cfg(target_os = "linux")]
+    fn quick_shop_api(fixture: &Fixture, local: u16) -> Tunnel {
+        let replica = ps_line("shop-api-1", Some(("shop", "api", 1)));
+        fixture.docker(std::slice::from_ref(&replica), &inspect_at("172.18.0.4"));
+        let mut container = container("shop-api-1", "");
+        container.project = Some("shop".into());
+        container.service = Some("api".into());
+        container.number = Some(1);
+        let target = ForwardTarget::Container {
+            target: Target::Host("prod".into()),
+            backend: BackendId::Docker,
+            container,
+            via: None,
+        };
+        let (tunnel, outcome) = fixture
+            .app
+            .quick_forward(&target, None, 80, Some(local), None, false)
+            .unwrap();
+        assert!(
+            matches!(outcome, StartOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        tunnel
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_quick_container_forward_restarts_at_the_new_address() {
+        let fixture = fixture();
+        let local = free_port();
+        let tunnel = quick_shop_api(&fixture, local);
+        let record = fs::read_to_string(fixture.app.runtime.record(&tunnel.name)).unwrap();
+        assert!(
+            record.contains("container docker shop/api#1 80\n"),
+            "{record}"
+        );
+        assert!(
+            record.contains(&format!("forward -L 127.0.0.1:{local}:172.18.0.4:80\n")),
+            "{record}"
+        );
+
+        // The ssh exits; the container is recreated elsewhere; the restart follows it.
+        let report = fixture.app.tunnel(&tunnel.name).unwrap();
+        let crate::domain::tunnel::TunnelStatus::Running { pid, .. } = report.status else {
+            panic!("not running: {:?}", report.status);
+        };
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fixture
+            .app
+            .tunnel(&tunnel.name)
+            .unwrap()
+            .status
+            .is_running()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in survived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fixture.docker(
+            &[ps_line("shop-api-1", Some(("shop", "api", 1)))],
+            &inspect_at("172.18.0.9"),
+        );
+
+        let outcome = fixture.app.start_tunnel(&tunnel.name, None, false).unwrap();
+
+        assert!(
+            matches!(outcome, StartOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            fixture
+                .read("starts")
+                .contains(&format!("-L 127.0.0.1:{local}:172.18.0.9:80 ")),
+            "{}",
+            fixture.read("starts")
+        );
+        let record = fs::read_to_string(fixture.app.runtime.record(&tunnel.name)).unwrap();
+        assert!(
+            record.contains("container docker shop/api#1 80\n"),
+            "{record}"
+        );
+        assert_eq!(
+            fixture.app.tunnel(&tunnel.name).unwrap().reaches,
+            "api on prod"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saving_a_quick_container_forward_saves_the_container_by_name() {
+        let fixture = fixture();
+        let local = free_port();
+        let tunnel = quick_shop_api(&fixture, local);
+
+        let saved = fixture.app.save_tunnel(&tunnel.name, "api", None).unwrap();
+
+        assert_eq!(saved.note, None);
+        assert!(
+            matches!(saved.restarted, Some(StartOutcome::Started { .. })),
+            "{:?}",
+            saved.restarted
+        );
+        let file = fixture.app.tunnels.load().unwrap().render();
+        assert!(
+            file.contains(&format!(
+                "\nTunnel api\n    Host prod\n    ContainerForward 127.0.0.1:{local} docker shop/api 80\n"
+            )),
+            "{file}"
+        );
+        assert_eq!(
+            fixture.app.tunnel("api").unwrap().reaches,
+            "shop/api on prod"
         );
     }
 }

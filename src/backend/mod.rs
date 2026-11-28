@@ -13,6 +13,7 @@ use proxmox::Proxmox;
 
 pub use listing::{
     Container, Group, Listing, Published, ResolveError, display_name, group, remember_key, resolve,
+    resolve_lowest,
 };
 
 /// Where the tool runs: on this machine, or through ssh on a host of the inventory.
@@ -152,6 +153,11 @@ impl BackendId {
             BackendId::Podman => "podman",
             BackendId::Proxmox => "proxmox",
         }
+    }
+
+    /// The backend with this id (`docker`, `podman` or `proxmox`).
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        AUTOMATIC.into_iter().find(|id| id.as_str() == name)
     }
 
     /// The program the backend runs, as messages name it.

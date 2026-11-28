@@ -71,6 +71,7 @@ fn password_only_server_says_the_test_cannot_type_a_password() {
     let real_home = RealHome::snapshot();
     let sshd = Sshd::start_with(SshdOptions {
         password_only: true,
+        ..SshdOptions::default()
     });
     let client = Client::new();
     client.init();
