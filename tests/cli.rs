@@ -1526,10 +1526,10 @@ fn tunnel_add_container_defaults_its_local_port() {
         .unwrap_or_else(|| panic!("{file}"));
     let (local, rest) = line.split_once(' ').unwrap();
     assert_eq!(rest, "docker shop/api 80");
-    // The port inside, or when it cannot be bound the next free one from it (or from 8080 for a
-    // privileged one).
+    // The port inside, or when it cannot be bound the next free one above it (from 8080 where 80
+    // is privileged; on Windows it is not, but something may already listen there).
     let local: u16 = local.parse().unwrap();
-    assert!(local == 80 || local >= 8080, "{local}");
+    assert!(local >= 80, "{local}");
 }
 
 #[test]
